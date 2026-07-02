@@ -6,9 +6,9 @@ use std::{
 
 use shardline_cas::{CasCoordinator, CasLimits};
 use shardline_index::{
-    DedupeShardMapping, FileId, FileReconstruction, IndexStore, LocalIndexStore,
-    ProviderRepositoryState, QuarantineCandidate, ReconstructionTerm, RetentionHold,
-    WebhookDelivery, XorbId,
+    DedupeShardMapping, DedupeStore, FileId, FileReconstruction, LifecycleStore, LocalIndexStore,
+    ProviderRepositoryState, QuarantineCandidate, ReconstructionStore, ReconstructionTerm,
+    RetentionHold, StoredObjectId, WebhookDelivery, xet_hash_hex_string,
 };
 use shardline_protocol::{ByteRange, ChunkRange, RepositoryProvider, ShardlineHash};
 use shardline_storage::{
@@ -136,7 +136,7 @@ struct MemoryIndexStore {
     retention_holds: RefCell<HashMap<ObjectKey, RetentionHold>>,
     webhook_deliveries: RefCell<HashMap<(String, String, String, String), WebhookDelivery>>,
     provider_repository_states: RefCell<HashMap<(String, String, String), ProviderRepositoryState>>,
-    xorbs: RefCell<HashSet<XorbId>>,
+    objects: RefCell<HashSet<StoredObjectId>>,
     dedupe_shards: RefCell<HashMap<ShardlineHash, DedupeShardMapping>>,
 }
 
@@ -147,12 +147,12 @@ impl MemoryIndexStore {
             .insert(file_id, reconstruction);
     }
 
-    fn insert_xorb(&self, xorb_id: XorbId) {
-        self.xorbs.borrow_mut().insert(xorb_id);
+    fn insert_object(&self, object_id: StoredObjectId) {
+        self.objects.borrow_mut().insert(object_id);
     }
 }
 
-impl IndexStore for MemoryIndexStore {
+impl ReconstructionStore for MemoryIndexStore {
     type Error = MemoryIndexError;
 
     fn reconstruction(&self, file_id: &FileId) -> Result<Option<FileReconstruction>, Self::Error> {
@@ -167,9 +167,7 @@ impl IndexStore for MemoryIndexStore {
             .copied()
             .collect::<Vec<_>>();
         file_ids.sort_by(|left, right| {
-            left.hash()
-                .api_hex_string()
-                .cmp(&right.hash().api_hex_string())
+            xet_hash_hex_string(left.hash()).cmp(&xet_hash_hex_string(right.hash()))
         });
         Ok(file_ids)
     }
@@ -178,9 +176,13 @@ impl IndexStore for MemoryIndexStore {
         Ok(self.reconstructions.borrow_mut().remove(file_id).is_some())
     }
 
-    fn contains_xorb(&self, xorb_id: &XorbId) -> Result<bool, Self::Error> {
-        Ok(self.xorbs.borrow().contains(xorb_id))
+    fn contains_object(&self, object_id: &StoredObjectId) -> Result<bool, Self::Error> {
+        Ok(self.objects.borrow().contains(object_id))
     }
+}
+
+impl DedupeStore for MemoryIndexStore {
+    type Error = MemoryIndexError;
 
     fn dedupe_shard_mapping(
         &self,
@@ -197,9 +199,7 @@ impl IndexStore for MemoryIndexStore {
             .cloned()
             .collect::<Vec<_>>();
         mappings.sort_by(|left, right| {
-            left.chunk_hash()
-                .api_hex_string()
-                .cmp(&right.chunk_hash().api_hex_string())
+            xet_hash_hex_string(left.chunk_hash()).cmp(&xet_hash_hex_string(right.chunk_hash()))
         });
         Ok(mappings)
     }
@@ -207,6 +207,10 @@ impl IndexStore for MemoryIndexStore {
     fn delete_dedupe_shard_mapping(&self, chunk_hash: &ShardlineHash) -> Result<bool, Self::Error> {
         Ok(self.dedupe_shards.borrow_mut().remove(chunk_hash).is_some())
     }
+}
+
+impl LifecycleStore for MemoryIndexStore {
+    type Error = MemoryIndexError;
 
     fn quarantine_candidate(
         &self,
@@ -392,6 +396,7 @@ const fn provider_key(provider: RepositoryProvider) -> &'static str {
         RepositoryProvider::GitHub => "github",
         RepositoryProvider::GitLab => "gitlab",
         RepositoryProvider::Gitea => "gitea",
+        RepositoryProvider::Codeberg => "codeberg",
         RepositoryProvider::Generic => "generic",
     }
 }
@@ -460,16 +465,16 @@ fn coordinator_adapters_support_lifecycle_and_reconstruction_contracts() {
     );
 
     let file_id = FileId::new(hash);
-    let xorb_id = XorbId::new(hash);
+    let object_id = StoredObjectId::new(hash);
     let chunk_range = ChunkRange::new(0, 1);
     assert!(chunk_range.is_ok());
     let Ok(chunk_range) = chunk_range else {
         return;
     };
-    let term = ReconstructionTerm::new(xorb_id, chunk_range, 4);
+    let term = ReconstructionTerm::new(object_id, chunk_range, 4);
     let reconstruction = FileReconstruction::new(vec![term]);
 
-    coordinator.index().insert_xorb(xorb_id);
+    coordinator.index().insert_object(object_id);
     coordinator
         .index()
         .insert_reconstruction(file_id, reconstruction.clone());
@@ -484,7 +489,7 @@ fn coordinator_adapters_support_lifecycle_and_reconstruction_contracts() {
         Ok(())
     );
 
-    assert_eq!(coordinator.index().contains_xorb(&xorb_id), Ok(true));
+    assert_eq!(coordinator.index().contains_object(&object_id), Ok(true));
     assert_eq!(
         coordinator.index().reconstruction(&file_id),
         Ok(Some(reconstruction))
@@ -588,19 +593,20 @@ fn coordinator_local_filesystem_adapters_support_lifecycle_and_reconstruction_co
     assert_eq!(listed.len(), 1);
 
     let file_id = FileId::new(hash);
-    let xorb_id = XorbId::new(hash);
+    let object_id = StoredObjectId::new(hash);
     let range = ChunkRange::new(0, 1);
     assert!(range.is_ok());
     let Ok(range) = range else {
         return;
     };
-    let reconstruction = FileReconstruction::new(vec![ReconstructionTerm::new(xorb_id, range, 4)]);
+    let reconstruction =
+        FileReconstruction::new(vec![ReconstructionTerm::new(object_id, range, 4)]);
     let inserted_reconstruction = coordinator
         .index()
         .insert_reconstruction(&file_id, &reconstruction);
     assert!(inserted_reconstruction.is_ok());
-    let inserted_xorb = coordinator.index().insert_xorb(&xorb_id);
-    assert!(inserted_xorb.is_ok());
+    let inserted_object = coordinator.index().insert_object(&object_id);
+    assert!(inserted_object.is_ok());
 
     let candidate = QuarantineCandidate::new(key.clone(), 4, 11, 22);
     assert!(candidate.is_ok());

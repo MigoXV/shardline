@@ -1,8 +1,9 @@
+use shardline_index::xet_hash_hex_string;
 use std::io::{self, Cursor};
 
 use axum::body::Bytes;
 use shardline_protocol::ShardlineHash;
-use xet_core_structures::{
+use shardline_xet_core::{
     merklehash::{HashedWrite, MerkleHash, compute_data_hash, file_hash, xorb_hash},
     metadata_shard::{
         file_structs::{FileDataSequenceEntry, FileDataSequenceHeader, MDBFileInfo},
@@ -15,12 +16,17 @@ use xet_core_structures::{
     },
 };
 
-pub(crate) fn xet_hash_hex(hash: &MerkleHash) -> String {
+#[must_use]
+pub fn xet_hash_hex(hash: &MerkleHash) -> String {
     let bytes: [u8; 32] = hash.as_bytes().try_into().unwrap_or([0; 32]);
-    ShardlineHash::from_bytes(bytes).api_hex_string()
+    xet_hash_hex_string(ShardlineHash::from_bytes(bytes))
 }
 
-pub(crate) fn single_chunk_xorb(bytes: &[u8]) -> (Bytes, String) {
+/// # Panics
+///
+/// Panics if serialized xorb object creation fails.
+#[must_use]
+pub fn single_chunk_xorb(bytes: &[u8]) -> (Bytes, String) {
     let chunk_hash = compute_data_hash(bytes);
     let xorb_hash = xorb_hash(&[(chunk_hash, u64::try_from(bytes.len()).unwrap_or(0))]);
     let serialized = serialized_xorb_object_from_components(
@@ -40,7 +46,11 @@ pub(crate) fn single_chunk_xorb(bytes: &[u8]) -> (Bytes, String) {
     )
 }
 
-pub(crate) fn single_file_shard(parts: &[(&[u8], &str)]) -> (Bytes, String) {
+/// # Panics
+///
+/// Panics if any xorb hash, xorb block, or file reconstruction info cannot be added.
+#[must_use]
+pub fn single_file_shard(parts: &[(&[u8], &str)]) -> (Bytes, String) {
     let mut shard = MDBInMemoryShard::default();
     let mut file_segments = Vec::with_capacity(parts.len());
     let mut file_chunks = Vec::with_capacity(parts.len());
@@ -102,7 +112,11 @@ pub(crate) fn single_file_shard(parts: &[(&[u8], &str)]) -> (Bytes, String) {
     (Bytes::from(serialized), xet_hash_hex(&file_hash))
 }
 
-pub(crate) fn shard_hash_hex(bytes: &[u8]) -> String {
+/// # Panics
+///
+/// Panics if the byte copy into the hashed writer fails.
+#[must_use]
+pub fn shard_hash_hex(bytes: &[u8]) -> String {
     let mut sink = HashedWrite::new(io::sink());
     let copied = io::copy(&mut Cursor::new(bytes), &mut sink);
     assert!(copied.is_ok());

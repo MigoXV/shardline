@@ -1,4 +1,16 @@
 #![deny(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::shadow_unrelated,
+        clippy::let_underscore_must_use,
+        clippy::format_push_string
+    )
+)]
 
 //! Version-control provider boundaries for Shardline.
 //!
@@ -31,6 +43,7 @@
 mod adapter;
 mod authorization;
 mod builtin;
+mod codeberg;
 mod generic;
 mod gitea;
 mod github;
@@ -48,6 +61,7 @@ pub use authorization::AuthorizationRequest;
 pub use builtin::{
     BuiltInProviderCatalog, BuiltInProviderError, ProviderRepositoryPolicy, configured_metadata,
 };
+pub use codeberg::CodebergAdapter;
 pub use generic::GenericAdapter;
 pub use gitea::GiteaAdapter;
 pub use github::GitHubAdapter;

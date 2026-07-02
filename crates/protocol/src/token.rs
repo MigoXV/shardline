@@ -47,6 +47,8 @@ pub enum RepositoryProvider {
     Gitea,
     /// GitLab repository scope.
     GitLab,
+    /// Codeberg (Gitea-based) repository scope.
+    Codeberg,
     /// Generic Git forge repository scope.
     Generic,
 }
@@ -59,6 +61,7 @@ impl RepositoryProvider {
             Self::GitHub => "github",
             Self::Gitea => "gitea",
             Self::GitLab => "gitlab",
+            Self::Codeberg => "codeberg",
             Self::Generic => "generic",
         }
     }
@@ -77,6 +80,7 @@ impl FromStr for RepositoryProvider {
             "github" => Ok(Self::GitHub),
             "gitea" => Ok(Self::Gitea),
             "gitlab" => Ok(Self::GitLab),
+            "codeberg" => Ok(Self::Codeberg),
             "generic" => Ok(Self::Generic),
             _other => Err(RepositoryProviderParseError),
         }
@@ -236,12 +240,18 @@ pub enum TokenClaimsError {
     TooLong,
 }
 
+/// Minimum signing key length in bytes.
+const MIN_SIGNING_KEY_BYTES: usize = 32;
+
 /// Token signing or verification failure.
 #[derive(Debug, Error)]
 pub enum TokenCodecError {
     /// The signing key was empty.
     #[error("token signing key must not be empty")]
     EmptySigningKey,
+    /// The signing key is too short.
+    #[error("token signing key must be at least {MIN_SIGNING_KEY_BYTES} bytes")]
+    SigningKeyTooShort,
     /// The token payload could not be serialized or deserialized.
     #[error("token json operation failed")]
     Json(#[from] JsonError),
@@ -286,6 +296,9 @@ impl TokenSigner {
     pub fn new(signing_key: &[u8]) -> Result<Self, TokenCodecError> {
         if signing_key.is_empty() {
             return Err(TokenCodecError::EmptySigningKey);
+        }
+        if signing_key.len() < MIN_SIGNING_KEY_BYTES {
+            return Err(TokenCodecError::SigningKeyTooShort);
         }
 
         Ok(Self {
@@ -417,6 +430,7 @@ mod tests {
         assert_eq!("github".parse(), Ok(RepositoryProvider::GitHub));
         assert_eq!("gitea".parse(), Ok(RepositoryProvider::Gitea));
         assert_eq!("gitlab".parse(), Ok(RepositoryProvider::GitLab));
+        assert_eq!("codeberg".parse(), Ok(RepositoryProvider::Codeberg));
         assert_eq!("generic".parse(), Ok(RepositoryProvider::Generic));
         assert_eq!(
             "bitbucket".parse::<RepositoryProvider>(),
@@ -426,7 +440,7 @@ mod tests {
 
     #[test]
     fn token_signer_debug_redacts_signing_key_material() {
-        let signer = TokenSigner::new(&[1, 2, 3, 4]);
+        let signer = TokenSigner::new(&[1; 32]);
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -482,7 +496,7 @@ mod tests {
 
     #[test]
     fn token_roundtrips_through_sign_and_verify() {
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -521,7 +535,7 @@ mod tests {
 
     #[test]
     fn token_verify_rejects_tampering() {
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -561,7 +575,7 @@ mod tests {
 
     #[test]
     fn token_verify_rejects_oversized_token_before_hex_decoding() {
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -580,7 +594,7 @@ mod tests {
 
     #[test]
     fn token_verify_rejects_oversized_signature_before_hex_decoding() {
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -595,7 +609,7 @@ mod tests {
 
     #[test]
     fn token_verify_rejects_expired_tokens() {
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;

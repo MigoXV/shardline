@@ -8,9 +8,9 @@ use std::{
 
 use axum::body::Bytes;
 use shardline_index::{
-    FileChunkRecord, FileRecord, IndexStore, LocalIndexStore, MemoryIndexStore, MemoryRecordStore,
-    PostgresIndexStore, PostgresRecordStore, QuarantineCandidate, RecordStore, RetentionHold,
-    WebhookDelivery,
+    FileChunkRecord, FileRecord, LifecycleStore, LocalIndexStore, MemoryIndexStore,
+    MemoryRecordStore, PostgresIndexStore, PostgresRecordStore, QuarantineCandidate,
+    RecordMutation, RetentionHold, WebhookDelivery,
 };
 use shardline_protocol::{RepositoryProvider, RepositoryScope};
 use shardline_storage::ObjectKey;
@@ -26,7 +26,7 @@ use super::{
     run_lifecycle_repair_with_stores_at_time, run_local_lifecycle_repair,
 };
 use crate::{
-    LocalBackend, apply_database_migrations, chunk_store::chunk_object_key,
+    LocalBackend, ServerFrontend, apply_database_migrations, chunk_store::chunk_object_key,
     object_store::ServerObjectStore, record_store::LocalRecordStore,
     test_invariant_error::ServerTestInvariantError,
 };
@@ -182,8 +182,8 @@ async fn exercise_lifecycle_repair_scans_large_metadata_inventory() -> Result<()
                 packed_end: 32,
             }],
         };
-        RecordStore::write_latest_record(&record_store, &record).await?;
-        RecordStore::write_version_record(&record_store, &record).await?;
+        RecordMutation::write_latest_record(&record_store, &record).await?;
+        RecordMutation::write_version_record(&record_store, &record).await?;
 
         let object_key = chunk_object_key(&chunk_hash)?;
         let object_path = storage.path().join("chunks").join(object_key.as_str());
@@ -278,6 +278,7 @@ async fn exercise_lifecycle_repair_webhook_delivery_boundaries_are_deterministic
         &record_store,
         &index_store,
         &object_store,
+        &[ServerFrontend::Xet],
         LifecycleRepairOptions::default(),
         now_unix_seconds,
     )
@@ -342,8 +343,8 @@ async fn exercise_lifecycle_repair_reconciles_postgres_index_adapter() -> Result
             packed_end: 4,
         }],
     };
-    RecordStore::write_latest_record(&record_store, &record).await?;
-    RecordStore::write_version_record(&record_store, &record).await?;
+    RecordMutation::write_latest_record(&record_store, &record).await?;
+    RecordMutation::write_version_record(&record_store, &record).await?;
 
     let live_object_key = chunk_object_key(&chunk_hash)?;
     let live_path = storage.path().join(live_object_key.as_str());
@@ -392,6 +393,7 @@ async fn exercise_lifecycle_repair_reconciles_postgres_index_adapter() -> Result
         &record_store,
         &index_store,
         &object_store,
+        &[ServerFrontend::Xet],
         LifecycleRepairOptions::default(),
     )
     .await?;
@@ -445,7 +447,7 @@ async fn exercise_lifecycle_repair_reconciles_memory_index_adapter() -> Result<(
             packed_end: 4,
         }],
     };
-    RecordStore::write_latest_record(&record_store, &record).await?;
+    RecordMutation::write_latest_record(&record_store, &record).await?;
     let live_object_key = chunk_object_key(&chunk_hash)?;
     let live_path = storage.path().join(live_object_key.as_str());
     let live_parent = live_path
@@ -474,6 +476,7 @@ async fn exercise_lifecycle_repair_reconciles_memory_index_adapter() -> Result<(
         &record_store,
         &index_store,
         &object_store,
+        &[ServerFrontend::Xet],
         LifecycleRepairOptions::default(),
     )
     .await?;

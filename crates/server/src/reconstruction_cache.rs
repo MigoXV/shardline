@@ -38,7 +38,7 @@ pub struct ReconstructionCacheBenchReport {
 
 /// Runtime reconstruction-cache service.
 #[derive(Clone)]
-pub(crate) struct ReconstructionCacheService {
+pub struct ReconstructionCacheService {
     adapter_name: &'static str,
     adapter: SharedReconstructionCache,
 }
@@ -53,7 +53,8 @@ impl Debug for ReconstructionCacheService {
 }
 
 impl ReconstructionCacheService {
-    pub(crate) fn disabled() -> Self {
+    #[must_use]
+    pub fn disabled() -> Self {
         Self {
             adapter_name: ReconstructionCacheAdapter::Disabled.as_str(),
             adapter: Arc::new(DisabledReconstructionCache::new()),
@@ -65,7 +66,7 @@ impl ReconstructionCacheService {
     /// # Errors
     ///
     /// Returns [`ServerError`] when the configured adapter cannot initialize.
-    pub(crate) fn from_config(config: &ServerConfig) -> Result<Self, ServerError> {
+    pub fn from_config(config: &ServerConfig) -> Result<Self, ServerError> {
         match config.reconstruction_cache_adapter() {
             ReconstructionCacheAdapter::Disabled => Ok(Self::disabled()),
             ReconstructionCacheAdapter::Memory => Ok(Self {
@@ -121,10 +122,12 @@ impl ReconstructionCacheService {
         {
             let parsed = from_slice::<FileReconstructionResponse>(&payload);
             if let Ok(response) = parsed {
+                shardline_metrics::record_reconstruction_cache_hit();
                 return Ok(response);
             }
         }
 
+        shardline_metrics::record_reconstruction_cache_miss();
         let response = load().await?;
         let payload = to_vec(&response)?;
         if payload_within_bound(&payload) {
@@ -194,8 +197,8 @@ where
     Load: Fn() -> LoadFuture,
     LoadFuture: Future<Output = Result<FileReconstructionResponse, ServerError>>,
 {
-    let ttl_seconds = NonZeroU64::new(60).map_or(NonZeroU64::MIN, |value| value);
-    let max_entries = NonZeroUsize::new(8).map_or(NonZeroUsize::MIN, |value| value);
+    let ttl_seconds = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
+    let max_entries = NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN);
     let adapter: SharedReconstructionCache =
         Arc::new(MemoryReconstructionCache::new(ttl_seconds, max_entries));
     let cache = ReconstructionCacheService::for_tests("memory-bench", adapter);
@@ -279,9 +282,10 @@ mod tests {
         MAX_RECONSTRUCTION_CACHE_PAYLOAD_BYTES, ReconstructionCacheService,
         SharedReconstructionCache,
     };
-    use crate::{
-        FileReconstructionResponse, ReconstructionChunkRange, ReconstructionFetchInfo,
-        ReconstructionTerm, ReconstructionUrlRange,
+    use crate::FileReconstructionResponse;
+    use crate::xet_adapter::{
+        ReconstructionChunkRange, ReconstructionFetchInfo, ReconstructionTerm,
+        ReconstructionUrlRange,
     };
 
     #[derive(Debug)]
@@ -391,9 +395,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_service_uses_cached_payload_after_first_load() {
-        let ttl_seconds = NonZeroU64::new(60).map_or(NonZeroU64::MIN, |value| value);
+        let ttl_seconds = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
         let adapter: SharedReconstructionCache = Arc::new(MemoryReconstructionCache::new(
             ttl_seconds,
             NonZeroUsize::MIN,
@@ -426,7 +430,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_service_falls_back_to_loader_when_cache_adapter_errors() {
         let adapter: SharedReconstructionCache = Arc::new(BrokenCache);
         let cache = ReconstructionCacheService::for_tests("broken", adapter);
@@ -445,7 +449,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_service_falls_back_to_loader_when_cached_payload_exceeds_bound() {
         let put_calls = Arc::new(AtomicUsize::new(0));
         let adapter: SharedReconstructionCache = Arc::new(StaticCache {
@@ -471,7 +475,7 @@ mod tests {
         assert_eq!(put_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_service_skips_put_when_loaded_payload_exceeds_bound() {
         let put_calls = Arc::new(AtomicUsize::new(0));
         let stored_payloads = Arc::new(Mutex::new(Vec::new()));

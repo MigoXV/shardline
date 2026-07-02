@@ -1,20 +1,24 @@
 use std::{io::Cursor, path::PathBuf};
 
 use serde::Serialize;
-use shardline_protocol::{ShardlineHash, validate_serialized_xorb};
+use shardline_index::{parse_xet_hash_hex, xet_hash_hex_string};
 use shardline_storage::{
-    ObjectBody, ObjectIntegrity, ObjectKey, ObjectPrefix, PutOutcome, S3ObjectStoreConfig,
+    ObjectBody, ObjectIntegrity, ObjectKey, ObjectPrefix, ObjectStore, PutOutcome,
+    S3ObjectStoreConfig,
 };
-use xet_core_structures::merklehash::compute_data_hash;
+use shardline_xet_core::merklehash::compute_data_hash;
 
 use crate::{
     ServerError,
     chunk_store::chunk_hash_from_chunk_object_key_if_present,
+    error::ObjectStoreError,
     local_backend::chunk_hash,
     object_store::{ServerObjectStore, read_full_object},
     overflow::checked_add,
-    shard_store::shard_hash_from_object_key_if_present,
-    xorb_store::xorb_hash_from_object_key_if_present,
+    xet_adapter::{
+        shard_hash_from_object_key_if_present, validate_serialized_xorb,
+        xorb_hash_from_object_key_if_present,
+    },
 };
 
 /// Object-storage endpoint used by storage migration.
@@ -130,7 +134,7 @@ pub fn run_storage_migration(
     let prefix = ObjectPrefix::parse(&options.prefix)?;
     let mut report = StorageMigrationReport::new(options);
 
-    source.visit_prefix(&prefix, |metadata| {
+    crate::object_store::visit_object_prefix(&source, &prefix, |metadata| {
         report.scanned_objects = checked_add(report.scanned_objects, 1)?;
         report.scanned_bytes = checked_add(report.scanned_bytes, metadata.length())?;
         if options.dry_run {
@@ -164,12 +168,12 @@ fn validate_source_object_matches_content_addressed_key(
     bytes: &[u8],
 ) -> Result<(), ServerError> {
     if let Some(expected_hash) = chunk_hash_from_chunk_object_key_if_present(key)? {
-        let observed_hash = chunk_hash(bytes).api_hex_string();
+        let observed_hash = xet_hash_hex_string(chunk_hash(bytes));
         ensure_observed_hash_matches_key(key, expected_hash, &observed_hash)?;
     }
 
     if let Some(expected_hash) = xorb_hash_from_object_key_if_present(key)? {
-        let expected_hash = ShardlineHash::parse_api_hex(expected_hash)?;
+        let expected_hash = parse_xet_hash_hex(expected_hash)?;
         let mut cursor = Cursor::new(bytes);
         validate_serialized_xorb(&mut cursor, expected_hash)?;
     }
@@ -191,19 +195,21 @@ fn ensure_observed_hash_matches_key(
         return Ok(());
     }
 
-    Err(ServerError::StorageMigrationSourceHashMismatch {
-        key: key.as_str().to_owned(),
-        expected_hash: expected_hash.to_owned(),
-        observed_hash: observed_hash.to_owned(),
-    })
+    Err(ServerError::ObjectStore(
+        ObjectStoreError::MigrationSourceHashMismatch {
+            key: key.as_str().to_owned(),
+            expected_hash: expected_hash.to_owned(),
+            observed_hash: observed_hash.to_owned(),
+        },
+    ))
 }
 
 fn endpoint_store(endpoint: &StorageMigrationEndpoint) -> Result<ServerObjectStore, ServerError> {
     match endpoint {
         StorageMigrationEndpoint::LocalStateRoot(root) => {
-            ServerObjectStore::local(root.join("chunks"))
+            Ok(ServerObjectStore::local(root.join("chunks"))?)
         }
-        StorageMigrationEndpoint::S3(config) => ServerObjectStore::s3(config.clone()),
+        StorageMigrationEndpoint::S3(config) => Ok(ServerObjectStore::s3(config.clone())?),
     }
 }
 
@@ -211,7 +217,7 @@ fn endpoint_store(endpoint: &StorageMigrationEndpoint) -> Result<ServerObjectSto
 mod tests {
     use std::fs;
 
-    use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectKey};
+    use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectKey, ObjectStore};
 
     use super::{StorageMigrationEndpoint, StorageMigrationOptions, run_storage_migration};
     use crate::{

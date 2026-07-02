@@ -2,3 +2,8 @@
 /dist
 /dist-release-check
 /.shardline
+/cobertura.xml
+/report.json
+/tarpaulin-report.html
+.DS_Store
+COORDINATION.md

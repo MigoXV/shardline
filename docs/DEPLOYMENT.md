@@ -8,17 +8,39 @@ high-availability layout, GC suspension during incident response, and operator r
 see [Operations](OPERATIONS.md).
 For single-node Linux service templates, see [systemd](SYSTEMD.md).
 
+## Runtime Shape
+
+`shardline serve` accepts an explicit frontend set through repeated `--frontend` flags
+or `SHARDLINE_SERVER_FRONTENDS=xet,...`. The default frontend is `xet`. `--role api` and
+`--role transfer` only split that frontend set across processes for scaling; they do not
+choose different protocols.
+
 ## Deployment Profiles
 
 ### Local Single-Node
 
 Use this profile for development and small private installs.
 
-```text
-server: shardline
-object store: local filesystem
-index and record storage: local SQLite metadata (`.shardline/data/metadata.sqlite3`)
-transfer: server-mediated
+```mermaid
+flowchart TD
+  subgraph Canvas[ ]
+    direction TD
+    Server[server: shardline]
+    Server --> Object[object store: local filesystem]
+    Server --> Metadata[index + record storage: local SQLite metadata]
+    Server --> Transfer[transfer: server-mediated]
+  end
+
+  style Canvas fill:#f8f4ec,stroke:#d7c9b2,color:#1f2937;
+  classDef server fill:#f6efe8,stroke:#c7b8a3,color:#1f2937;
+  classDef storage fill:#dff3e4,stroke:#90c6a0,color:#1f2937;
+  classDef data fill:#efe3f8,stroke:#b89bd6,color:#1f2937;
+  classDef flow fill:#dcecf8,stroke:#8db7d8,color:#1f2937;
+  class Server server;
+  class Object storage;
+  class Metadata data;
+  class Transfer flow;
+  linkStyle default stroke:#111827,stroke-width:1.5px;
 ```
 
 The bundled compose file starts the local profile by default:
@@ -28,8 +50,9 @@ docker compose -f docker-compose.yml up --build
 ```
 
 That compose profile is Docker-native by default: it generates and persists its
-development signing key inside the named data volume. To mint an authenticated local
-token against that running container, execute the CLI inside the service:
+development signing key inside the named data volume.
+To mint an authenticated local token against that running container, execute the CLI
+inside the service:
 
 ```bash
 TOKEN="$(docker compose -f docker-compose.yml exec -T shardline \
@@ -65,9 +88,10 @@ TOKEN="$(SHARDLINE_TOKEN_SIGNING_KEY=dev-signing-key shardline admin token \
 curl -H "Authorization: Bearer ${TOKEN}" http://127.0.0.1:18080/v1/stats
 ```
 
-For a host-native server process, run `shardline serve` directly and provide the
-runtime configuration through normal environment variables or files. Provider integration
-is independent of whether the process runs on the host or in a container.
+For a host-native server process, run `shardline serve` directly and provide the runtime
+configuration through normal environment variables or files.
+Provider integration is independent of whether the process runs on the host or in a
+container.
 
 For local S3-compatible testing, start the MinIO profile and point Shardline at the
 bucket it creates:
@@ -90,22 +114,49 @@ For a direct, providerless Xet-compatible backend, follow
 
 Use this profile for self-hosted teams.
 
-```text
-server: shardline
-object store: S3-compatible
-index store: Postgres-compatible SQL
-transfer: presigned object-store URLs when supported
+```mermaid
+flowchart TD
+  subgraph Canvas[ ]
+    direction TD
+    Server[server: shardline]
+    Server --> Object[object store: S3-compatible]
+    Server --> Index[index store: Postgres-compatible SQL]
+    Server --> Transfer[transfer: presigned object-store URLs when supported]
+  end
+
+  style Canvas fill:#f8f4ec,stroke:#d7c9b2,color:#1f2937;
+  classDef server fill:#f6efe8,stroke:#c7b8a3,color:#1f2937;
+  classDef storage fill:#dff3e4,stroke:#90c6a0,color:#1f2937;
+  classDef data fill:#efe3f8,stroke:#b89bd6,color:#1f2937;
+  classDef flow fill:#dcecf8,stroke:#8db7d8,color:#1f2937;
+  class Server server;
+  class Object storage;
+  class Index data;
+  class Transfer flow;
+  linkStyle default stroke:#111827,stroke-width:1.5px;
 ```
 
 ### Production Scaled
 
 Use this profile when API traffic and transfer traffic need independent scaling.
 
-```text
-api servers: shardline serve --role api
-transfer servers: shardline serve --role transfer
-object store: S3-compatible or custom adapter
-index store: managed Postgres-compatible SQL
+```mermaid
+flowchart TD
+  subgraph Canvas[ ]
+    direction TD
+    Api[api servers: shardline serve --role api]
+    Transfer[transfer servers: shardline serve --role transfer]
+    Shared[shared backend services<br/>object store: S3-compatible or custom adapter<br/>index store: managed Postgres-compatible SQL]
+    Api --> Shared
+    Transfer --> Shared
+  end
+
+  style Canvas fill:#f8f4ec,stroke:#d7c9b2,color:#1f2937;
+  classDef role fill:#f6efe8,stroke:#c7b8a3,color:#1f2937;
+  classDef shared fill:#dff3e4,stroke:#90c6a0,color:#1f2937;
+  class Api,Transfer role;
+  class Shared shared;
+  linkStyle default stroke:#111827,stroke-width:1.5px;
 ```
 
 The scaled role split lets API traffic and transfer traffic grow independently while
@@ -145,6 +196,8 @@ The included ingress maps these route families:
 - API: `/healthz`, `/v1/providers`, `/api`, `/reconstructions`, `/v1/reconstructions`,
   `/v2/reconstructions`, `/shards`, `/v1/shards`, `/v1/stats`
 - transfer: `/v1/chunks`, `/v1/xorbs`, `/transfer/xorb`
+- hub: `/api/*`, `/{type}/{ns}/{repo}/info/refs`, `/{type}/{ns}/{repo}/HEAD`,
+  `/{type}/{ns}/{repo}/git-upload-pack`, `/{type}/{ns}/{repo}/git-receive-pack`
 
 Provider integration remains optional in this profile.
 A scaled deployment can run as a direct Xet-compatible backend with only the CAS and
@@ -221,9 +274,9 @@ SHARDLINE_LOG_LEVEL=info
 Set exactly one signing-key source for a server process that exposes CAS routes:
 `SHARDLINE_TOKEN_SIGNING_KEY` for a direct environment value, or
 `SHARDLINE_TOKEN_SIGNING_KEY_FILE` for a file or mounted secret.
-If both are set, startup fails with a configuration error instead of guessing precedence.
-CAS routes require bearer tokens with a valid Shardline signature, issuer, repository
-scope, and the required read or write scope.
+If both are set, startup fails with a configuration error instead of guessing
+precedence. CAS routes require bearer tokens with a valid Shardline signature, issuer,
+repository scope, and the required read or write scope.
 The stats endpoint follows the same rule and requires a valid bearer token.
 `SHARDLINE_PROVIDER_CONFIG_FILE` and `SHARDLINE_PROVIDER_API_KEY_FILE` are optional.
 Leave them unset for a providerless deployment that serves clients directly.
@@ -242,9 +295,9 @@ SHARDLINE_TOKEN_SIGNING_KEY=change-me-for-local-only
 SHARDLINE_OBJECT_STORAGE_ADAPTER=local
 ```
 
-For production, prefer `SHARDLINE_TOKEN_SIGNING_KEY_FILE=/run/secrets/shardline-token-key`
-or a platform secret mount instead of putting the signing key directly in the process
-environment.
+For production, prefer
+`SHARDLINE_TOKEN_SIGNING_KEY_FILE=/run/secrets/shardline-token-key` or a platform secret
+mount instead of putting the signing key directly in the process environment.
 
 For local single-node, keep the default SQLite metadata store under
 `.shardline/data/metadata.sqlite3`. For durable production installs, switch to:
@@ -508,6 +561,148 @@ In a split deployment behind a reverse proxy, route ownership is:
 
 - `api`: `/v1/reconstructions/*`, `/v1/providers/*`, `/v1/shards`, `/v1/stats`
 - `transfer`: `/v1/chunks/*`, `/v1/xorbs/*`, `/transfer/xorb/*`
+- `hub`: `/api/*`, `/{type}/{ns}/{repo}/info/refs`, `/{type}/{ns}/{repo}/HEAD`,
+  `/{type}/{ns}/{repo}/git-upload-pack`, `/{type}/{ns}/{repo}/git-receive-pack`
+
+## Hub API
+
+The Hub API provides HuggingFace Hub compatibility. Enable it by adding `hub` to the
+frontend set:
+
+```text
+SHARDLINE_SERVER_FRONTENDS=xet,hub
+```
+
+Or pass `--frontend hub` to `shardline serve`.
+
+### REST Endpoints
+
+Once enabled, these routes are available:
+
+```text
+GET  /api/{type}/{ns}/{repo}              — get repository info
+POST /api/{type}/{ns}/{repo}              — create repository
+GET  /api/{type}/{ns}/{repo}/revisions     — list revisions
+POST /api/{type}/{ns}/{repo}/revisions     — create revision
+GET  /api/{type}/{ns}/{repo}/revisions/{sha}/entries — list file entries
+POST /api/{type}/{ns}/{repo}/revisions/{sha}/entries — store file entries
+POST /api/{type}/{ns}/{repo}/lfs/objects   — store LFS objects
+POST /api/{type}/{ns}/{repo}/login          — token exchange
+GET  /api/whoami                            — current user info
+```
+
+### Git Smart HTTP Endpoints
+
+Direct `git clone` and `git push` via the Git Smart HTTP protocol:
+
+```text
+GET  /{type}/{ns}/{repo}/info/refs          — discovery (service=upload-pack|receive-pack)
+GET  /{type}/{ns}/{repo}/HEAD               — HEAD reference
+POST /{type}/{ns}/{repo}/git-upload-pack    — clone/fetch pack generation
+POST /{type}/{ns}/{repo}/git-receive-pack   — push pack acceptance
+```
+
+Clone a Hub repository:
+
+```bash
+git clone http://127.0.0.1:8080/models/my-org/my-model
+```
+
+Push to a Hub repository:
+
+```bash
+cd my-model
+git remote add hub http://127.0.0.1:8080/models/my-org/my-model
+git push hub main
+```
+
+Pack files are generated from stored file entries. LFS pointer blobs are created for
+files with LFS metadata. The `.gitattributes` file is auto-generated when LFS files
+are present.
+
+### Hub API Metadata Storage
+
+Hub metadata (repos, revisions, file entries, LFS objects) is stored separately from
+the main CAS index:
+
+- **SQLite**: `{root_dir}/hub/` directory (default for local deployments)
+- **Postgres**: same connection as the main index (`SHARDLINE_INDEX_POSTGRES_URL`)
+
+For Postgres deployments, apply the Hub API migration:
+
+```text
+shardline db migrate up
+```
+
+The Hub API migration is migration 7 in the bundled set.
+
+### Hub API with huggingface-cli
+
+Point the CLI at your Shardline server:
+
+```bash
+export HF_ENDPOINT=http://127.0.0.1:8080
+huggingface-cli upload my-org/my-model ./model-files
+huggingface-cli download my-org/my-model
+```
+
+### Hub API Authentication
+
+Hub API routes use the same `AuthProvider` trait as CAS routes. When an auth provider
+is configured (OIDC, JWKS, or Ed25519), Hub API bearer tokens are validated against it.
+
+When no auth provider is configured (providerless mode), Hub API routes accept all
+requests anonymously.
+
+## Authentication Providers
+
+Shardline supports pluggable authentication via the `SHARDLINE_AUTH_PROVIDER` variable:
+
+```text
+SHARDLINE_AUTH_PROVIDER=local          # Ed25519 key pair (default)
+SHARDLINE_AUTH_PROVIDER=oidc           # OpenID Connect
+SHARDLINE_AUTH_PROVIDER=jwks           # JSON Web Key Set
+SHARDLINE_AUTH_PROVIDER=passthrough    # Trust upstream proxy
+```
+
+### Local (Ed25519)
+
+Default for providerless deployments. Tokens are signed with a local key pair.
+
+```text
+SHARDLINE_TOKEN_SIGNING_KEY=change-me-for-local-only
+# or
+SHARDLINE_TOKEN_SIGNING_KEY_FILE=/run/secrets/shardline-token-key
+```
+
+### OIDC
+
+Validate tokens against an OpenID Connect issuer:
+
+```text
+SHARDLINE_AUTH_PROVIDER=oidc
+SHARDLINE_AUTH_OIDC_ISSUER=https://accounts.google.com
+```
+
+### JWKS
+
+Validate tokens against a JSON Web Key Set endpoint:
+
+```text
+SHARDLINE_AUTH_PROVIDER=jwks
+SHARDLINE_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json
+```
+
+### Passthrough
+
+Trust an upstream reverse proxy that handles authentication. The server reads the
+`Authorization` header directly without validation:
+
+```text
+SHARDLINE_AUTH_PROVIDER=passthrough
+```
+
+Use this behind a trusted proxy (e.g., Cloudflare Access, oauth2-proxy).
 
 ## Health Checks
 
@@ -537,21 +732,17 @@ for private data.
 When `SHARDLINE_METRICS_TOKEN_FILE` is set, the endpoint rejects unauthenticated scrape
 requests and requires `Authorization: Bearer <metrics-token>`.
 
-Initial metrics:
+50+ metrics across 9 categories:
 
-- request count by route, method, status
-- request duration
-- upload bytes accepted
-- upload bytes stored
-- download bytes served
-- logical bytes registered
-- dedupe hits and misses
-- xorb validation failures
-- shard validation failures
-- reconstruction lookup failures
-- transfer range failures
-- object-store latency
-- index-store latency
+- **Storage**: objects stored/retrieved, bytes transferred, dedup hits/misses
+- **Transfer**: upload/download counts, bytes, chunks processed, range failures
+- **Xet**: xorbs/shards processed, reconstruction terms, validation failures
+- **Protocol**: LFS, Bazel, OCI request counts and latencies
+- **Reconstruction**: lookups, cache hits/misses, failures
+- **GC/FSCK**: runs, duration, chunks quarantined/swept, orphans found
+- **Backend**: local/S3 operation counts and latency histograms
+- **Provider**: token issuance, webhook events processed
+- **System**: active connections, memory usage, cache eviction counts
 
 Metric labels must be bounded.
 Do not use raw hashes, tokens, user IDs, repository names, or object keys as labels.

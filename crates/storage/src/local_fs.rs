@@ -9,10 +9,7 @@ use std::{
 };
 
 #[cfg(not(unix))]
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::Write;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -25,8 +22,6 @@ use crate::anchored_fs::{
     write_anchored_temporary_file as write_anchored_temporary_file_shared,
 };
 
-#[cfg(not(unix))]
-static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(unix)]
 const LOCAL_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
@@ -104,6 +99,7 @@ pub(crate) fn hard_link_file_if_absent(
 
     #[cfg(not(unix))]
     {
+        let _ = root;
         let parent = path.parent().ok_or_else(invalid_local_path_error)?;
         fs::create_dir_all(parent)?;
         fs::hard_link(temporary, path)
@@ -127,6 +123,7 @@ pub(crate) fn put_bytes_if_absent(
 
     #[cfg(not(unix))]
     {
+        let _ = root;
         let parent = path.parent().ok_or_else(invalid_local_path_error)?;
         fs::create_dir_all(parent)?;
         match OpenOptions::new().write(true).create_new(true).open(path) {
@@ -142,6 +139,23 @@ pub(crate) fn put_bytes_if_absent(
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+pub(crate) fn write_bytes_atomically(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        write_bytes_atomically_unix(root, path, bytes)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        let parent = path.parent().ok_or_else(invalid_local_path_error)?;
+        fs::create_dir_all(parent)?;
+        let temporary = write_temporary_file(path, bytes)?;
+        fs::rename(temporary, path)?;
+        Ok(())
     }
 }
 
@@ -208,6 +222,27 @@ fn put_bytes_if_absent_unix(
 }
 
 #[cfg(unix)]
+fn write_bytes_atomically_unix(root: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let anchored = open_anchored_target(root, path)?;
+    run_before_local_write_hook(&anchored.logical_path());
+    let final_path = anchored.final_path();
+    let temporary =
+        write_anchored_temporary_file_shared(&anchored, bytes, anchored_path_options().file_mode)?;
+    match fs::rename(&temporary, &final_path) {
+        Ok(()) => {}
+        Err(error) => {
+            remove_if_present(&temporary)?;
+            return Err(error);
+        }
+    }
+    if let Err(error) = ensure_parent_path_matches_anchor(&anchored) {
+        remove_if_present(&final_path)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_anchored_target(root: &Path, path: &Path) -> io::Result<AnchoredTarget> {
     open_anchored_target_shared(
         root,
@@ -241,6 +276,27 @@ fn open_existing_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(not(unix))]
+fn write_temporary_file(path: &Path, bytes: &[u8]) -> io::Result<std::path::PathBuf> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Ok(mut file) => {
+            file.write_all(bytes)?;
+            file.flush()?;
+            Ok(temporary)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            fs::remove_file(&temporary)?;
+            write_temporary_file(path, bytes)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(unix)]
 const fn anchored_path_options() -> AnchoredPathOptions {
     AnchoredPathOptions::new(Some(LOCAL_DIRECTORY_MODE), Some(LOCAL_FILE_MODE))
@@ -268,6 +324,7 @@ fn invalid_local_path_error() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs::metadata;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

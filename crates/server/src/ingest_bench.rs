@@ -2,10 +2,11 @@ use std::num::NonZeroUsize;
 
 use axum::body::Bytes;
 
+#[cfg(test)]
+use crate::config::default_upload_max_in_flight_chunks;
 use crate::{
-    ServerError, config::default_upload_max_in_flight_chunks, model::UploadFileResponse,
-    object_store::ServerObjectStore, upload_ingest::FileUploadIngestor,
-    validation::validate_identifier,
+    ServerError, model::UploadFileResponse, object_store::ServerObjectStore,
+    upload_ingest::FileUploadIngestor, validation::validate_identifier,
 };
 
 /// Runs the upload ingestion pipeline without persisting chunk bytes or metadata.
@@ -17,6 +18,7 @@ use crate::{
 ///
 /// Returns [`ServerError`] when the identifier is invalid, arithmetic overflows, or the
 /// optional expected SHA-256 digest does not match the uploaded bytes.
+#[cfg(test)]
 pub async fn ingest_without_storage(
     chunk_size: NonZeroUsize,
     file_id: &str,

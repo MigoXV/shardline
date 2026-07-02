@@ -1,0 +1,29 @@
+[package]
+name = "shardline-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarks and load testing for the Shardline server ecosystem."
+
+[[bench]]
+name = "reconstruction"
+harness = false
+
+[[bin]]
+name = "load_test"
+path = "src/load_test.rs"
+
+[dependencies]
+libc.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+serde_json.workspace = true
+shardline-index.workspace = true
+shardline-protocol.workspace = true
+shardline-server-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[lints]
+workspace = true

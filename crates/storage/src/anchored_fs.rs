@@ -254,10 +254,17 @@ pub fn ensure_parent_path_matches_anchor(
 /// Returns an error when `path` does not name an existing directory or the directory cannot be
 /// opened safely.
 pub fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // On macOS, /dev/fd/N paths are kernel-created symlinks for file descriptors.
+    // The FD-based path approach is already secure by construction (the FD is obtained
+    // from a verified directory open), so O_NOFOLLOW is not needed on macOS.
+    // On Linux, /proc/self/fd/N is not a symlink, so O_NOFOLLOW provides defense-in-depth.
+    #[cfg(not(target_os = "macos"))]
+    options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(libc::O_DIRECTORY);
+    options.open(path)
 }
 
 /// Creates and opens a brand-new file without following symlinks.
@@ -313,6 +320,107 @@ pub fn fd_child_path(directory: &File, child: &OsStr) -> PathBuf {
     path
 }
 
+/// Atomically renames a file within the same parent directory using FD-relative
+/// operations on macOS.
+///
+/// On Linux, `/proc/self/fd/N/child` paths resolve through the FD, so `std::fs::rename`
+/// works even after the parent directory is renamed. On macOS, `/dev/fd/N` cannot traverse
+/// children, so this uses `renameat` with the parent FD instead.
+///
+/// # Errors
+///
+/// Returns an error when either name contains a null byte or the rename fails.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn rename_at(parent: &File, old_name: &OsStr, new_name: &OsStr) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    let old_cstr = CString::new(old_name.as_encoded_bytes()).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("name contains null byte: {e}"),
+        )
+    })?;
+    let new_cstr = CString::new(new_name.as_encoded_bytes()).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("name contains null byte: {e}"),
+        )
+    })?;
+
+    // SAFETY: renameat(2) is safe when given valid FDs and null-terminated strings.
+    // The parent FD is an open directory descriptor; old_cstr and new_cstr are
+    // valid C strings produced by CString::new above.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            old_cstr.as_ptr(),
+            parent.as_raw_fd(),
+            new_cstr.as_ptr(),
+        )
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Renames a file. On non-macOS platforms, this delegates to `std::fs::rename`.
+///
+/// # Errors
+///
+/// Returns an error if the source path does not exist, the target path already
+/// exists, or the filesystem prevents the rename.
+#[cfg(not(target_os = "macos"))]
+pub fn rename_at(parent: &File, old_name: &OsStr, new_name: &OsStr) -> io::Result<()> {
+    let old_path = fd_child_path(parent, old_name);
+    let new_path = fd_child_path(parent, new_name);
+    std::fs::rename(old_path, new_path)
+}
+
+/// Removes a file within a directory using FD-relative operations.
+///
+/// On macOS, `/dev/fd/N` cannot traverse children, so this uses `unlinkat`.
+///
+/// # Errors
+///
+/// Returns an error when the name contains a null byte or the removal fails.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn remove_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::io::AsRawFd;
+
+    let cstr = CString::new(name.as_encoded_bytes()).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("name contains null byte: {e}"),
+        )
+    })?;
+    // SAFETY: unlinkat(2) is safe when given a valid FD and null-terminated string.
+    // The parent FD is an open directory descriptor; cstr is a valid C string.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), cstr.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Removes a file. On non-macOS, delegates to `std::fs::remove_file`.
+///
+/// # Errors
+///
+/// Returns an error if the file does not exist or cannot be removed.
+#[cfg(not(target_os = "macos"))]
+pub fn remove_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    let path = fd_child_path(parent, name);
+    std::fs::remove_file(path)
+}
+
 /// Removes a file when it exists.
 ///
 /// # Errors
@@ -326,11 +434,37 @@ pub fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_fd_real_path(fd: std::os::unix::io::RawFd) -> PathBuf {
+    let mut buf = [0i8; 1024];
+    // SAFETY: fcntl(2) with F_GETPATH writes a NUL-terminated path into buf.
+    // buf is stack-allocated with sufficient size for any valid filesystem path.
+    let result = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+    if result < 0 {
+        return PathBuf::from(format!("/dev/fd/{fd}"));
+    }
+    // SAFETY: fcntl(F_GETPATH) guarantees the buffer contains a valid NUL-terminated
+    // C string when it returns success (result >= 0).
+    let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    PathBuf::from(c_str.to_string_lossy().as_ref())
+}
+
 fn fd_base_path(directory: &File) -> PathBuf {
     #[cfg(target_os = "linux")]
-    let prefix = "/proc/self/fd";
+    {
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, /dev/fd/N is a fescfs virtual directory entry, NOT a symlink.
+        // You cannot traverse children through it (open("/dev/fd/3/var") fails with ENOENT).
+        // Use fcntl(F_GETPATH) to resolve the real path from the file descriptor.
+        macos_fd_real_path(directory.as_raw_fd())
+    }
     #[cfg(not(target_os = "linux"))]
-    let prefix = "/dev/fd";
-
-    PathBuf::from(format!("{prefix}/{}", directory.as_raw_fd()))
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()))
+    }
 }

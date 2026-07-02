@@ -2,7 +2,7 @@ use std::{io::Error as IoError, num::TryFromIntError};
 
 use axum::{
     Error as AxumError, Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::WWW_AUTHENTICATE},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -12,170 +12,111 @@ use shardline_index::{
     FileRecordInvariantError, LocalIndexStoreError, MemoryIndexStoreError, MemoryRecordStoreError,
     PostgresMetadataStoreError, QuarantineCandidateError, RetentionHoldError, WebhookDeliveryError,
 };
-use shardline_protocol::{HashParseError, HttpRangeParseError, TokenCodecError, XorbParseError};
+use shardline_protocol::{HashParseError, HttpRangeParseError, TokenCodecError};
+pub use shardline_server_core::{
+    InvalidLifecycleMetadataError, InvalidReconstructionResponseError, InvalidSerializedShardError,
+    ParseStoredFileRecordError,
+};
 use shardline_storage::{LocalObjectStoreError, ObjectPrefixError, S3ObjectStoreError};
 use thiserror::Error;
 use tokio::task::JoinError;
 
-use crate::{config::ServerConfigError, provider::ProviderServiceError};
+use crate::{
+    config::ServerConfigError, provider::ProviderServiceError, xet_adapter::XorbParseError,
+};
+use shardline_gc::GcError;
+use shardline_oci_adapter::OciAdapterError;
+use shardline_provider_events::ProviderEventsError;
+use shardline_xet_adapter::XetAdapterError;
 
-/// Lifecycle metadata consistency failure.
-#[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum InvalidLifecycleMetadataError {
-    /// A quarantine candidate cannot be deleted before it was first observed.
+/// Object-storage subsystem failure.
+#[derive(Debug, Error)]
+pub enum ObjectStoreError {
+    /// Local storage IO failed.
+    #[error("local storage operation failed")]
+    Local(#[from] LocalObjectStoreError),
+    /// S3-compatible object-storage adapter access failed.
+    #[error("s3 object storage adapter operation failed")]
+    S3(#[from] S3ObjectStoreError),
+    /// Object inventory prefix validation failed.
+    #[error("object storage prefix validation failed")]
+    Prefix(#[from] ObjectPrefixError),
+    /// S3-compatible object storage was selected without concrete configuration.
+    #[error("s3 object storage configuration is missing")]
+    MissingS3Config,
+    /// Stored object metadata disagreed with the expected transfer length.
+    #[error("stored object length did not match indexed metadata")]
+    StoredLengthMismatch,
+    /// Storage migration found a content-addressed source object under the wrong key.
     #[error(
-        "quarantine candidate for {object_key} had delete-after {delete_after_unix_seconds} before first-seen {first_seen_unreachable_at_unix_seconds}"
+        "storage migration source object hash mismatch for key {key}: expected {expected_hash}, observed {observed_hash}"
     )]
-    QuarantineCandidateDeleteBeforeFirstSeen {
-        /// Quarantined object key.
-        object_key: String,
-        /// Candidate deletion timestamp.
-        delete_after_unix_seconds: u64,
-        /// First observed unreachable timestamp.
-        first_seen_unreachable_at_unix_seconds: u64,
-    },
-    /// A quarantine candidate referenced an object that is no longer present.
-    #[error("quarantine candidate referenced missing object {object_key}")]
-    QuarantineCandidateMissingObject {
-        /// Quarantined object key.
-        object_key: String,
-    },
-    /// A quarantine candidate recorded a length that differs from object-store metadata.
-    #[error(
-        "quarantine candidate for {object_key} expected length {expected_length}, got {observed_length}"
-    )]
-    QuarantineCandidateLengthMismatch {
-        /// Quarantined object key.
-        object_key: String,
-        /// Length recorded in quarantine metadata.
-        expected_length: u64,
-        /// Length observed in object-store metadata.
-        observed_length: u64,
-    },
-    /// A retention hold cannot be released before it was created.
-    #[error(
-        "retention hold for {object_key} had release-after {release_after_unix_seconds} before held-at {held_at_unix_seconds}"
-    )]
-    RetentionHoldReleaseBeforeHeld {
-        /// Held object key.
-        object_key: String,
-        /// Hold release timestamp.
-        release_after_unix_seconds: u64,
-        /// Hold creation timestamp.
-        held_at_unix_seconds: u64,
-    },
-    /// An active retention hold referenced an object that is no longer present.
-    #[error("active retention hold referenced missing object {object_key}")]
-    ActiveRetentionHoldMissingObject {
-        /// Held object key.
-        object_key: String,
-    },
-    /// An active retention hold coexisted with quarantine metadata for the same object.
-    #[error("active retention hold for {object_key} coexisted with quarantine state")]
-    ActiveRetentionHoldQuarantined {
-        /// Held object key.
-        object_key: String,
+    MigrationSourceHashMismatch {
+        /// Content-addressed object key being migrated.
+        key: String,
+        /// Hash implied by the object key.
+        expected_hash: String,
+        /// Hash computed from the source object bytes.
+        observed_hash: String,
     },
 }
 
-/// Serialized shard validation failure.
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub enum InvalidSerializedShardError {
-    /// The external shard parser rejected the bytes.
-    #[error("shard parser rejected metadata")]
-    ParserRejectedMetadata,
-    /// A native Xet term used an empty or inverted chunk range.
-    #[error("native xet term had an empty or inverted chunk range")]
-    NativeXetTermEmptyOrInvertedChunkRange,
-    /// A native Xet term referenced chunks past the end of its xorb.
-    #[error("native xet term range exceeded xorb chunk count")]
-    NativeXetTermRangeExceededXorbChunkCount,
-    /// A shard file term used an empty or inverted chunk range.
-    #[error("shard file term had an empty or inverted chunk range")]
-    ShardFileTermEmptyOrInvertedChunkRange,
-    /// The transient xorb metadata cache could not return a just-inserted entry.
-    #[error("xorb metadata cache insertion failed")]
-    XorbMetadataCacheInsertionFailed,
-    /// A shard term started past the referenced xorb chunk list.
-    #[error("shard term chunk range started past the xorb chunk list")]
-    ShardTermRangeStartedPastXorbChunkList,
-    /// A shard term ended past the referenced xorb chunk list.
-    #[error("shard term chunk range ended past the xorb chunk list")]
-    ShardTermRangeEndedPastXorbChunkList,
-    /// The retained shard chunk hash list was not strictly ordered.
-    #[error("retained shard chunk hashes were not strictly ordered")]
-    RetainedShardChunkHashesNotStrictlyOrdered,
-}
-
-/// Reconstruction response shape failure.
-#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
-pub enum InvalidReconstructionResponseError {
-    /// A guarded test record store detected a forbidden global latest-record walk.
-    #[error("global latest-record walk attempted")]
-    RecordStoreGlobalLatestWalkAttempted,
-    /// A guarded test record store could not find the requested record.
-    #[error("record not found")]
-    RecordStoreRecordNotFound,
-    /// V1 response emitted more terms than the source record has chunks.
-    #[error("response term count exceeded record chunk count")]
-    TermCountExceededRecordChunkCount,
-    /// A response term had no bytes.
-    #[error("response term had zero unpacked length")]
-    TermHadZeroUnpackedLength,
-    /// A response term contained an empty chunk range.
-    #[error("response term had an empty chunk range")]
-    TermHadEmptyChunkRange,
-    /// A response term did not have matching fetch metadata.
-    #[error("response term did not have matching fetch info")]
-    TermMissingFetchInfo,
-    /// A fetch-info entry had no fetches.
-    #[error("response fetch info contained an empty fetch list")]
-    EmptyFetchList,
-    /// A fetch URL did not point to the xorb hash that owns it.
-    #[error("response fetch URL did not match its xorb hash")]
-    FetchUrlHashMismatch,
-    /// A fetch entry had an empty chunk range.
-    #[error("response fetch entry had an empty chunk range")]
-    FetchEntryEmptyChunkRange,
-    /// A fetch entry had an inverted byte range.
-    #[error("response fetch entry had an inverted byte range")]
-    FetchEntryInvertedByteRange,
-    /// A fetch entry did not correspond to any response term.
-    #[error("response fetch entry did not have a matching term")]
-    FetchEntryMissingTerm,
-    /// V2 conversion changed `offset_into_first_range`.
-    #[error("v2 response changed offset_into_first_range")]
-    V2ChangedOffsetIntoFirstRange,
-    /// V2 conversion changed the reconstruction terms.
-    #[error("v2 response changed reconstruction terms")]
-    V2ChangedTerms,
-    /// V2 conversion changed the xorb fetch-info cardinality.
-    #[error("v2 response changed xorb fetch-info cardinality")]
-    V2ChangedXorbFetchInfoCardinality,
-    /// V2 conversion emitted a hash absent from V1 fetch-info.
-    #[error("v2 response emitted a fetch hash absent from v1")]
-    V2FetchHashAbsentFromV1,
-    /// V2 conversion emitted an empty fetch list.
-    #[error("v2 response emitted an empty fetch list")]
-    V2EmptyFetchList,
-    /// V2 conversion emitted a fetch entry without ranges.
-    #[error("v2 response emitted a fetch entry without ranges")]
-    V2FetchEntryWithoutRanges,
-    /// V2 conversion emitted an empty chunk range.
-    #[error("v2 response emitted an empty chunk range")]
-    V2EmptyChunkRange,
-    /// V2 conversion emitted an inverted byte range.
-    #[error("v2 response emitted an inverted byte range")]
-    V2InvertedByteRange,
-    /// V2 fetch count did not match V1.
-    #[error("v2 response fetch count disagreed with v1")]
-    V2FetchCountDisagreedWithV1,
-    /// V2 range count did not match V1.
-    #[error("v2 response range count disagreed with v1")]
-    V2RangeCountDisagreedWithV1,
+/// Metadata index subsystem failure.
+#[derive(Debug, Error)]
+pub enum IndexError {
+    /// Index adapter access failed.
+    #[error("index adapter operation failed")]
+    Local(#[from] LocalIndexStoreError),
+    /// In-memory index adapter access failed.
+    #[error("memory index adapter operation failed")]
+    MemoryIndex(#[from] MemoryIndexStoreError),
+    /// In-memory record adapter access failed.
+    #[error("memory record adapter operation failed")]
+    MemoryRecord(#[from] MemoryRecordStoreError),
+    /// Postgres metadata adapter access failed.
+    #[error("postgres metadata adapter operation failed")]
+    PostgresMetadata(#[from] PostgresMetadataStoreError),
+    /// Retention hold input was invalid.
+    #[error("retention hold input was invalid")]
+    RetentionHold(#[from] RetentionHoldError),
+    /// Quarantine candidate input was invalid.
+    #[error("quarantine candidate input was invalid")]
+    QuarantineCandidate(#[from] QuarantineCandidateError),
+    /// Webhook delivery metadata was invalid.
+    #[error("webhook delivery metadata was invalid")]
+    WebhookDelivery(#[from] WebhookDeliveryError),
+    /// Stored file metadata could not produce a valid reconstruction plan.
+    #[error("stored file metadata was invalid")]
+    FileRecordInvariant(#[from] FileRecordInvariantError),
+    /// Lifecycle metadata was internally inconsistent.
+    #[error("lifecycle metadata was internally inconsistent")]
+    InvalidLifecycleMetadata(#[from] InvalidLifecycleMetadataError),
+    /// A reconstruction response violated an internal protocol-shape invariant.
+    #[error("reconstruction response invariant failed: {0}")]
+    InvalidReconstructionResponse(#[from] InvalidReconstructionResponseError),
+    /// A required metadata table was missing.
+    #[error("required metadata table is missing: {0}")]
+    MissingRequiredMetadataTable(String),
+    /// Repository rename encountered conflicting target-scope metadata.
+    #[error("repository rename target already contains conflicting metadata")]
+    ConflictingRenameTargetRecord,
 }
 
 /// Server runtime failure.
+///
+/// This is the unified error type for the Shardline server layer. It maps
+/// domain-specific errors from storage, indexing, protocol, auth, and OCI
+/// subsystems into a single enum with HTTP status code mapping.
+///
+/// # Design
+///
+/// Each variant maps to exactly one HTTP status code via [`ServerError::status_code`].
+/// Subsystem errors (e.g., [`LocalIndexStoreError`], [`S3ObjectStoreError`]) are
+/// converted via `From` implementations for ergonomic `?` usage.
+///
+/// When adding new error sources, prefer adding a new variant with a `#[from]`
+/// attribute over manual `From` implementations unless the source error maps
+/// to multiple variants.
 #[derive(Debug, Error)]
 pub enum ServerError {
     /// Local storage IO failed.
@@ -202,42 +143,12 @@ pub enum ServerError {
     /// Hash parsing failed.
     #[error("invalid content hash")]
     HashParse(#[from] HashParseError),
-    /// Object-storage adapter access failed.
-    #[error("object storage adapter operation failed")]
-    ObjectStore(#[from] LocalObjectStoreError),
-    /// S3-compatible object-storage adapter access failed.
-    #[error("s3 object storage adapter operation failed")]
-    S3ObjectStore(#[from] S3ObjectStoreError),
-    /// Object inventory prefix validation failed.
-    #[error("object storage prefix validation failed")]
-    ObjectPrefix(#[from] ObjectPrefixError),
-    /// S3-compatible object storage was selected without concrete configuration.
-    #[error("s3 object storage configuration is missing")]
-    MissingS3ObjectStoreConfig,
-    /// Index adapter access failed.
+    /// Object-storage subsystem failure.
+    #[error("object storage operation failed")]
+    ObjectStore(#[from] ObjectStoreError),
+    /// Metadata index subsystem failure.
     #[error("index adapter operation failed")]
-    IndexStore(#[from] LocalIndexStoreError),
-    /// In-memory index adapter access failed.
-    #[error("memory index adapter operation failed")]
-    MemoryIndexStore(#[from] MemoryIndexStoreError),
-    /// In-memory record adapter access failed.
-    #[error("memory record adapter operation failed")]
-    MemoryRecordStore(#[from] MemoryRecordStoreError),
-    /// Postgres metadata adapter access failed.
-    #[error("postgres metadata adapter operation failed")]
-    PostgresMetadata(#[from] PostgresMetadataStoreError),
-    /// Retention hold input was invalid.
-    #[error("retention hold input was invalid")]
-    RetentionHold(#[from] RetentionHoldError),
-    /// Quarantine candidate input was invalid.
-    #[error("quarantine candidate input was invalid")]
-    QuarantineCandidate(#[from] QuarantineCandidateError),
-    /// Webhook delivery metadata was invalid.
-    #[error("webhook delivery metadata was invalid")]
-    WebhookDelivery(#[from] WebhookDeliveryError),
-    /// Stored file metadata could not produce a valid reconstruction plan.
-    #[error("stored file metadata was invalid")]
-    FileRecordInvariant(#[from] FileRecordInvariantError),
+    Index(#[from] IndexError),
     /// Stored file metadata exceeded the bounded parser ceiling.
     #[error("stored file metadata exceeded the bounded parser ceiling")]
     StoredFileMetadataTooLarge {
@@ -249,17 +160,11 @@ pub enum ServerError {
     /// Stored file metadata changed after bounded validation.
     #[error("stored file metadata length did not match the validated length")]
     StoredFileMetadataLengthMismatch,
-    /// Lifecycle metadata was internally inconsistent for a mutating operator workflow.
-    #[error("lifecycle metadata was internally inconsistent")]
-    InvalidLifecycleMetadata(#[from] InvalidLifecycleMetadataError),
     /// A file identifier was unsafe.
     #[error(
         "file identifier must be relative and must not contain traversal or control characters"
     )]
     InvalidFileId,
-    /// A required metadata table was missing from the configured backend.
-    #[error("required metadata table is missing: {0}")]
-    MissingRequiredMetadataTable(String),
     /// A content hash was malformed.
     #[error("content hash must be 64 hexadecimal characters")]
     InvalidContentHash,
@@ -350,6 +255,30 @@ pub enum ServerError {
     /// The uploaded body did not match the expected SHA-256 identifier.
     #[error("uploaded body hash did not match the expected sha256")]
     ExpectedBodyHashMismatch,
+    /// A digest string was malformed.
+    #[error("digest must use sha256:<64 lowercase hex> format")]
+    InvalidDigest,
+    /// A repository name or namespace path was malformed.
+    #[error("repository name was invalid")]
+    InvalidRepositoryName,
+    /// A manifest reference or tag was malformed.
+    #[error("manifest reference was invalid")]
+    InvalidManifestReference,
+    /// The requested representation does not match any accepted media type.
+    #[error("requested representation was not acceptable")]
+    NotAcceptable,
+    /// The request requires a protocol-specific authentication challenge.
+    #[error("authorization challenge required")]
+    UnauthorizedChallenge(String),
+    /// An upload session identifier was malformed.
+    #[error("upload session identifier was invalid")]
+    InvalidUploadSession,
+    /// Too many OCI upload sessions are currently active.
+    #[error("too many active oci upload sessions")]
+    TooManyUploadSessions,
+    /// Too many OCI registry token exchanges are currently active.
+    #[error("too many active oci registry token requests")]
+    TooManyRegistryTokenRequests,
     /// Redis reconstruction cache was selected without a URL.
     #[error("redis reconstruction cache requires a redis url")]
     MissingReconstructionCacheRedisUrl,
@@ -359,27 +288,6 @@ pub enum ServerError {
     /// A blocking worker task failed before it could finish storage work.
     #[error("blocking worker task failed")]
     BlockingTask(#[source] JoinError),
-    /// Stored object metadata disagreed with the expected transfer length.
-    #[error("stored object length did not match indexed metadata")]
-    StoredObjectLengthMismatch,
-    /// Storage migration found a content-addressed source object under the wrong key.
-    #[error(
-        "storage migration source object hash mismatch for key {key}: expected {expected_hash}, observed {observed_hash}"
-    )]
-    StorageMigrationSourceHashMismatch {
-        /// Content-addressed object key being migrated.
-        key: String,
-        /// Hash implied by the object key.
-        expected_hash: String,
-        /// Hash computed from the source object bytes.
-        observed_hash: String,
-    },
-    /// Repository rename encountered conflicting target-scope metadata.
-    #[error("repository rename target already contains conflicting metadata")]
-    ConflictingRenameTargetRecord,
-    /// A reconstruction response violated an internal protocol-shape invariant.
-    #[error("reconstruction response invariant failed: {0}")]
-    InvalidReconstructionResponse(#[from] InvalidReconstructionResponseError),
 }
 
 impl ServerError {
@@ -387,9 +295,14 @@ impl ServerError {
         match self {
             Self::InvalidFileId
             | Self::InvalidContentHash
+            | Self::InvalidDigest
+            | Self::InvalidRepositoryName
+            | Self::InvalidManifestReference
+            | Self::InvalidUploadSession
             | Self::InvalidXorbPrefix
-            | Self::HashParse(_)
-            | Self::ObjectPrefix(_) => StatusCode::BAD_REQUEST,
+            | Self::HashParse(_) => StatusCode::BAD_REQUEST,
+            Self::NotAcceptable => StatusCode::NOT_ACCEPTABLE,
+            Self::UnauthorizedChallenge(_) => StatusCode::UNAUTHORIZED,
             Self::InvalidRangeHeader => StatusCode::BAD_REQUEST,
             Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::XorbHashMismatch
@@ -402,9 +315,6 @@ impl ServerError {
             Self::RequestQueryTooLarge => StatusCode::URI_TOO_LONG,
             Self::RequestBodyRead(_) | Self::RequestBodyFrameOutOfBounds => StatusCode::BAD_REQUEST,
             Self::ExpectedBodyHashMismatch => StatusCode::BAD_REQUEST,
-            Self::MissingRequiredMetadataTable(_) | Self::MissingS3ObjectStoreConfig => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
             Self::NotFound | Self::UnknownProvider | Self::ProviderTokensDisabled => {
                 StatusCode::NOT_FOUND
             }
@@ -421,32 +331,22 @@ impl ServerError {
             Self::InvalidProviderTokenRequest | Self::InvalidProviderWebhookPayload => {
                 StatusCode::BAD_REQUEST
             }
+            Self::TooManyUploadSessions | Self::TooManyRegistryTokenRequests => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             Self::TransferLimiterClosed => StatusCode::SERVICE_UNAVAILABLE,
             Self::Io(_)
             | Self::Json(_)
             | Self::NumericConversion(_)
             | Self::ObjectStore(_)
-            | Self::S3ObjectStore(_)
-            | Self::IndexStore(_)
-            | Self::MemoryIndexStore(_)
-            | Self::MemoryRecordStore(_)
-            | Self::PostgresMetadata(_)
-            | Self::RetentionHold(_)
-            | Self::QuarantineCandidate(_)
-            | Self::WebhookDelivery(_)
-            | Self::FileRecordInvariant(_)
+            | Self::Index(_)
             | Self::StoredFileMetadataTooLarge { .. }
             | Self::StoredFileMetadataLengthMismatch
-            | Self::InvalidLifecycleMetadata(_)
             | Self::Config(_)
             | Self::Overflow
             | Self::MissingReconstructionCacheRedisUrl
             | Self::ReconstructionCache(_)
             | Self::BlockingTask(_)
-            | Self::StoredObjectLengthMismatch
-            | Self::StorageMigrationSourceHashMismatch { .. }
-            | Self::ConflictingRenameTargetRecord
-            | Self::InvalidReconstructionResponse(_)
             | Self::Provider(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -455,10 +355,32 @@ impl ServerError {
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        let should_attach_default_challenge = matches!(
+            self,
+            Self::MissingAuthorization | Self::InvalidAuthorizationHeader | Self::InvalidToken(_)
+        );
+        let custom_challenge = if let Self::UnauthorizedChallenge(custom_header) = &self {
+            Some(custom_header.as_str())
+        } else {
+            None
+        };
         let body = ErrorBody {
             error: self.to_string(),
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(custom_header) = custom_challenge {
+            if let Ok(header_value) = HeaderValue::from_str(custom_header) {
+                response
+                    .headers_mut()
+                    .insert(WWW_AUTHENTICATE, header_value);
+            }
+        } else if should_attach_default_challenge {
+            response.headers_mut().insert(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"shardline\""),
+            );
+        }
+        response
     }
 }
 
@@ -484,7 +406,360 @@ impl From<XorbParseError> for ServerError {
     }
 }
 
+impl From<XetAdapterError> for ServerError {
+    fn from(value: XetAdapterError) -> Self {
+        match value {
+            XetAdapterError::Io(e) => Self::Io(e),
+            XetAdapterError::NumericConversion(e) => Self::NumericConversion(e),
+            XetAdapterError::HashParse(e) => Self::HashParse(e),
+            XetAdapterError::ObjectStore(e) => Self::from(e),
+            XetAdapterError::LocalObjectStore(e) => Self::ObjectStore(ObjectStoreError::Local(e)),
+            XetAdapterError::S3ObjectStore(e) => Self::ObjectStore(ObjectStoreError::S3(e)),
+            XetAdapterError::IndexStore(e) => Self::Index(IndexError::Local(e)),
+            XetAdapterError::MemoryIndexStore(e) => Self::Index(IndexError::MemoryIndex(e)),
+            XetAdapterError::MemoryRecordStore(e) => Self::Index(IndexError::MemoryRecord(e)),
+            XetAdapterError::PostgresMetadata(e) => Self::Index(IndexError::PostgresMetadata(e)),
+            XetAdapterError::FileRecordInvariant(e) => {
+                Self::Index(IndexError::FileRecordInvariant(e))
+            }
+            XetAdapterError::InvalidContentHash => Self::InvalidContentHash,
+            XetAdapterError::InvalidXorbPrefix => Self::InvalidXorbPrefix,
+            XetAdapterError::XorbHashMismatch => Self::XorbHashMismatch,
+            XetAdapterError::InvalidSerializedXorb => Self::InvalidSerializedXorb,
+            XetAdapterError::InvalidSerializedShard(e) => Self::InvalidSerializedShard(e),
+            XetAdapterError::MissingReferencedXorb => Self::MissingReferencedXorb,
+            XetAdapterError::TooManyShardTerms => Self::TooManyShardTerms,
+            XetAdapterError::NotFound => Self::NotFound,
+            XetAdapterError::Overflow => Self::Overflow,
+            XetAdapterError::RangeNotSatisfiable => Self::RangeNotSatisfiable,
+        }
+    }
+}
+
+impl From<ProviderEventsError> for ServerError {
+    fn from(value: ProviderEventsError) -> Self {
+        match value {
+            ProviderEventsError::Overflow => Self::Overflow,
+            ProviderEventsError::InvalidContentHash => Self::InvalidContentHash,
+            ProviderEventsError::InvalidProviderWebhookPayload => {
+                Self::InvalidProviderWebhookPayload
+            }
+            ProviderEventsError::ConflictingRenameTargetRecord => {
+                Self::Index(IndexError::ConflictingRenameTargetRecord)
+            }
+            ProviderEventsError::Json(e) => Self::Json(e),
+            ProviderEventsError::NumericConversion(e) => Self::NumericConversion(e),
+            ProviderEventsError::RetentionHold(e) => Self::Index(IndexError::RetentionHold(e)),
+            ProviderEventsError::XetAdapter(e) => Self::from(e),
+            ProviderEventsError::IndexStore(e) => Self::Index(IndexError::Local(e)),
+            ProviderEventsError::MemoryIndexStore(e) => Self::Index(IndexError::MemoryIndex(e)),
+            ProviderEventsError::MemoryRecordStore(e) => Self::Index(IndexError::MemoryRecord(e)),
+            ProviderEventsError::PostgresMetadata(e) => {
+                Self::Index(IndexError::PostgresMetadata(e))
+            }
+            ProviderEventsError::WebhookDelivery(e) => Self::Index(IndexError::WebhookDelivery(e)),
+            ProviderEventsError::ObjectStore(e) => Self::from(e),
+            ProviderEventsError::ParseStoredFileRecord(e) => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        }
+    }
+}
+
+impl From<GcError> for ServerError {
+    fn from(err: GcError) -> Self {
+        match err {
+            GcError::Io(e) => Self::Io(e),
+            GcError::Json(e) => Self::Json(e),
+            GcError::NumericConversion(e) => Self::NumericConversion(e),
+            GcError::ObjectStore(e) => Self::from(e),
+            GcError::LocalObjectStore(e) => Self::ObjectStore(ObjectStoreError::Local(e)),
+            GcError::S3ObjectStore(e) => Self::ObjectStore(ObjectStoreError::S3(e)),
+            GcError::ObjectPrefix(e) => Self::ObjectStore(ObjectStoreError::Prefix(e)),
+            GcError::IndexStore(e) => Self::Index(IndexError::Local(e)),
+            GcError::MemoryIndexStore(e) => Self::Index(IndexError::MemoryIndex(e)),
+            GcError::MemoryRecordStore(e) => Self::Index(IndexError::MemoryRecord(e)),
+            GcError::PostgresMetadata(e) => Self::Index(IndexError::PostgresMetadata(e)),
+            GcError::RetentionHold(e) => Self::Index(IndexError::RetentionHold(e)),
+            GcError::QuarantineCandidate(e) => Self::Index(IndexError::QuarantineCandidate(e)),
+            GcError::WebhookDelivery(e) => Self::Index(IndexError::WebhookDelivery(e)),
+            GcError::FileRecordInvariant(e) => Self::Index(IndexError::FileRecordInvariant(e)),
+            GcError::InvalidLifecycleMetadata(e) => {
+                Self::Index(IndexError::InvalidLifecycleMetadata(e))
+            }
+            GcError::InvalidContentHash => Self::InvalidContentHash,
+            GcError::Overflow => Self::Overflow,
+            GcError::XetAdapter(e) => Self::from(e),
+        }
+    }
+}
+
+impl From<OciAdapterError> for ServerError {
+    fn from(value: OciAdapterError) -> Self {
+        match value {
+            OciAdapterError::Io(e) => Self::Io(e),
+            OciAdapterError::Json(e) => Self::Json(e),
+            OciAdapterError::NumericConversion(e) => Self::NumericConversion(e),
+            OciAdapterError::ObjectStore(e) => Self::from(e),
+            OciAdapterError::S3ObjectStore(e) => Self::ObjectStore(ObjectStoreError::S3(e)),
+            OciAdapterError::LocalObjectStore(e) => Self::ObjectStore(ObjectStoreError::Local(e)),
+            OciAdapterError::ObjectPrefix(e) => Self::ObjectStore(ObjectStoreError::Prefix(e)),
+            OciAdapterError::NotFound => Self::NotFound,
+            OciAdapterError::Overflow => Self::Overflow,
+            OciAdapterError::InvalidContentHash => Self::InvalidContentHash,
+            OciAdapterError::InvalidDigest => Self::InvalidDigest,
+            OciAdapterError::InvalidRepositoryName => Self::InvalidRepositoryName,
+            OciAdapterError::InvalidManifestReference => Self::InvalidManifestReference,
+            OciAdapterError::InvalidUploadSession => Self::InvalidUploadSession,
+            OciAdapterError::TooManyUploadSessions => Self::TooManyUploadSessions,
+            OciAdapterError::ExpectedBodyHashMismatch => Self::ExpectedBodyHashMismatch,
+            OciAdapterError::BlockingTask(e) => Self::BlockingTask(e),
+        }
+    }
+}
+
+impl From<shardline_protocol_adapters::ProtocolError> for ServerError {
+    fn from(error: shardline_protocol_adapters::ProtocolError) -> Self {
+        match error {
+            shardline_protocol_adapters::ProtocolError::InvalidContentHash => {
+                Self::InvalidContentHash
+            }
+        }
+    }
+}
+
+impl From<LocalObjectStoreError> for ServerError {
+    fn from(e: LocalObjectStoreError) -> Self {
+        Self::ObjectStore(ObjectStoreError::Local(e))
+    }
+}
+
+impl From<S3ObjectStoreError> for ServerError {
+    fn from(e: S3ObjectStoreError) -> Self {
+        Self::ObjectStore(ObjectStoreError::S3(e))
+    }
+}
+
+impl From<ObjectPrefixError> for ServerError {
+    fn from(e: ObjectPrefixError) -> Self {
+        Self::ObjectStore(ObjectStoreError::Prefix(e))
+    }
+}
+
+impl From<LocalIndexStoreError> for ServerError {
+    fn from(e: LocalIndexStoreError) -> Self {
+        Self::Index(IndexError::Local(e))
+    }
+}
+
+impl From<MemoryIndexStoreError> for ServerError {
+    fn from(e: MemoryIndexStoreError) -> Self {
+        Self::Index(IndexError::MemoryIndex(e))
+    }
+}
+
+impl From<MemoryRecordStoreError> for ServerError {
+    fn from(e: MemoryRecordStoreError) -> Self {
+        Self::Index(IndexError::MemoryRecord(e))
+    }
+}
+
+impl From<PostgresMetadataStoreError> for ServerError {
+    fn from(e: PostgresMetadataStoreError) -> Self {
+        Self::Index(IndexError::PostgresMetadata(e))
+    }
+}
+
+impl From<RetentionHoldError> for ServerError {
+    fn from(e: RetentionHoldError) -> Self {
+        Self::Index(IndexError::RetentionHold(e))
+    }
+}
+
+impl From<QuarantineCandidateError> for ServerError {
+    fn from(e: QuarantineCandidateError) -> Self {
+        Self::Index(IndexError::QuarantineCandidate(e))
+    }
+}
+
+impl From<WebhookDeliveryError> for ServerError {
+    fn from(e: WebhookDeliveryError) -> Self {
+        Self::Index(IndexError::WebhookDelivery(e))
+    }
+}
+
+impl From<FileRecordInvariantError> for ServerError {
+    fn from(e: FileRecordInvariantError) -> Self {
+        Self::Index(IndexError::FileRecordInvariant(e))
+    }
+}
+
+impl From<InvalidLifecycleMetadataError> for ServerError {
+    fn from(e: InvalidLifecycleMetadataError) -> Self {
+        Self::Index(IndexError::InvalidLifecycleMetadata(e))
+    }
+}
+
+impl From<InvalidReconstructionResponseError> for ServerError {
+    fn from(e: InvalidReconstructionResponseError) -> Self {
+        Self::Index(IndexError::InvalidReconstructionResponse(e))
+    }
+}
+
+impl From<ParseStoredFileRecordError> for ServerError {
+    fn from(e: ParseStoredFileRecordError) -> Self {
+        match e {
+            ParseStoredFileRecordError::StoredFileMetadataTooLarge {
+                observed_bytes,
+                maximum_bytes,
+            } => Self::StoredFileMetadataTooLarge {
+                observed_bytes,
+                maximum_bytes,
+            },
+            ParseStoredFileRecordError::Json(e) => Self::Json(e),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::ServerError;
+
+    fn status_for(error: &ServerError) -> StatusCode {
+        error.status_code()
+    }
+
+    #[test]
+    fn not_found_maps_to_404() {
+        assert_eq!(status_for(&ServerError::NotFound), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn insufficient_scope_maps_to_403() {
+        assert_eq!(
+            status_for(&ServerError::InsufficientScope),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn too_many_upload_sessions_maps_to_429() {
+        assert_eq!(
+            status_for(&ServerError::TooManyUploadSessions),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn too_many_registry_token_requests_maps_to_429() {
+        assert_eq!(
+            status_for(&ServerError::TooManyRegistryTokenRequests),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[test]
+    fn missing_authorization_maps_to_401() {
+        assert_eq!(
+            status_for(&ServerError::MissingAuthorization),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn request_body_too_large_maps_to_413() {
+        assert_eq!(
+            status_for(&ServerError::RequestBodyTooLarge),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn invalid_file_id_maps_to_400() {
+        assert_eq!(
+            status_for(&ServerError::InvalidFileId),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn range_not_satisfiable_maps_to_416() {
+        assert_eq!(
+            status_for(&ServerError::RangeNotSatisfiable),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+    }
+
+    #[test]
+    fn not_acceptable_maps_to_406() {
+        assert_eq!(
+            status_for(&ServerError::NotAcceptable),
+            StatusCode::NOT_ACCEPTABLE
+        );
+    }
+
+    #[test]
+    fn io_error_maps_to_500() {
+        let io_err = std::io::Error::other("test");
+        assert_eq!(
+            status_for(&ServerError::Io(io_err)),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn transfer_limiter_closed_maps_to_503() {
+        assert_eq!(
+            status_for(&ServerError::TransferLimiterClosed),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn provider_denied_maps_to_403() {
+        assert_eq!(
+            status_for(&ServerError::ProviderDenied),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn unknown_provider_maps_to_404() {
+        assert_eq!(
+            status_for(&ServerError::UnknownProvider),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn overflow_maps_to_500() {
+        assert_eq!(
+            status_for(&ServerError::Overflow),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn invalid_content_hash_maps_to_400() {
+        assert_eq!(
+            status_for(&ServerError::InvalidContentHash),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn expected_body_hash_mismatch_maps_to_400() {
+        assert_eq!(
+            status_for(&ServerError::ExpectedBodyHashMismatch),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

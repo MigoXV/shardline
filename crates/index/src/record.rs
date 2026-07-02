@@ -1,12 +1,59 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use shardline_protocol::{HashParseError, RepositoryProvider, RepositoryScope, ShardlineHash};
+use shardline_protocol::{HashParseError, RepositoryProvider, RepositoryScope};
 use thiserror::Error;
+
+use crate::parse_xet_hash_hex;
 
 /// Boxed asynchronous record-store operation.
 pub type RecordStoreFuture<'operation, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'operation>>;
+
+macro_rules! visit_locators_async {
+    ($visit:ident, $list:ident) => {
+        fn $visit<'operation, Visitor, VisitorError>(
+            &'operation self,
+            mut visitor: Visitor,
+        ) -> RecordStoreFuture<'operation, (), VisitorError>
+        where
+            Self: Sync,
+            Self::Error: Into<VisitorError> + 'operation,
+            Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
+            VisitorError: Send + 'operation,
+        {
+            Box::pin(async move {
+                for locator in self.$list().await.map_err(Into::into)? {
+                    visitor(locator)?;
+                }
+                Ok(())
+            })
+        }
+    };
+}
+
+macro_rules! visit_repository_locators_async {
+    ($visit:ident, $list:ident) => {
+        fn $visit<'operation, Visitor, VisitorError>(
+            &'operation self,
+            repository: &'operation crate::RepositoryRecordScope,
+            mut visitor: Visitor,
+        ) -> RecordStoreFuture<'operation, (), VisitorError>
+        where
+            Self: Sync,
+            Self::Error: Into<VisitorError> + 'operation,
+            Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
+            VisitorError: Send + 'operation,
+        {
+            Box::pin(async move {
+                for locator in self.$list(repository).await.map_err(Into::into)? {
+                    visitor(locator)?;
+                }
+                Ok(())
+            })
+        }
+    };
+}
 
 /// Stored record bytes together with adapter locator and modification time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,16 +75,16 @@ pub struct FileChunkRecord {
     pub offset: u64,
     /// Chunk byte length.
     pub length: u64,
-    /// Start chunk index inside the referenced xorb.
+    /// Start member index inside the referenced protocol object.
     #[serde(default)]
     pub range_start: u32,
-    /// End-exclusive chunk index inside the referenced xorb.
+    /// End-exclusive member index inside the referenced protocol object.
     #[serde(default = "default_range_end")]
     pub range_end: u32,
-    /// Inclusive start byte for the serialized xorb range that covers this term.
+    /// Inclusive start byte for the serialized protocol object range that covers this term.
     #[serde(default)]
     pub packed_start: u64,
-    /// Exclusive end byte for the serialized xorb range that covers this term.
+    /// Exclusive end byte for the serialized protocol object range that covers this term.
     #[serde(default = "default_packed_end")]
     pub packed_end: u64,
 }
@@ -59,12 +106,21 @@ pub struct FileRecord {
     pub content_hash: String,
     /// Total logical byte length of the reconstructed file.
     pub total_bytes: u64,
-    /// Chunk size used for this upload. Shard-backed records may use zero.
+    /// Chunk size used for this upload. Protocol-object term records may use zero.
     pub chunk_size: u64,
     /// Optional repository namespace for provider-backed storage.
     pub repository_scope: Option<RepositoryScope>,
     /// Ordered chunks needed to reconstruct the file.
     pub chunks: Vec<FileChunkRecord>,
+}
+
+/// File-record reconstruction storage layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRecordStorageLayout {
+    /// The file reconstructs directly from stored chunk objects.
+    StoredChunks,
+    /// The file reconstructs from protocol-owned object terms.
+    ReferencedObjectTerms,
 }
 
 /// Repository identity used to scope record traversal across all revisions.
@@ -116,6 +172,16 @@ impl RepositoryRecordScope {
 }
 
 impl FileRecord {
+    /// Returns the storage layout encoded by this record.
+    #[must_use]
+    pub const fn storage_layout(&self) -> FileRecordStorageLayout {
+        if self.chunk_size == 0 {
+            return FileRecordStorageLayout::ReferencedObjectTerms;
+        }
+
+        FileRecordStorageLayout::StoredChunks
+    }
+
     /// Validates the invariants required to build a deterministic reconstruction plan.
     ///
     /// # Errors
@@ -125,7 +191,7 @@ impl FileRecord {
     pub fn validate_reconstruction_plan(&self) -> Result<(), FileRecordInvariantError> {
         let mut expected_offset = 0_u64;
         for chunk in &self.chunks {
-            ShardlineHash::parse_api_hex(&chunk.hash)?;
+            parse_xet_hash_hex(&chunk.hash)?;
             if chunk.length == 0 {
                 return Err(FileRecordInvariantError::EmptyChunk);
             }
@@ -170,7 +236,7 @@ pub enum FileRecordInvariantError {
     /// A chunk range was empty or inverted.
     #[error("file record chunk range must be non-empty and ordered")]
     InvalidChunkRange,
-    /// A packed xorb byte range was empty or inverted.
+    /// A packed protocol-object byte range was empty or inverted.
     #[error("file record packed byte range must be non-empty and ordered")]
     InvalidPackedRange,
     /// Logical chunk lengths overflowed the supported integer range.
@@ -181,8 +247,11 @@ pub enum FileRecordInvariantError {
     TotalBytesMismatch,
 }
 
-/// Durable file-record adapter contract.
-pub trait RecordStore {
+/// Read-only record traversal capability.
+///
+/// Provides all locator-listing, record-reading, and visitor methods.
+/// Use as a trait bound when only read access to records is needed.
+pub trait RecordTraversal {
     /// Adapter-specific failure type.
     type Error;
     /// Adapter-specific record locator.
@@ -192,29 +261,7 @@ pub trait RecordStore {
     fn list_latest_record_locators(&self)
     -> RecordStoreFuture<'_, Vec<Self::Locator>, Self::Error>;
 
-    /// Visits visible latest-file record locators.
-    fn visit_latest_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for locator in self
-                .list_latest_record_locators()
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_locators_async!(visit_latest_record_locators, list_latest_record_locators);
 
     /// Visits visible latest-file records together with raw bytes and modification time.
     fn visit_latest_records<'operation, Visitor, VisitorError>(
@@ -255,30 +302,10 @@ pub trait RecordStore {
         repository: &'operation RepositoryRecordScope,
     ) -> RecordStoreFuture<'operation, Vec<Self::Locator>, Self::Error>;
 
-    /// Visits visible latest-file record locators for one repository across all revisions.
-    fn visit_repository_latest_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        repository: &'operation RepositoryRecordScope,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for locator in self
-                .list_repository_latest_record_locators(repository)
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_repository_locators_async!(
+        visit_repository_latest_record_locators,
+        list_repository_latest_record_locators
+    );
 
     /// Visits visible latest-file records for one repository across all revisions.
     fn visit_repository_latest_records<'operation, Visitor, VisitorError>(
@@ -325,29 +352,7 @@ pub trait RecordStore {
         repository: &'operation RepositoryRecordScope,
     ) -> RecordStoreFuture<'operation, Vec<Self::Locator>, Self::Error>;
 
-    /// Visits immutable version-record locators.
-    fn visit_version_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for locator in self
-                .list_version_record_locators()
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_locators_async!(visit_version_record_locators, list_version_record_locators);
 
     /// Visits immutable version records together with raw bytes and modification time.
     fn visit_version_records<'operation, Visitor, VisitorError>(
@@ -382,30 +387,10 @@ pub trait RecordStore {
         })
     }
 
-    /// Visits immutable version-record locators for one repository across all revisions.
-    fn visit_repository_version_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        repository: &'operation RepositoryRecordScope,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for locator in self
-                .list_repository_version_record_locators(repository)
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_repository_locators_async!(
+        visit_repository_version_record_locators,
+        list_repository_version_record_locators
+    );
 
     /// Visits immutable version records for one repository across all revisions.
     fn visit_repository_version_records<'operation, Visitor, VisitorError>(
@@ -453,6 +438,30 @@ pub trait RecordStore {
         record: &'operation FileRecord,
     ) -> RecordStoreFuture<'operation, Option<Vec<u8>>, Self::Error>;
 
+    /// Returns whether a record locator exists.
+    fn record_locator_exists<'operation>(
+        &'operation self,
+        locator: &'operation Self::Locator,
+    ) -> RecordStoreFuture<'operation, bool, Self::Error>;
+
+    /// Returns a locator modification timestamp relative to Unix epoch.
+    fn modified_since_epoch<'operation>(
+        &'operation self,
+        locator: &'operation Self::Locator,
+    ) -> RecordStoreFuture<'operation, Duration, Self::Error>;
+
+    /// Computes the visible latest-record locator for a domain record.
+    fn latest_record_locator(&self, record: &FileRecord) -> Self::Locator;
+
+    /// Computes the immutable version-record locator for a domain record.
+    fn version_record_locator(&self, record: &FileRecord) -> Self::Locator;
+}
+
+/// Write/delete record mutation capability.
+///
+/// Provides record-writing and deletion methods.
+/// Use as a trait bound when only mutation access to records is needed.
+pub trait RecordMutation: RecordTraversal {
     /// Writes or replaces an immutable version record.
     fn write_version_record<'operation>(
         &'operation self,
@@ -471,27 +480,17 @@ pub trait RecordStore {
         locator: &'operation Self::Locator,
     ) -> RecordStoreFuture<'operation, (), Self::Error>;
 
-    /// Returns whether a record locator exists.
-    fn record_locator_exists<'operation>(
-        &'operation self,
-        locator: &'operation Self::Locator,
-    ) -> RecordStoreFuture<'operation, bool, Self::Error>;
-
     /// Removes empty latest-record containers after stale record deletion.
     fn prune_empty_latest_records(&self) -> RecordStoreFuture<'_, (), Self::Error>;
-
-    /// Returns a locator modification timestamp relative to Unix epoch.
-    fn modified_since_epoch<'operation>(
-        &'operation self,
-        locator: &'operation Self::Locator,
-    ) -> RecordStoreFuture<'operation, Duration, Self::Error>;
-
-    /// Computes the visible latest-record locator for a domain record.
-    fn latest_record_locator(&self, record: &FileRecord) -> Self::Locator;
-
-    /// Computes the immutable version-record locator for a domain record.
-    fn version_record_locator(&self, record: &FileRecord) -> Self::Locator;
 }
+
+/// Combined read + write record-store contract.
+///
+/// Automatically implemented for all types that implement both
+/// [`RecordTraversal`] and [`RecordMutation`].
+pub trait RecordStore: RecordTraversal + RecordMutation {}
+
+impl<T: RecordTraversal + RecordMutation> RecordStore for T {}
 
 #[cfg(test)]
 mod tests {
@@ -501,11 +500,8 @@ mod tests {
 
     #[test]
     fn file_record_preserves_repository_scope_and_chunk_order() {
-        let scope = RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", Some("main"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+        let scope = RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", Some("main"))
+            .unwrap();
         let first = FileChunkRecord {
             hash: "a".repeat(64),
             offset: 0,

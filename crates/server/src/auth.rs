@@ -1,5 +1,6 @@
 use axum::http::{HeaderMap, header::AUTHORIZATION};
-use shardline_protocol::{TokenClaims, TokenCodecError, TokenScope, TokenSigner};
+use shardline_protocol::{TokenClaims, TokenCodecError, TokenScope};
+use shardline_server_core::{AuthError, AuthProvider};
 use subtle::ConstantTimeEq;
 
 use crate::ServerError;
@@ -26,21 +27,44 @@ impl AuthContext {
     }
 }
 
-/// Local bearer-token verifier.
-#[derive(Debug, Clone)]
+/// Bearer-token verifier backed by a pluggable [`AuthProvider`].
+#[derive(Clone)]
 pub struct ServerAuth {
-    signer: TokenSigner,
+    provider: std::sync::Arc<dyn AuthProvider>,
 }
 
 impl ServerAuth {
-    /// Creates the bearer-token verifier.
+    /// Creates a bearer-token verifier from a signing key using the local
+    /// Ed25519 provider.
     ///
     /// # Errors
     ///
     /// Returns [`ServerError`] when the signing key is invalid.
     pub fn new(signing_key: &[u8]) -> Result<Self, ServerError> {
-        let signer = TokenSigner::new(signing_key)?;
-        Ok(Self { signer })
+        let provider = shardline_server_core::auth::LocalEd25519Provider::new(signing_key)?;
+        Ok(Self {
+            provider: std::sync::Arc::new(provider),
+        })
+    }
+
+    /// Creates a bearer-token verifier from a boxed [`AuthProvider`].
+    #[must_use]
+    pub fn from_provider(provider: Box<dyn AuthProvider>) -> Self {
+        Self {
+            provider: std::sync::Arc::from(provider),
+        }
+    }
+
+    /// Returns a reference to the underlying [`AuthProvider`].
+    #[must_use]
+    pub fn provider(&self) -> &dyn AuthProvider {
+        self.provider.as_ref()
+    }
+
+    /// Returns a clone of the underlying [`AuthProvider`] as an [`Arc`].
+    #[must_use]
+    pub fn provider_arc(&self) -> std::sync::Arc<dyn AuthProvider> {
+        self.provider.clone()
     }
 
     /// Validates the request token and required scope.
@@ -61,12 +85,20 @@ impl ServerAuth {
             .to_str()
             .map_err(|_error| ServerError::InvalidAuthorizationHeader)?;
         let token = parse_bearer_token(header)?;
-        let claims = self.signer.verify_now(token)?;
+        let claims = self.provider.verify_token(token)?;
         if !scope_allows(claims.scope(), required_scope) {
             return Err(ServerError::InsufficientScope);
         }
 
         Ok(AuthContext::new(claims))
+    }
+}
+
+impl std::fmt::Debug for ServerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerAuth")
+            .field("provider", &"<dyn AuthProvider>")
+            .finish()
     }
 }
 
@@ -99,10 +131,11 @@ pub(crate) fn authorize_static_bearer_token(
         .map_err(|_error| ServerError::InvalidAuthorizationHeader)?;
     let token = parse_bearer_token(header)?;
     let actual = token.as_bytes();
-    if actual.len() != expected_token.len() {
-        return Err(ServerError::InvalidAuthorizationHeader);
-    }
-    if expected_token.ct_eq(actual).into() {
+
+    use sha2::{Digest, Sha256};
+    let actual_hash = Sha256::digest(actual);
+    let expected_hash = Sha256::digest(expected_token);
+    if bool::from(actual_hash.ct_eq(&expected_hash)) {
         return Ok(());
     }
 
@@ -122,6 +155,17 @@ impl From<TokenCodecError> for ServerError {
     }
 }
 
+impl From<AuthError> for ServerError {
+    fn from(error: AuthError) -> Self {
+        match error {
+            AuthError::InvalidToken => Self::InvalidToken(TokenCodecError::InvalidFormat),
+            AuthError::ExpiredToken => Self::InvalidToken(TokenCodecError::Expired),
+            AuthError::InsufficientScope => Self::InsufficientScope,
+            AuthError::ProviderError(_msg) => Self::InvalidToken(TokenCodecError::InvalidFormat),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{
@@ -137,7 +181,7 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_missing_header() {
-        let auth = ServerAuth::new(b"signing-key");
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
         assert!(auth.is_ok());
         let Ok(auth) = auth else {
             return;
@@ -151,12 +195,12 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_insufficient_scope() {
-        let auth = ServerAuth::new(b"signing-key");
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
         assert!(auth.is_ok());
         let Ok(auth) = auth else {
             return;
         };
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;
@@ -199,7 +243,7 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_oversized_bearer_token_before_decoding() {
-        let auth = ServerAuth::new(b"signing-key");
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
         assert!(auth.is_ok());
         let Ok(auth) = auth else {
             return;
@@ -221,7 +265,7 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_bearer_token_with_whitespace() {
-        let auth = ServerAuth::new(b"signing-key");
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
         assert!(auth.is_ok());
         let Ok(auth) = auth else {
             return;
@@ -240,12 +284,12 @@ mod tests {
 
     #[test]
     fn server_auth_accepts_valid_write_token() {
-        let auth = ServerAuth::new(b"signing-key");
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
         assert!(auth.is_ok());
         let Ok(auth) = auth else {
             return;
         };
-        let signer = TokenSigner::new(b"signing-key");
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
         assert!(signer.is_ok());
         let Ok(signer) = signer else {
             return;

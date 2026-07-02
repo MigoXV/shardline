@@ -2,12 +2,86 @@
 resolver = "3"
 members = ["crates/*"]
 
+# Duplicate dependency note:
+# - hashbrown: 3 versions (0.14, 0.15, 0.17) — pinned by xet ecosystem crates (xet-client, xet-data)
+#   at different versions; cannot be unified without upstream changes.
+# - hashlink, cfg-if, core-foundation, itertools, webpki-roots, whoami, rand: 2 versions each —
+#   transitive deps from xet-client 1.5.x and other third-party crates pin incompatible versions.
+# - reqwest: duplicate (0.12 workspace, 0.13 pinned by xet-client 1.5.2) — NOT FIXABLE.
+# - getrandom: duplicate (0.3 workspace, older via xet ecosystem) — NOT FIXABLE.
+
 [workspace.package]
+version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/shardline/shardline"
-homepage = "https://github.com/shardline/shardline"
-documentation = "https://github.com/shardline/shardline/tree/main/docs"
+repository = "https://github.com/STEXS-Technologies/shardline"
+homepage = "https://github.com/STEXS-Technologies/shardline"
+documentation = "https://docs.rs/shardline"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = "0.8.8"
+base64 = "0.22"
+blake3 = "1.8.3"
+bytes = "1.10.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+clap = "4.5.60"
+clap_complete = "4.5.59"
+clap_mangen = "0.2.31"
+criterion = { version = "0.5.1", default-features = false, features = ["html_reports"] }
+flate2 = "1"
+futures-util = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+jsonwebtoken = "9"
+libc = "0.2.177"
+libfuzzer-sys = "0.4"
+object_store = { version = "0.13.2", default-features = false }
+redis = "1.0.2"
+reqwest = { version = "0.12.28", default-features = false }
+rusqlite = "0.32"
+serde = "1.0"
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = { version = "0.10", features = ["compress"] }
+shardline = { version = "1.0.0", path = "crates/cli" }
+shardline-cache = { version = "1.0.0", path = "crates/cache" }
+shardline-cas = { version = "1.0.0", path = "crates/cas" }
+shardline-fsck = { version = "1.0.0", path = "crates/fsck" }
+shardline-gc = { version = "1.0.0", path = "crates/gc" }
+shardline-hub-api = { version = "1.0.0", path = "crates/hub_api" }
+shardline-index = { version = "1.0.0", path = "crates/index" }
+shardline-metrics = { version = "1.0.0", path = "crates/metrics" }
+shardline-protocol = { version = "1.0.0", path = "crates/protocol" }
+shardline-protocol-adapters = { version = "1.0.0", path = "crates/protocol_adapters" }
+shardline-rebuild = { version = "1.0.0", path = "crates/rebuild" }
+shardline-provider-events = { version = "1.0.0", path = "crates/provider_events" }
+shardline-oci-adapter = { version = "1.0.0", path = "crates/oci_adapter" }
+shardline-server = { version = "1.0.0", path = "crates/server" }
+shardline-server-core = { version = "1.0.0", path = "crates/server_core" }
+shardline-storage = { version = "1.0.0", path = "crates/storage" }
+shardline-test-support = { version = "1.0.0", path = "crates/test_support" }
+shardline-vcs = { version = "1.0.0", path = "crates/vcs" }
+shardline-xet-adapter = { version = "1.0.0", path = "crates/xet_adapter" }
+shardline-xet-core = { version = "1.0.0", path = "crates/xet_core" }
+sqlx = { version = "0.8.6", default-features = false }
+subtle = { version = "2.6", default-features = false }
+tempfile = "3.15"
+thiserror = { version = "2.0.18", default-features = false }
+tokio = "1.48.0"
+url = "2.5"
+xet-client = "1.5.1"
+xet-core-structures = "1.5.1"
+xet-data = "1.5.1"
+xet-runtime = "1.5.1"
+prometheus = { version = "0.14", default-features = false }
+tower = "0.5"
+tower-http = { version = "0.6", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+zeroize = "1.8"
+proptest = "1"
 
 [profile.release]
 opt-level = 3

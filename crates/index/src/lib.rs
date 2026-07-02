@@ -1,11 +1,28 @@
 #![deny(unsafe_code)]
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::shadow_unrelated,
+        clippy::let_underscore_must_use,
+        clippy::format_push_string,
+        unused_imports,
+        unused_variables,
+        unused_mut,
+        dead_code,
+    )
+)]
 
 //! Metadata index contracts and adapters for Shardline.
 //!
 //! This crate models the metadata Shardline needs to reconstruct files from
-//! content-addressed xorbs:
+//! immutable content-addressed objects:
 //!
-//! - [`FileId`] and [`XorbId`] wrap protocol hashes with domain-specific meaning.
+//! - [`FileId`] and [`StoredObjectId`] wrap protocol hashes with domain-specific meaning.
 //! - [`FileReconstruction`] stores the ordered recipe for one file.
 //! - [`IndexStore`] and [`RecordStore`] describe the synchronous metadata
 //!   contracts used by local and Postgres-backed deployments.
@@ -14,25 +31,26 @@
 //! # Example
 //!
 //! ```
-//! use shardline_index::{FileId, FileReconstruction, ReconstructionTerm, XorbId};
+//! use shardline_index::{FileId, FileReconstruction, ReconstructionTerm, StoredObjectId};
 //! use shardline_protocol::{ChunkRange, ShardlineHash};
 //!
 //! let file_id = FileId::new(ShardlineHash::from_bytes([1; 32]));
-//! let xorb_id = XorbId::new(ShardlineHash::from_bytes([2; 32]));
-//! let term = ReconstructionTerm::new(xorb_id, ChunkRange::new(0, 2)?, 128);
+//! let object_id = StoredObjectId::new(ShardlineHash::from_bytes([2; 32]));
+//! let term = ReconstructionTerm::new(object_id, ChunkRange::new(0, 2)?, 128);
 //! let reconstruction = FileReconstruction::new(vec![term]);
 //!
 //! assert_eq!(file_id.hash().as_bytes(), &[1; 32]);
-//! assert_eq!(reconstruction.terms()[0].xorb_id(), xorb_id);
+//! assert_eq!(reconstruction.terms()[0].object_id(), object_id);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#[cfg(not(unix))]
-compile_error!(
-    "shardline-index requires Unix anchored filesystem semantics; non-Unix builds are unsupported until equivalent TOCTOU hardening exists"
-);
+#[macro_use]
+mod store;
 
 mod dedupe;
+pub mod hub;
+mod hub_local_sqlite;
+mod hub_postgres;
 mod ids;
 mod lifecycle;
 mod local_sqlite;
@@ -42,12 +60,12 @@ mod provider;
 mod reconstruction;
 mod record;
 mod record_key;
-mod store;
 #[cfg(test)]
 mod test_invariant_error;
+mod xet_hash;
 
 pub use dedupe::DedupeShardMapping;
-pub use ids::{FileId, XorbId};
+pub use ids::{FileId, StoredObjectId, XorbId};
 pub use lifecycle::{
     ProviderRepositoryState, QuarantineCandidate, QuarantineCandidateError, RetentionHold,
     RetentionHoldError, WebhookDelivery, WebhookDeliveryError,
@@ -64,7 +82,11 @@ pub use postgres::{
 };
 pub use reconstruction::{FileReconstruction, ReconstructionTerm};
 pub use record::{
-    FileChunkRecord, FileRecord, FileRecordInvariantError, RecordStore, RecordStoreFuture,
-    RepositoryRecordScope, StoredRecord,
+    FileChunkRecord, FileRecord, FileRecordInvariantError, FileRecordStorageLayout, RecordMutation,
+    RecordStore, RecordStoreFuture, RecordTraversal, RepositoryRecordScope, StoredRecord,
 };
-pub use store::{AsyncIndexStore, IndexStore, IndexStoreFuture};
+pub use store::{
+    AsyncIndexStore, DedupeStore, IndexStore, IndexStoreFuture, LifecycleStore,
+    ReconstructionStore, Repository,
+};
+pub use xet_hash::{parse_xet_hash_hex, xet_hash_hex_string};

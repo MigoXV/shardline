@@ -8,7 +8,6 @@ use bytes::Bytes;
 use rusqlite::Connection;
 use shardline_server::LocalBackend;
 use support::CliE2eInvariantError;
-use tokio::time::sleep;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn index_rebuild_restores_missing_latest_record() {
@@ -28,7 +27,7 @@ async fn exercise_index_rebuild() -> Result<(), Box<dyn Error>> {
     backend
         .upload_file("asset.bin", Bytes::from_static(b"aaaabbbbcccc"), None)
         .await?;
-    sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
     backend
         .upload_file("asset.bin", Bytes::from_static(b"aaaaZZZZcccc"), None)
         .await?;

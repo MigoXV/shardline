@@ -1,3 +1,13 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::shadow_unrelated,
+    clippy::let_underscore_must_use,
+    clippy::format_push_string
+)]
+
 //! Test support utilities shared by Shardline workspace crates.
 //!
 //! This crate only contains helpers that are useful across crate boundaries. It
@@ -16,12 +26,20 @@
 //! );
 //! ```
 
+#[cfg(feature = "docker")]
+mod docker;
+
 use std::{
     fmt::Display,
     io::{Error as IoError, ErrorKind},
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
 };
 
 use thiserror::Error;
+
+#[cfg(feature = "docker")]
+pub use docker::{DockerLocalStack, DockerLocalStackBuilder};
 
 /// Error type for test-only invariant failures.
 #[derive(Debug, Error)]
@@ -43,5 +61,49 @@ impl InvariantError {
 impl From<InvariantError> for IoError {
     fn from(value: InvariantError) -> Self {
         Self::new(ErrorKind::InvalidData, value)
+    }
+}
+
+/// Shared test fixture providing a temporary directory and default chunk size.
+///
+/// Eliminates the repetitive `tempfile::tempdir()` + `NonZeroUsize::new(4)` + assert
+/// boilerplate found across ~105 test functions.
+pub struct TempStorage {
+    /// The temporary directory (kept alive for the test duration).
+    pub temp: tempfile::TempDir,
+    /// A default chunk size suitable for most tests.
+    pub chunk_size: NonZeroUsize,
+}
+
+impl TempStorage {
+    /// Creates a new temporary storage fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the temporary directory or chunk size cannot be created (should
+    /// never happen in practice).
+    #[must_use]
+    pub fn new() -> Self {
+        let temp = tempfile::tempdir().expect("failed to create temporary directory");
+        let chunk_size = NonZeroUsize::new(4).expect("NonZeroUsize::new(4) should always succeed");
+        Self { temp, chunk_size }
+    }
+
+    /// Returns the temporary directory path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.temp.path()
+    }
+
+    /// Returns the temporary directory path as an owned `PathBuf`.
+    #[must_use]
+    pub fn path_buf(&self) -> PathBuf {
+        self.temp.path().to_path_buf()
+    }
+}
+
+impl Default for TempStorage {
+    fn default() -> Self {
+        Self::new()
     }
 }

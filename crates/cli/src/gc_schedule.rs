@@ -1,15 +1,28 @@
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::env::current_exe;
+#[cfg(any(target_os = "linux", test))]
+use std::fs;
+#[cfg(any(target_os = "linux", test))]
+use std::fs::{File, OpenOptions};
+#[cfg(any(target_os = "linux", test))]
+use std::io::Read;
 #[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 use std::{
-    collections::BTreeMap,
-    env::current_exe,
-    fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
 };
 
 use thiserror::Error;
 
+#[cfg(any(target_os = "linux", test))]
+use shardline_storage::local_path::resolve_platform_symlinks;
+
+#[cfg(not(target_os = "linux"))]
+use crate::local_output::remove_output_file_if_present;
+#[cfg(target_os = "linux")]
 use crate::local_output::{
     ensure_output_directory, remove_output_file_if_present, write_output_bytes,
 };
@@ -22,7 +35,10 @@ const DEFAULT_ENV_FILE: &str = "/etc/shardline/shardline.env";
 const DEFAULT_WORKING_DIRECTORY: &str = "/var/lib/shardline";
 const DEFAULT_SERVICE_USER: &str = "shardline";
 const DEFAULT_SERVICE_GROUP: &str = "shardline";
+#[cfg(any(target_os = "linux", test))]
 const MAX_SYSTEMD_ENV_FILE_BYTES: u64 = 65_536;
+#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const MAX_SYSTEM_ACCOUNT_FILE_BYTES: u64 = 4_194_304;
 
 #[cfg(test)]
@@ -99,6 +115,18 @@ pub struct GcScheduleInstallReport {
     pub retention_seconds: u64,
 }
 
+impl GcScheduleInstallReport {
+    pub fn print_summary(&self) {
+        println!("service_path: {}", self.service_path.display());
+        println!("timer_path: {}", self.timer_path.display());
+        println!("binary_path: {}", self.binary_path.display());
+        println!("env_file: {}", self.env_file.display());
+        println!("working_directory: {}", self.working_directory.display());
+        println!("calendar: {}", self.calendar);
+        println!("retention_seconds: {}", self.retention_seconds);
+    }
+}
+
 /// Summary for a scheduled-GC uninstall run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcScheduleUninstallReport {
@@ -110,6 +138,15 @@ pub struct GcScheduleUninstallReport {
     pub removed_service: bool,
     /// Whether the timer file existed and was removed.
     pub removed_timer: bool,
+}
+
+impl GcScheduleUninstallReport {
+    pub fn print_summary(&self) {
+        println!("service_path: {}", self.service_path.display());
+        println!("timer_path: {}", self.timer_path.display());
+        println!("removed_service: {}", self.removed_service);
+        println!("removed_timer: {}", self.removed_timer);
+    }
 }
 
 /// Scheduled-GC helper failure.
@@ -214,39 +251,50 @@ pub enum GcScheduleError {
 /// # Errors
 ///
 /// Returns [`GcScheduleError`] when one option is invalid or the unit files cannot be
-/// written.
+/// written. On non-Linux platforms, always returns an error since systemd is not available.
 pub fn install_gc_schedule(
     options: &GcScheduleInstallOptions,
 ) -> Result<GcScheduleInstallReport, GcScheduleError> {
-    let resolved = resolve_install_options(options)?;
-
-    ensure_output_directory(&resolved.output_dir)?;
-    if !resolved.output_dir.is_dir() {
-        return Err(GcScheduleError::InvalidOutputDirectory(resolved.output_dir));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = options;
+        Err(GcScheduleError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scheduled garbage collection via systemd is only supported on Linux",
+        )))
     }
-    ensure_output_directory(&resolved.working_directory)?;
+    #[cfg(target_os = "linux")]
+    {
+        let resolved = resolve_install_options(options)?;
 
-    let service_path = resolved
-        .output_dir
-        .join(format!("{}.service", resolved.unit_prefix));
-    let timer_path = resolved
-        .output_dir
-        .join(format!("{}.timer", resolved.unit_prefix));
+        ensure_output_directory(&resolved.output_dir)?;
+        if !resolved.output_dir.is_dir() {
+            return Err(GcScheduleError::InvalidOutputDirectory(resolved.output_dir));
+        }
+        ensure_output_directory(&resolved.working_directory)?;
 
-    let service_unit = render_service_unit(&resolved);
-    let timer_unit = render_timer_unit(&resolved);
-    write_output_bytes(&service_path, service_unit.as_bytes(), true)?;
-    write_output_bytes(&timer_path, timer_unit.as_bytes(), true)?;
+        let service_path = resolved
+            .output_dir
+            .join(format!("{}.service", resolved.unit_prefix));
+        let timer_path = resolved
+            .output_dir
+            .join(format!("{}.timer", resolved.unit_prefix));
 
-    Ok(GcScheduleInstallReport {
-        service_path,
-        timer_path,
-        binary_path: resolved.binary_path,
-        env_file: resolved.env_file,
-        working_directory: resolved.working_directory,
-        calendar: resolved.calendar,
-        retention_seconds: resolved.retention_seconds,
-    })
+        let service_unit = render_service_unit(&resolved);
+        let timer_unit = render_timer_unit(&resolved);
+        write_output_bytes(&service_path, service_unit.as_bytes(), true)?;
+        write_output_bytes(&timer_path, timer_unit.as_bytes(), true)?;
+
+        Ok(GcScheduleInstallReport {
+            service_path,
+            timer_path,
+            binary_path: resolved.binary_path,
+            env_file: resolved.env_file,
+            working_directory: resolved.working_directory,
+            calendar: resolved.calendar,
+            retention_seconds: resolved.retention_seconds,
+        })
+    }
 }
 
 /// Removes systemd units for scheduled Shardline garbage collection.
@@ -278,6 +326,7 @@ fn remove_if_present(path: &Path) -> io::Result<bool> {
     remove_output_file_if_present(path)
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_install_options(
     options: &GcScheduleInstallOptions,
 ) -> Result<GcScheduleInstallOptions, GcScheduleError> {
@@ -341,11 +390,13 @@ fn resolve_install_options(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn validate_path_field(field: &'static str, path: &Path) -> Result<(), GcScheduleError> {
     let rendered = path.to_string_lossy();
     validate_text_field(field, rendered.as_ref())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_absolute_path_field(field: &'static str, path: &Path) -> Result<(), GcScheduleError> {
     validate_path_field(field, path)?;
     if path.is_absolute() {
@@ -367,6 +418,7 @@ fn validate_text_field(field: &'static str, value: &str) -> Result<(), GcSchedul
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn resolve_binary_path(configured_binary_path: &Path) -> PathBuf {
     if configured_binary_path != Path::new(DEFAULT_BINARY_PATH) {
         return configured_binary_path.to_path_buf();
@@ -379,6 +431,7 @@ fn resolve_binary_path(configured_binary_path: &Path) -> PathBuf {
     configured_binary_path.to_path_buf()
 }
 
+#[cfg(target_os = "linux")]
 fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>, GcScheduleError> {
     let contents = read_text_file_with_limit("environment file", path, MAX_SYSTEMD_ENV_FILE_BYTES)?;
     let mut env = BTreeMap::new();
@@ -403,6 +456,7 @@ fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>, GcScheduleErr
     Ok(env)
 }
 
+#[cfg(target_os = "linux")]
 fn strip_wrapping_quotes(value: &str) -> &str {
     let Some(first) = value.chars().next() else {
         return value;
@@ -416,6 +470,7 @@ fn strip_wrapping_quotes(value: &str) -> &str {
     value
 }
 
+#[cfg(target_os = "linux")]
 fn validate_env_referenced_path(
     env: &BTreeMap<String, String>,
     field: &'static str,
@@ -434,6 +489,7 @@ fn validate_env_referenced_path(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn validate_user_exists(user: &str) -> Result<(), GcScheduleError> {
     let passwd = read_text_file_with_limit(
         "passwd database",
@@ -449,6 +505,7 @@ fn validate_user_exists(user: &str) -> Result<(), GcScheduleError> {
     Err(GcScheduleError::MissingUser(user.to_owned()))
 }
 
+#[cfg(target_os = "linux")]
 fn validate_group_exists(group: &str) -> Result<(), GcScheduleError> {
     let groups = read_text_file_with_limit(
         "group database",
@@ -464,6 +521,7 @@ fn validate_group_exists(group: &str) -> Result<(), GcScheduleError> {
     Err(GcScheduleError::MissingGroup(group.to_owned()))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_text_file_with_limit(
     field: &'static str,
     path: &Path,
@@ -492,23 +550,27 @@ fn read_text_file_with_limit(
     Ok(contents)
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[cfg(unix)]
 fn open_local_text_file(path: &Path) -> Result<File, GcScheduleError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     ensure_regular_local_file_path(path)?;
+    let resolved = resolve_platform_symlinks(path);
     Ok(OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?)
+        .open(&resolved)?)
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[cfg(not(unix))]
 fn open_local_text_file(path: &Path) -> Result<File, GcScheduleError> {
     ensure_regular_local_file_path(path)?;
     Ok(File::open(path)?)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn ensure_regular_local_file_path(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -521,6 +583,7 @@ fn ensure_regular_local_file_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_bounded_local_text_file(
     field: &'static str,
     path: &Path,
@@ -565,6 +628,7 @@ fn read_bounded_local_text_file(
     Ok(bytes)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn ensure_local_file_size_within_limit(
     field: &'static str,
     path: &Path,
@@ -626,8 +690,10 @@ fn take_matching_local_text_file_read_hook(
 }
 
 #[cfg(not(test))]
+#[cfg(any(target_os = "linux", test))]
 const fn run_before_local_text_file_read_hook_for_tests(_path: &Path) {}
 
+#[cfg(target_os = "linux")]
 fn render_service_unit(options: &GcScheduleInstallOptions) -> String {
     format!(
         "[Unit]\nDescription=Shardline garbage collection\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser={user}\nGroup={group}\nEnvironmentFile={env_file}\nExecStart={binary_path} gc --mark --sweep --retention-seconds {retention_seconds}\nWorkingDirectory={working_directory}\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths={working_directory}\n",
@@ -640,6 +706,7 @@ fn render_service_unit(options: &GcScheduleInstallOptions) -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
 fn render_timer_unit(options: &GcScheduleInstallOptions) -> String {
     format!(
         "[Unit]\nDescription=Run Shardline garbage collection on a schedule\n\n[Timer]\nOnCalendar={calendar}\nPersistent=true\nUnit={unit_prefix}.service\n\n[Install]\nWantedBy=timers.target\n",
@@ -650,19 +717,22 @@ fn render_timer_unit(options: &GcScheduleInstallOptions) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    use std::{fs::read_to_string, io::ErrorKind, os::unix::fs::symlink};
     use std::{
-        fs::{OpenOptions, read_to_string, write as write_file},
-        io::{ErrorKind, Write},
+        fs::{OpenOptions, write as write_file},
+        io::Write,
         path::Path,
     };
 
     use super::{
-        GcScheduleError, GcScheduleInstallOptions, MAX_SYSTEMD_ENV_FILE_BYTES, install_gc_schedule,
-        read_text_file_with_limit, set_before_local_text_file_read_hook, uninstall_gc_schedule,
+        GcScheduleError, MAX_SYSTEMD_ENV_FILE_BYTES, read_text_file_with_limit,
+        set_before_local_text_file_read_hook,
     };
+    #[cfg(target_os = "linux")]
+    use super::{GcScheduleInstallOptions, install_gc_schedule, uninstall_gc_schedule};
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_writes_systemd_units() {
         let sandbox = tempfile::tempdir();
@@ -717,6 +787,7 @@ mod tests {
         assert!(timer.contains("OnCalendar=hourly"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn uninstall_gc_schedule_removes_both_units() {
         let sandbox = tempfile::tempdir();
@@ -758,6 +829,7 @@ mod tests {
         assert!(!report.timer_path.exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_control_characters() {
         let sandbox = tempfile::tempdir();
@@ -784,6 +856,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_uses_root_dir_from_env_file() {
         let sandbox = tempfile::tempdir();
@@ -820,6 +893,7 @@ mod tests {
         assert_eq!(report.working_directory, configured_root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_missing_referenced_secret() {
         let sandbox = tempfile::tempdir();
@@ -855,6 +929,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_relative_env_file() {
         let result = install_gc_schedule(&GcScheduleInstallOptions {
@@ -873,6 +948,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_oversized_env_file() {
         let sandbox = tempfile::tempdir();
@@ -944,7 +1020,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_symlinked_env_file() {
         let sandbox = tempfile::tempdir();
@@ -983,7 +1059,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn install_gc_schedule_rejects_symlinked_referenced_secret() {
         let sandbox = tempfile::tempdir();

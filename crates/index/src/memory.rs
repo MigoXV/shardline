@@ -10,9 +10,10 @@ use shardline_storage::ObjectKey;
 use thiserror::Error;
 
 use crate::{
-    AsyncIndexStore, DedupeShardMapping, FileId, FileReconstruction, FileRecord, IndexStore,
-    IndexStoreFuture, ProviderRepositoryState, QuarantineCandidate, RecordStore, RecordStoreFuture,
-    RepositoryRecordScope, RetentionHold, StoredRecord, WebhookDelivery, XorbId,
+    AsyncIndexStore, DedupeShardMapping, DedupeStore, FileId, FileReconstruction, FileRecord,
+    IndexStoreFuture, LifecycleStore, ProviderRepositoryState, QuarantineCandidate,
+    ReconstructionStore, RecordMutation, RecordStoreFuture, RecordTraversal, RepositoryRecordScope,
+    RetentionHold, StoredObjectId, StoredRecord, WebhookDelivery, XorbId, xet_hash_hex_string,
 };
 
 /// In-memory implementation of [`IndexStore`].
@@ -44,14 +45,23 @@ impl MemoryIndexStore {
         Ok(())
     }
 
-    /// Persists xorb presence metadata in memory.
+    /// Persists stored-object presence metadata in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryIndexStoreError`] when the in-memory state lock is poisoned.
+    pub fn insert_object(&self, object_id: &StoredObjectId) -> Result<(), MemoryIndexStoreError> {
+        self.lock_state()?.xorbs.insert(*object_id);
+        Ok(())
+    }
+
+    /// Persists Xet xorb presence metadata in memory.
     ///
     /// # Errors
     ///
     /// Returns [`MemoryIndexStoreError`] when the in-memory state lock is poisoned.
     pub fn insert_xorb(&self, xorb_id: &XorbId) -> Result<(), MemoryIndexStoreError> {
-        self.lock_state()?.xorbs.insert(*xorb_id);
-        Ok(())
+        self.insert_object(xorb_id)
     }
 
     /// Persists a chunk-hash to retained-shard mapping in memory.
@@ -109,7 +119,7 @@ impl MemoryIndexStore {
     }
 }
 
-impl IndexStore for MemoryIndexStore {
+impl ReconstructionStore for MemoryIndexStore {
     type Error = MemoryIndexStoreError;
 
     fn reconstruction(&self, file_id: &FileId) -> Result<Option<FileReconstruction>, Self::Error> {
@@ -124,9 +134,7 @@ impl IndexStore for MemoryIndexStore {
             .copied()
             .collect::<Vec<_>>();
         file_ids.sort_by(|left, right| {
-            left.hash()
-                .api_hex_string()
-                .cmp(&right.hash().api_hex_string())
+            xet_hash_hex_string(left.hash()).cmp(&xet_hash_hex_string(right.hash()))
         });
         Ok(file_ids)
     }
@@ -135,9 +143,13 @@ impl IndexStore for MemoryIndexStore {
         Ok(self.lock_state()?.reconstructions.remove(file_id).is_some())
     }
 
-    fn contains_xorb(&self, xorb_id: &XorbId) -> Result<bool, Self::Error> {
-        Ok(self.lock_state()?.xorbs.contains(xorb_id))
+    fn contains_object(&self, object_id: &StoredObjectId) -> Result<bool, Self::Error> {
+        Ok(self.lock_state()?.xorbs.contains(object_id))
     }
+}
+
+impl DedupeStore for MemoryIndexStore {
+    type Error = MemoryIndexStoreError;
 
     fn dedupe_shard_mapping(
         &self,
@@ -154,9 +166,7 @@ impl IndexStore for MemoryIndexStore {
             .cloned()
             .collect::<Vec<_>>();
         mappings.sort_by(|left, right| {
-            left.chunk_hash()
-                .api_hex_string()
-                .cmp(&right.chunk_hash().api_hex_string())
+            xet_hash_hex_string(left.chunk_hash()).cmp(&xet_hash_hex_string(right.chunk_hash()))
         });
         Ok(mappings)
     }
@@ -169,7 +179,7 @@ impl IndexStore for MemoryIndexStore {
         Self::Error: Into<VisitorError>,
         Visitor: FnMut(DedupeShardMapping) -> Result<(), VisitorError>,
     {
-        for mapping in IndexStore::list_dedupe_shard_mappings(self).map_err(Into::into)? {
+        for mapping in DedupeStore::list_dedupe_shard_mappings(self).map_err(Into::into)? {
             visitor(mapping)?;
         }
 
@@ -183,6 +193,10 @@ impl IndexStore for MemoryIndexStore {
             .remove(chunk_hash)
             .is_some())
     }
+}
+
+impl LifecycleStore for MemoryIndexStore {
+    type Error = MemoryIndexStoreError;
 
     fn quarantine_candidate(
         &self,
@@ -211,7 +225,7 @@ impl IndexStore for MemoryIndexStore {
         Self::Error: Into<VisitorError>,
         Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError>,
     {
-        for candidate in IndexStore::list_quarantine_candidates(self).map_err(Into::into)? {
+        for candidate in LifecycleStore::list_quarantine_candidates(self).map_err(Into::into)? {
             visitor(candidate)?;
         }
 
@@ -255,7 +269,7 @@ impl IndexStore for MemoryIndexStore {
         Self::Error: Into<VisitorError>,
         Visitor: FnMut(RetentionHold) -> Result<(), VisitorError>,
     {
-        for hold in IndexStore::list_retention_holds(self).map_err(Into::into)? {
+        for hold in LifecycleStore::list_retention_holds(self).map_err(Into::into)? {
             visitor(hold)?;
         }
 
@@ -362,7 +376,7 @@ impl AsyncIndexStore for MemoryIndexStore {
         &'operation self,
         file_id: &'operation FileId,
     ) -> IndexStoreFuture<'operation, Option<FileReconstruction>, Self::Error> {
-        Box::pin(async move { IndexStore::reconstruction(self, file_id) })
+        Box::pin(async move { ReconstructionStore::reconstruction(self, file_id) })
     }
 
     fn insert_reconstruction<'operation>(
@@ -374,41 +388,41 @@ impl AsyncIndexStore for MemoryIndexStore {
     }
 
     fn list_reconstruction_file_ids(&self) -> IndexStoreFuture<'_, Vec<FileId>, Self::Error> {
-        Box::pin(async move { IndexStore::list_reconstruction_file_ids(self) })
+        Box::pin(async move { ReconstructionStore::list_reconstruction_file_ids(self) })
     }
 
     fn delete_reconstruction<'operation>(
         &'operation self,
         file_id: &'operation FileId,
     ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::delete_reconstruction(self, file_id) })
+        Box::pin(async move { ReconstructionStore::delete_reconstruction(self, file_id) })
     }
 
-    fn contains_xorb<'operation>(
+    fn contains_object<'operation>(
         &'operation self,
-        xorb_id: &'operation XorbId,
+        object_id: &'operation StoredObjectId,
     ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::contains_xorb(self, xorb_id) })
+        Box::pin(async move { ReconstructionStore::contains_object(self, object_id) })
     }
 
-    fn insert_xorb<'operation>(
+    fn insert_object<'operation>(
         &'operation self,
-        xorb_id: &'operation XorbId,
+        object_id: &'operation StoredObjectId,
     ) -> IndexStoreFuture<'operation, (), Self::Error> {
-        Box::pin(async move { self.insert_xorb(xorb_id) })
+        Box::pin(async move { self.insert_object(object_id) })
     }
 
     fn dedupe_shard_mapping<'operation>(
         &'operation self,
         chunk_hash: &'operation ShardlineHash,
     ) -> IndexStoreFuture<'operation, Option<DedupeShardMapping>, Self::Error> {
-        Box::pin(async move { IndexStore::dedupe_shard_mapping(self, chunk_hash) })
+        Box::pin(async move { DedupeStore::dedupe_shard_mapping(self, chunk_hash) })
     }
 
     fn list_dedupe_shard_mappings(
         &self,
     ) -> IndexStoreFuture<'_, Vec<DedupeShardMapping>, Self::Error> {
-        Box::pin(async move { IndexStore::list_dedupe_shard_mappings(self) })
+        Box::pin(async move { DedupeStore::list_dedupe_shard_mappings(self) })
     }
 
     fn visit_dedupe_shard_mappings<'operation, Visitor, VisitorError>(
@@ -420,7 +434,7 @@ impl AsyncIndexStore for MemoryIndexStore {
         Visitor: FnMut(DedupeShardMapping) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move { IndexStore::visit_dedupe_shard_mappings(self, visitor) })
+        Box::pin(async move { DedupeStore::visit_dedupe_shard_mappings(self, visitor) })
     }
 
     fn upsert_dedupe_shard_mapping<'operation>(
@@ -434,135 +448,10 @@ impl AsyncIndexStore for MemoryIndexStore {
         &'operation self,
         chunk_hash: &'operation ShardlineHash,
     ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::delete_dedupe_shard_mapping(self, chunk_hash) })
+        Box::pin(async move { DedupeStore::delete_dedupe_shard_mapping(self, chunk_hash) })
     }
 
-    fn quarantine_candidate<'operation>(
-        &'operation self,
-        object_key: &'operation ObjectKey,
-    ) -> IndexStoreFuture<'operation, Option<QuarantineCandidate>, Self::Error> {
-        Box::pin(async move { IndexStore::quarantine_candidate(self, object_key) })
-    }
-
-    fn list_quarantine_candidates(
-        &self,
-    ) -> IndexStoreFuture<'_, Vec<QuarantineCandidate>, Self::Error> {
-        Box::pin(async move { IndexStore::list_quarantine_candidates(self) })
-    }
-
-    fn visit_quarantine_candidates<'operation, Visitor, VisitorError>(
-        &'operation self,
-        visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move { IndexStore::visit_quarantine_candidates(self, visitor) })
-    }
-
-    fn upsert_quarantine_candidate<'operation>(
-        &'operation self,
-        candidate: &'operation QuarantineCandidate,
-    ) -> IndexStoreFuture<'operation, (), Self::Error> {
-        Box::pin(async move { IndexStore::upsert_quarantine_candidate(self, candidate) })
-    }
-
-    fn delete_quarantine_candidate<'operation>(
-        &'operation self,
-        object_key: &'operation ObjectKey,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::delete_quarantine_candidate(self, object_key) })
-    }
-
-    fn retention_hold<'operation>(
-        &'operation self,
-        object_key: &'operation ObjectKey,
-    ) -> IndexStoreFuture<'operation, Option<RetentionHold>, Self::Error> {
-        Box::pin(async move { IndexStore::retention_hold(self, object_key) })
-    }
-
-    fn list_retention_holds(&self) -> IndexStoreFuture<'_, Vec<RetentionHold>, Self::Error> {
-        Box::pin(async move { IndexStore::list_retention_holds(self) })
-    }
-
-    fn visit_retention_holds<'operation, Visitor, VisitorError>(
-        &'operation self,
-        visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(RetentionHold) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move { IndexStore::visit_retention_holds(self, visitor) })
-    }
-
-    fn upsert_retention_hold<'operation>(
-        &'operation self,
-        hold: &'operation RetentionHold,
-    ) -> IndexStoreFuture<'operation, (), Self::Error> {
-        Box::pin(async move { IndexStore::upsert_retention_hold(self, hold) })
-    }
-
-    fn delete_retention_hold<'operation>(
-        &'operation self,
-        object_key: &'operation ObjectKey,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::delete_retention_hold(self, object_key) })
-    }
-
-    fn record_webhook_delivery<'operation>(
-        &'operation self,
-        delivery: &'operation WebhookDelivery,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::record_webhook_delivery(self, delivery) })
-    }
-
-    fn list_webhook_deliveries(&self) -> IndexStoreFuture<'_, Vec<WebhookDelivery>, Self::Error> {
-        Box::pin(async move { IndexStore::list_webhook_deliveries(self) })
-    }
-
-    fn delete_webhook_delivery<'operation>(
-        &'operation self,
-        delivery: &'operation WebhookDelivery,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { IndexStore::delete_webhook_delivery(self, delivery) })
-    }
-
-    fn provider_repository_state<'operation>(
-        &'operation self,
-        provider: RepositoryProvider,
-        owner: &'operation str,
-        repo: &'operation str,
-    ) -> IndexStoreFuture<'operation, Option<ProviderRepositoryState>, Self::Error> {
-        Box::pin(async move { IndexStore::provider_repository_state(self, provider, owner, repo) })
-    }
-
-    fn list_provider_repository_states(
-        &self,
-    ) -> IndexStoreFuture<'_, Vec<ProviderRepositoryState>, Self::Error> {
-        Box::pin(async move { IndexStore::list_provider_repository_states(self) })
-    }
-
-    fn upsert_provider_repository_state<'operation>(
-        &'operation self,
-        state: &'operation ProviderRepositoryState,
-    ) -> IndexStoreFuture<'operation, (), Self::Error> {
-        Box::pin(async move { IndexStore::upsert_provider_repository_state(self, state) })
-    }
-
-    fn delete_provider_repository_state<'operation>(
-        &'operation self,
-        provider: RepositoryProvider,
-        owner: &'operation str,
-        repo: &'operation str,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move {
-            IndexStore::delete_provider_repository_state(self, provider, owner, repo)
-        })
-    }
+    impl_async_lifecycle_delegation!(MemoryIndexStore);
 }
 
 const fn provider_sort_key(provider: RepositoryProvider) -> &'static str {
@@ -570,6 +459,7 @@ const fn provider_sort_key(provider: RepositoryProvider) -> &'static str {
         RepositoryProvider::GitHub => "github",
         RepositoryProvider::Gitea => "gitea",
         RepositoryProvider::GitLab => "gitlab",
+        RepositoryProvider::Codeberg => "codeberg",
         RepositoryProvider::Generic => "generic",
     }
 }
@@ -695,7 +585,7 @@ impl MemoryRecordStore {
     }
 }
 
-impl RecordStore for MemoryRecordStore {
+impl RecordTraversal for MemoryRecordStore {
     type Error = MemoryRecordStoreError;
     type Locator = MemoryRecordLocator;
 
@@ -952,6 +842,50 @@ impl RecordStore for MemoryRecordStore {
         })
     }
 
+    fn record_locator_exists<'operation>(
+        &'operation self,
+        locator: &'operation Self::Locator,
+    ) -> RecordStoreFuture<'operation, bool, Self::Error> {
+        Box::pin(async move { Ok(self.record_entry(locator)?.is_some()) })
+    }
+
+    fn modified_since_epoch<'operation>(
+        &'operation self,
+        locator: &'operation Self::Locator,
+    ) -> RecordStoreFuture<'operation, Duration, Self::Error> {
+        Box::pin(async move {
+            self.record_entry(locator)?
+                .map(|entry| entry.modified_since_epoch)
+                .ok_or(MemoryRecordStoreError::RecordNotFound)
+        })
+    }
+
+    fn latest_record_locator(&self, record: &FileRecord) -> Self::Locator {
+        MemoryRecordLocator {
+            kind: MemoryRecordKind::Latest,
+            repository_scope: record
+                .repository_scope
+                .as_ref()
+                .map(MemoryRepositoryScope::from_protocol),
+            file_id: record.file_id.clone(),
+            content_hash: None,
+        }
+    }
+
+    fn version_record_locator(&self, record: &FileRecord) -> Self::Locator {
+        MemoryRecordLocator {
+            kind: MemoryRecordKind::Version,
+            repository_scope: record
+                .repository_scope
+                .as_ref()
+                .map(MemoryRepositoryScope::from_protocol),
+            file_id: record.file_id.clone(),
+            content_hash: Some(record.content_hash.clone()),
+        }
+    }
+}
+
+impl RecordMutation for MemoryRecordStore {
     fn write_version_record<'operation>(
         &'operation self,
         record: &'operation FileRecord,
@@ -988,50 +922,8 @@ impl RecordStore for MemoryRecordStore {
         })
     }
 
-    fn record_locator_exists<'operation>(
-        &'operation self,
-        locator: &'operation Self::Locator,
-    ) -> RecordStoreFuture<'operation, bool, Self::Error> {
-        Box::pin(async move { Ok(self.record_entry(locator)?.is_some()) })
-    }
-
     fn prune_empty_latest_records(&self) -> RecordStoreFuture<'_, (), Self::Error> {
         Box::pin(async move { Ok(()) })
-    }
-
-    fn modified_since_epoch<'operation>(
-        &'operation self,
-        locator: &'operation Self::Locator,
-    ) -> RecordStoreFuture<'operation, Duration, Self::Error> {
-        Box::pin(async move {
-            self.record_entry(locator)?
-                .map(|entry| entry.modified_since_epoch)
-                .ok_or(MemoryRecordStoreError::RecordNotFound)
-        })
-    }
-
-    fn latest_record_locator(&self, record: &FileRecord) -> Self::Locator {
-        MemoryRecordLocator {
-            kind: MemoryRecordKind::Latest,
-            repository_scope: record
-                .repository_scope
-                .as_ref()
-                .map(MemoryRepositoryScope::from_protocol),
-            file_id: record.file_id.clone(),
-            content_hash: None,
-        }
-    }
-
-    fn version_record_locator(&self, record: &FileRecord) -> Self::Locator {
-        MemoryRecordLocator {
-            kind: MemoryRecordKind::Version,
-            repository_scope: record
-                .repository_scope
-                .as_ref()
-                .map(MemoryRepositoryScope::from_protocol),
-            file_id: record.file_id.clone(),
-            content_hash: Some(record.content_hash.clone()),
-        }
     }
 }
 
@@ -1108,6 +1000,7 @@ enum MemoryRepositoryProvider {
     GitHub,
     Gitea,
     GitLab,
+    Codeberg,
     Generic,
 }
 
@@ -1117,6 +1010,7 @@ impl MemoryRepositoryProvider {
             RepositoryProvider::GitHub => Self::GitHub,
             RepositoryProvider::Gitea => Self::Gitea,
             RepositoryProvider::GitLab => Self::GitLab,
+            RepositoryProvider::Codeberg => Self::Codeberg,
             RepositoryProvider::Generic => Self::Generic,
         }
     }
@@ -1145,8 +1039,9 @@ mod tests {
 
     use super::{MemoryIndexStore, MemoryRecordStore};
     use crate::{
-        FileChunkRecord, FileId, FileReconstruction, FileRecord, IndexStore, LocalIndexStore,
-        QuarantineCandidate, ReconstructionTerm, RecordStore, RepositoryRecordScope, RetentionHold,
+        DedupeStore, FileChunkRecord, FileId, FileReconstruction, FileRecord, IndexStore,
+        LifecycleStore, LocalIndexStore, QuarantineCandidate, ReconstructionStore,
+        ReconstructionTerm, RecordMutation, RecordTraversal, RepositoryRecordScope, RetentionHold,
         WebhookDelivery, XorbId,
     };
 
@@ -1162,12 +1057,8 @@ mod tests {
 
     #[test]
     fn local_index_store_satisfies_index_store_lifecycle_contract() {
-        let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
-        let store = LocalIndexStore::new(storage.path().to_path_buf());
+        let storage = shardline_test_support::TempStorage::new();
+        let store = LocalIndexStore::new(storage.path_buf());
         assert!(store.is_ok());
         let Ok(store) = store else {
             return;
@@ -1179,7 +1070,7 @@ mod tests {
         });
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_satisfies_record_store_lifecycle_contract() {
         let store = MemoryRecordStore::new();
         let record = scoped_file_record();
@@ -1238,7 +1129,7 @@ mod tests {
         assert!(pruned.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_lists_repository_versions_across_revisions_only() {
         let store = MemoryRecordStore::new();
         let main_scope =
@@ -1285,9 +1176,16 @@ mod tests {
 
     fn assert_index_store_lifecycle_contract<Store, Seed>(store: &Store, seed_index: Seed)
     where
-        Store: IndexStore,
-        Store::Error: Debug,
-        Seed: Fn(&Store, &FileId, &FileReconstruction, &XorbId) -> Result<(), Store::Error>,
+        Store: ReconstructionStore + DedupeStore + LifecycleStore,
+        <Store as ReconstructionStore>::Error: Debug + Into<<Store as LifecycleStore>::Error>,
+        <Store as DedupeStore>::Error: Debug + Into<<Store as LifecycleStore>::Error>,
+        <Store as LifecycleStore>::Error: Debug,
+        Seed: Fn(
+            &Store,
+            &FileId,
+            &FileReconstruction,
+            &XorbId,
+        ) -> Result<(), <Store as ReconstructionStore>::Error>,
     {
         let hash = ShardlineHash::from_bytes([9; 32]);
         let file_id = FileId::new(hash);
@@ -1339,7 +1237,7 @@ mod tests {
         let mut visited_candidates = Vec::new();
         let visited_candidates_result = store.visit_quarantine_candidates(|entry| {
             visited_candidates.push(entry);
-            Ok::<(), Store::Error>(())
+            Ok::<(), <Store as LifecycleStore>::Error>(())
         });
         assert!(visited_candidates_result.is_ok());
         assert_eq!(visited_candidates, vec![candidate]);
@@ -1377,7 +1275,7 @@ mod tests {
         let mut visited_holds = Vec::new();
         let visited_holds_result = store.visit_retention_holds(|entry| {
             visited_holds.push(entry);
-            Ok::<(), Store::Error>(())
+            Ok::<(), <Store as LifecycleStore>::Error>(())
         });
         assert!(visited_holds_result.is_ok());
         assert_eq!(visited_holds, vec![hold]);

@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -6,27 +5,31 @@ use std::sync::{
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use axum::body::Bytes;
-use shardline_protocol::{ByteRange, RepositoryScope};
-#[cfg(test)]
+use sha2::{Digest, Sha256};
+use shardline_protocol::{ByteRange, RepositoryScope, ShardlineHash};
+use shardline_storage::{
+    BeginMultipartUploadResult, DeleteOutcome, ObjectBody, ObjectIntegrity, ObjectKey,
+    ObjectMetadata, ObjectPrefix, ObjectStore, PutOutcome,
+};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
     LocalBackend, ObjectStorageAdapter, PostgresBackend, ServerConfig, ServerError,
     ShardMetadataLimits,
     download_stream::ServerByteStream,
-    model::{
-        FileReconstructionResponse, ServerStatsResponse, ShardUploadResponse, UploadFileResponse,
-        XorbUploadResponse,
-    },
-    object_store::object_store_from_config,
+    model::{ServerStatsResponse, UploadFileResponse},
+    object_store::{ServerObjectStore, object_store_from_config},
+    overflow::checked_add,
+    protocol_support::shared_sha256_object_key,
     reconstruction_cache::{
         ReconstructionCacheBenchReport, benchmark_memory_reconstruction_cache_with_loader,
     },
-    upload_ingest::RequestBodyReader,
+    upload_ingest::{RequestBodyReader, read_body_to_bytes},
+    xet_adapter::{FileReconstructionResponse, ShardUploadResponse, XorbUploadResponse},
 };
 
 #[derive(Debug, Clone)]
-pub(crate) enum ServerBackend {
+pub enum ServerBackend {
     Local(LocalBackend),
     Postgres(PostgresBackend),
 }
@@ -38,12 +41,9 @@ pub struct BenchmarkBackend {
     backend: ServerBackend,
 }
 
-#[cfg(test)]
 static REPOSITORY_REFERENCE_PROBE_COUNT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
 static REPOSITORY_REFERENCE_PROBE_FILTER: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
-#[cfg(test)]
 static REPOSITORY_REFERENCE_PROBE_TEST_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
     LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
@@ -51,24 +51,27 @@ impl ServerBackend {
     pub(crate) async fn from_config(config: &ServerConfig) -> Result<Self, ServerError> {
         let object_store = object_store_from_config(config)?;
         if let Some(index_postgres_url) = config.index_postgres_url() {
-            let backend = PostgresBackend::new_with_object_store_and_upload_parallelism(
-                config.root_dir().to_path_buf(),
-                config.public_base_url().to_owned(),
-                config.chunk_size(),
-                config.upload_max_in_flight_chunks(),
-                index_postgres_url,
-                object_store,
-            )
-            .await?;
+            let backend =
+                PostgresBackend::new_with_object_store_and_upload_parallelism_with_frontends(
+                    config.root_dir().to_path_buf(),
+                    config.public_base_url().to_owned(),
+                    config.chunk_size(),
+                    config.upload_max_in_flight_chunks(),
+                    index_postgres_url,
+                    object_store,
+                    config.server_frontends(),
+                )
+                .await?;
             return Ok(Self::Postgres(backend));
         }
 
-        let backend = LocalBackend::new_with_object_store_and_upload_parallelism(
+        let backend = LocalBackend::new_with_object_store_and_upload_parallelism_with_frontends(
             config.root_dir().to_path_buf(),
             config.public_base_url().to_owned(),
             config.chunk_size(),
             config.upload_max_in_flight_chunks(),
             object_store,
+            config.server_frontends(),
         )
         .await?;
         Ok(Self::Local(backend))
@@ -101,6 +104,34 @@ impl ServerBackend {
                 backend
                     .upload_shard_stream(body, repository_scope, shard_metadata_limits)
                     .await
+            }
+        }
+    }
+
+    pub(crate) async fn put_sha256_addressed_object_stream_if_absent(
+        &self,
+        object_key: &ObjectKey,
+        digest_hex: &str,
+        body: RequestBodyReader,
+    ) -> Result<PutOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => {
+                put_sha256_addressed_object_stream_if_absent_with_object_store(
+                    &backend.object_store(),
+                    object_key,
+                    digest_hex,
+                    body,
+                )
+                .await
+            }
+            Self::Postgres(backend) => {
+                put_sha256_addressed_object_stream_if_absent_with_object_store(
+                    &backend.object_store(),
+                    object_key,
+                    digest_hex,
+                    body,
+                )
+                .await
             }
         }
     }
@@ -146,7 +177,6 @@ impl ServerBackend {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn chunk_length(&self, hash_hex: &str) -> Result<u64, ServerError> {
         match self {
             Self::Local(backend) => backend.chunk_length(hash_hex).await,
@@ -203,7 +233,6 @@ impl ServerBackend {
         hash_hex: &str,
         repository_scope: &RepositoryScope,
     ) -> Result<bool, ServerError> {
-        #[cfg(test)]
         count_repository_reference_probe_for_tests(hash_hex);
         match self {
             Self::Local(backend) => {
@@ -244,6 +273,442 @@ impl ServerBackend {
         match self {
             Self::Local(backend) => backend.object_backend_name(),
             Self::Postgres(backend) => backend.object_backend_name(),
+        }
+    }
+
+    pub(crate) fn uses_s3_object_store(&self) -> bool {
+        match self {
+            Self::Local(backend) => matches!(backend.object_store(), ServerObjectStore::S3(_)),
+            Self::Postgres(backend) => matches!(backend.object_store(), ServerObjectStore::S3(_)),
+        }
+    }
+
+    pub(crate) fn put_object_bytes_if_absent(
+        &self,
+        object_key: &ObjectKey,
+        bytes: Vec<u8>,
+    ) -> Result<PutOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => backend.put_object_bytes_if_absent(object_key, bytes),
+            Self::Postgres(backend) => backend.put_object_bytes_if_absent(object_key, bytes),
+        }
+    }
+
+    pub(crate) fn put_sha256_addressed_object_bytes_if_absent(
+        &self,
+        object_key: &ObjectKey,
+        digest_hex: &str,
+        bytes: Vec<u8>,
+    ) -> Result<PutOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => {
+                backend.put_sha256_addressed_object_bytes_if_absent(object_key, digest_hex, bytes)
+            }
+            Self::Postgres(backend) => {
+                backend.put_sha256_addressed_object_bytes_if_absent(object_key, digest_hex, bytes)
+            }
+        }
+    }
+
+    pub(crate) fn copy_object_if_absent(
+        &self,
+        source: &ObjectKey,
+        destination: &ObjectKey,
+    ) -> Result<PutOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => backend.copy_object_if_absent(source, destination),
+            Self::Postgres(backend) => backend.copy_object_if_absent(source, destination),
+        }
+    }
+
+    pub(crate) fn put_object_bytes_overwrite(
+        &self,
+        object_key: &ObjectKey,
+        bytes: Vec<u8>,
+    ) -> Result<(), ServerError> {
+        match self {
+            Self::Local(backend) => backend.put_object_bytes_overwrite(object_key, bytes),
+            Self::Postgres(backend) => backend.put_object_bytes_overwrite(object_key, bytes),
+        }
+    }
+
+    pub(crate) fn put_sha256_addressed_object_file(
+        &self,
+        object_key: &ObjectKey,
+        digest_hex: &str,
+        path: &std::path::Path,
+        integrity: &shardline_storage::ObjectIntegrity,
+    ) -> Result<PutOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => {
+                backend.put_sha256_addressed_object_file(object_key, digest_hex, path, integrity)
+            }
+            Self::Postgres(backend) => {
+                backend.put_sha256_addressed_object_file(object_key, digest_hex, path, integrity)
+            }
+        }
+    }
+
+    pub(crate) async fn object_length(&self, object_key: &ObjectKey) -> Result<u64, ServerError> {
+        match self {
+            Self::Local(backend) => backend.object_length(object_key).await,
+            Self::Postgres(backend) => backend.object_length(object_key).await,
+        }
+    }
+
+    pub(crate) async fn read_object(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ServerError> {
+        match self {
+            Self::Local(backend) => backend.read_object(object_key).await,
+            Self::Postgres(backend) => backend.read_object(object_key).await,
+        }
+    }
+
+    pub(crate) async fn read_object_stream(
+        &self,
+        object_key: &ObjectKey,
+        total_length: u64,
+        range: Option<ByteRange>,
+    ) -> Result<ServerByteStream, ServerError> {
+        match self {
+            Self::Local(backend) => {
+                backend
+                    .read_object_stream(object_key, total_length, range)
+                    .await
+            }
+            Self::Postgres(backend) => {
+                backend
+                    .read_object_stream(object_key, total_length, range)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn visit_object_prefix<Visitor>(
+        &self,
+        prefix: &ObjectPrefix,
+        visitor: Visitor,
+    ) -> Result<(), ServerError>
+    where
+        Visitor: FnMut(ObjectMetadata) -> Result<(), ServerError>,
+    {
+        match self {
+            Self::Local(backend) => backend.visit_object_prefix(prefix, visitor),
+            Self::Postgres(backend) => backend.visit_object_prefix(prefix, visitor),
+        }
+    }
+
+    pub(crate) fn list_object_flat_namespace_page(
+        &self,
+        prefix: &ObjectPrefix,
+        start_after: Option<&ObjectKey>,
+        limit: usize,
+    ) -> Result<Vec<ObjectMetadata>, ServerError> {
+        match self {
+            Self::Local(backend) => {
+                backend.list_object_flat_namespace_page(prefix, start_after, limit)
+            }
+            Self::Postgres(backend) => {
+                backend.list_object_flat_namespace_page(prefix, start_after, limit)
+            }
+        }
+    }
+
+    pub(crate) async fn delete_object_if_present(
+        &self,
+        object_key: &ObjectKey,
+    ) -> Result<DeleteOutcome, ServerError> {
+        match self {
+            Self::Local(backend) => backend.delete_object_if_present(object_key).await,
+            Self::Postgres(backend) => backend.delete_object_if_present(object_key).await,
+        }
+    }
+}
+
+impl shardline_oci_adapter::OciBackend for ServerBackend {
+    async fn create_resumable_object_upload(
+        &self,
+        object_key: &ObjectKey,
+    ) -> Result<Option<String>, shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => Ok(Some(
+                    store
+                        .create_resumable_upload(object_key)
+                        .await
+                        .map_err(shardline_oci_adapter::OciAdapterError::from)?,
+                )),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(None),
+            },
+            Self::Postgres(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => Ok(Some(
+                    store
+                        .create_resumable_upload(object_key)
+                        .await
+                        .map_err(shardline_oci_adapter::OciAdapterError::from)?,
+                )),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(None),
+            },
+        }
+    }
+
+    async fn upload_resumable_object_part(
+        &self,
+        object_key: &ObjectKey,
+        upload_id: &str,
+        part_idx: usize,
+        bytes: Bytes,
+    ) -> Result<String, shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .upload_resumable_part(object_key, upload_id, part_idx, bytes)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
+                }
+            },
+            Self::Postgres(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .upload_resumable_part(object_key, upload_id, part_idx, bytes)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
+                }
+            },
+        }
+    }
+
+    async fn complete_resumable_object_upload(
+        &self,
+        object_key: &ObjectKey,
+        upload_id: &str,
+        part_ids: Vec<String>,
+    ) -> Result<(), shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .complete_resumable_upload(object_key, upload_id, part_ids)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
+                }
+            },
+            Self::Postgres(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .complete_resumable_upload(object_key, upload_id, part_ids)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
+                }
+            },
+        }
+    }
+
+    async fn abort_resumable_object_upload(
+        &self,
+        object_key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<(), shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .abort_resumable_upload(object_key, upload_id)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(()),
+            },
+            Self::Postgres(backend) => match backend.object_store() {
+                ServerObjectStore::S3(store) => store
+                    .abort_resumable_upload(object_key, upload_id)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from),
+                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(()),
+            },
+        }
+    }
+
+    fn put_sha256_addressed_object_bytes_if_absent(
+        &self,
+        object_key: &ObjectKey,
+        digest_hex: &str,
+        bytes: Vec<u8>,
+    ) -> Result<PutOutcome, shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => backend
+                .put_sha256_addressed_object_bytes_if_absent(object_key, digest_hex, bytes)
+                .map_err(server_error_to_oci),
+            Self::Postgres(backend) => backend
+                .put_sha256_addressed_object_bytes_if_absent(object_key, digest_hex, bytes)
+                .map_err(server_error_to_oci),
+        }
+    }
+
+    fn copy_object_if_absent(
+        &self,
+        source: &ObjectKey,
+        destination: &ObjectKey,
+    ) -> Result<PutOutcome, shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => backend
+                .copy_object_if_absent(source, destination)
+                .map_err(server_error_to_oci),
+            Self::Postgres(backend) => backend
+                .copy_object_if_absent(source, destination)
+                .map_err(server_error_to_oci),
+        }
+    }
+
+    async fn delete_object_if_present(
+        &self,
+        object_key: &ObjectKey,
+    ) -> Result<DeleteOutcome, shardline_oci_adapter::OciAdapterError> {
+        match self {
+            Self::Local(backend) => backend
+                .delete_object_if_present(object_key)
+                .await
+                .map_err(server_error_to_oci),
+            Self::Postgres(backend) => backend
+                .delete_object_if_present(object_key)
+                .await
+                .map_err(server_error_to_oci),
+        }
+    }
+}
+
+fn server_error_to_oci(error: ServerError) -> shardline_oci_adapter::OciAdapterError {
+    use crate::error::ObjectStoreError;
+    use shardline_oci_adapter::OciAdapterError;
+    match error {
+        ServerError::Io(e) => OciAdapterError::Io(e),
+        ServerError::Json(e) => OciAdapterError::Json(e),
+        ServerError::NumericConversion(e) => OciAdapterError::NumericConversion(e),
+        ServerError::ObjectStore(ObjectStoreError::Local(e)) => {
+            OciAdapterError::LocalObjectStore(e)
+        }
+        ServerError::ObjectStore(ObjectStoreError::S3(e)) => OciAdapterError::S3ObjectStore(e),
+        ServerError::ObjectStore(ObjectStoreError::Prefix(e)) => OciAdapterError::ObjectPrefix(e),
+        ServerError::NotFound => OciAdapterError::NotFound,
+        ServerError::Overflow => OciAdapterError::Overflow,
+        ServerError::InvalidContentHash => OciAdapterError::InvalidContentHash,
+        ServerError::InvalidDigest => OciAdapterError::InvalidDigest,
+        ServerError::InvalidRepositoryName => OciAdapterError::InvalidRepositoryName,
+        ServerError::InvalidManifestReference => OciAdapterError::InvalidManifestReference,
+        ServerError::InvalidUploadSession => OciAdapterError::InvalidUploadSession,
+        ServerError::TooManyUploadSessions => OciAdapterError::TooManyUploadSessions,
+        ServerError::ExpectedBodyHashMismatch => OciAdapterError::ExpectedBodyHashMismatch,
+        ServerError::BlockingTask(e) => OciAdapterError::BlockingTask(e),
+        ref other @ (ServerError::RequestBodyRead(_)
+        | ServerError::RequestBodyTooLarge
+        | ServerError::RequestQueryTooLarge
+        | ServerError::RequestBodyFrameOutOfBounds
+        | ServerError::HashParse(_)
+        | ServerError::ObjectStore(
+            ObjectStoreError::MissingS3Config
+            | ObjectStoreError::StoredLengthMismatch
+            | ObjectStoreError::MigrationSourceHashMismatch { .. },
+        )
+        | ServerError::Index(_)
+        | ServerError::StoredFileMetadataTooLarge { .. }
+        | ServerError::StoredFileMetadataLengthMismatch
+        | ServerError::InvalidFileId
+        | ServerError::InvalidXorbPrefix
+        | ServerError::XorbHashMismatch
+        | ServerError::InvalidSerializedXorb
+        | ServerError::InvalidSerializedShard(_)
+        | ServerError::MissingReferencedXorb
+        | ServerError::TooManyShardTerms
+        | ServerError::TooManyBatchReconstructionFileIds
+        | ServerError::InvalidRangeHeader
+        | ServerError::RangeNotSatisfiable
+        | ServerError::MissingAuthorization
+        | ServerError::InvalidAuthorizationHeader
+        | ServerError::InvalidToken(_)
+        | ServerError::InsufficientScope
+        | ServerError::ProviderTokensDisabled
+        | ServerError::MissingProviderApiKey
+        | ServerError::InvalidProviderApiKey
+        | ServerError::MissingProviderSubject
+        | ServerError::InvalidProviderTokenRequest
+        | ServerError::MissingProviderWebhookAuthentication
+        | ServerError::InvalidProviderWebhookAuthentication
+        | ServerError::InvalidProviderWebhookPayload
+        | ServerError::UnknownProvider
+        | ServerError::ProviderDenied
+        | ServerError::Provider(_)
+        | ServerError::ReconstructionCache(_)
+        | ServerError::Config(_)
+        | ServerError::NotAcceptable
+        | ServerError::UnauthorizedChallenge(_)
+        | ServerError::TooManyRegistryTokenRequests
+        | ServerError::MissingReconstructionCacheRedisUrl
+        | ServerError::TransferLimiterClosed) => {
+            OciAdapterError::Io(std::io::Error::other(other.to_string()))
+        }
+    }
+}
+
+async fn put_sha256_addressed_object_stream_if_absent_with_object_store(
+    object_store: &ServerObjectStore,
+    object_key: &ObjectKey,
+    digest_hex: &str,
+    mut body: RequestBodyReader,
+) -> Result<PutOutcome, ServerError> {
+    let canonical_key = shared_sha256_object_key(digest_hex)?;
+    match object_store {
+        ServerObjectStore::S3(store) => {
+            let canonical_outcome =
+                match store.begin_content_addressed_upload(&canonical_key).await? {
+                    BeginMultipartUploadResult::AlreadyExists => PutOutcome::AlreadyExists,
+                    BeginMultipartUploadResult::Upload(mut upload) => {
+                        let mut sha256 = Sha256::new();
+                        let mut total_length = 0_u64;
+                        while let Some(bytes) = body.next_bytes().await? {
+                            sha256.update(&bytes);
+                            total_length = checked_add(total_length, u64::try_from(bytes.len())?)?;
+                            upload.write(&bytes);
+                            if let Err(error) = upload.wait_for_capacity(4).await {
+                                let _ignored = upload.abort().await;
+                                return Err(ServerError::from(error));
+                            }
+                        }
+                        let observed = hex::encode(sha256.finalize());
+                        if observed != digest_hex {
+                            let _ignored = upload.abort().await;
+                            return Err(ServerError::ExpectedBodyHashMismatch);
+                        }
+                        let _total_length = total_length;
+                        upload.finish().await?;
+                        PutOutcome::Inserted
+                    }
+                };
+            if canonical_key == *object_key {
+                return Ok(canonical_outcome);
+            }
+            Ok(object_store.copy_if_absent(&canonical_key, object_key)?)
+        }
+        ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+            let bytes = read_body_to_bytes(&mut body).await?;
+            let observed = hex::encode(Sha256::digest(&bytes));
+            if observed != digest_hex {
+                return Err(ServerError::ExpectedBodyHashMismatch);
+            }
+            let integrity = ObjectIntegrity::new(
+                ShardlineHash::from_bytes(*blake3::hash(&bytes).as_bytes()),
+                u64::try_from(bytes.len())?,
+            );
+            let canonical_outcome = object_store.put_if_absent(
+                &canonical_key,
+                ObjectBody::from_vec(bytes),
+                &integrity,
+            )?;
+            if canonical_key == *object_key {
+                return Ok(canonical_outcome);
+            }
+            Ok(object_store.copy_if_absent(&canonical_key, object_key)?)
         }
     }
 }
@@ -427,8 +892,7 @@ fn compose_benchmark_object_key_prefix(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn reset_repository_reference_probe_count_for_hash(hash_hex: &str) {
+pub fn reset_repository_reference_probe_count_for_hash(hash_hex: &str) {
     REPOSITORY_REFERENCE_PROBE_COUNT.store(0, Ordering::Relaxed);
     let filter = REPOSITORY_REFERENCE_PROBE_FILTER.lock();
     match filter {
@@ -437,13 +901,11 @@ pub(crate) fn reset_repository_reference_probe_count_for_hash(hash_hex: &str) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn repository_reference_probe_count() -> usize {
+pub fn repository_reference_probe_count() -> usize {
     REPOSITORY_REFERENCE_PROBE_COUNT.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
-pub(crate) fn clear_repository_reference_probe_filter() {
+pub fn clear_repository_reference_probe_filter() {
     let filter = REPOSITORY_REFERENCE_PROBE_FILTER.lock();
     match filter {
         Ok(mut filter) => *filter = None,
@@ -451,15 +913,13 @@ pub(crate) fn clear_repository_reference_probe_filter() {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn lock_repository_reference_probe_test() -> OwnedMutexGuard<()> {
+pub async fn lock_repository_reference_probe_test() -> OwnedMutexGuard<()> {
     REPOSITORY_REFERENCE_PROBE_TEST_LOCK
         .clone()
         .lock_owned()
         .await
 }
 
-#[cfg(test)]
 fn count_repository_reference_probe_for_tests(hash_hex: &str) {
     let filter = REPOSITORY_REFERENCE_PROBE_FILTER.lock();
     let matches_filter = match filter {
@@ -498,8 +958,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn configured_benchmark_backend_uses_local_runtime_configuration() {
-        let chunk_size = NonZeroUsize::new(4).map_or(NonZeroUsize::MIN, |value| value);
-        let upload_budget = NonZeroUsize::new(4).map_or(NonZeroUsize::MIN, |value| value);
+        let chunk_size = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
+        let upload_budget = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
         let bind_addr = "127.0.0.1:8080".parse();
         assert!(bind_addr.is_ok());
         let Ok(bind_addr) = bind_addr else {

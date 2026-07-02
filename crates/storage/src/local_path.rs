@@ -51,7 +51,8 @@ pub fn ensure_directory_path_components_are_not_symlinked(
 }
 
 fn validate_existing_directory_component(path: &Path) -> Result<(), DirectoryPathError> {
-    match fs::symlink_metadata(path) {
+    let check_path = resolve_platform_symlinks(path);
+    match fs::symlink_metadata(&check_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(DirectoryPathError::SymlinkedComponent(path.to_path_buf()))
         }
@@ -64,9 +65,44 @@ fn validate_existing_directory_component(path: &Path) -> Result<(), DirectoryPat
     }
 }
 
+/// Resolves well-known platform symlinks in the path without resolving user-created symlinks.
+///
+/// On macOS, `/var`, `/etc`, and `/tmp` are symlinks to `/private/var`, `/private/etc`, and
+/// `/private/tmp`. Opening files under these paths with `O_NOFOLLOW` or SQLite's `NOFOLLOW`
+/// fails because the symlink component is not followed. This resolves the known platform
+/// symlinks so the flag applies only to the final path component.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn resolve_platform_symlinks(path: &Path) -> PathBuf {
+    let components: Vec<_> = path.components().collect();
+    if let [Component::RootDir, Component::Normal(first), rest @ ..] = components.as_slice() {
+        let resolved_prefix = match first.as_encoded_bytes() {
+            b"var" | b"etc" | b"tmp" => Some("/private"),
+            _ => None,
+        };
+        if let Some(prefix) = resolved_prefix {
+            let mut resolved = PathBuf::from(prefix);
+            resolved.push(first);
+            for component in rest {
+                resolved.push(component.as_os_str());
+            }
+            return resolved;
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn resolve_platform_symlinks(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::{File, create_dir_all};
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::fs::create_dir_all;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 

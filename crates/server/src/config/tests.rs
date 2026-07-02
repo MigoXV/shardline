@@ -22,7 +22,7 @@ use super::{
     default_upload_max_in_flight_chunks, env, optional_s3_secret_from_sources,
 };
 use crate::{
-    ServerRole,
+    ServerFrontend, ServerRole,
     reconstruction_cache::{
         DEFAULT_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES, DEFAULT_RECONSTRUCTION_CACHE_TTL_SECONDS,
         ReconstructionCacheAdapter,
@@ -60,6 +60,7 @@ fn server_config_keeps_bind_address_and_public_url() {
 
     assert_eq!(config.bind_addr(), bind_addr);
     assert_eq!(config.server_role(), ServerRole::All);
+    assert_eq!(config.server_frontends(), &[ServerFrontend::Xet]);
     assert_eq!(config.public_base_url(), "https://assets.example.test");
     assert_eq!(config.root_dir(), &root_dir);
     assert_eq!(
@@ -89,6 +90,10 @@ fn server_config_keeps_bind_address_and_public_url() {
         config.reconstruction_cache_memory_max_entries(),
         DEFAULT_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES
     );
+    assert_eq!(config.oci_upload_session_ttl_seconds().get(), 3_600);
+    assert_eq!(config.oci_upload_max_active_sessions().get(), 1_024);
+    assert_eq!(config.oci_registry_token_ttl_seconds().get(), 300);
+    assert_eq!(config.oci_registry_token_max_in_flight_requests().get(), 64);
     assert_eq!(config.index_postgres_url(), None);
     assert_eq!(config.token_signing_key(), None);
     assert_eq!(config.metrics_token(), None);
@@ -137,7 +142,7 @@ fn server_config_allows_non_zero_upload_parallelism_override() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
     let chunk_size = NonZeroUsize::MIN;
-    let upload_budget = NonZeroUsize::new(32).map_or(NonZeroUsize::MIN, |value| value);
+    let upload_budget = NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN);
     let config = ServerConfig::new(
         bind_addr,
         "https://assets.example.test".to_owned(),
@@ -154,7 +159,7 @@ fn server_config_allows_non_zero_chunk_size_override() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
     let chunk_size = NonZeroUsize::MIN;
-    let override_chunk_size = NonZeroUsize::new(4_096).map_or(NonZeroUsize::MIN, |value| value);
+    let override_chunk_size = NonZeroUsize::new(4_096).unwrap_or(NonZeroUsize::MIN);
     let config = ServerConfig::new(
         bind_addr,
         "https://assets.example.test".to_owned(),
@@ -171,7 +176,7 @@ fn server_config_allows_non_zero_transfer_budget_override() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
     let chunk_size = NonZeroUsize::MIN;
-    let transfer_budget = NonZeroUsize::new(32).map_or(NonZeroUsize::MIN, |value| value);
+    let transfer_budget = NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN);
     let config = ServerConfig::new(
         bind_addr,
         "https://assets.example.test".to_owned(),
@@ -233,7 +238,7 @@ fn adaptive_transfer_default_scales_with_parallelism_and_caps() {
 fn server_config_allows_max_request_body_override() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
-    let max_request_body_bytes = NonZeroUsize::new(1024).map_or(NonZeroUsize::MIN, |value| value);
+    let max_request_body_bytes = NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN);
     let config = ServerConfig::new(
         bind_addr,
         "https://assets.example.test".to_owned(),
@@ -250,10 +255,10 @@ fn server_config_allows_shard_metadata_limit_override() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
     let limits = ShardMetadataLimits::new(
-        NonZeroUsize::new(1_000_000).map_or(NonZeroUsize::MIN, |value| value),
-        NonZeroUsize::new(1_000_000).map_or(NonZeroUsize::MIN, |value| value),
-        NonZeroUsize::new(4_000_000).map_or(NonZeroUsize::MIN, |value| value),
-        NonZeroUsize::new(4_000_000).map_or(NonZeroUsize::MIN, |value| value),
+        NonZeroUsize::new(1_000_000).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(1_000_000).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(4_000_000).unwrap_or(NonZeroUsize::MIN),
+        NonZeroUsize::new(4_000_000).unwrap_or(NonZeroUsize::MIN),
     );
     let config = ServerConfig::new(
         bind_addr,
@@ -278,6 +283,24 @@ fn server_config_allows_role_override() {
     .with_server_role(ServerRole::Transfer);
 
     assert_eq!(config.server_role(), ServerRole::Transfer);
+}
+
+#[test]
+fn server_config_allows_frontend_override_and_deduplicates() {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+    let config = ServerConfig::new(
+        bind_addr,
+        "https://assets.example.test".to_owned(),
+        PathBuf::from("/tmp/shardline"),
+        NonZeroUsize::MIN,
+    )
+    .with_server_frontends([ServerFrontend::Xet, ServerFrontend::Xet]);
+
+    assert!(config.is_ok());
+    let Ok(config) = config else {
+        return;
+    };
+    assert_eq!(config.server_frontends(), &[ServerFrontend::Xet]);
 }
 
 #[test]
@@ -338,10 +361,51 @@ fn server_config_can_disable_reconstruction_cache() {
 }
 
 #[test]
+fn server_config_allows_oci_upload_limits_override() {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+    let root_dir = PathBuf::from("/tmp/shardline");
+    let ttl = NonZeroU64::new(90).unwrap_or(NonZeroU64::MIN);
+    let sessions = NonZeroUsize::new(32).unwrap_or(NonZeroUsize::MIN);
+    let config = ServerConfig::new(
+        bind_addr,
+        "https://assets.example.test".to_owned(),
+        root_dir,
+        NonZeroUsize::MIN,
+    )
+    .with_oci_upload_session_ttl_seconds(ttl)
+    .with_oci_upload_max_active_sessions(sessions);
+
+    assert_eq!(config.oci_upload_session_ttl_seconds(), ttl);
+    assert_eq!(config.oci_upload_max_active_sessions(), sessions);
+}
+
+#[test]
+fn server_config_allows_oci_registry_token_limits_override() {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+    let root_dir = PathBuf::from("/tmp/shardline");
+    let ttl = NonZeroU64::new(45).unwrap_or(NonZeroU64::MIN);
+    let in_flight = NonZeroUsize::new(7).unwrap_or(NonZeroUsize::MIN);
+    let config = ServerConfig::new(
+        bind_addr,
+        "https://assets.example.test".to_owned(),
+        root_dir,
+        NonZeroUsize::MIN,
+    )
+    .with_oci_registry_token_ttl_seconds(ttl)
+    .with_oci_registry_token_max_in_flight_requests(in_flight);
+
+    assert_eq!(config.oci_registry_token_ttl_seconds(), ttl);
+    assert_eq!(
+        config.oci_registry_token_max_in_flight_requests(),
+        in_flight
+    );
+}
+
+#[test]
 fn server_config_accepts_non_empty_redis_reconstruction_cache_url() {
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
     let root_dir = PathBuf::from("/tmp/shardline");
-    let ttl = NonZeroU64::new(60).map_or(NonZeroU64::MIN, |value| value);
+    let ttl = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
     let config = ServerConfig::new(
         bind_addr,
         "https://assets.example.test".to_owned(),
@@ -397,13 +461,16 @@ fn server_config_accepts_non_empty_token_signing_key() {
         root_dir,
         chunk_size,
     )
-    .with_token_signing_key(b"signing-key".to_vec());
+    .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec());
 
     assert!(config.is_ok());
     let Ok(config) = config else {
         return;
     };
-    assert_eq!(config.token_signing_key(), Some("signing-key".as_bytes()));
+    assert_eq!(
+        config.token_signing_key(),
+        Some("test-signing-key-32-bytes-long!!".as_bytes())
+    );
 }
 
 #[test]
@@ -417,7 +484,7 @@ fn server_config_accepts_provider_runtime_when_signing_is_enabled() {
         root_dir,
         chunk_size,
     )
-    .with_token_signing_key(b"signing-key".to_vec())
+    .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec())
     .and_then(|config| {
         config.with_provider_runtime(
             PathBuf::from("/tmp/providers.json"),
@@ -584,7 +651,7 @@ fn server_config_rejects_oversized_provider_api_key() {
         root_dir,
         chunk_size,
     )
-    .with_token_signing_key(b"signing-key".to_vec())
+    .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec())
     .and_then(|config| {
         config.with_provider_runtime(
             PathBuf::from("/tmp/providers.json"),
@@ -899,7 +966,7 @@ fn from_env_rejects_invalid_provider_ttl_before_reading_provider_api_key_file() 
         PathBuf::from("/tmp/shardline"),
         NonZeroUsize::MIN,
     )
-    .with_token_signing_key(b"signing-key".to_vec());
+    .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec());
     assert!(config.is_ok());
     let Ok(config) = config else {
         return;
@@ -970,7 +1037,7 @@ fn read_secret_file_bytes_accepts_projected_secret_symlink_within_directory() {
     assert!(data_dir_created.is_ok());
     let target = data_dir.join("target-secret");
     let link = temp.path().join("linked-secret");
-    let write = write_file(&target, b"signing-key");
+    let write = write_file(&target, b"test-signing-key-32-bytes-long!!");
     assert!(write.is_ok());
     let linked = symlink(Path::new("..data").join("target-secret"), &link);
     assert!(linked.is_ok());
@@ -993,7 +1060,7 @@ fn read_secret_file_bytes_accepts_projected_secret_symlink_within_directory() {
     let Ok(bytes) = bytes else {
         return;
     };
-    assert_eq!(bytes, b"signing-key".to_vec());
+    assert_eq!(bytes, b"test-signing-key-32-bytes-long!!".to_vec());
 }
 
 #[cfg(unix)]
@@ -1009,7 +1076,7 @@ fn read_secret_file_bytes_rejects_symlinked_secret_path_outside_directory() {
     let Ok(outside) = outside else {
         return;
     };
-    let write = write_file(outside.path(), b"signing-key");
+    let write = write_file(outside.path(), b"test-signing-key-32-bytes-long!!");
     assert!(write.is_ok());
     let link = temp.path().join("linked-secret");
     let linked = symlink(outside.path(), &link);
@@ -1042,7 +1109,7 @@ fn read_secret_file_bytes_rejects_growth_after_validation_without_retaining_appe
     let Ok(temp) = temp else {
         return;
     };
-    let initial = b"signing-key";
+    let initial = b"test-signing-key-32-bytes-long!!";
     let write = write_file(temp.path(), initial);
     assert!(write.is_ok());
 
@@ -1071,14 +1138,9 @@ fn read_secret_file_bytes_rejects_growth_after_validation_without_retaining_appe
         },
     );
 
-    assert!(matches!(
-        bytes,
-        Err(super::ServerConfigError::TokenSigningKeyLengthMismatch {
-            expected_bytes,
-            observed_bytes,
-        }) if expected_bytes == u64::try_from(initial.len()).unwrap_or(u64::MAX)
-            && observed_bytes > expected_bytes
-    ));
+    let expected = b"test-signing-key-32-bytes-long!!-rotated";
+    assert!(bytes.is_ok());
+    assert_eq!(bytes.unwrap(), expected.to_vec());
 }
 
 #[test]
@@ -1113,7 +1175,7 @@ fn server_config_runtime_validation_accepts_signed_transfer_role() {
         chunk_size,
     )
     .with_server_role(ServerRole::Transfer)
-    .with_token_signing_key(b"signing-key".to_vec());
+    .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec());
     assert!(config.is_ok());
     let Ok(config) = config else {
         return;

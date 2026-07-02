@@ -1,83 +1,59 @@
 # Compatibility Status
 
-Shardline targets the public Xet protocol and is being built to run against existing Git
-workflows and self-hosted deployments.
+Shardline has a CAS-agnostic runtime with explicit protocol frontends.
+The current compatibility contract is scoped to the protocol and operator workflows
+documented in this repository.
 
-Current status:
+## 1.0.0 Contract
 
-- core CAS routing exists
-- serialized xorb upload validation exists
-- serialized shard upload validation exists
-- dedupe shard fetch exists
-- local and Postgres-backed metadata paths exist
-- provider adapters exist for GitHub, GitLab, Gitea, and generic forges
-- provider-backed runtime token issuance is covered through live HTTP routes for GitHub,
-  GitLab, Gitea, and generic adapters
-- provider-backed webhook handling is covered through live HTTP routes for GitHub
-  repository lifecycle and revision-push events, GitLab repository lifecycle and
-  revision-push events, Gitea repository lifecycle and revision-push events, and the
-  generic normalized webhook contract
-- provider lifecycle handling persists durable repository state for access-change and
-  revision-push events, and applies deletion and rename transitions to retained metadata
-- storage, index, and reconstruction-cache adapters are explicit and replaceable behind
-  crate boundaries
-- Docker packaging and operator tooling exist
-- native Xet upload and download flows are covered by end-to-end tests
-- authenticated native Xet flows are covered with provider-issued repository-scoped
-  bearer tokens, ranged downloads, and cross-repository scope rejection
-- native Xet refresh-route bootstrap is covered end to end through the token refresher
-  path
-- authenticated native Xet concurrent upload and download sessions are covered end to
-  end
-- authenticated native Xet long-lived upload, full-download, and ranged-download
-  sessions are covered end to end through repeated refresh-route cycles
-- an unpatched `git-lfs` + `git-xet` push flow is covered by end-to-end tests
-- a `git` + `git-lfs` + `git-xet` clone, fresh cold clone, fetch, pull, and historical
-  checkout smoke test is covered with stock tooling
-- sparse checkout creation and sparse checkout expansion are covered with stock tooling
-  for Xet-tracked files
-- provider-mediated Git LFS download batches reconstruct file bytes through Shardline
-  native CAS routes when the installed `git-xet` build routes downloads through the
-  standard Git LFS download path
-- provider-mediated native Xet downloads are covered for GitHub, GitLab, Gitea, and
-  generic provider adapters
-- operator integrity workflows exist for `fsck`, lifecycle repair, rebuild, retention
-  holds, backup, storage migration, and garbage collection
-- corruption-detection and garbage-collection fail-closed behavior are covered through
-  tests and operator documentation
-- protocol, reconstruction, lifecycle-repair, CLI, and local-filesystem boundaries are
-  covered by dedicated fuzz targets and persisted corpora
-- Criterion microbenchmarks, deterministic CLI end-to-end benchmarks, and repeatable
-  `perf` workflows exist for hot-path profiling
+Shardline `1.0.0` should be treated as a content-addressed backend for the validated
+workflows covered by this repository.
 
-Shardline is not yet claimed as a complete drop-in Xet backend across every Git workflow
-and deployment matrix.
+## Validated Today
+
+- native Xet upload and download flows
+- Git LFS batch negotiation plus direct object upload, download, and metadata lookup
+  routes
+- Bazel HTTP remote-cache `ac` and `cas` read and write routes
+- OCI Distribution blob upload and download, manifest upload and lookup, and tag listing
+  routes
+- native external-client coverage for `git-lfs`, `bazel`/`bazelisk`, and `skopeo` across
+  multiple command-path variants in the repository test matrix
+- provider-issued repository-scoped tokens and provider webhook handling for GitHub,
+  GitLab, Gitea, Codeberg, and the generic provider adapter
+- stock `git` + `git-lfs` + `git-xet` push, clone, fetch, pull, and historical checkout
+  coverage in the validated test matrix
+- sparse checkout behavior for Xet-tracked files
+- local SQLite + filesystem deployments and Postgres + S3-style durable deployments
+- operator workflows for migrations, fsck, lifecycle repair, index rebuild, backup,
+  storage migration, retention holds, and garbage collection
+- fuzz coverage for protocol parsing, protocol frontend selectors and validators,
+  reconstruction, lifecycle repair, CLI parsing, and local filesystem race boundaries
+
+## Validated Native Clients
+
+| Frontend | Native client coverage |
+| --- | --- |
+| Xet | native Xet upload and download flows, plus `git` + `git-lfs` + `git-xet` push, clone, fetch, pull, historical checkout, and sparse checkout coverage |
+| Git LFS | `git-lfs` push/pull plus separate `pull` and `fetch --all` flows |
+| Bazel HTTP remote cache | `bazel` and `bazelisk` remote-cache flows with `remote_download_outputs=all` and `remote_download_outputs=toplevel` |
+| OCI Distribution | `skopeo` push/pull/tag-list, digest-reference, multi-tag, registry-to-registry copy, multi-arch index, Docker schema2, and token-service credential flow; `helm` OCI chart push/pull; `podman` pull/push; `docker` login/pull/push |
+
+## Validated Route Surface
+
+- Git LFS: batch negotiation plus direct object `GET`, `HEAD`, and `PUT`
+- Bazel HTTP remote cache: `ac` and `cas` object `GET` and `PUT`
+- OCI Distribution: blob `GET`, `HEAD`, upload, mount, and ranged read paths; manifest
+  `PUT`, `GET`, `HEAD`, and digest delete; tag listing with pagination; token-service
+  flow at `/v2/token`; upload cancellation and scoped upload-session handling
 
 ## Current Limits
 
-- Shardline does not yet claim blanket compatibility across every possible
-  forge-specific workflow, deployment topology, and client-version matrix.
-- Shardline documentation intentionally scopes the public contract to the Xet-facing
-  protocol and operator surface it currently implements.
-- Shardline crates remain source-release artifacts inside this repository and still keep
-  `publish = false`.
-
-## Ongoing Ratchets
-
-- keep adding protocol-conformance vectors as new native-client behavior is observed
-- keep verifying unpatched `git` + `git-lfs` + `git-xet` flows as compatibility coverage
-  grows
-- keep expanding provider webhook fixtures when new primary-source payload variants are
-  confirmed
-- keep extending sustained-load, fuzzing, benchmark, and profiling coverage as new hot
-  paths or regressions appear
-
-## Release Gate
-
-Shardline should only claim full Xet compatibility after:
-
-- the verified workflow matrix is broad enough to remove the current deployment-matrix
-  caveat
-- provider-backed workflows remain transparent to normal Git usage on supported forges
-- unpatched native Xet clients continue to cover upload, download, clone, fetch, pull,
-  push, sparse checkout, and historical checkout against a stock Shardline deployment
+- Shardline does not claim blanket compatibility across every possible Git workflow,
+  container client, Bazel deployment, deployment topology, provider setup, or
+  client-version combination.
+- Xet and OCI currently have the deepest native-client coverage in this repository.
+- Git LFS, Bazel HTTP remote cache, and OCI Distribution claims are scoped to the route
+  behavior and client flows covered by the repository tests.
+- The first crates.io release still has to publish the internal crate graph in
+  dependency order before publishing the `shardline` CLI crate.

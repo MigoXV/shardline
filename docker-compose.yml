@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shardline
+      POSTGRES_PASSWORD: shardline-dev-password
+      POSTGRES_DB: shardline
+    ports:
+      - "127.0.0.1:5532:5432"
+    volumes:
+      - shardline_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shardline"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   shardline:
     build:
       context: .
@@ -7,21 +24,6 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        mkdir -p /var/lib/shardline/secrets
-        chmod 700 /var/lib/shardline/secrets
-        if [ ! -s /var/lib/shardline/secrets/token-signing-key ]; then
-          umask 077
-          dd if=/dev/urandom bs=32 count=1 status=none | base64 > /var/lib/shardline/secrets/token-signing-key
-        fi
-        if [ -z "$${SHARDLINE_TOKEN_SIGNING_KEY:-}" ]; then
-          unset SHARDLINE_TOKEN_SIGNING_KEY
-          export SHARDLINE_TOKEN_SIGNING_KEY_FILE=/var/lib/shardline/secrets/token-signing-key
-        fi
-        exec shardline serve
     ports:
       - "127.0.0.1:18080:8080"
     environment:
@@ -79,6 +81,8 @@ services:
 
 volumes:
   shardline_data:
+    driver: local
+  shardline_postgres:
     driver: local
   shardline_minio:
     driver: local

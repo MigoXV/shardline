@@ -1,4 +1,16 @@
 #![deny(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::shadow_unrelated,
+        clippy::let_underscore_must_use,
+        clippy::format_push_string
+    )
+)]
 
 //! Library surface behind the `shardline` command-line entry point.
 //!
@@ -24,11 +36,6 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#[cfg(not(unix))]
-compile_error!(
-    "shardline requires Unix anchored filesystem semantics; non-Unix builds are unsupported until equivalent TOCTOU hardening exists"
-);
-
 mod adapter;
 mod admin;
 mod artifact;
@@ -46,6 +53,7 @@ mod local_path;
 mod providerless;
 mod rebuild;
 mod repair;
+pub mod report_output;
 mod storage_migration;
 
 pub use adapter::{CliRuntimeError, run_health_check};
@@ -54,9 +62,10 @@ pub use artifact::{CliArtifactError, render_completion, render_manpage};
 pub use backup::{BackupRuntimeError, run_backup_manifest};
 pub use bench::{
     BenchConfig, BenchDeploymentTarget, BenchInventoryScope, BenchReport, BenchRuntimeError,
-    BenchScenario, IngestBenchReport, run_bench, run_ingest_bench,
+    BenchScenario, ByteMetrics, ChunkMetrics, IngestBenchReport, InventoryMetrics, LatencyMetrics,
+    TimingMetrics, run_bench, run_ingest_bench,
 };
-pub use command::{BenchMode, CliCommand, CliParseError, CompletionShell};
+pub use command::{BenchMode, CliCommand, CliParseError, CompletionShell, RedactedDbUrl};
 pub use config::{
     ConfigRuntimeError, effective_root, load_server_config, run_config_check_from_env,
 };
@@ -67,7 +76,10 @@ pub use gc_schedule::{
     GcScheduleError, GcScheduleInstallOptions, GcScheduleInstallReport, GcScheduleUninstallReport,
     install_gc_schedule, uninstall_gc_schedule,
 };
-pub use hold::{HoldRuntimeError, run_hold_list, run_hold_release, run_hold_set};
+pub use hold::{
+    HoldRuntimeError, print_hold_list_summary, print_hold_summary, run_hold_list, run_hold_release,
+    run_hold_set,
+};
 pub use local_output::write_output_bytes;
 pub use providerless::{
     ProviderlessRuntimeError, ProviderlessSetupReport, load_runtime_server_config,

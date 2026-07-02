@@ -46,7 +46,6 @@ args = ["${@}", "check-all"]
 [tasks.audit]
 description = "Security audit for dependencies"
 workspace = false
-install_crate = "cargo-audit"
 command = "cargo"
 args = ["audit", "${@}"]
 
@@ -69,7 +68,16 @@ workspace = false
 install_crate = "cargo-nextest@0.9.123"
 install_crate_args = ["--locked"]
 command = "cargo"
-args = ["nextest", "run", "--workspace", "--all-features", "--no-tests=pass", "${@}"]
+args = ["nextest", "run", "--workspace", "--all-features", "--no-tests=pass", "-E", "not package(shardline-xet-core)", "${@}"]
+
+[tasks.test-e2e]
+description = "Run e2e integration tests from the e2e/ folder"
+workspace = false
+install_crate = "cargo-nextest@0.9.123"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = ["nextest", "run", "--all-features", "--no-tests=pass", "${@}"]
+cwd = "e2e"
 
 [tasks.verify-release-binary]
 description = "Build the release shardline binary and smoke-test the packaged entrypoint"
@@ -81,7 +89,7 @@ args = ["scripts/verify-release-binary.sh"]
 description = "Run clippy with strict rules on the shardline workspace"
 workspace = false
 command = "cargo"
-args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings", "${@}"]
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--exclude", "shardline-xet-core", "--", "-D", "warnings", "${@}"]
 
 [tasks.udeps]
 description = "Find unused dependencies (requires nightly)"
@@ -189,15 +197,45 @@ install_crate = "cargo-deny"
 command = "cargo"
 args = ["deny", "check"]
 
-[tasks.ci]
-description = "Run the core contributor CI checks"
+[tasks.coverage]
+description = "Generate test coverage report using cargo-tarpaulin"
 workspace = false
-dependencies = ["format-check", "clippy", "test", "verify-release-binary"]
+install_crate = "cargo-tarpaulin"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = ["tarpaulin", "--workspace", "--all-features", "--skip-clean", "--out", "Stdout", "--skip", "shardline-fuzz", "${@}"]
+
+[tasks.coverage-html]
+description = "Generate HTML test coverage report using cargo-tarpaulin"
+workspace = false
+install_crate = "cargo-tarpaulin"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = ["tarpaulin", "--workspace", "--all-features", "--skip-clean", "--out", "Html", "--skip", "shardline-fuzz", "${@}"]
+
+[tasks.coverage-json]
+description = "Generate JSON test coverage report using cargo-tarpaulin"
+workspace = false
+install_crate = "cargo-tarpaulin"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = ["tarpaulin", "--workspace", "--all-features", "--skip-clean", "--out", "Json", "--skip", "shardline-fuzz", "${@}"]
+
+[tasks.ci]
+description = "Run the core contributor CI checks, including dependency advisories"
+workspace = false
+dependencies = ["format-check", "clippy", "test", "verify-release-binary", "check-migration-sync", "audit"]
 
 [tasks.ci-full]
 description = "Run contributor CI plus dependency policy checks"
 workspace = false
 dependencies = ["ci", "deny"]
+
+[tasks.check-migration-sync]
+description = "Verify Postgres and SQLite migration versions are in sync"
+workspace = false
+command = "bash"
+args = ["scripts/check_migration_sync.sh"]
 
 [tasks.sqlx]
 description = "Run raw SQLx CLI commands"

@@ -11,13 +11,16 @@ use super::secrets::{
     read_secret_file_bytes,
 };
 use super::{
-    DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_SHARD_FILES,
+    AuthProviderKind, DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_SHARD_FILES,
     DEFAULT_MAX_SHARD_RECONSTRUCTION_TERMS, DEFAULT_MAX_SHARD_XORB_CHUNKS, DEFAULT_MAX_SHARD_XORBS,
     MAX_METRICS_TOKEN_BYTES, MAX_TOKEN_SIGNING_KEY_BYTES, ObjectStorageAdapter, ServerConfig,
     ServerConfigError, ShardMetadataLimits, default_transfer_max_in_flight_chunks,
     default_upload_max_in_flight_chunks,
 };
-use crate::{reconstruction_cache::ReconstructionCacheAdapter, server_role::ServerRole};
+use crate::{
+    reconstruction_cache::ReconstructionCacheAdapter, server_frontend::ServerFrontend,
+    server_role::ServerRole,
+};
 
 pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfigError> {
     let bind_addr = match var("SHARDLINE_BIND_ADDR") {
@@ -26,9 +29,16 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     };
     let public_base_url = var("SHARDLINE_PUBLIC_BASE_URL")
         .unwrap_or_else(|_error| "http://127.0.0.1:8080".to_owned());
+    // Validate public_base_url is a valid URL before consuming it.
+    if url::Url::parse(&public_base_url).is_err() {
+        return Err(ServerConfigError::InvalidPublicBaseUrl(public_base_url));
+    }
     let server_role =
         ServerRole::parse(&var("SHARDLINE_SERVER_ROLE").unwrap_or_else(|_error| "all".to_owned()))
             .map_err(|_error| ServerConfigError::InvalidServerRole)?;
+    let server_frontends = parse_server_frontends_env(
+        &var("SHARDLINE_SERVER_FRONTENDS").unwrap_or_else(|_error| "xet".to_owned()),
+    )?;
     let root_dir = var("SHARDLINE_ROOT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_error| PathBuf::from("/var/lib/shardline"));
@@ -112,6 +122,41 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     else {
         return Err(ServerConfigError::ZeroReconstructionCacheMemoryMaxEntries);
     };
+    let raw_oci_upload_session_ttl_seconds = var("SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS")
+        .unwrap_or_else(|_error| "3600".to_owned())
+        .parse::<u64>()
+        .map_err(ServerConfigError::OciUploadSessionTtl)?;
+    let Some(oci_upload_session_ttl_seconds) = NonZeroU64::new(raw_oci_upload_session_ttl_seconds)
+    else {
+        return Err(ServerConfigError::ZeroOciUploadSessionTtlSeconds);
+    };
+    let raw_oci_upload_max_active_sessions = var("SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS")
+        .unwrap_or_else(|_error| "1024".to_owned())
+        .parse::<usize>()
+        .map_err(ServerConfigError::OciUploadMaxActiveSessions)?;
+    let Some(oci_upload_max_active_sessions) =
+        NonZeroUsize::new(raw_oci_upload_max_active_sessions)
+    else {
+        return Err(ServerConfigError::ZeroOciUploadMaxActiveSessions);
+    };
+    let raw_oci_registry_token_ttl_seconds = var("SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS")
+        .unwrap_or_else(|_error| "300".to_owned())
+        .parse::<u64>()
+        .map_err(ServerConfigError::OciRegistryTokenTtl)?;
+    let Some(oci_registry_token_ttl_seconds) = NonZeroU64::new(raw_oci_registry_token_ttl_seconds)
+    else {
+        return Err(ServerConfigError::ZeroOciRegistryTokenTtlSeconds);
+    };
+    let raw_oci_registry_token_max_in_flight_requests =
+        var("SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS")
+            .unwrap_or_else(|_error| "64".to_owned())
+            .parse::<usize>()
+            .map_err(ServerConfigError::OciRegistryTokenMaxInFlightRequests)?;
+    let Some(oci_registry_token_max_in_flight_requests) =
+        NonZeroUsize::new(raw_oci_registry_token_max_in_flight_requests)
+    else {
+        return Err(ServerConfigError::ZeroOciRegistryTokenMaxInFlightRequests);
+    };
     let reconstruction_cache_redis_url = var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL").ok();
     let index_postgres_url = var("SHARDLINE_INDEX_POSTGRES_URL").ok();
     let token_signing_key = optional_token_signing_key_from_sources(
@@ -143,20 +188,26 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
 
     let mut config = ServerConfig::new(bind_addr, public_base_url, root_dir, chunk_size)
         .with_server_role(server_role)
+        .with_server_frontends(server_frontends)?
         .with_object_storage(object_storage_adapter, s3_object_store_config)
         .with_max_request_body_bytes(max_request_body_bytes)
         .with_shard_metadata_limits(shard_metadata_limits)
         .with_upload_max_in_flight_chunks(upload_max_in_flight_chunks)
         .with_transfer_max_in_flight_chunks(transfer_max_in_flight_chunks)
+        .with_oci_upload_session_ttl_seconds(oci_upload_session_ttl_seconds)
+        .with_oci_upload_max_active_sessions(oci_upload_max_active_sessions)
+        .with_oci_registry_token_ttl_seconds(oci_registry_token_ttl_seconds)
+        .with_oci_registry_token_max_in_flight_requests(oci_registry_token_max_in_flight_requests)
         .with_reconstruction_cache_memory(
             reconstruction_cache_ttl_seconds,
             reconstruction_cache_memory_max_entries,
         );
-    config.reconstruction_cache_adapter = reconstruction_cache_adapter;
-    config.reconstruction_cache_redis_url = reconstruction_cache_redis_url.map(SecretString::new);
-    if config.reconstruction_cache_adapter == ReconstructionCacheAdapter::Redis
+    config.cache.adapter = reconstruction_cache_adapter;
+    config.cache.redis_url = reconstruction_cache_redis_url.map(SecretString::new);
+    if config.cache.adapter == ReconstructionCacheAdapter::Redis
         && config
-            .reconstruction_cache_redis_url
+            .cache
+            .redis_url
             .as_ref()
             .map(SecretString::expose_secret)
             .is_none_or(|value| value.trim().is_empty())
@@ -169,9 +220,57 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     if let Some(signing_key) = token_signing_key {
         config = config.with_token_signing_key(signing_key)?;
     }
+
+    // Validate chunk size upper bound (1 GB).
+    const MAX_CHUNK_SIZE: usize = 1_073_741_824;
+    if chunk_size.get() > MAX_CHUNK_SIZE {
+        return Err(ServerConfigError::ChunkSizeTooLarge);
+    }
+
+    // Validate auth provider configuration.
+    let auth_provider = AuthProviderKind::parse(
+        &var("SHARDLINE_AUTH_PROVIDER").unwrap_or_else(|_error| "local".to_owned()),
+    )?;
+    let auth_oidc_issuer = var("SHARDLINE_AUTH_OIDC_ISSUER").ok();
+    let auth_jwks_url = var("SHARDLINE_AUTH_JWKS_URL").ok();
+    let auth_jwks_issuer = var("SHARDLINE_AUTH_JWKS_ISSUER").ok();
+    match auth_provider {
+        AuthProviderKind::Oidc => {
+            if auth_oidc_issuer.is_none() {
+                return Err(ServerConfigError::MissingOidcIssuer);
+            }
+        }
+        AuthProviderKind::Jwks => {
+            if auth_jwks_url.is_none() {
+                return Err(ServerConfigError::MissingJwksUrl);
+            }
+        }
+        AuthProviderKind::Local | AuthProviderKind::Passthrough => {}
+    }
+    config = config.with_auth_provider(auth_provider);
+    if let Some(issuer) = auth_oidc_issuer {
+        config = config.with_auth_oidc_issuer(issuer);
+    }
+    if let Some(url) = auth_jwks_url {
+        config = config.with_auth_jwks_url(url);
+    }
+    if let Some(issuer) = auth_jwks_issuer {
+        config = config.with_auth_jwks_issuer(issuer);
+    }
     if let Some(metrics_token) = metrics_token {
         config = config.with_metrics_token(metrics_token)?;
     }
+
+    // Validate Hub frontend requires auth configuration.
+    if config
+        .server_frontends()
+        .contains(&crate::server_frontend::ServerFrontend::Hub)
+        && config.token_signing_key().is_none()
+        && auth_provider == AuthProviderKind::Local
+    {
+        return Err(ServerConfigError::HubRequiresAuth);
+    }
+
     let issuer_identity = var("SHARDLINE_PROVIDER_TOKEN_ISSUER")
         .unwrap_or_else(|_error| "shardline-provider".to_owned());
     let provider_ttl_seconds = var("SHARDLINE_PROVIDER_TOKEN_TTL_SECONDS")
@@ -190,6 +289,26 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     )?;
 
     Ok(config)
+}
+
+fn parse_server_frontends_env(value: &str) -> Result<Vec<ServerFrontend>, ServerConfigError> {
+    let mut parsed = Vec::new();
+    for token in value.split(',').map(str::trim) {
+        if token.is_empty() {
+            continue;
+        }
+        let frontend = ServerFrontend::parse(token)
+            .map_err(|_error| ServerConfigError::InvalidServerFrontend)?;
+        if !parsed.contains(&frontend) {
+            parsed.push(frontend);
+        }
+    }
+
+    if parsed.is_empty() {
+        return Err(ServerConfigError::MissingServerFrontends);
+    }
+
+    Ok(parsed)
 }
 
 pub(super) fn optional_token_signing_key_from_sources(
@@ -230,4 +349,44 @@ fn load_non_zero_usize_env(
         .parse::<usize>()
         .map_err(parse_error)?;
     NonZeroUsize::new(raw).ok_or_else(zero_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ServerFrontend;
+
+    use super::parse_server_frontends_env;
+
+    #[test]
+    fn parse_server_frontends_env_accepts_one_or_more_tokens() {
+        let single = parse_server_frontends_env("xet");
+        assert!(single.is_ok());
+        assert_eq!(single.ok(), Some(vec![ServerFrontend::Xet]));
+        let deduplicated = parse_server_frontends_env("xet, xet");
+        assert!(deduplicated.is_ok());
+        assert_eq!(deduplicated.ok(), Some(vec![ServerFrontend::Xet]));
+        let multiple = parse_server_frontends_env("xet,lfs,bazel-http,oci");
+        assert!(multiple.is_ok());
+        assert_eq!(
+            multiple.ok(),
+            Some(vec![
+                ServerFrontend::Xet,
+                ServerFrontend::Lfs,
+                ServerFrontend::BazelHttp,
+                ServerFrontend::Oci,
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_server_frontends_env_rejects_invalid_or_empty_tokens() {
+        assert!(parse_server_frontends_env("").is_err());
+        let trailing_comma = parse_server_frontends_env("xet,");
+        assert!(trailing_comma.is_ok());
+        assert_eq!(trailing_comma.ok(), Some(vec![ServerFrontend::Xet]));
+        let empty_segments = parse_server_frontends_env(",xet,,");
+        assert!(empty_segments.is_ok());
+        assert_eq!(empty_segments.ok(), Some(vec![ServerFrontend::Xet]));
+        assert!(parse_server_frontends_env("unknown").is_err());
+    }
 }

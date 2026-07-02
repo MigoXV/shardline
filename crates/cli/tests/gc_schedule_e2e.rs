@@ -3,13 +3,14 @@ mod support;
 use std::{
     env::var,
     error::Error,
-    fs::{create_dir_all, read_to_string, write as write_file},
+    fs::{create_dir_all, write as write_file},
     path::PathBuf,
     process::Command,
 };
 
 use support::CliE2eInvariantError;
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gc_schedule_install_and_uninstall_manage_systemd_units() {
     let result = exercise_gc_schedule_install_and_uninstall();
@@ -39,6 +40,7 @@ fn gc_schedule_install_rejects_symlinked_working_directory() {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn exercise_gc_schedule_install_and_uninstall() -> Result<(), Box<dyn Error>> {
     let sandbox = tempfile::tempdir()?;
     let output_dir = sandbox.path().join("systemd");
@@ -107,7 +109,7 @@ fn exercise_gc_schedule_install_and_uninstall() -> Result<(), Box<dyn Error>> {
         return Err(CliE2eInvariantError::new("gc schedule did not create timer unit").into());
     }
 
-    let service = read_to_string(&service_path)?;
+    let service = std::fs::read_to_string(&service_path)?;
     let expected_exec = format!(
         "ExecStart={} gc --mark --sweep --retention-seconds 600",
         shardline_bin.display()
@@ -126,7 +128,7 @@ fn exercise_gc_schedule_install_and_uninstall() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let timer = read_to_string(&timer_path)?;
+    let timer = std::fs::read_to_string(&timer_path)?;
     if !timer.contains("OnCalendar=hourly") {
         return Err(CliE2eInvariantError::new("gc timer unit used unexpected calendar").into());
     }

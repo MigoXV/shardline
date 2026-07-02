@@ -1,18 +1,23 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use shardline_index::{
-    AsyncIndexStore, LocalIndexStore, PostgresIndexStore, PostgresRecordStore, RecordStore,
+    AsyncIndexStore, FileRecordStorageLayout, LocalIndexStore, PostgresIndexStore,
+    PostgresRecordStore, RecordStore, RecordTraversal, xet_hash_hex_string,
 };
+use shardline_storage::ObjectStore;
 
 use crate::{
-    ServerConfig, ServerError,
+    ServerConfig, ServerError, ServerFrontend,
     chunk_store::chunk_object_key,
     clock::unix_now_seconds_checked,
     object_store::{ServerObjectStore, object_store_from_config},
     overflow::checked_increment,
     postgres_backend::connect_postgres_metadata_pool,
     record_store::{LocalRecordStore, parse_stored_file_record_bytes},
-    xorb_store::{visit_stored_xorb_chunk_hashes, xorb_object_key},
+    server_frontend::{
+        optional_chunk_container_keys, referenced_term_object_key,
+        visit_protocol_object_member_chunks,
+    },
 };
 
 /// Default retention for processed webhook delivery claims before repair prunes them.
@@ -111,6 +116,7 @@ pub async fn run_lifecycle_repair(
             &record_store,
             &index_store,
             &object_store,
+            config.server_frontends(),
             options,
         )
         .await;
@@ -118,7 +124,14 @@ pub async fn run_lifecycle_repair(
 
     let index_store = LocalIndexStore::open(config.root_dir().to_path_buf());
     let record_store = LocalRecordStore::open(config.root_dir().to_path_buf());
-    run_lifecycle_repair_with_stores(&record_store, &index_store, &object_store, options).await
+    run_lifecycle_repair_with_stores(
+        &record_store,
+        &index_store,
+        &object_store,
+        config.server_frontends(),
+        options,
+    )
+    .await
 }
 
 /// Repairs stale lifecycle metadata for one local storage root.
@@ -133,13 +146,21 @@ pub async fn run_local_lifecycle_repair(
     let object_store = ServerObjectStore::local(root.join("chunks"))?;
     let index_store = LocalIndexStore::open(root.clone());
     let record_store = LocalRecordStore::open(root);
-    run_lifecycle_repair_with_stores(&record_store, &index_store, &object_store, options).await
+    run_lifecycle_repair_with_stores(
+        &record_store,
+        &index_store,
+        &object_store,
+        &[ServerFrontend::Xet],
+        options,
+    )
+    .await
 }
 
 async fn run_lifecycle_repair_with_stores<RecordAdapter, IndexAdapter>(
     record_store: &RecordAdapter,
     index_store: &IndexAdapter,
     object_store: &ServerObjectStore,
+    frontends: &[ServerFrontend],
     options: LifecycleRepairOptions,
 ) -> Result<LifecycleRepairReport, ServerError>
 where
@@ -153,6 +174,7 @@ where
         record_store,
         index_store,
         object_store,
+        frontends,
         options,
         now_unix_seconds,
     )
@@ -163,6 +185,7 @@ async fn run_lifecycle_repair_with_stores_at_time<RecordAdapter, IndexAdapter>(
     record_store: &RecordAdapter,
     index_store: &IndexAdapter,
     object_store: &ServerObjectStore,
+    frontends: &[ServerFrontend],
     options: LifecycleRepairOptions,
     now_unix_seconds: u64,
 ) -> Result<LifecycleRepairReport, ServerError>
@@ -173,8 +196,14 @@ where
     IndexAdapter::Error: Into<ServerError>,
 {
     let mut reachability = RepairReachability::default();
-    collect_referenced_object_keys(record_store, index_store, object_store, &mut reachability)
-        .await?;
+    collect_referenced_object_keys(
+        record_store,
+        index_store,
+        object_store,
+        frontends,
+        &mut reachability,
+    )
+    .await?;
 
     let max_processed_at_unix_seconds = now_unix_seconds
         .checked_add(WEBHOOK_DELIVERY_FUTURE_SKEW_SECONDS)
@@ -314,6 +343,7 @@ async fn collect_referenced_object_keys<RecordAdapter, IndexAdapter>(
     record_store: &RecordAdapter,
     index_store: &IndexAdapter,
     object_store: &ServerObjectStore,
+    frontends: &[ServerFrontend],
     reachability: &mut RepairReachability,
 ) -> Result<(), ServerError>
 where
@@ -322,19 +352,19 @@ where
     IndexAdapter: AsyncIndexStore + Sync,
     IndexAdapter::Error: Into<ServerError>,
 {
-    RecordStore::visit_latest_records(record_store, |entry| {
-        collect_record_object_references(object_store, &entry.bytes, reachability)
+    RecordTraversal::visit_latest_records(record_store, |entry| {
+        collect_record_object_references(object_store, frontends, &entry.bytes, reachability)
     })
     .await?;
 
-    RecordStore::visit_version_records(record_store, |entry| {
-        collect_record_object_references(object_store, &entry.bytes, reachability)
+    RecordTraversal::visit_version_records(record_store, |entry| {
+        collect_record_object_references(object_store, frontends, &entry.bytes, reachability)
     })
     .await?;
 
     index_store
         .visit_dedupe_shard_mappings(|mapping| {
-            let chunk_hash_hex = mapping.chunk_hash().api_hex_string();
+            let chunk_hash_hex = xet_hash_hex_string(mapping.chunk_hash());
             if reachability
                 .live_dedupe_chunk_hashes
                 .contains(&chunk_hash_hex)
@@ -352,39 +382,50 @@ where
 
 fn collect_record_object_references(
     object_store: &ServerObjectStore,
+    frontends: &[ServerFrontend],
     record_bytes: &[u8],
     reachability: &mut RepairReachability,
 ) -> Result<(), ServerError> {
     let record = parse_stored_file_record_bytes(record_bytes)?;
+    let storage_layout = record.storage_layout();
     reachability.scanned_records = checked_increment(reachability.scanned_records)?;
     for chunk in &record.chunks {
-        if record.chunk_size == 0 {
-            let xorb_key = xorb_object_key(&chunk.hash)?;
-            reachability
-                .referenced_object_keys
-                .insert(xorb_key.as_str().to_owned());
-            visit_stored_xorb_chunk_hashes(object_store, &xorb_key, |chunk_hash_hex| {
-                let chunk_key = chunk_object_key(&chunk_hash_hex)?;
+        match storage_layout {
+            FileRecordStorageLayout::ReferencedObjectTerms => {
+                let protocol_object_key = referenced_term_object_key(frontends, &chunk.hash)?;
+                reachability
+                    .referenced_object_keys
+                    .insert(protocol_object_key.as_str().to_owned());
+                visit_protocol_object_member_chunks(
+                    frontends,
+                    object_store,
+                    &protocol_object_key,
+                    |chunk_hash_hex| {
+                        let chunk_key = chunk_object_key(&chunk_hash_hex)?;
+                        reachability
+                            .referenced_object_keys
+                            .insert(chunk_key.as_str().to_owned());
+                        Ok(())
+                    },
+                )?;
+            }
+            FileRecordStorageLayout::StoredChunks => {
+                let chunk_key = chunk_object_key(&chunk.hash)?;
                 reachability
                     .referenced_object_keys
                     .insert(chunk_key.as_str().to_owned());
-                Ok(())
-            })?;
-            continue;
-        }
+                reachability
+                    .live_dedupe_chunk_hashes
+                    .insert(chunk.hash.clone());
 
-        let chunk_key = chunk_object_key(&chunk.hash)?;
-        reachability
-            .referenced_object_keys
-            .insert(chunk_key.as_str().to_owned());
-        reachability
-            .live_dedupe_chunk_hashes
-            .insert(chunk.hash.clone());
-        let xorb_key = xorb_object_key(&chunk.hash)?;
-        if object_store.metadata(&xorb_key)?.is_some() {
-            reachability
-                .referenced_object_keys
-                .insert(xorb_key.as_str().to_owned());
+                for protocol_object_key in optional_chunk_container_keys(frontends, &chunk.hash)? {
+                    if object_store.metadata(&protocol_object_key)?.is_some() {
+                        reachability
+                            .referenced_object_keys
+                            .insert(protocol_object_key.as_str().to_owned());
+                    }
+                }
+            }
         }
     }
 

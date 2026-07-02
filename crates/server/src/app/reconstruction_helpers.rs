@@ -9,17 +9,20 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
-use shardline_protocol::{ByteRange, RepositoryScope, ShardlineHash, parse_http_byte_range};
+use shardline_protocol::{ByteRange, RepositoryScope, parse_http_byte_range};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::{AppState, MAX_BATCH_RECONSTRUCTION_FILE_IDS, MAX_BATCH_RECONSTRUCTION_QUERY_BYTES};
 use crate::{
     ServerError,
     download_stream::ServerByteStream,
-    model::{FileReconstructionResponse, FileReconstructionV2Response},
-    reconstruction::reconstruction_v2_from_v1,
+    error::ObjectStoreError,
     reconstruction_cache::ReconstructionCacheService,
     transfer_limiter::TransferLimiter,
+    xet_adapter::{
+        FileReconstructionResponse, FileReconstructionV2Response, reconstruction_v2_from_v1,
+        validate_hash_path,
+    },
 };
 
 struct TransferByteStreamState {
@@ -57,7 +60,8 @@ pub(super) fn byte_range_stream_response(
         .into_response()
 }
 
-pub(super) fn full_byte_stream_response(
+#[must_use]
+pub fn full_byte_stream_response(
     byte_stream: ServerByteStream,
     transfer_limiter: TransferLimiter,
     total_length: u64,
@@ -90,19 +94,25 @@ fn metered_transfer_body(
         if stream_state.remaining_bytes == 0 {
             let next = stream_state.byte_stream.next().await;
             if next.is_some() {
-                return Err(ServerError::StoredObjectLengthMismatch);
+                return Err(ServerError::ObjectStore(
+                    ObjectStoreError::StoredLengthMismatch,
+                ));
             }
 
             return Ok::<Option<(Bytes, TransferByteStreamState)>, ServerError>(None);
         }
 
         let Some(next) = stream_state.byte_stream.next().await else {
-            return Err(ServerError::StoredObjectLengthMismatch);
+            return Err(ServerError::ObjectStore(
+                ObjectStoreError::StoredLengthMismatch,
+            ));
         };
         let bytes = next?;
         let read = u64::try_from(bytes.len())?;
         if read == 0 || read > stream_state.remaining_bytes {
-            return Err(ServerError::StoredObjectLengthMismatch);
+            return Err(ServerError::ObjectStore(
+                ObjectStoreError::StoredLengthMismatch,
+            ));
         }
         let permit = stream_state.transfer_limiter.acquire_bytes(read).await?;
 
@@ -207,29 +217,6 @@ pub(super) fn parse_required_xorb_transfer_range(
     Ok(range)
 }
 
-pub(super) fn validate_xorb_prefix(prefix: &str) -> Result<(), ServerError> {
-    if prefix != "default" {
-        return Err(ServerError::InvalidXorbPrefix);
-    }
-
-    Ok(())
-}
-
-pub(super) fn validate_xet_hash_path(value: &str) -> Result<(), ServerError> {
-    ShardlineHash::parse_api_hex(value)?;
-    Ok(())
-}
-
-pub(super) fn validate_optional_content_hash(
-    content_hash: Option<&str>,
-) -> Result<(), ServerError> {
-    if let Some(content_hash) = content_hash {
-        validate_xet_hash_path(content_hash)?;
-    }
-
-    Ok(())
-}
-
 pub(super) fn parse_batch_reconstruction_file_ids(uri: &Uri) -> Result<Vec<String>, ServerError> {
     let Some(query) = uri.query() else {
         return Ok(Vec::new());
@@ -238,7 +225,14 @@ pub(super) fn parse_batch_reconstruction_file_ids(uri: &Uri) -> Result<Vec<Strin
     parse_batch_reconstruction_query(query)
 }
 
-pub(super) fn parse_batch_reconstruction_query(query: &str) -> Result<Vec<String>, ServerError> {
+/// Parses a batch reconstruction query string into a list of file IDs.
+///
+/// # Errors
+///
+/// Returns [`ServerError::RequestQueryTooLarge`] if the query exceeds the maximum allowed byte count,
+/// or [`ServerError::InvalidFileId`] / [`ServerError::InvalidContentHash`] if any file ID or
+/// content hash is malformed.
+pub fn parse_batch_reconstruction_query(query: &str) -> Result<Vec<String>, ServerError> {
     if query.len() > MAX_BATCH_RECONSTRUCTION_QUERY_BYTES {
         return Err(ServerError::RequestQueryTooLarge);
     }
@@ -252,7 +246,7 @@ pub(super) fn parse_batch_reconstruction_query(query: &str) -> Result<Vec<String
         if key != "file_id" {
             continue;
         }
-        ShardlineHash::parse_api_hex(value)?;
+        validate_hash_path(value)?;
         if !seen.insert(value) {
             continue;
         }

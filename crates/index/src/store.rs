@@ -3,17 +3,284 @@ use std::{future::Future, pin::Pin};
 use shardline_protocol::{RepositoryProvider, ShardlineHash};
 use shardline_storage::ObjectKey;
 
+use crate::hub::HubStore;
+use crate::record::RecordStore;
 use crate::{
     DedupeShardMapping, FileId, FileReconstruction, ProviderRepositoryState, QuarantineCandidate,
-    RetentionHold, WebhookDelivery, XorbId,
+    RetentionHold, StoredObjectId, WebhookDelivery, XorbId,
 };
+
+macro_rules! visit_items {
+    ($visit:ident, $list:ident, $item:ty) => {
+        #[allow(clippy::missing_errors_doc)]
+        fn $visit<Visitor, VisitorError>(&self, mut visitor: Visitor) -> Result<(), VisitorError>
+        where
+            Self::Error: Into<VisitorError>,
+            Visitor: FnMut($item) -> Result<(), VisitorError>,
+        {
+            for item in self.$list().map_err(Into::into)? {
+                visitor(item)?;
+            }
+            Ok(())
+        }
+    };
+}
+
+macro_rules! visit_items_async {
+    ($visit:ident, $list:ident, $item:ty) => {
+        #[allow(clippy::missing_errors_doc)]
+        fn $visit<'operation, Visitor, VisitorError>(
+            &'operation self,
+            mut visitor: Visitor,
+        ) -> IndexStoreFuture<'operation, (), VisitorError>
+        where
+            Self: Sync,
+            Self::Error: Into<VisitorError> + 'operation,
+            Visitor: FnMut($item) -> Result<(), VisitorError> + Send + 'operation,
+            VisitorError: Send + 'operation,
+        {
+            Box::pin(async move {
+                for item in self.$list().await.map_err(Into::into)? {
+                    visitor(item)?;
+                }
+                Ok(())
+            })
+        }
+    };
+}
+
+/// Generates the [`AsyncIndexStore`] lifecycle method implementations for a type
+/// that already implements [`LifecycleStore`]. This eliminates the delegation
+/// boilerplate that was duplicated across local and memory adapters.
+macro_rules! impl_async_lifecycle_delegation {
+    ($ty:ty) => {
+        fn quarantine_candidate<'operation>(
+            &'operation self,
+            object_key: &'operation ObjectKey,
+        ) -> IndexStoreFuture<'operation, Option<QuarantineCandidate>, Self::Error> {
+            let store = self.clone();
+            let object_key = object_key.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::quarantine_candidate(&store, &object_key)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn list_quarantine_candidates(
+            &self,
+        ) -> IndexStoreFuture<'_, Vec<QuarantineCandidate>, Self::Error> {
+            let store = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::list_quarantine_candidates(&store)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn upsert_quarantine_candidate<'operation>(
+            &'operation self,
+            candidate: &'operation QuarantineCandidate,
+        ) -> IndexStoreFuture<'operation, (), Self::Error> {
+            let store = self.clone();
+            let candidate = candidate.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::upsert_quarantine_candidate(&store, &candidate)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn delete_quarantine_candidate<'operation>(
+            &'operation self,
+            object_key: &'operation ObjectKey,
+        ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+            let store = self.clone();
+            let object_key = object_key.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::delete_quarantine_candidate(&store, &object_key)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn retention_hold<'operation>(
+            &'operation self,
+            object_key: &'operation ObjectKey,
+        ) -> IndexStoreFuture<'operation, Option<RetentionHold>, Self::Error> {
+            let store = self.clone();
+            let object_key = object_key.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::retention_hold(&store, &object_key)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn list_retention_holds(&self) -> IndexStoreFuture<'_, Vec<RetentionHold>, Self::Error> {
+            let store = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || LifecycleStore::list_retention_holds(&store))
+                    .await
+                    .expect("lifecycle task panicked")
+            })
+        }
+
+        fn upsert_retention_hold<'operation>(
+            &'operation self,
+            hold: &'operation RetentionHold,
+        ) -> IndexStoreFuture<'operation, (), Self::Error> {
+            let store = self.clone();
+            let hold = hold.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::upsert_retention_hold(&store, &hold)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn delete_retention_hold<'operation>(
+            &'operation self,
+            object_key: &'operation ObjectKey,
+        ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+            let store = self.clone();
+            let object_key = object_key.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::delete_retention_hold(&store, &object_key)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn record_webhook_delivery<'operation>(
+            &'operation self,
+            delivery: &'operation WebhookDelivery,
+        ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+            let store = self.clone();
+            let delivery = delivery.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::record_webhook_delivery(&store, &delivery)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn list_webhook_deliveries(
+            &self,
+        ) -> IndexStoreFuture<'_, Vec<WebhookDelivery>, Self::Error> {
+            let store = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || LifecycleStore::list_webhook_deliveries(&store))
+                    .await
+                    .expect("lifecycle task panicked")
+            })
+        }
+
+        fn delete_webhook_delivery<'operation>(
+            &'operation self,
+            delivery: &'operation WebhookDelivery,
+        ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+            let store = self.clone();
+            let delivery = delivery.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::delete_webhook_delivery(&store, &delivery)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn provider_repository_state<'operation>(
+            &'operation self,
+            provider: RepositoryProvider,
+            owner: &'operation str,
+            repo: &'operation str,
+        ) -> IndexStoreFuture<'operation, Option<ProviderRepositoryState>, Self::Error> {
+            let store = self.clone();
+            let owner = owner.to_owned();
+            let repo = repo.to_owned();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::provider_repository_state(&store, provider, &owner, &repo)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn list_provider_repository_states(
+            &self,
+        ) -> IndexStoreFuture<'_, Vec<ProviderRepositoryState>, Self::Error> {
+            let store = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::list_provider_repository_states(&store)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn upsert_provider_repository_state<'operation>(
+            &'operation self,
+            state: &'operation ProviderRepositoryState,
+        ) -> IndexStoreFuture<'operation, (), Self::Error> {
+            let store = self.clone();
+            let state = state.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::upsert_provider_repository_state(&store, &state)
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+
+        fn delete_provider_repository_state<'operation>(
+            &'operation self,
+            provider: RepositoryProvider,
+            owner: &'operation str,
+            repo: &'operation str,
+        ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+            let store = self.clone();
+            let owner = owner.to_owned();
+            let repo = repo.to_owned();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    LifecycleStore::delete_provider_repository_state(
+                        &store, provider, &owner, &repo,
+                    )
+                })
+                .await
+                .expect("lifecycle task panicked")
+            })
+        }
+    };
+}
 
 /// Boxed asynchronous index-store operation.
 pub type IndexStoreFuture<'operation, T, E> =
     Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'operation>>;
 
-/// Metadata index adapter contract.
-pub trait IndexStore {
+/// File reconstruction and stored-object presence queries.
+pub trait ReconstructionStore {
     /// Adapter-specific error type.
     type Error;
 
@@ -38,12 +305,27 @@ pub trait IndexStore {
     /// Returns the adapter error when persistence fails.
     fn delete_reconstruction(&self, file_id: &FileId) -> Result<bool, Self::Error>;
 
-    /// Returns whether a xorb is registered.
+    /// Returns whether a stored object is registered.
     ///
     /// # Errors
     ///
     /// Returns the adapter error when the index lookup fails.
-    fn contains_xorb(&self, xorb_id: &XorbId) -> Result<bool, Self::Error>;
+    fn contains_object(&self, object_id: &StoredObjectId) -> Result<bool, Self::Error>;
+
+    /// Backward-compatible Xet alias for [`Self::contains_object`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when the index lookup fails.
+    fn contains_xorb(&self, xorb_id: &XorbId) -> Result<bool, Self::Error> {
+        self.contains_object(xorb_id)
+    }
+}
+
+/// Dedupe shard mapping queries.
+pub trait DedupeStore {
+    /// Adapter-specific error type.
+    type Error;
 
     /// Loads the retained shard mapping for one chunk hash.
     ///
@@ -62,26 +344,11 @@ pub trait IndexStore {
     /// Returns the adapter error when the inventory lookup fails.
     fn list_dedupe_shard_mappings(&self) -> Result<Vec<DedupeShardMapping>, Self::Error>;
 
-    /// Visits every retained dedupe-shard mapping.
-    ///
-    /// # Errors
-    ///
-    /// Returns the adapter error when the inventory lookup fails or when the visitor
-    /// rejects an entry.
-    fn visit_dedupe_shard_mappings<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(DedupeShardMapping) -> Result<(), VisitorError>,
-    {
-        for mapping in self.list_dedupe_shard_mappings().map_err(Into::into)? {
-            visitor(mapping)?;
-        }
-
-        Ok(())
-    }
+    visit_items!(
+        visit_dedupe_shard_mappings,
+        list_dedupe_shard_mappings,
+        DedupeShardMapping
+    );
 
     /// Deletes one retained dedupe-shard mapping.
     ///
@@ -89,6 +356,12 @@ pub trait IndexStore {
     ///
     /// Returns the adapter error when persistence fails.
     fn delete_dedupe_shard_mapping(&self, chunk_hash: &ShardlineHash) -> Result<bool, Self::Error>;
+}
+
+/// Lifecycle metadata: quarantine, retention, webhooks, and provider state.
+pub trait LifecycleStore {
+    /// Adapter-specific error type.
+    type Error;
 
     /// Loads durable quarantine state for one object key.
     ///
@@ -107,26 +380,11 @@ pub trait IndexStore {
     /// Returns the adapter error when the inventory lookup fails.
     fn list_quarantine_candidates(&self) -> Result<Vec<QuarantineCandidate>, Self::Error>;
 
-    /// Visits every durable quarantine candidate.
-    ///
-    /// # Errors
-    ///
-    /// Returns the adapter error when the inventory lookup fails or when the visitor
-    /// rejects an entry.
-    fn visit_quarantine_candidates<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError>,
-    {
-        for candidate in self.list_quarantine_candidates().map_err(Into::into)? {
-            visitor(candidate)?;
-        }
-
-        Ok(())
-    }
+    visit_items!(
+        visit_quarantine_candidates,
+        list_quarantine_candidates,
+        QuarantineCandidate
+    );
 
     /// Inserts or replaces durable quarantine state for one object key.
     ///
@@ -159,26 +417,7 @@ pub trait IndexStore {
     /// Returns the adapter error when the inventory lookup fails.
     fn list_retention_holds(&self) -> Result<Vec<RetentionHold>, Self::Error>;
 
-    /// Visits every durable retention hold.
-    ///
-    /// # Errors
-    ///
-    /// Returns the adapter error when the inventory lookup fails or when the visitor
-    /// rejects an entry.
-    fn visit_retention_holds<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(RetentionHold) -> Result<(), VisitorError>,
-    {
-        for hold in self.list_retention_holds().map_err(Into::into)? {
-            visitor(hold)?;
-        }
-
-        Ok(())
-    }
+    visit_items!(visit_retention_holds, list_retention_holds, RetentionHold);
 
     /// Inserts or replaces durable retention-hold state for one object key.
     ///
@@ -211,26 +450,11 @@ pub trait IndexStore {
     /// Returns the adapter error when the inventory lookup fails.
     fn list_webhook_deliveries(&self) -> Result<Vec<WebhookDelivery>, Self::Error>;
 
-    /// Visits every processed provider webhook delivery claim.
-    ///
-    /// # Errors
-    ///
-    /// Returns the adapter error when the inventory lookup fails or when the visitor
-    /// rejects an entry.
-    fn visit_webhook_deliveries<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(WebhookDelivery) -> Result<(), VisitorError>,
-    {
-        for delivery in self.list_webhook_deliveries().map_err(Into::into)? {
-            visitor(delivery)?;
-        }
-
-        Ok(())
-    }
+    visit_items!(
+        visit_webhook_deliveries,
+        list_webhook_deliveries,
+        WebhookDelivery
+    );
 
     /// Deletes a recorded provider webhook delivery claim.
     ///
@@ -258,25 +482,11 @@ pub trait IndexStore {
     /// Returns the adapter error when the inventory lookup fails.
     fn list_provider_repository_states(&self) -> Result<Vec<ProviderRepositoryState>, Self::Error>;
 
-    /// Visits every durable provider-derived repository lifecycle state.
-    ///
-    /// # Errors
-    ///
-    /// Returns the adapter error when the inventory lookup fails or the visitor rejects an entry.
-    fn visit_provider_repository_states<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(ProviderRepositoryState) -> Result<(), VisitorError>,
-    {
-        for state in self.list_provider_repository_states().map_err(Into::into)? {
-            visitor(state)?;
-        }
-
-        Ok(())
-    }
+    visit_items!(
+        visit_provider_repository_states,
+        list_provider_repository_states,
+        ProviderRepositoryState
+    );
 
     /// Inserts or replaces durable provider-derived lifecycle state for one repository.
     ///
@@ -300,6 +510,11 @@ pub trait IndexStore {
         repo: &str,
     ) -> Result<bool, Self::Error>;
 }
+
+/// Metadata index adapter contract.
+pub trait IndexStore: ReconstructionStore + DedupeStore + LifecycleStore {}
+
+impl<T: ReconstructionStore + DedupeStore + LifecycleStore> IndexStore for T {}
 
 /// Asynchronous metadata index adapter contract.
 pub trait AsyncIndexStore {
@@ -328,17 +543,33 @@ pub trait AsyncIndexStore {
         file_id: &'operation FileId,
     ) -> IndexStoreFuture<'operation, bool, Self::Error>;
 
-    /// Returns whether a xorb is registered.
+    /// Returns whether a stored object is registered.
+    fn contains_object<'operation>(
+        &'operation self,
+        object_id: &'operation StoredObjectId,
+    ) -> IndexStoreFuture<'operation, bool, Self::Error>;
+
+    /// Backward-compatible Xet alias for [`Self::contains_object`].
     fn contains_xorb<'operation>(
         &'operation self,
         xorb_id: &'operation XorbId,
-    ) -> IndexStoreFuture<'operation, bool, Self::Error>;
+    ) -> IndexStoreFuture<'operation, bool, Self::Error> {
+        self.contains_object(xorb_id)
+    }
 
-    /// Inserts xorb presence metadata.
+    /// Inserts stored-object presence metadata.
+    fn insert_object<'operation>(
+        &'operation self,
+        object_id: &'operation StoredObjectId,
+    ) -> IndexStoreFuture<'operation, (), Self::Error>;
+
+    /// Backward-compatible Xet alias for [`Self::insert_object`].
     fn insert_xorb<'operation>(
         &'operation self,
         xorb_id: &'operation XorbId,
-    ) -> IndexStoreFuture<'operation, (), Self::Error>;
+    ) -> IndexStoreFuture<'operation, (), Self::Error> {
+        self.insert_object(xorb_id)
+    }
 
     /// Loads the retained shard mapping for one chunk hash.
     fn dedupe_shard_mapping<'operation>(
@@ -351,29 +582,11 @@ pub trait AsyncIndexStore {
         &self,
     ) -> IndexStoreFuture<'_, Vec<DedupeShardMapping>, Self::Error>;
 
-    /// Visits every retained dedupe-shard mapping.
-    fn visit_dedupe_shard_mappings<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(DedupeShardMapping) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for mapping in self
-                .list_dedupe_shard_mappings()
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(mapping)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_items_async!(
+        visit_dedupe_shard_mappings,
+        list_dedupe_shard_mappings,
+        DedupeShardMapping
+    );
 
     /// Inserts or replaces one chunk-hash to retained-shard mapping.
     fn upsert_dedupe_shard_mapping<'operation>(
@@ -398,29 +611,11 @@ pub trait AsyncIndexStore {
         &self,
     ) -> IndexStoreFuture<'_, Vec<QuarantineCandidate>, Self::Error>;
 
-    /// Visits every durable quarantine candidate.
-    fn visit_quarantine_candidates<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for candidate in self
-                .list_quarantine_candidates()
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(candidate)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_items_async!(
+        visit_quarantine_candidates,
+        list_quarantine_candidates,
+        QuarantineCandidate
+    );
 
     /// Inserts or replaces durable quarantine state for one object key.
     fn upsert_quarantine_candidate<'operation>(
@@ -443,25 +638,7 @@ pub trait AsyncIndexStore {
     /// Lists every durable retention hold.
     fn list_retention_holds(&self) -> IndexStoreFuture<'_, Vec<RetentionHold>, Self::Error>;
 
-    /// Visits every durable retention hold.
-    fn visit_retention_holds<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(RetentionHold) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for hold in self.list_retention_holds().await.map_err(Into::into)? {
-                visitor(hold)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_items_async!(visit_retention_holds, list_retention_holds, RetentionHold);
 
     /// Inserts or replaces durable retention-hold state for one object key.
     fn upsert_retention_hold<'operation>(
@@ -487,25 +664,11 @@ pub trait AsyncIndexStore {
     /// Lists every processed provider webhook delivery claim.
     fn list_webhook_deliveries(&self) -> IndexStoreFuture<'_, Vec<WebhookDelivery>, Self::Error>;
 
-    /// Visits every processed provider webhook delivery claim.
-    fn visit_webhook_deliveries<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(WebhookDelivery) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for delivery in self.list_webhook_deliveries().await.map_err(Into::into)? {
-                visitor(delivery)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_items_async!(
+        visit_webhook_deliveries,
+        list_webhook_deliveries,
+        WebhookDelivery
+    );
 
     /// Deletes a recorded provider webhook delivery claim.
     fn delete_webhook_delivery<'operation>(
@@ -526,29 +689,11 @@ pub trait AsyncIndexStore {
         &self,
     ) -> IndexStoreFuture<'_, Vec<ProviderRepositoryState>, Self::Error>;
 
-    /// Visits every durable provider-derived repository lifecycle state.
-    fn visit_provider_repository_states<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> IndexStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(ProviderRepositoryState) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            for state in self
-                .list_provider_repository_states()
-                .await
-                .map_err(Into::into)?
-            {
-                visitor(state)?;
-            }
-
-            Ok(())
-        })
-    }
+    visit_items_async!(
+        visit_provider_repository_states,
+        list_provider_repository_states,
+        ProviderRepositoryState
+    );
 
     /// Inserts or replaces durable provider-derived lifecycle state for one repository.
     fn upsert_provider_repository_state<'operation>(
@@ -563,4 +708,19 @@ pub trait AsyncIndexStore {
         owner: &'operation str,
         repo: &'operation str,
     ) -> IndexStoreFuture<'operation, bool, Self::Error>;
+}
+
+/// A complete repository providing all storage capabilities.
+///
+/// This supertrait bundles all individual store traits for convenience.
+/// Use specific traits when only a subset of capabilities is needed.
+pub trait Repository:
+    ReconstructionStore + DedupeStore + LifecycleStore + RecordStore + HubStore + Send + Sync
+{
+}
+
+// Blanket impl for any type that implements all the component traits.
+impl<T> Repository for T where
+    T: ReconstructionStore + DedupeStore + LifecycleStore + RecordStore + HubStore + Send + Sync
+{
 }

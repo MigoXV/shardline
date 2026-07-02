@@ -1,19 +1,87 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     num::{NonZeroU64, NonZeroUsize},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use tokio::sync::RwLock;
+use tokio::time::Instant;
+
+use tokio::sync::{Notify, RwLock};
 
 use crate::{AsyncReconstructionCache, ReconstructionCacheFuture, ReconstructionCacheKey};
 
 #[derive(Debug, Clone)]
 struct MemoryEntry {
-    payload: Vec<u8>,
+    payload: Arc<Vec<u8>>,
     expires_at: Instant,
     inserted_at: Instant,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct EvictionKey(Instant, u64);
+
+impl Ord for EvictionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0).then_with(|| self.1.cmp(&other.1))
+    }
+}
+
+impl PartialOrd for EvictionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug)]
+struct CacheInner {
+    entries: HashMap<ReconstructionCacheKey, MemoryEntry>,
+    eviction_order: BTreeMap<EvictionKey, ReconstructionCacheKey>,
+    next_seq: u64,
+    loading: HashMap<ReconstructionCacheKey, Arc<Notify>>,
+}
+
+impl CacheInner {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            eviction_order: BTreeMap::new(),
+            next_seq: 0,
+            loading: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: ReconstructionCacheKey, entry: MemoryEntry) {
+        let inserted_at = entry.inserted_at;
+        if let Some(old) = self.entries.insert(key.clone(), entry) {
+            self.eviction_order
+                .remove(&EvictionKey(old.inserted_at, old.seq));
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.eviction_order
+            .insert(EvictionKey(inserted_at, seq), key);
+    }
+
+    fn remove(&mut self, key: &ReconstructionCacheKey) -> Option<MemoryEntry> {
+        if let Some(entry) = self.entries.remove(key) {
+            self.eviction_order
+                .remove(&EvictionKey(entry.inserted_at, entry.seq));
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some((_eviction_key, key)) = self.eviction_order.pop_first() {
+            if self.entries.contains_key(&key) {
+                self.entries.remove(&key);
+                return;
+            }
+        }
+    }
 }
 
 /// Bounded in-memory reconstruction cache adapter.
@@ -21,7 +89,7 @@ struct MemoryEntry {
 pub struct MemoryReconstructionCache {
     ttl: Duration,
     max_entries: NonZeroUsize,
-    entries: Arc<RwLock<HashMap<ReconstructionCacheKey, MemoryEntry>>>,
+    inner: Arc<RwLock<CacheInner>>,
 }
 
 impl MemoryReconstructionCache {
@@ -31,7 +99,7 @@ impl MemoryReconstructionCache {
         Self {
             ttl: Duration::from_secs(ttl_seconds.get()),
             max_entries,
-            entries: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(CacheInner::new())),
         }
     }
 }
@@ -48,22 +116,47 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
         Box::pin(async move {
             let now = Instant::now();
             {
-                let entries = self.entries.read().await;
-                if let Some(entry) = entries.get(key) {
+                let inner = self.inner.read().await;
+                if let Some(entry) = inner.entries.get(key) {
                     if entry.expires_at > now {
-                        return Ok(Some(entry.payload.clone()));
+                        return Ok(Some(entry.payload.as_ref().clone()));
                     }
-                } else {
+                } else if !inner.loading.contains_key(key) {
                     return Ok(None);
                 }
             }
 
-            let mut entries = self.entries.write().await;
-            let should_remove = entries
+            let mut inner = self.inner.write().await;
+
+            if let Some(entry) = inner.entries.get(key)
+                && entry.expires_at > now
+            {
+                return Ok(Some(entry.payload.as_ref().clone()));
+            }
+
+            if let Some(notify) = inner.loading.get(key) {
+                let notify = Arc::clone(notify);
+                drop(inner);
+                notify.notified().await;
+
+                let read_inner = self.inner.read().await;
+                if let Some(entry) = read_inner.entries.get(key)
+                    && entry.expires_at > Instant::now()
+                {
+                    return Ok(Some(entry.payload.as_ref().clone()));
+                }
+                return Ok(None);
+            }
+
+            let notify = Arc::new(Notify::new());
+            inner.loading.insert(key.clone(), Arc::clone(&notify));
+
+            let should_remove = inner
+                .entries
                 .get(key)
                 .is_some_and(|entry| entry.expires_at <= now);
             if should_remove {
-                let _removed = entries.remove(key);
+                inner.remove(key);
             }
             Ok(None)
         })
@@ -76,20 +169,23 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
     ) -> ReconstructionCacheFuture<'operation, ()> {
         Box::pin(async move {
             let now = Instant::now();
-            let expires_at = now.checked_add(self.ttl).map_or(now, |value| value);
-            let mut entries = self.entries.write().await;
-            prune_expired_entries(&mut entries, now);
-            if !entries.contains_key(key) && entries.len() >= self.max_entries.get() {
-                evict_oldest_entry(&mut entries);
+            let expires_at = now.checked_add(self.ttl).unwrap_or(now);
+            let mut inner = self.inner.write().await;
+            if !inner.entries.contains_key(key) && inner.entries.len() >= self.max_entries.get() {
+                inner.evict_oldest();
             }
-            entries.insert(
+            inner.insert(
                 key.clone(),
                 MemoryEntry {
-                    payload: payload.to_vec(),
+                    payload: Arc::new(payload.to_vec()),
                     expires_at,
                     inserted_at: now,
+                    seq: 0,
                 },
             );
+            if let Some(notify) = inner.loading.remove(key) {
+                notify.notify_waiters();
+            }
             Ok(())
         })
     }
@@ -99,23 +195,9 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
         key: &'operation ReconstructionCacheKey,
     ) -> ReconstructionCacheFuture<'operation, bool> {
         Box::pin(async move {
-            let mut entries = self.entries.write().await;
-            Ok(entries.remove(key).is_some())
+            let mut inner = self.inner.write().await;
+            Ok(inner.remove(key).is_some())
         })
-    }
-}
-
-fn prune_expired_entries(entries: &mut HashMap<ReconstructionCacheKey, MemoryEntry>, now: Instant) {
-    entries.retain(|_key, entry| entry.expires_at > now);
-}
-
-fn evict_oldest_entry(entries: &mut HashMap<ReconstructionCacheKey, MemoryEntry>) {
-    let oldest_key = entries
-        .iter()
-        .min_by_key(|(_key, entry)| entry.inserted_at)
-        .map(|(key, _entry)| key.clone());
-    if let Some(oldest_key) = oldest_key {
-        let _removed = entries.remove(&oldest_key);
     }
 }
 
@@ -125,8 +207,6 @@ mod tests {
         num::{NonZeroU64, NonZeroUsize},
         time::Duration,
     };
-
-    use tokio::time::sleep;
 
     use super::MemoryReconstructionCache;
     use crate::{AsyncReconstructionCache, ReconstructionCacheKey};
@@ -146,8 +226,8 @@ mod tests {
 
     #[tokio::test]
     async fn memory_cache_evicts_oldest_entry_when_capacity_is_full() {
-        let max_entries = NonZeroUsize::new(2).map_or(NonZeroUsize::MIN, |value| value);
-        let ttl_seconds = NonZeroU64::new(60).map_or(NonZeroU64::MIN, |value| value);
+        let max_entries = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let ttl_seconds = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
         let cache = MemoryReconstructionCache::new(ttl_seconds, max_entries);
         let first = ReconstructionCacheKey::latest("asset-1.bin", None);
         let second = ReconstructionCacheKey::latest("asset-2.bin", None);
@@ -169,14 +249,14 @@ mod tests {
         assert_eq!(third_value.ok(), Some(Some(b"third".to_vec())));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn memory_cache_expires_entries_after_ttl() {
-        let ttl_seconds = NonZeroU64::new(1).map_or(NonZeroU64::MIN, |value| value);
+        let ttl_seconds = NonZeroU64::new(1).unwrap_or(NonZeroU64::MIN);
         let cache = MemoryReconstructionCache::new(ttl_seconds, NonZeroUsize::MIN);
         let key = ReconstructionCacheKey::latest("asset.bin", None);
         assert!(cache.put(&key, b"payload").await.is_ok());
 
-        sleep(Duration::from_millis(1100)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         let value = cache.get(&key).await;
 
         assert!(value.is_ok());

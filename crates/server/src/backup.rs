@@ -3,7 +3,8 @@ use std::io::Write;
 use serde::Serialize;
 use serde_json::to_writer;
 use shardline_index::{
-    AsyncIndexStore, LocalIndexStore, PostgresIndexStore, PostgresRecordStore, RecordStore,
+    AsyncIndexStore, LocalIndexStore, PostgresIndexStore, PostgresRecordStore, RecordTraversal,
+    xet_hash_hex_string,
 };
 use shardline_storage::{ObjectMetadata, ObjectPrefix};
 
@@ -79,7 +80,7 @@ impl BackupManifestObjectEntry {
         Self {
             key: metadata.key().as_str().to_owned(),
             length: metadata.length(),
-            checksum: metadata.checksum().map(|hash| hash.api_hex_string()),
+            checksum: metadata.checksum().map(xet_hash_hex_string),
         }
     }
 }
@@ -131,13 +132,13 @@ where
     IndexAdapter: AsyncIndexStore + Sync,
     IndexAdapter::Error: Into<ServerError>,
 {
-    RecordStore::visit_latest_records(record_store, |_entry| {
+    RecordTraversal::visit_latest_records(record_store, |_entry| {
         report.latest_records = checked_increment(report.latest_records)?;
         Ok::<(), ServerError>(())
     })
     .await?;
 
-    RecordStore::visit_version_records(record_store, |_entry| {
+    RecordTraversal::visit_version_records(record_store, |_entry| {
         report.version_records = checked_increment(report.version_records)?;
         Ok::<(), ServerError>(())
     })
@@ -268,7 +269,7 @@ where
     writer.write_all(b"[")?;
 
     let mut first_object = true;
-    object_store.visit_prefix(&prefix, |metadata| {
+    crate::object_store::visit_object_prefix(object_store, &prefix, |metadata| {
         if first_object {
             first_object = false;
         } else {
