@@ -1,0 +1,22 @@
+[package]
+name = "shardline-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shared Prometheus metrics for the Shardline server ecosystem."
+readme = "README.md"
+
+[dependencies]
+prometheus = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+futures-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[lints]
+workspace = true

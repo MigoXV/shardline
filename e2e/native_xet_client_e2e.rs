@@ -27,6 +27,7 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::{from_slice, json, to_vec};
 use sha2::Sha256;
+use shardline_protocol::SecretString;
 use shardline_server::{
     BatchReconstructionResponse, FileReconstructionResponse, FileReconstructionV2Response,
     ObjectStorageAdapter, ServerConfig, XetCasTokenResponse, serve_with_listener,
@@ -86,11 +87,16 @@ fn shardline_accepts_native_xet_upload_and_download_flows_with_s3_when_configure
     let Ok(Some(services)) = services else {
         return;
     };
-    let Some(s3_config) =
-        services.s3_config_with_prefix(Some(&services.unique_s3_key_prefix("native-xet-e2e")))
+    let Some(raw) =
+        services.s3_raw_config(Some(&services.unique_s3_key_prefix("native-xet-e2e")))
     else {
         return;
     };
+    let s3_config = shardline_storage::S3ObjectStoreConfig::new(raw.bucket, raw.region)
+        .with_endpoint(raw.endpoint)
+        .with_credentials(raw.access_key.map(SecretString::new), raw.secret_key.map(SecretString::new), raw.session_token.map(SecretString::new))
+        .with_key_prefix(raw.key_prefix.as_deref())
+        .with_allow_http(raw.allow_http);
 
     let runtime = threadpool();
     assert!(runtime.is_some());

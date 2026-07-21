@@ -1,0 +1,35 @@
+[package]
+name = "shardline-server-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/shardline-server-core"
+readme = "README.md"
+description = "Shared core types for the Shardline server ecosystem."
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shardline-auth.workspace = true
+shardline-index.workspace = true
+shardline-protocol.workspace = true
+shardline-storage = { workspace = true, features = ["s3"] }
+shardline-validation.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["cargo_bench_support"] }
+proptest.workspace = true
+shardline-test-support.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "auth_verify"
+harness = false
+
+[lints]
+workspace = true

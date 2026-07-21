@@ -1,0 +1,632 @@
+mod operational;
+mod protocol_routes;
+mod provider;
+mod provider_routes;
+mod reconstruction_helpers;
+mod reconstruction_routes;
+
+pub use provider::{
+    extract_provider_subject, latest_lifecycle_signal_at, reconciled_provider_repository_state,
+    validate_provider_name_path,
+};
+pub use reconstruction_helpers::{full_byte_stream_response, parse_batch_reconstruction_query};
+
+use std::{
+    fs,
+    future::{Future, pending},
+    io::Error,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    http::{HeaderMap, Method, header},
+    middleware::{self, Next},
+    routing::{get, head, post},
+    serve as serve_http,
+};
+use shardline_protocol::{RepositoryScope, TokenScope};
+use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::{
+    ServerConfig, ServerError,
+    auth::{AuthContext, ServerAuth},
+    backend::ServerBackend,
+    config::AuthProviderKind,
+    config::ServerConfigError,
+    jwks_provider::JwksProvider,
+    metrics::MetricsLayer,
+    oidc_provider::OidcProvider,
+    provider::ProviderTokenService,
+    reconstruction_cache::ReconstructionCacheService,
+    server_frontend::ServerFrontend,
+    server_role::ServerRole,
+    transfer_limiter::TransferLimiter,
+    xet_adapter::{XET_READ_TOKEN_ROUTE, XET_WRITE_TOKEN_ROUTE, XORB_TRANSFER_ROUTE},
+};
+use operational::{
+    head_xorb, health, metrics, read_chunk, read_xorb_transfer, ready, stats, upload_shard,
+    upload_xorb, write_xorb_transfer,
+};
+use protocol_routes::{
+    bazel_get, bazel_get_ac, bazel_get_cas, bazel_head, bazel_head_ac, bazel_head_cas, bazel_put,
+    bazel_put_ac, bazel_put_cas, lfs_batch, lfs_delete_object, lfs_get_object, lfs_head_object,
+    lfs_patch_object, lfs_put_object, lfs_verify_object, oci_api_dispatch, oci_dispatch,
+    oci_registry_token, oci_transfer_dispatch, oci_v2_root,
+};
+#[cfg(feature = "fuzzing")]
+pub(crate) use protocol_routes::{parse_oci_path, parse_upload_content_range};
+use provider_routes::{
+    git_lfs_authenticate, handle_provider_webhook, issue_provider_token, issue_xet_read_token,
+    issue_xet_write_token,
+};
+use reconstruction_routes::{batch_reconstruction, reconstruction, reconstruction_v2};
+
+pub const MAX_BATCH_RECONSTRUCTION_FILE_IDS: usize = 1024;
+pub const MAX_BATCH_RECONSTRUCTION_QUERY_BYTES: usize = 131_072;
+pub const MAX_LFS_BATCH_OBJECTS: usize = 1024;
+pub const MAX_OCI_MANIFEST_TAGS: usize = 128;
+pub const MAX_OCI_TAG_LIST_PAGE_SIZE: usize = 256;
+pub const MAX_PROTOCOL_QUERY_BYTES: usize = 16_384;
+pub const MAX_PROVIDER_TOKEN_REQUEST_BODY_BYTES: usize = 16_384;
+pub const MAX_PROVIDER_WEBHOOK_BODY_BYTES: usize = 1_048_576;
+pub const MAX_PROVIDER_NAME_BYTES: usize = 64;
+pub const MAX_PROVIDER_SUBJECT_BYTES: usize = 512;
+pub const MAX_PROVIDER_BASIC_AUTH_HEADER_BYTES: usize = 4096;
+
+#[derive(Debug)]
+pub struct AppState {
+    pub config: ServerConfig,
+    pub role: ServerRole,
+    pub backend: ServerBackend,
+    pub auth: Option<ServerAuth>,
+    pub provider_tokens: Option<ProviderTokenService>,
+    pub reconstruction_cache: ReconstructionCacheService,
+    pub transfer_limiter: TransferLimiter,
+    pub oci_registry_token_limiter: Arc<Semaphore>,
+    pub protocol_metrics: ProtocolMetrics,
+}
+
+#[derive(Debug, Default)]
+pub struct ProtocolMetrics {
+    oci_registry_token_requests_total: AtomicU64,
+    oci_registry_token_rate_limited_total: AtomicU64,
+    oci_registry_token_active_requests: AtomicU64,
+}
+
+impl ProtocolMetrics {
+    fn increment_oci_registry_token_requests(&self) {
+        let _previous = self
+            .oci_registry_token_requests_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn increment_oci_registry_token_rate_limited(&self) {
+        let _previous = self
+            .oci_registry_token_rate_limited_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn begin_oci_registry_token_request(&self) -> ActiveProtocolRequestGuard<'_> {
+        let _previous = self
+            .oci_registry_token_active_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ActiveProtocolRequestGuard {
+            gauge: &self.oci_registry_token_active_requests,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ActiveProtocolRequestGuard<'metric> {
+    gauge: &'metric AtomicU64,
+}
+
+impl Drop for ActiveProtocolRequestGuard<'_> {
+    fn drop(&mut self) {
+        let _previous = self.gauge.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Builds the Shardline HTTP router.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when the configured backend cannot initialize.
+pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
+    config.validate_runtime_requirements()?;
+    let role = config.server_role();
+    let max_request_body_bytes = config.max_request_body_bytes();
+    let provider_token_body_limit = bounded_api_body_limit(
+        max_request_body_bytes,
+        MAX_PROVIDER_TOKEN_REQUEST_BODY_BYTES,
+    );
+    let provider_webhook_body_limit =
+        bounded_api_body_limit(max_request_body_bytes, MAX_PROVIDER_WEBHOOK_BODY_BYTES);
+    let backend = ServerBackend::from_config(&config).await?;
+    let auth = build_auth_provider(&config).await?;
+    let provider_tokens = if role.serves_api() {
+        match (
+            config.provider_config_path(),
+            config.provider_api_key(),
+            config.provider_token_issuer(),
+            config.provider_token_ttl_seconds(),
+            config.token_signing_key(),
+        ) {
+            (
+                Some(config_path),
+                Some(api_key),
+                Some(issuer),
+                Some(ttl_seconds),
+                Some(signing_key),
+            ) => Some(ProviderTokenService::from_file(
+                config_path,
+                api_key.to_vec(),
+                issuer,
+                ttl_seconds,
+                signing_key,
+            )?),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let reconstruction_cache = if role.uses_reconstruction_cache() {
+        ReconstructionCacheService::from_config(&config)?
+    } else {
+        ReconstructionCacheService::disabled()
+    };
+    let transfer_limiter =
+        TransferLimiter::new(config.chunk_size(), config.transfer_max_in_flight_chunks());
+    let oci_registry_token_limiter = Arc::new(Semaphore::new(
+        config.oci_registry_token_max_in_flight_requests().get(),
+    ));
+    let state = Arc::new(AppState {
+        config,
+        role,
+        backend,
+        auth,
+        provider_tokens,
+        reconstruction_cache,
+        transfer_limiter,
+        oci_registry_token_limiter,
+        protocol_metrics: ProtocolMetrics::default(),
+    });
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers(Any);
+
+    let mut app = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(ready))
+        .route("/metrics", get(metrics))
+        .layer(MetricsLayer)
+        .layer(middleware::from_fn(security_headers_middleware));
+    if role.serves_api() {
+        app = app
+            .route(
+                "/v1/providers/{provider}/tokens",
+                post(issue_provider_token).layer(DefaultBodyLimit::max(provider_token_body_limit)),
+            )
+            .route(
+                "/v1/providers/{provider}/git-lfs-authenticate",
+                post(git_lfs_authenticate).layer(DefaultBodyLimit::max(provider_token_body_limit)),
+            )
+            .route(
+                "/v1/providers/{provider}/webhooks",
+                post(handle_provider_webhook)
+                    .layer(DefaultBodyLimit::max(provider_webhook_body_limit)),
+            )
+            .route("/v1/stats", get(stats));
+    }
+
+    // Build hub routes separately — they carry their own state type (HubState)
+    // and must be merged at the Router<()> level after both sides are
+    // converted via `.with_state()`.
+    let mut hub_state: Option<shardline_hub_api::routes::HubState> = None;
+    let mut xet_frontend_enabled = false;
+    for frontend in state.config.server_frontends() {
+        match frontend {
+            ServerFrontend::Hub => {
+                hub_state = Some(build_hub_state(&state)?);
+            }
+            ServerFrontend::Xet => {
+                xet_frontend_enabled = true;
+                app = register_frontend_routes(app, *frontend, role, &state);
+            }
+            ServerFrontend::Lfs | ServerFrontend::BazelHttp | ServerFrontend::Oci => {
+                app = register_frontend_routes(app, *frontend, role, &state);
+            }
+        }
+    }
+
+    let app = app
+        .layer(DefaultBodyLimit::max(max_request_body_bytes.get()))
+        .with_state(state);
+
+    // Merge hub routes (Router<()>) into the main app (Router<()>).
+    let app = if let Some(hs) = hub_state {
+        app.merge(shardline_hub_api::hub_routes(hs, !xet_frontend_enabled))
+    } else {
+        app
+    };
+
+    // Apply CORS after every optional frontend has been registered and the Hub
+    // router has been merged, so preflight and normal requests are covered by
+    // the same policy regardless of which protocol owns the route.
+    Ok(app.layer(cors))
+}
+
+/// Runs the Shardline HTTP server.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when the listener cannot bind or the server exits with an
+/// IO error.
+#[tracing::instrument(skip(config), fields(bind_addr = %config.bind_addr()))]
+pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+    shardline_metrics::metrics()
+        .system
+        .set_uptime(shardline_protocol::unix_now_seconds_lossy() as i64);
+    let listener = TcpListener::bind(config.bind_addr()).await?;
+    tracing::info!("listening on {}", config.bind_addr());
+    serve_with_listener(config, listener).await
+}
+
+/// Runs the Shardline HTTP server on an existing listener.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] when router initialization fails or the server exits with
+/// an IO error.
+pub async fn serve_with_listener(
+    config: ServerConfig,
+    listener: TcpListener,
+) -> Result<(), ServerError> {
+    serve_with_listener_until(config, listener, async {
+        tokio::signal::ctrl_c().await.ok();
+    })
+    .await
+}
+
+/// Runs the server until the supplied shutdown signal resolves.
+///
+/// Keeping the signal injectable lets the shutdown timeout be exercised without
+/// delivering a process-wide signal during tests.
+async fn serve_with_listener_until<F>(
+    config: ServerConfig,
+    listener: TcpListener,
+    shutdown_signal: F,
+) -> Result<(), ServerError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let app = router(config.clone()).await?;
+    tracing::info!("router initialized, starting HTTP serve");
+    let shutdown_timeout = config.shutdown_timeout();
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let graceful_shutdown = async move {
+        shutdown_signal.await;
+        tracing::info!("shutdown signal received, draining connections");
+        let _ignored = shutdown_started_tx.send(());
+    };
+    let serve = serve_http(listener, app).with_graceful_shutdown(graceful_shutdown);
+    if let Some(timeout) = shutdown_timeout {
+        tokio::select! {
+            result = serve => {
+                result.map_err(ServerError::from)?;
+            }
+            () = async {
+                if shutdown_started_rx.await.is_ok() {
+                    tokio::time::sleep(timeout).await;
+                } else {
+                    pending::<()>().await;
+                }
+            } => {
+                tracing::warn!("graceful shutdown timed out after {timeout:?}, aborting");
+            }
+        }
+    } else {
+        serve.await.map_err(ServerError::from)?;
+    }
+    Ok(())
+}
+
+fn register_frontend_routes(
+    app: Router<Arc<AppState>>,
+    frontend: ServerFrontend,
+    role: ServerRole,
+    _app_state: &AppState,
+) -> Router<Arc<AppState>> {
+    match frontend {
+        ServerFrontend::Xet => register_xet_routes(app, role),
+        ServerFrontend::Lfs => register_lfs_routes(app, role),
+        ServerFrontend::BazelHttp => register_bazel_routes(app, role),
+        ServerFrontend::Oci => register_oci_routes(app, role),
+        ServerFrontend::Hub => app, // Hub routes are built separately
+    }
+}
+
+fn register_xet_routes(mut app: Router<Arc<AppState>>, role: ServerRole) -> Router<Arc<AppState>> {
+    if role.serves_api() {
+        app = app
+            .route(XET_READ_TOKEN_ROUTE, get(issue_xet_read_token))
+            .route(XET_WRITE_TOKEN_ROUTE, get(issue_xet_write_token))
+            .route("/reconstructions", get(batch_reconstruction))
+            .route("/v1/reconstructions", get(batch_reconstruction))
+            .route("/v1/reconstructions/{file_id}", get(reconstruction))
+            .route("/v2/reconstructions/{file_id}", get(reconstruction_v2))
+            .route("/shards", post(upload_shard))
+            .route("/v1/shards", post(upload_shard));
+    }
+    if role.serves_transfer() {
+        app = app
+            .route("/v1/chunks/default/{hash}", get(read_chunk))
+            .route("/v1/chunks/default-merkledb/{hash}", get(read_chunk))
+            .route(
+                "/v1/xorbs/default/{hash}",
+                head(head_xorb).post(upload_xorb),
+            )
+            .route(
+                XORB_TRANSFER_ROUTE,
+                get(read_xorb_transfer).put(write_xorb_transfer),
+            );
+    }
+    app
+}
+
+fn register_lfs_routes(mut app: Router<Arc<AppState>>, role: ServerRole) -> Router<Arc<AppState>> {
+    if role.serves_api() {
+        app = app.route("/v1/lfs/objects/batch", post(lfs_batch));
+    }
+    if role.serves_transfer() {
+        app = app
+            .route(
+                "/v1/lfs/objects/{oid}",
+                get(lfs_get_object)
+                    .head(lfs_head_object)
+                    .put(lfs_put_object)
+                    .patch(lfs_patch_object)
+                    .delete(lfs_delete_object),
+            )
+            .route("/v1/lfs/objects/{oid}/verify", post(lfs_verify_object));
+    }
+    app
+}
+
+fn register_bazel_routes(
+    mut app: Router<Arc<AppState>>,
+    role: ServerRole,
+) -> Router<Arc<AppState>> {
+    if role.serves_transfer() {
+        app = app
+            .route(
+                "/v1/bazel/cache/ac/{hash}",
+                get(bazel_get_ac).put(bazel_put_ac).head(bazel_head_ac),
+            )
+            .route(
+                "/v1/bazel/cache/cas/{hash}",
+                get(bazel_get_cas).put(bazel_put_cas).head(bazel_head_cas),
+            )
+            // Flat routes for Bazel client compatibility
+            .route(
+                "/v1/bazel/{hash}",
+                get(bazel_get).put(bazel_put).head(bazel_head),
+            );
+    }
+    app
+}
+
+fn register_oci_routes(mut app: Router<Arc<AppState>>, role: ServerRole) -> Router<Arc<AppState>> {
+    match role {
+        ServerRole::All => {
+            app = app
+                .route("/v2/token", get(oci_registry_token))
+                .route("/v2/", get(oci_v2_root))
+                .route("/v2/{*path}", axum::routing::any(oci_dispatch));
+        }
+        ServerRole::Api => {
+            app = app
+                .route("/v2/token", get(oci_registry_token))
+                .route("/v2/", get(oci_v2_root))
+                .route("/v2/{*path}", axum::routing::any(oci_api_dispatch));
+        }
+        ServerRole::Transfer => {
+            app = app.route("/v2/{*path}", axum::routing::any(oci_transfer_dispatch));
+        }
+    }
+    app
+}
+
+fn authorize(
+    state: &AppState,
+    headers: &HeaderMap,
+    required_scope: TokenScope,
+) -> Result<Option<AuthContext>, ServerError> {
+    if let Some(auth) = &state.auth {
+        return Ok(Some(auth.authorize(headers, required_scope)?));
+    }
+
+    Ok(None)
+}
+
+const fn scope_from_auth(auth: &AuthContext) -> &RepositoryScope {
+    auth.claims().repository()
+}
+
+#[must_use]
+pub fn bounded_api_body_limit(configured_limit: NonZeroUsize, endpoint_limit: usize) -> usize {
+    configured_limit.get().min(endpoint_limit)
+}
+
+fn build_hub_state(
+    app_state: &AppState,
+) -> Result<shardline_hub_api::routes::HubState, ServerError> {
+    let hub_auth = app_state
+        .auth
+        .as_ref()
+        .map(|sa| shardline_hub_api::auth::HubAuth::from_arc(sa.provider_arc()));
+
+    // Create a HubStore from the configured backend.
+    // When using Postgres, share the main server's pool so Hub API and the core
+    // server operate on the same database connection pool (multi-process safe).
+    let root_dir = app_state.config.root_dir();
+    let store: shardline_index::hub::BoxedHubStore =
+        app_state.config.index_postgres_url().map_or_else(
+            || -> Result<shardline_index::hub::BoxedHubStore, ServerError> {
+                let hub_root = root_dir.join("hub");
+                if let Err(e) = fs::create_dir_all(&hub_root) {
+                    tracing::warn!("failed to create hub directory: {e}");
+                }
+                let sqlite_store = shardline_index::LocalIndexStore::new(hub_root.clone())
+                    .map_err(|e| ServerError::Io(Error::other(e)))?;
+                // Ensure hub-specific tables exist
+                if let Err(e) = shardline_index::hub::ensure_hub_tables(&hub_root) {
+                    tracing::warn!("failed to create hub tables: {e}");
+                }
+                Ok(shardline_index::hub::BoxedHubStore::from_store(
+                    sqlite_store,
+                ))
+            },
+            |pg_url| -> Result<shardline_index::hub::BoxedHubStore, ServerError> {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(16)
+                    .connect_lazy(pg_url)
+                    .map_err(|e| ServerError::Io(Error::other(e)))?;
+                let pg_store = shardline_index::PostgresIndexStore::new(pool);
+                Ok(shardline_index::hub::BoxedHubStore::from_store(pg_store))
+            },
+        )?;
+
+    // Build an HTTP client for outbound webhook delivery.
+    let http_client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::warn!("failed to build HTTP client for webhook delivery: {e}");
+            None
+        }
+    };
+
+    Ok(shardline_hub_api::routes::HubState {
+        store,
+        object_store: app_state.backend.object_store(),
+        auth: hub_auth,
+        http_client,
+    })
+}
+
+fn endpoint_body_limit(
+    configured_limit: NonZeroUsize,
+    endpoint_limit: usize,
+) -> Result<NonZeroUsize, ServerError> {
+    NonZeroUsize::new(bounded_api_body_limit(configured_limit, endpoint_limit))
+        .ok_or(ServerError::Overflow)
+}
+
+/// Acquires a semaphore permit for a chunk transfer.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] if the chunk length cannot be determined or the transfer limiter
+/// is closed.
+pub async fn acquire_chunk_transfer_permit(
+    state: &AppState,
+    hash_hex: &str,
+) -> Result<OwnedSemaphorePermit, ServerError> {
+    let total_bytes = state.backend.chunk_length(hash_hex).await?;
+    state.transfer_limiter.acquire_bytes(total_bytes).await
+}
+
+async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>, ServerError> {
+    match config.auth_provider() {
+        AuthProviderKind::Local => {
+            let Some(key) = config.token_signing_key() else {
+                return Ok(None);
+            };
+            Ok(Some(ServerAuth::new(key)?))
+        }
+        AuthProviderKind::Passthrough => {
+            let provider = Box::new(shardline_server_core::auth::PassthroughProvider);
+            Ok(Some(ServerAuth::from_provider(provider)))
+        }
+        AuthProviderKind::Oidc => {
+            let issuer = config
+                .auth_oidc_issuer()
+                .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            let provider = OidcProvider::new(issuer, None)
+                .await
+                .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            Ok(Some(ServerAuth::from_provider(Box::new(provider))))
+        }
+        AuthProviderKind::Jwks => {
+            let jwks_url = config
+                .auth_jwks_url()
+                .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            let issuer = config.auth_jwks_issuer().unwrap_or("jwks");
+            let provider = JwksProvider::new(jwks_url, issuer)
+                .await
+                .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            Ok(Some(ServerAuth::from_provider(Box::new(provider))))
+        }
+    }
+}
+
+pub(super) async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let response = next.run(request).await;
+    let (mut parts, body) = response.into_parts();
+    let headers = &mut parts.headers;
+    if !headers.contains_key(header::X_CONTENT_TYPE_OPTIONS) {
+        headers.insert(
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::HeaderValue::from_static("nosniff"),
+        );
+    }
+    if !headers.contains_key(header::X_FRAME_OPTIONS) {
+        headers.insert(
+            header::X_FRAME_OPTIONS,
+            header::HeaderValue::from_static("DENY"),
+        );
+    }
+    if !headers.contains_key(header::STRICT_TRANSPORT_SECURITY) {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            header::HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    if !headers.contains_key(header::REFERRER_POLICY) {
+        headers.insert(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
+    axum::response::Response::from_parts(parts, body)
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod e2e_tests;

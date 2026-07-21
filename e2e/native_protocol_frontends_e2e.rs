@@ -22,7 +22,7 @@ use reqwest::Client;
 use serde_json::{Value, json, to_vec};
 use sha2::{Digest, Sha256};
 use shardline_protocol::{
-    RepositoryProvider, RepositoryScope, TokenClaims, TokenScope, TokenSigner,
+    RepositoryProvider, RepositoryScope, SecretString, TokenClaims, TokenScope, TokenSigner,
 };
 use shardline_server::{
     ObjectStorageAdapter, ServerConfig, ServerError, ServerFrontend, serve_with_listener,
@@ -1624,9 +1624,14 @@ async fn start_runtime_with_s3(
     let addr = listener.local_addr()?;
     let base_url = format!("http://{addr}");
     let key_prefix = deployment.unique_s3_key_prefix("native-protocol-frontends");
-    let s3_config = deployment
-        .s3_config_with_prefix(Some(&key_prefix))
+    let raw = deployment
+        .s3_raw_config(Some(&key_prefix))
         .ok_or_else(|| ServerE2eInvariantError::new("minio s3 config was unavailable"))?;
+    let s3_config = shardline_storage::S3ObjectStoreConfig::new(raw.bucket, raw.region)
+        .with_endpoint(raw.endpoint)
+        .with_credentials(raw.access_key.map(SecretString::new), raw.secret_key.map(SecretString::new), raw.session_token.map(SecretString::new))
+        .with_key_prefix(raw.key_prefix.as_deref())
+        .with_allow_http(raw.allow_http);
     let config = ServerConfig::new(
         addr,
         base_url.clone(),
