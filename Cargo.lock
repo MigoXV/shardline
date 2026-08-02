@@ -561,15 +561,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "concurrent-queue"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1013,11 +1004,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -1966,6 +1956,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "lz4_flex"
@@ -3243,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "shardline"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "bytes",
  "clap",
@@ -3273,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-auth"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -3287,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-bench"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "criterion",
  "libc",
@@ -3301,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-cache"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "criterion",
  "hex",
@@ -3315,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-cas"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3329,8 +3328,9 @@ dependencies = [
 
 [[package]]
 name = "shardline-fsck"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
+ "lz4_flex 0.11.6",
  "rusqlite",
  "serde_json",
  "shardline-cas",
@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-gc"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-hub-api"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "axum",
  "base64",
@@ -3430,7 +3430,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-index"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-metrics"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-oci-adapter"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-protocol"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "criterion",
  "hex",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-protocol-adapters"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "hex",
  "serde",
@@ -3521,7 +3521,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-provider-events"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "serde_json",
  "shardline-index",
@@ -3539,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-rebuild"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-server"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3574,6 +3574,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "libc",
+ "lz4_flex 0.11.6",
  "prometheus",
  "redis",
  "reqwest 0.12.28",
@@ -3619,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-server-core"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3640,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-storage"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3661,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-test-support"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -3670,14 +3671,14 @@ dependencies = [
 
 [[package]]
 name = "shardline-validation"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "shardline-vcs"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "hex",
  "hmac",
@@ -3690,7 +3691,7 @@ dependencies = [
 
 [[package]]
 name = "shardline-xet-adapter"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "axum",
  "criterion",
@@ -3708,12 +3709,13 @@ dependencies = [
 
 [[package]]
 name = "shardline-xet-core"
-version = "1.2.2"
+version = "1.3.0"
 dependencies = [
  "blake3",
  "bytes",
  "countio",
- "lz4_flex",
+ "gearhash",
+ "lz4_flex 0.13.0",
  "proptest",
  "serde",
  "static_assertions",
@@ -5532,7 +5534,7 @@ dependencies = [
  "heapify",
  "itertools 0.14.0",
  "lazy_static",
- "lz4_flex",
+ "lz4_flex 0.13.0",
  "more-asserts",
  "rand 0.10.1",
  "regex",
