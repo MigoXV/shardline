@@ -5,7 +5,12 @@ minting. The server selects a concrete provider at startup based on configuratio
 
 ## The `AuthProvider` Trait
 
-Defined in `shardline-server-core`, the trait has two methods:
+> **Internals note:** the trait below is defined in the `shardline-server-core` crate.
+> Builders of custom token issuers need its exact contract; user documentation refers
+> to it simply as the pluggable auth-provider interface.
+
+Shardline uses a pluggable auth-provider interface for bearer-token verification and
+minting. The interface has two methods:
 
 ```rust
 pub trait AuthProvider: Send + Sync {
@@ -124,7 +129,19 @@ SHARDLINE_AUTH_OIDC_ISSUER=https://accounts.google.com
 The provider fetches the issuer's JWKS signing keys at startup and caches them.
 Tokens are validated against the issuer's public keys and standard OIDC claims
 (expiration, issuer match).
-Token minting is not supported; use an external identity provider to issue tokens.
+
+The `jwks_uri` advertised by the discovery document must be hosted on the
+issuer's own host; the discovery fetch never follows redirects. IdPs that
+legitimately serve keys from a different host (e.g. Google serves JWKS from
+`www.googleapis.com`) must list that host explicitly:
+
+```bash
+SHARDLINE_AUTH_OIDC_JWKS_HOST_ALLOWLIST=www.googleapis.com
+```
+
+Set `SHARDLINE_AUTH_OIDC_AUDIENCE` to additionally require a specific `aud`
+claim (and reject tokens that omit it). Token minting is not supported; use an
+external identity provider to issue tokens.
 
 ### JWKS
 

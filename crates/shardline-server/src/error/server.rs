@@ -47,7 +47,7 @@ use crate::{
 ///
 /// # Design
 ///
-/// Each variant maps to exactly one HTTP status code via [`ServerError::status_code`].
+/// Each variant maps to exactly one HTTP status code via `ServerError::status_code`.
 /// Subsystem errors (e.g., [`LocalIndexStoreError`], [`S3ObjectStoreError`]) are
 /// converted via `From` implementations for ergonomic `?` usage.
 ///
@@ -216,6 +216,22 @@ pub enum ServerError {
     /// Too many OCI upload sessions are currently active.
     #[error("too many active oci upload sessions")]
     TooManyUploadSessions,
+    /// Too many LFS chunked-patch (PATCH) staging sessions are currently
+    /// active.
+    #[error("too many active lfs patch sessions")]
+    LfsPatchTooManySessions,
+    /// The aggregate staging-byte cap across active LFS chunked-patch
+    /// sessions was exceeded.
+    #[error("lfs patch staging byte quota exceeded")]
+    LfsPatchStoreFull,
+    /// An LFS chunked-patch (PATCH) `Content-Range` start seeks beyond the
+    /// session's sequential-growth high-water mark.
+    #[error("lfs patch content-range seeks beyond the session high-water mark")]
+    LfsPatchRangeNotSatisfiable,
+    /// The global cap on S3 multipart part files across active upload
+    /// sessions was exceeded.
+    #[error("too many active s3 upload part files")]
+    S3UploadTooManyParts,
     /// Too many OCI registry token exchanges are currently active.
     #[error("too many active oci registry token requests")]
     TooManyRegistryTokenRequests,
@@ -249,6 +265,9 @@ pub enum ServerError {
     /// The revision already exists.
     #[error("revision already exists")]
     RevisionConflict,
+    /// The per-repo revision-registry cap was reached.
+    #[error("revision registry is full for this repository")]
+    TooManyRevisions,
 }
 
 impl ServerError {
@@ -270,7 +289,9 @@ impl ServerError {
             Self::InsufficientScope => "DENIED",
             Self::NotAcceptable => "UNSUPPORTED",
             Self::ExpectedBodyHashMismatch => "DIGEST_INVALID",
-            Self::TooManyUploadSessions | Self::TooManyRegistryTokenRequests => "TOO_MANY_REQUESTS",
+            Self::TooManyUploadSessions
+            | Self::S3UploadTooManyParts
+            | Self::TooManyRegistryTokenRequests => "TOO_MANY_REQUESTS",
             // All remaining variants are internal server errors with no
             // OCI-specific code. Add new OCI-mappable variants above.
             Self::Io(_)
@@ -294,6 +315,9 @@ impl ServerError {
             | Self::TooManyShardTerms
             | Self::TooManyBatchReconstructionFileIds
             | Self::UploadIntentConflict
+            | Self::LfsPatchTooManySessions
+            | Self::LfsPatchStoreFull
+            | Self::LfsPatchRangeNotSatisfiable
             | Self::Overflow
             | Self::InvalidRangeHeader
             | Self::RangeNotSatisfiable
@@ -320,7 +344,8 @@ impl ServerError {
             | Self::BlockingTask(_)
             | Self::InvalidPath
             | Self::UnregisteredFile(_)
-            | Self::RevisionConflict => "INTERNAL",
+            | Self::RevisionConflict
+            | Self::TooManyRevisions => "INTERNAL",
         }
     }
 
@@ -367,9 +392,13 @@ impl ServerError {
             Self::TooManyUploadSessions | Self::TooManyRegistryTokenRequests => {
                 StatusCode::TOO_MANY_REQUESTS
             }
+            Self::LfsPatchTooManySessions => StatusCode::TOO_MANY_REQUESTS,
+            Self::LfsPatchStoreFull => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::LfsPatchRangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::S3UploadTooManyParts => StatusCode::TOO_MANY_REQUESTS,
             Self::UploadIntentConflict => StatusCode::CONFLICT,
             Self::InvalidPath | Self::UnregisteredFile(_) => StatusCode::BAD_REQUEST,
-            Self::RevisionConflict => StatusCode::CONFLICT,
+            Self::RevisionConflict | Self::TooManyRevisions => StatusCode::CONFLICT,
             Self::TransferLimiterClosed
             | Self::TransferLimiterTimedOut
             | Self::WorkQueueSaturated
@@ -487,7 +516,8 @@ impl From<XetAdapterError> for ServerError {
             XetAdapterError::InvalidContentHash => Self::InvalidContentHash,
             XetAdapterError::InvalidXorbPrefix => Self::InvalidXorbPrefix,
             XetAdapterError::XorbHashMismatch => Self::XorbHashMismatch,
-            XetAdapterError::InvalidSerializedXorb => Self::InvalidSerializedXorb,
+            XetAdapterError::InvalidSerializedXorb
+            | XetAdapterError::XorbUnpackedLengthExceedsCap => Self::InvalidSerializedXorb,
             XetAdapterError::InvalidSerializedShard(e) => Self::InvalidSerializedShard(e),
             XetAdapterError::MissingReferencedXorb => Self::MissingReferencedXorb,
             XetAdapterError::TooManyShardTerms => Self::TooManyShardTerms,
@@ -677,6 +707,94 @@ impl From<ParseStoredFileRecordError> for ServerError {
                 maximum_bytes,
             },
             ParseStoredFileRecordError::Json(e) => Self::Json(e),
+        }
+    }
+}
+
+/// Classifies a [`ServerError`] into the S3 error envelope's coarse classes.
+///
+/// Lives in the server crate (not the adapter) so the S3 adapter never depends
+/// on `shardline-server`. The generic `From<E: S3ErrorClassify> for S3Error`
+/// in the adapter then produces the XML `<Error>` response:
+///
+/// - `RangeNotSatisfiable` → `416 InvalidRange`
+/// - `NotFound` → `404 NoSuchKey`
+/// - authorization failures → `403 AccessDenied`
+/// - everything else → `500 InternalError`
+impl shardline_s3_adapter::S3ErrorClassify for ServerError {
+    fn s3_class(&self) -> shardline_s3_adapter::S3ErrorClass {
+        use shardline_s3_adapter::S3ErrorClass;
+        match self {
+            Self::RangeNotSatisfiable | Self::LfsPatchRangeNotSatisfiable => {
+                S3ErrorClass::RangeNotSatisfiable
+            }
+            Self::NotFound => S3ErrorClass::NotFound,
+            Self::MissingAuthorization
+            | Self::InvalidAuthorizationHeader
+            | Self::InvalidToken(_)
+            | Self::InsufficientScope
+            | Self::ProviderDenied => S3ErrorClass::AccessDenied,
+            // All remaining variants are internal server errors with no S3
+            // meaning. Add new S3-mappable variants above this catch-all.
+            Self::Io(_)
+            | Self::Json(_)
+            | Self::RequestBodyRead(_)
+            | Self::RequestBodyTooLarge
+            | Self::RequestQueryTooLarge
+            | Self::RequestBodyFrameOutOfBounds
+            | Self::NumericConversion(_)
+            | Self::HashParse(_)
+            | Self::ObjectStore(_)
+            | Self::Index(_)
+            | Self::StoredFileMetadataTooLarge { .. }
+            | Self::StoredFileMetadataLengthMismatch
+            | Self::InvalidFileId
+            | Self::InvalidContentHash
+            | Self::InvalidXorbPrefix
+            | Self::XorbHashMismatch
+            | Self::InvalidSerializedXorb
+            | Self::InvalidSerializedShard(_)
+            | Self::MissingReferencedXorb
+            | Self::TooManyShardTerms
+            | Self::TooManyBatchReconstructionFileIds
+            | Self::UploadIntentConflict
+            | Self::Overflow
+            | Self::InvalidRangeHeader
+            | Self::SigningKeyError(_)
+            | Self::ProviderTokensDisabled
+            | Self::MissingProviderApiKey
+            | Self::InvalidProviderApiKey
+            | Self::MissingProviderSubject
+            | Self::InvalidProviderTokenRequest
+            | Self::MissingProviderWebhookAuthentication
+            | Self::InvalidProviderWebhookAuthentication
+            | Self::InvalidProviderWebhookPayload
+            | Self::UnknownProvider
+            | Self::Provider(_)
+            | Self::ReconstructionCache(_)
+            | Self::Config(_)
+            | Self::ExpectedBodyHashMismatch
+            | Self::InvalidDigest
+            | Self::InvalidRepositoryName
+            | Self::InvalidManifestReference
+            | Self::NotAcceptable
+            | Self::UnauthorizedChallenge(_)
+            | Self::InvalidUploadSession
+            | Self::TooManyUploadSessions
+            | Self::LfsPatchTooManySessions
+            | Self::LfsPatchStoreFull
+            | Self::S3UploadTooManyParts
+            | Self::TooManyRegistryTokenRequests
+            | Self::MissingReconstructionCacheRedisUrl
+            | Self::TransferLimiterClosed
+            | Self::TransferLimiterTimedOut
+            | Self::WorkQueueSaturated
+            | Self::RequestTimedOut
+            | Self::BlockingTask(_)
+            | Self::InvalidPath
+            | Self::UnregisteredFile(_)
+            | Self::RevisionConflict
+            | Self::TooManyRevisions => S3ErrorClass::Internal,
         }
     }
 }

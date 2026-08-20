@@ -143,10 +143,33 @@ pub(crate) fn read_signing_key_bytes(path: &Path) -> Result<SecretBytes, AdminTo
 
     run_before_signing_key_read_hook_for_tests(path);
 
-    let bytes = read_bounded_signing_key(&mut file, metadata.len())?;
+    let mut bytes = read_bounded_signing_key(&mut file, metadata.len())?;
     ensure_signing_key_size_within_limit(metadata.len())?;
 
+    // Strip exactly one trailing line terminator: a trailing newline is almost
+    // always the `echo $KEY > file` / editor artifact, and signing with a key
+    // that still contains it produces tokens that diverge from a key shared as
+    // the raw file bytes. A signing key is never legitimately newline-
+    // terminated, so strip exactly one terminator.
+    bytes = strip_one_trailing_line_terminator(bytes);
+
     Ok(SecretBytes::new(bytes))
+}
+
+/// Strips exactly one trailing line terminator (`\n`, or `\r\n`) so the
+/// effective signing key matches the raw key bytes. No other bytes are altered.
+fn strip_one_trailing_line_terminator(mut bytes: Vec<u8>) -> Vec<u8> {
+    let Some(&last) = bytes.last() else {
+        return bytes;
+    };
+    if last != b'\n' {
+        return bytes;
+    }
+    bytes.pop();
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    bytes
 }
 
 pub(crate) fn read_signing_key_bytes_from_env(name: &str) -> Result<SecretBytes, AdminTokenError> {

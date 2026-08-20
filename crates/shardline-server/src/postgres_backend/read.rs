@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use shardline_index::{
     FileRecord, FileRecordStorageLayout, PostgresMetadataStoreError, RecordStore, RecordTraversal,
-    RepositoryRecordScope,
+    RepositoryRecordScope, S3ObjectEntry, S3ObjectIndexStore,
 };
 use shardline_protocol::{ByteRange, RepositoryScope};
 #[cfg(test)]
@@ -65,12 +67,43 @@ impl super::PostgresBackend {
         Ok(true)
     }
 
+    /// Guarded purge for the S3 conditional-write path (F-92): deletes the
+    /// file's latest reference + version record only when the latest record is
+    /// still `expected_content_hash` (the just-committed LOSER version).
+    ///
+    /// The per-key S3 upload lock is process-local, so in a multi-replica
+    /// Postgres deployment the latest alias can move to the WINNER's record
+    /// before this purge runs. Deleting unconditionally would then destroy the
+    /// winner's acknowledged write; skipping (returning `Ok(false)`) leaves the
+    /// loser as a non-latest version that GC eventually reclaims.
+    pub(crate) async fn delete_file_reference_if_latest(
+        &self,
+        file_id: &str,
+        expected_content_hash: &str,
+    ) -> Result<bool, ServerError> {
+        let record = match self.read_record(file_id, None, None).await {
+            Ok(record) => record,
+            Err(ServerError::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if record.content_hash != expected_content_hash {
+            return Ok(false);
+        }
+        self.record_store
+            .delete_file_version_metadata(&record)
+            .await?;
+        Ok(true)
+    }
+
     pub(crate) async fn read_file_stream(
         &self,
         file_id: &str,
+        content_hash: Option<&str>,
         range: Option<ByteRange>,
     ) -> Result<(ServerByteStream, u64), ServerError> {
-        let record = self.read_record(file_id, None, None).await?;
+        // With a content hash the read is pinned to that immutable version
+        // record; without one it resolves the latest record.
+        let record = self.read_record(file_id, content_hash, None).await?;
         let total_bytes = record.total_bytes;
         crate::metrics::record_object_read_by_repr(record.storage_repr.as_str(), total_bytes);
         let stream = file_record_byte_stream(self.object_store(), record, range).await?;
@@ -406,6 +439,81 @@ impl super::PostgresBackend {
             .map_err(map_record_store_error)?;
         parse_stored_file_record_bytes(&bytes)
     }
+
+    /// Loads the authoritative file-version record for a protocol object's
+    /// deterministic file id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::NotFound`] when no record exists, or the adapter
+    /// error when the record cannot be read.
+    pub(crate) async fn protocol_file_record(
+        &self,
+        file_id: &str,
+    ) -> Result<FileRecord, ServerError> {
+        self.read_record(file_id, None, None).await
+    }
+
+    /// Upserts one S3 object listing-index row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the index write fails.
+    pub(crate) async fn upsert_s3_object(&self, entry: &S3ObjectEntry) -> Result<(), ServerError> {
+        self.index_store.upsert_s3_object(entry).await?;
+        Ok(())
+    }
+
+    /// Deletes one S3 object listing-index row, returning whether a row was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the index delete fails.
+    pub(crate) async fn delete_s3_object(
+        &self,
+        scope_namespace: &str,
+        object_key: &str,
+    ) -> Result<bool, ServerError> {
+        self.index_store
+            .delete_s3_object(scope_namespace, object_key)
+            .await
+            .map_err(ServerError::from)
+    }
+
+    /// Scans S3 object listing rows for a scope namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the index scan fails.
+    pub(crate) async fn scan_s3_objects(
+        &self,
+        scope_namespace: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
+        self.index_store
+            .scan_s3_objects(scope_namespace, prefix, cursor, limit)
+            .await
+            .map_err(ServerError::from)
+    }
+
+    /// Resolves exactly one S3 object listing row by its full raw key (no
+    /// prefix matching).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the index lookup fails.
+    pub(crate) async fn scan_s3_object_exact(
+        &self,
+        scope_namespace: &str,
+        object_key: &str,
+    ) -> Result<Option<S3ObjectEntry>, ServerError> {
+        self.index_store
+            .scan_s3_object_exact(scope_namespace, object_key)
+            .await
+            .map_err(ServerError::from)
+    }
 }
 
 pub(crate) async fn repository_references_hash_in_scope<RecordAdapter>(
@@ -467,6 +575,10 @@ pub(crate) fn connect_postgres_metadata_pool(
 ) -> Result<sqlx::PgPool, ServerError> {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
+        // A bounded acquire timeout keeps a saturated shared pool from hanging
+        // requests for the sqlx default (30s): the caller gets a clean error
+        // instead of a stuck 500 after a long stall.
+        .acquire_timeout(Duration::from_secs(10))
         .connect_lazy(index_postgres_url)
         .map_err(PostgresMetadataStoreError::from)
         .map_err(ServerError::from)

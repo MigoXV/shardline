@@ -6,7 +6,7 @@ pub(crate) struct LocalSqliteMigration {
     pub(crate) down_sql: &'static str,
 }
 
-pub(crate) const LOCAL_SQLITE_MIGRATIONS: [LocalSqliteMigration; 14] = [
+pub(crate) const LOCAL_SQLITE_MIGRATIONS: [LocalSqliteMigration; 17] = [
     LocalSqliteMigration {
         version: "20260417000000",
         name: "metadata_store",
@@ -80,6 +80,12 @@ pub(crate) const LOCAL_SQLITE_MIGRATIONS: [LocalSqliteMigration; 14] = [
         down_sql: include_str!("../../migrations/20260630000003_drop_inline_content.down.sql"),
     },
     LocalSqliteMigration {
+        version: "20260630000004",
+        name: "drop_lfs_objects",
+        up_sql: include_str!("../../migrations/20260630000004_drop_lfs_objects.up.sql"),
+        down_sql: include_str!("../../migrations/20260630000004_drop_lfs_objects.down.sql"),
+    },
+    LocalSqliteMigration {
         version: "20260720000000",
         name: "fix_indexes",
         up_sql: include_str!("../../migrations/20260720000000_fix_indexes.up.sql"),
@@ -96,5 +102,17 @@ pub(crate) const LOCAL_SQLITE_MIGRATIONS: [LocalSqliteMigration; 14] = [
         name: "tree_store",
         up_sql: include_str!("../../migrations/20260805000000_tree_store.up.sql"),
         down_sql: include_str!("../../migrations/20260805000000_tree_store.down.sql"),
+    },
+    LocalSqliteMigration {
+        version: "20260813000000",
+        name: "s3_object_index",
+        up_sql: include_str!("../../migrations/20260813000000_s3_object_index.up.sql"),
+        down_sql: include_str!("../../migrations/20260813000000_s3_object_index.down.sql"),
+    },
+    LocalSqliteMigration {
+        version: "20260814000000",
+        name: "s3_object_etag_metadata",
+        up_sql: include_str!("../../migrations/20260814000000_s3_object_etag_metadata.up.sql"),
+        down_sql: include_str!("../../migrations/20260814000000_s3_object_etag_metadata.down.sql"),
     },
 ];

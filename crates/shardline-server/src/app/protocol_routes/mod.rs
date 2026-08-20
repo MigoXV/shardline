@@ -2,6 +2,7 @@ mod bazel;
 mod helpers;
 mod lfs;
 pub(super) mod oci;
+mod s3;
 
 pub(crate) use bazel::{
     bazel_get, bazel_get_ac, bazel_get_cas, bazel_head, bazel_head_ac, bazel_head_cas, bazel_put,
@@ -13,12 +14,16 @@ pub(crate) use helpers::{
 };
 pub(crate) use lfs::{
     lfs_batch, lfs_delete_object, lfs_get_object, lfs_head_object, lfs_patch_object,
-    lfs_put_object, lfs_verify_object,
+    lfs_put_object, lfs_verify_object, sweep_lfs_patch_sessions,
 };
 #[cfg(feature = "fuzzing")]
 pub(crate) use oci::parse_oci_path;
 pub(crate) use oci::{
     oci_api_dispatch, oci_dispatch, oci_registry_token, oci_transfer_dispatch, oci_v2_root,
+};
+pub(crate) use s3::{
+    s3_create_bucket, s3_delete_bucket, s3_delete_object, s3_get_bucket, s3_get_object,
+    s3_head_bucket, s3_head_object, s3_list_buckets, s3_post_bucket, s3_post_object, s3_put_object,
 };
 
 use super::MAX_PROTOCOL_QUERY_BYTES;
@@ -27,7 +32,6 @@ use super::MAX_PROTOCOL_QUERY_BYTES;
 use super::reconstruction_helpers::{byte_range_stream_response, full_byte_stream_response};
 use super::{
     AppState, MAX_LFS_BATCH_OBJECTS, MAX_OCI_MANIFEST_TAGS, MAX_OCI_TAG_LIST_PAGE_SIZE, authorize,
-    scope_from_auth,
 };
 
 #[cfg(test)]

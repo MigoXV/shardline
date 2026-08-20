@@ -38,12 +38,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tower_http::cors::{Any, CorsLayer};
 
-use shardline_server_core::auth::Ed25519AuthProvider;
+use shardline_server_core::{VerifiedAuthContext, auth::Ed25519AuthProvider};
 
 use crate::{
     ServerConfig, ServerError,
     admission::{ExecutionPools, WeightedAdmission, timeouts},
-    auth::{AuthContext, ServerAuth},
+    auth::ServerAuth,
     backend::ServerBackend,
     config::{
         AuthProviderKind, DeploymentMode, ServerConfigError, env::bounded_pool_size_from_env,
@@ -73,7 +73,9 @@ use protocol_routes::{
     bazel_get, bazel_get_ac, bazel_get_cas, bazel_head, bazel_head_ac, bazel_head_cas, bazel_put,
     bazel_put_ac, bazel_put_cas, lfs_batch, lfs_delete_object, lfs_get_object, lfs_head_object,
     lfs_patch_object, lfs_put_object, lfs_verify_object, oci_api_dispatch, oci_dispatch,
-    oci_registry_token, oci_transfer_dispatch, oci_v2_root,
+    oci_registry_token, oci_transfer_dispatch, oci_v2_root, s3_create_bucket, s3_delete_bucket,
+    s3_delete_object, s3_get_bucket, s3_get_object, s3_head_bucket, s3_head_object,
+    s3_list_buckets, s3_post_bucket, s3_post_object, s3_put_object,
 };
 #[cfg(feature = "fuzzing")]
 pub(crate) use protocol_routes::{parse_oci_path, parse_upload_content_range};
@@ -272,6 +274,57 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
         protocol_metrics: ProtocolMetrics::default(),
     });
 
+    // Sweep expired S3 multipart upload sessions at startup (crash recovery);
+    // in-flight sweeps also run on every session creation.
+    if state
+        .config
+        .server_frontends()
+        .iter()
+        .any(|frontend| matches!(frontend, ServerFrontend::S3))
+    {
+        match shardline_s3_adapter::sweep_expired_sessions(
+            state.config.root_dir(),
+            state.config.s3_upload_session_ttl_seconds(),
+        )
+        .await
+        {
+            Ok(removed) => {
+                tracing::info!(
+                    removed,
+                    "s3 startup sweep removed expired multipart upload sessions"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "s3 startup sweep of expired multipart upload sessions failed");
+            }
+        }
+    }
+
+    // Sweep expired LFS chunked-patch (PATCH) staging sessions at startup
+    // (crash recovery); in-flight sweeps also run on every PATCH, mirroring
+    // the S3 multipart sweep's startup + on-creation scheduling (F-20).
+    if state
+        .config
+        .server_frontends()
+        .iter()
+        .any(|frontend| matches!(frontend, ServerFrontend::Lfs))
+    {
+        match protocol_routes::sweep_lfs_patch_sessions(
+            state.config.root_dir(),
+            state.config.lfs_patch_ttl_seconds(),
+        ) {
+            Ok(removed) => {
+                tracing::info!(
+                    removed,
+                    "lfs startup sweep removed expired chunked-patch staging sessions"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "lfs startup sweep of expired chunked-patch staging sessions failed");
+            }
+        }
+    }
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([
@@ -314,6 +367,14 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
     // converted via `.with_state()`.
     let mut hub_state: Option<shardline_hub_api::routes::HubState> = None;
     let mut xet_frontend_enabled = false;
+    // S3 is mounted as the app-level FALLBACK rather than merged into the main
+    // route trie: its `/{bucket}/{*key}` wildcard would otherwise conflict with
+    // any other frontend's root-level parameter routes (Hub's Git Smart HTTP
+    // and file-resolve routes) — matchit cannot host a wildcard and a parameter
+    // with children at the same position. As a fallback, every registered route
+    // (Hub/OCI/LFS/Xet/Bazel/metrics/healthz) wins, and S3 serves everything
+    // else, which is exactly the S3 catch-all contract.
+    let mut s3_router: Option<Router> = None;
     for frontend in state.config.server_frontends() {
         match frontend {
             ServerFrontend::Hub => {
@@ -322,6 +383,12 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
             ServerFrontend::Xet => {
                 xet_frontend_enabled = true;
                 app = register_frontend_routes(app, *frontend, role, &state);
+            }
+            ServerFrontend::S3 => {
+                // Build the S3 router separately and apply the state at build
+                // time so it can be mounted as the app-level fallback service
+                // (an un-applied Router<Arc<AppState>> is not a Service).
+                s3_router = Some(register_s3_routes(Router::new(), role).with_state(state.clone()));
             }
             ServerFrontend::Lfs | ServerFrontend::BazelHttp | ServerFrontend::Oci => {
                 app = register_frontend_routes(app, *frontend, role, &state);
@@ -336,6 +403,14 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
     // Merge hub routes (Router<()>) into the main app (Router<()>).
     let app = if let Some(hs) = hub_state {
         app.merge(shardline_hub_api::hub_routes(hs, !xet_frontend_enabled))
+    } else {
+        app
+    };
+
+    // Mount S3 as the fallback AFTER every registered route (frontends, Hub,
+    // health/metrics): unmatched paths fall through to the S3 router.
+    let app = if let Some(s3_router) = s3_router {
+        app.fallback_service(s3_router)
     } else {
         app
     };
@@ -465,6 +540,7 @@ fn register_frontend_routes(
         ServerFrontend::Lfs => register_lfs_routes(app, role),
         ServerFrontend::BazelHttp => register_bazel_routes(app, role),
         ServerFrontend::Oci => register_oci_routes(app, role),
+        ServerFrontend::S3 => register_s3_routes(app, role),
         ServerFrontend::Hub => app, // Hub routes are built separately
     }
 }
@@ -577,11 +653,53 @@ fn register_oci_routes(mut app: Router<Arc<AppState>>, role: ServerRole) -> Rout
     app
 }
 
+/// Registers the S3 frontend routes.
+///
+/// S3 is an API-tier frontend (reads + writes touch records/ingest), so the
+/// routes are registered only when the role serves the API surface.
+///
+/// Bucket-level operations are registered on BOTH `/{bucket}` and `/{bucket}/`:
+/// real clients (mc, the AWS SDKs, pyarrow) canonicalize bucket paths with a
+/// trailing slash (`PUT /ac.assets/`, `GET /ac.assets/?location=`), and axum
+/// does not match `/{bucket}` against the trailing-slash form.
+fn register_s3_routes(mut app: Router<Arc<AppState>>, role: ServerRole) -> Router<Arc<AppState>> {
+    if role.serves_api() {
+        app = app
+            // Service-level `GET /` — `ListBuckets` (the caller's single bucket).
+            .route("/", axum::routing::get(s3_list_buckets))
+            .route(
+                "/{bucket}",
+                axum::routing::put(s3_create_bucket)
+                    .get(s3_get_bucket)
+                    .head(s3_head_bucket)
+                    .post(s3_post_bucket)
+                    .delete(s3_delete_bucket),
+            )
+            .route(
+                "/{bucket}/",
+                axum::routing::put(s3_create_bucket)
+                    .get(s3_get_bucket)
+                    .head(s3_head_bucket)
+                    .post(s3_post_bucket)
+                    .delete(s3_delete_bucket),
+            )
+            .route(
+                "/{bucket}/{*key}",
+                axum::routing::get(s3_get_object)
+                    .head(s3_head_object)
+                    .put(s3_put_object)
+                    .post(s3_post_object)
+                    .delete(s3_delete_object),
+            );
+    }
+    app
+}
+
 fn authorize(
     state: &AppState,
     headers: &HeaderMap,
     required_scope: TokenScope,
-) -> Result<Option<AuthContext>, ServerError> {
+) -> Result<Option<VerifiedAuthContext>, ServerError> {
     if let Some(auth) = &state.auth {
         return Ok(Some(auth.authorize(headers, required_scope)?));
     }
@@ -595,7 +713,10 @@ fn authorize(
     Ok(None)
 }
 
-const fn scope_from_auth(auth: &AuthContext) -> &RepositoryScope {
+/// Kept during the authorization-capability migration; not yet wired to a
+/// caller.
+#[allow(dead_code)]
+const fn scope_from_auth(auth: &VerifiedAuthContext) -> &RepositoryScope {
     auth.claims().repository()
 }
 
@@ -644,16 +765,7 @@ fn build_hub_state(
         )?;
 
     // Build an HTTP client for outbound webhook delivery.
-    let http_client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => Some(client),
-        Err(e) => {
-            tracing::warn!("failed to build HTTP client for webhook delivery: {e}");
-            None
-        }
-    };
+    let http_client = build_webhook_delivery_client();
 
     // Thread an at-rest cipher for webhook signing secrets when configured.
     let webhook_secret_cipher = app_state.config.hub_webhook_secret_key().map_or_else(
@@ -714,6 +826,28 @@ fn endpoint_body_limit(
         .ok_or(ServerError::Overflow)
 }
 
+/// Builds the HTTP client used for outbound webhook delivery.
+///
+/// Redirects are deliberately disabled: an attacker-controlled webhook URL
+/// could answer with a 301/302/307/308 pointing at a private, loopback, or
+/// metadata address that was never validated. Following such a redirect would
+/// carry the webhook payload (and the server's credentials) into the internal
+/// network — an SSRF bypass. A 3xx response is therefore surfaced as a
+/// non-success status and the delivery fails instead of being followed.
+fn build_webhook_delivery_client() -> Option<reqwest::Client> {
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::warn!("failed to build HTTP client for webhook delivery: {e}");
+            None
+        }
+    }
+}
+
 /// Acquires a semaphore permit for a chunk transfer.
 ///
 /// # Errors
@@ -744,9 +878,21 @@ async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>
             let issuer = config
                 .auth_oidc_issuer()
                 .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
-            let provider = OidcProvider::new(issuer, None)
-                .await
-                .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            let audience = config.auth_oidc_audience();
+            if audience.is_none() {
+                tracing::warn!(
+                    "OIDC auth provider has no SHARDLINE_AUTH_OIDC_AUDIENCE configured; the \
+                     token aud claim is not validated and any aud-bearing token is accepted \
+                     (set SHARDLINE_AUTH_OIDC_AUDIENCE to require a specific audience)"
+                );
+            }
+            let provider = OidcProvider::new(
+                issuer,
+                audience.map(str::to_owned),
+                config.auth_oidc_jwks_host_allowlist().unwrap_or(&[]),
+            )
+            .await
+            .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
             Ok(Some(ServerAuth::from_provider(Box::new(provider))))
         }
         AuthProviderKind::Jwks => {

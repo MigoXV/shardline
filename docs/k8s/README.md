@@ -7,7 +7,9 @@ These manifests target the scaled production deployment profile:
 - garbage collection runs as a separate `CronJob`
 - immutable object bytes live in S3-compatible storage
 - durable metadata lives in Postgres-compatible SQL
-- reconstruction cache uses the Redis protocol; the shipped manifests deploy Garnet
+- reconstruction cache uses the Redis protocol; the manifests reference an external
+  Redis-compatible endpoint that you must provide (the runtime secret carries a
+  placeholder URL at `garnet.example.com` — no cache service is deployed here)
 
 This package does not assume local object storage or local metadata.
 The pod state mount is only local runtime state in this profile, not the durable source
@@ -42,8 +44,8 @@ docs/k8s/production-scaled/
 ## Configuration
 
 Server settings are defined in `configmap.yaml` as a `shardline.toml` file mounted at
-`/etc/shardline/shardline.toml`. Shardline automatically detects this path, so no
-`--config` flag is needed.
+`/etc/shardline/shardline.toml`. When no `--config` flag is given, Shardline
+automatically detects this path, so pods need no explicit `--config` flag.
 Credentials and secrets remain in the runtime secret as env vars or mounted files.
 
 ```bash
@@ -51,10 +53,21 @@ kubectl apply -f docs/k8s/production-scaled/configmap.yaml
 ```
 
 Use `--config` and `--env-file` with the CLI locally to match the production
-configuration during development:
+configuration during development. An explicit `--config` overrides auto-detection,
+and it must point at the TOML document itself, not at the ConfigMap manifest that
+wraps it (`configmap.yaml` is a Kubernetes object; the TOML content lives under its
+`data.shardline.toml` key). Extract that content to a local file first:
 
 ```bash
-shardline --config docs/k8s/production-scaled/configmap.yaml serve
+kubectl get cm shardline-config -o jsonpath='{.data.shardline\.toml}' > shardline.toml
+shardline --config shardline.toml serve
+```
+
+Bash supports process substitution, so the same recipe works without the
+intermediate file when you prefer:
+
+```bash
+shardline --config <(kubectl get cm shardline-config -o jsonpath='{.data.shardline\.toml}') serve
 ```
 
 ## Prerequisites
@@ -83,11 +96,27 @@ The runtime secret carries:
 - Shardline token-signing key
 - metrics scrape bearer token
 - provider bootstrap API key
+- provider-config at-rest encryption key
 
 The provider catalog secret carries the provider repository catalog JSON, including
 webhook secrets.
 
-The manifests use the placeholder image `registry.example.com/shardline:1.0.1`. Replace
+The provider-config webhook secrets are encrypted at rest with
+`SHARDLINE_CONFIG_SECRET_KEY`, a 32-byte AES-256 key read from the runtime
+secret's `config-secret-key` entry. Generate one before applying the manifests:
+
+```bash
+openssl rand -base64 24
+```
+
+24 random bytes base64-encode to exactly 32 characters, and the trailing newline
+the command prints is stripped on load. Without this key, the fail-loud
+plaintext-secrets gate rejects the deployment because the provider runtime is
+enabled (`SHARDLINE_PROVIDER_API_KEY_FILE` + `SHARDLINE_PROVIDER_CONFIG_FILE`),
+so the API pods would CrashLoopBackOff in their `config-check` init container.
+
+The manifests use the placeholder image `registry.example.com/shardline:1.0.1` (the
+`1.0.1` tag is an example, not the current workspace version). Replace
 it with the image tag you build or publish for your environment.
 
 The runtime egress policy is environment-specific and is therefore shipped as a
@@ -122,6 +151,11 @@ API routes:
 - `/shards`
 - `/v1/shards`
 - `/v1/stats`
+- S3 route family (API tier): `GET /` (`ListBuckets`), `/{bucket}` and `/{bucket}/`
+  (bucket-level operations), `/{bucket}/{*key}` (object data path)
+- Hub LFS objects: `/objects/batch`, `/lfs/objects/{oid}`
+- Hub Git Smart HTTP: `/{type}/{ns}/{repo}/info/refs`, `/{type}/{ns}/{repo}/HEAD`,
+  `/{type}/{ns}/{repo}/git-upload-pack`, `/{type}/{ns}/{repo}/git-receive-pack`
 
 Transfer routes:
 
@@ -133,7 +167,11 @@ Internal scrape route:
 
 - `/metrics`
 
-`ingress-nginx.yaml` provides one concrete `Ingress` example with those path splits.
+`ingress-nginx.yaml` provides one concrete `Ingress` example with the Xet route
+family splits. The S3 bucket/object paths (`/{bucket}`, `/{bucket}/{*key}`) and the
+Hub path-based routes are **API-tier** and must be sent to the API Service; the
+shipped example does not encode them (the S3 catch-all in particular needs explicit
+path mapping per bucket when both roles are exposed on one hostname).
 Clusters that use another gateway should keep the same path ownership while translating
 the object shape to their controller.
 The example also disables NGINX request and response buffering and sets the body-size
@@ -217,6 +255,10 @@ On failure, the script preserves Kubernetes diagnostics in a temporary directory
 `SHARDLINE_KIND_LOG_DIR` when set) before deleting the cluster.
 Set `SHARDLINE_KIND_CLUSTER_NAME` only when a predictable, still-disposable name is
 required; the script refuses to reuse an existing cluster.
+
+> **Test-only:** `SHARDLINE_KIND_LOG_DIR` and `SHARDLINE_KIND_CLUSTER_NAME` are
+> environment overrides for this disposable `kind` smoke test only. They are not
+> Shardline server configuration and have no effect on a deployed server.
 
 ## Runtime hardening
 

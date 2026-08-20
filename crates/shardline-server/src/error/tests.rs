@@ -37,6 +37,14 @@ fn too_many_registry_token_requests_maps_to_429() {
 }
 
 #[test]
+fn s3_upload_too_many_parts_maps_to_429() {
+    assert_eq!(
+        status_for(&ServerError::S3UploadTooManyParts),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[test]
 fn missing_authorization_maps_to_401() {
     assert_eq!(
         status_for(&ServerError::MissingAuthorization),
@@ -2146,4 +2154,65 @@ fn from_oci_adapter_error_blocking_task() {
     let join_err = rt.block_on(async { task.await.unwrap_err() });
     let err: ServerError = shardline_oci_adapter::OciAdapterError::BlockingTask(join_err).into();
     assert!(matches!(err, ServerError::BlockingTask(_)));
+}
+
+// ── ServerError → S3Error mapping ──────────────────────────────────────────
+
+use shardline_s3_adapter::{S3Error, S3ErrorClass, S3ErrorClassify};
+
+#[test]
+fn s3_classify_range_not_satisfiable_maps_to_invalid_range() {
+    assert_eq!(
+        ServerError::RangeNotSatisfiable.s3_class(),
+        S3ErrorClass::RangeNotSatisfiable
+    );
+    let error = S3Error::from(ServerError::RangeNotSatisfiable);
+    assert_eq!(error.code, "InvalidRange");
+    assert_eq!(error.status, StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[test]
+fn s3_classify_not_found_maps_to_no_such_key() {
+    assert_eq!(ServerError::NotFound.s3_class(), S3ErrorClass::NotFound);
+    let error = S3Error::from(ServerError::NotFound);
+    assert_eq!(error.code, "NoSuchKey");
+    assert_eq!(error.status, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn s3_classify_authz_failures_map_to_access_denied() {
+    for server_error in [
+        ServerError::MissingAuthorization,
+        ServerError::InvalidAuthorizationHeader,
+        ServerError::InvalidToken(shardline_protocol::TokenCodecError::InvalidFormat),
+        ServerError::InsufficientScope,
+        ServerError::ProviderDenied,
+    ] {
+        assert_eq!(
+            server_error.s3_class(),
+            S3ErrorClass::AccessDenied,
+            "variant must classify as AccessDenied"
+        );
+        let error = S3Error::from(server_error);
+        assert_eq!(error.code, "AccessDenied");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[test]
+fn s3_classify_io_error_maps_to_internal() {
+    let server_error = ServerError::Io(std::io::Error::other("boom"));
+    assert_eq!(server_error.s3_class(), S3ErrorClass::Internal);
+    let error = S3Error::from(server_error);
+    assert_eq!(error.code, "InternalError");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn s3_classify_body_too_large_maps_to_internal() {
+    // The S3 handlers translate oversized bodies to a 413 EntityTooLarge
+    // directly; through the generic mapping it is an internal error.
+    let error = S3Error::from(ServerError::RequestBodyTooLarge);
+    assert_eq!(error.code, "InternalError");
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
 }
