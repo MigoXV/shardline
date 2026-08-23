@@ -18,6 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Validate development deployment graph
+        run: docker compose config --quiet
+
       - name: Setup Rust CI toolchain and tools
         uses: ./.github/actions/rust-ci-setup
 
@@ -59,11 +62,47 @@ jobs:
         run: |
           cargo test -p shardline-index -- hub_postgres 2>&1
           cargo test -p shardline-index -- pg_upload_intent 2>&1
+          cargo test -p shardline-index -- pg_s3_object 2>&1
+          cargo test -p shardline-index -- pg_oci_tag 2>&1
+          cargo test -p shardline-index -- pg_manifest_tombstone 2>&1
+          cargo test -p shardline-index -- pg_provider_repository_state 2>&1
+          cargo test -p shardline-index -- pg_provider_mutation 2>&1
+          cargo test -p shardline-provider-events --test provider_events_integration -- postgres_ 2>&1
           cargo test -p shardline-server -- postgres_backend:: 2>&1
           cargo test -p shardline-server -- database_migration 2>&1
+          cargo test -p shardline-server -- maintenance_barrier 2>&1
           cargo test -p shardline-server -- lifecycle_repair::tests 2>&1
 
       - name: Run Postgres-gated E2E tests
         env:
           DATABASE_URL: postgres://shardline:shardline-dev-password@localhost:5432/shardline
         run: cargo test -p shardline --test db_migrate_e2e 2>&1
+
+  release-candidate-infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Setup Rust CI toolchain and tools
+        uses: ./.github/actions/rust-ci-setup
+
+      - name: Install Kubernetes smoke-test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl_version="v1.33.1"
+          kind_version="v0.29.0"
+          curl --fail --location --silent --show-error \
+            --output /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${kubectl_version}/bin/linux/amd64/kubectl"
+          curl --fail --location --silent --show-error \
+            --output /usr/local/bin/kind \
+            "https://kind.sigs.k8s.io/dl/${kind_version}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kubectl /usr/local/bin/kind
+          kubectl version --client=true
+          kind version
+
+      - name: Run release-candidate infrastructure matrix
+        run: cargo make test-infrastructure

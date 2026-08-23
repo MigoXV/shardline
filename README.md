@@ -3,14 +3,20 @@
 [![Status](https://img.shields.io/badge/status-stable-1f6feb)](docs/COMPATIBILITY_STATUS.md)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 
-**Shardline is a protocol-neutral content-addressed storage engine, optimized for
-deduplicated model, dataset, container and build-artifact distribution, with Xet, OCI,
-Git LFS, S3, HuggingFace Hub and cache-compatible frontends.**
+**Shardline is a self-hostable content-addressed storage backend for anyone’s storage
+needs, with content deduplication at its core and version-aware workflows where the
+frontend supports them.**
 
-Shardline is a self-hostable content-addressed storage (CAS) server.
 It accepts immutable object uploads, deduplicates content, and serves range-aware
-downloads. Run it standalone or pair it with GitHub, GitLab, or Gitea for
-repository-scoped storage.
+downloads. It is especially useful for large-file versioning when the selected frontend
+keeps revisions or commits, because unchanged content can be reused instead of uploaded
+repeatedly. Use the frontend that fits your workflow: Xet, OCI, Git LFS, S3, Hugging Face
+Hub, cache clients, or the native API—or run it standalone for your own storage needs.
+Pair it with GitHub, GitLab, or Gitea when you want repository-scoped storage.
+
+**Use only the protocols you need.** Run Shardline as a focused Xet backend, OCI
+registry, S3-compatible service, or Hugging Face backend—or compose multiple
+frontends over the same hardened storage core.
 
 ## Surface Maturity
 
@@ -26,16 +32,17 @@ repository-scoped storage.
 | S3-compatible storage | **Stable** | Checked-in object read/write/list and HTTP integration coverage |
 | Postgres metadata | **Stable** | Checked-in index, dedupe, concurrency, and operator workflow coverage |
 | SQLite metadata | **Stable** | Checked-in local single-node and operator workflow coverage |
-| Redis reconstruction cache | **Beta** | TLS and mTLS connectivity; cache hit/miss paths validated |
+| Redis reconstruction cache | **Beta** | TLS/mTLS, bounded operation latency, cache hit/miss, and corrupt-value recovery are validated |
 | Provider integration (GitHub/GitLab/Gitea/Codeberg/generic) | **Beta** | Checked-in token issuance, webhook, and repository-scoped authorization coverage |
-| Ed25519 auth provider | **Experimental** | Signing and verification, verification-only mode, configuration, and authenticated HTTP flows have targeted tests |
+| Ed25519 auth provider | **Experimental** | Signing/verification, CLI minting, verification-only mode, configuration, and authenticated HTTP flows have targeted tests |
 
 ## What it does
 
 - **Store and deduplicate** any binary content — datasets, model weights, build
   artifacts, media
-- **Multiple protocols** — Xet (default), Git LFS, Bazel HTTP remote cache, OCI
-  Distribution, S3, and HuggingFace Hub
+- **Composable protocol frontends** — enable only the protocols you need: Xet
+  (default), Git LFS, Bazel HTTP remote cache, OCI Distribution, S3, and
+  Hugging Face Hub
 - **HuggingFace Hub API** — drop-in alternative for `huggingface-cli` uploads and
   downloads
 - **Pluggable auth** — local HMAC, Ed25519, OIDC, JWKS, or passthrough provider adapters
@@ -57,11 +64,20 @@ repository-scoped storage.
 
 ## Quick start
 
-```bash
-# Run with Docker
-docker compose -f docker-compose.yml up --build
+The recommended first run is the development Compose profile.
+It provisions the local Postgres and MinIO dependencies, applies migrations, and waits
+for them before starting Shardline:
 
-# Or build from source
+```bash
+docker compose -f docker-compose.yml up --build
+```
+
+See [Getting Started](docs/GETTING_STARTED.md) for readiness checks, token creation,
+state cleanup, and the boundary between the development and production profiles.
+
+For a host-native binary:
+
+```bash
 cargo build --release
 ./target/release/shardline serve
 ```
@@ -86,7 +102,7 @@ shardline admin token
 | --- | --- |
 | **Local** | Single-node with local filesystem storage — `docker compose up` |
 | **Production small** | Single process with S3 + Postgres |
-| **Production scaled** | Split `api` and `transfer` roles with shared storage |
+| **Production scaled** | Split `api` and `transfer` roles with shared Postgres/S3 plus lock-coherent RWX staging |
 
 All profiles run providerless by default.
 Provider integration is optional.
@@ -96,6 +112,7 @@ Provider integration is optional.
 | Guide | Description |
 | --- | --- |
 | [Deployment](docs/DEPLOYMENT.md) | Installation and configuration |
+| [Getting Started](docs/GETTING_STARTED.md) | One deterministic local path from checkout to a running server |
 | [Authentication](docs/AUTHENTICATION.md) | Pluggable auth providers (HMAC, Ed25519, OIDC, JWKS, passthrough) |
 | [HuggingFace Hub API](docs/HUGGINGFACE_HUB_API.md) | Hub API compatibility for huggingface-cli |
 | [S3 Frontend](docs/S3_FRONTEND.md) | S3-compatible object API for lakehouse and s3:// clients |
@@ -103,6 +120,7 @@ Provider integration is optional.
 | [CLI Reference](docs/CLI.md) | All commands and flags |
 | [Compatibility Status](docs/COMPATIBILITY_STATUS.md) | Surface maturity tiers and validated route coverage |
 | [Architecture](docs/ARCHITECTURE.md) | System design and runtime shape |
+| [Distributed Correctness](docs/DISTRIBUTED_CORRECTNESS.md) | Multi-writer contracts, lock ordering, fencing epochs, and supported deployment boundaries |
 | [Provider Setup](docs/PROVIDER_QUICKSTART.md) | GitHub/GitLab/Gitea/Codeberg integration |
 | [Client Configuration](docs/CLIENT_CONFIGURATION.md) | Configure git, LFS, and Xet clients |
 | [Protocols](docs/PROTOCOLS.md) | Supported protocol frontends |
