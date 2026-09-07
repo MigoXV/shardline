@@ -1,3 +1,4 @@
+mod admin_api;
 mod metadata_routes;
 mod operational;
 mod protocol_routes;
@@ -36,7 +37,7 @@ use axum::{
 use shardline_protocol::{RepositoryScope, TokenScope};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use shardline_server_core::{VerifiedAuthContext, auth::Ed25519AuthProvider};
 
@@ -62,6 +63,13 @@ use crate::{
         XET_TREE_ROUTE, XET_WRITE_TOKEN_ROUTE, XORB_TRANSFER_ROUTE,
     },
 };
+use admin_api::{
+    gc as admin_gc, integrity as admin_integrity, metrics as admin_metrics, nodes as admin_nodes,
+    plugins as admin_plugins, replication as admin_replication, status as admin_status,
+    storage as admin_storage, tasks as admin_tasks,
+};
+#[cfg(feature = "fuzzing")]
+pub(crate) use admin_api::{parse_admin_cursor_for_fuzzing, parse_admin_query_for_fuzzing};
 use metadata_routes::{
     create_revision, delete_path, delete_revision, list_revisions, register_path, tree_lookup,
 };
@@ -326,7 +334,16 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
     }
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(AllowOrigin::predicate(
+            |_origin: &axum::http::HeaderValue, parts: &axum::http::request::Parts| {
+                !parts.uri.path().starts_with("/api/v1/")
+            },
+        ))
+        // Admin routes are protected by the origin predicate above (they get no
+        // Access-Control-Allow-Origin, so the browser blocks any cross-origin
+        // read regardless of method). Protocol frontends legitimately use
+        // POST/PUT/DELETE for browser-based uploads (LFS batch, OCI blobs), so
+        // the full method set must remain available on those routes.
         .allow_methods([
             Method::GET,
             Method::HEAD,
@@ -341,6 +358,15 @@ pub async fn router(config: ServerConfig) -> Result<Router, ServerError> {
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics))
+        .route("/api/v1/status", get(admin_status))
+        .route("/api/v1/storage", get(admin_storage))
+        .route("/api/v1/gc", get(admin_gc))
+        .route("/api/v1/integrity", get(admin_integrity))
+        .route("/api/v1/nodes", get(admin_nodes))
+        .route("/api/v1/tasks", get(admin_tasks))
+        .route("/api/v1/metrics", get(admin_metrics))
+        .route("/api/v1/plugins", get(admin_plugins))
+        .route("/api/v1/replication", get(admin_replication))
         .layer(MetricsLayer)
         .layer(middleware::from_fn(request_timeout_middleware))
         .layer(middleware::from_fn(security_headers_middleware));
@@ -875,6 +901,13 @@ async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>
             Ok(Some(ServerAuth::new(key)?))
         }
         AuthProviderKind::Passthrough => {
+            // Trusted-proxy carve-out: Passthrough trusts every inbound token,
+            // so the real control is the loopback-bind requirement and the
+            // deployment-mode contract enforced in
+            // `ServerConfig::validate_runtime_requirements` (Strict rejects it
+            // outright; Authenticated warns that it must sit behind a trusted
+            // proxy). Enforcing mode checks here as well would break the
+            // documented Authenticated+Passthrough trusted-proxy deployment.
             let provider = Box::new(shardline_server_core::auth::PassthroughProvider);
             Ok(Some(ServerAuth::from_provider(provider)))
         }
@@ -882,17 +915,21 @@ async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>
             let issuer = config
                 .auth_oidc_issuer()
                 .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
-            let audience = config.auth_oidc_audience();
-            if audience.is_none() {
-                tracing::warn!(
-                    "OIDC auth provider has no SHARDLINE_AUTH_OIDC_AUDIENCE configured; the \
-                     token aud claim is not validated and any aud-bearing token is accepted \
-                     (set SHARDLINE_AUTH_OIDC_AUDIENCE to require a specific audience)"
-                );
-            }
+            // Audience validation is mandatory: without a configured audience
+            // the verifier accepts ANY aud-bearing token minted by the issuer
+            // (including tokens for unrelated services at the same issuer),
+            // broadening token acceptance across service boundaries.
+            let audience = config.auth_oidc_audience().ok_or_else(|| {
+                ServerError::Config(ServerConfigError::ConfigFileError(
+                    "SHARDLINE_AUTH_OIDC_AUDIENCE is required when \
+                     SHARDLINE_AUTH_PROVIDER=oidc; without it any aud-bearing token \
+                     from the issuer is accepted"
+                        .into(),
+                ))
+            })?;
             let provider = OidcProvider::new(
                 issuer,
-                audience.map(str::to_owned),
+                Some(audience.to_owned()),
                 config.auth_oidc_jwks_host_allowlist().unwrap_or(&[]),
             )
             .await
@@ -933,6 +970,7 @@ pub(super) async fn security_headers_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    let is_admin_api = request.uri().path().starts_with("/api/v1/");
     let response = next.run(request).await;
     let (mut parts, body) = response.into_parts();
     let headers = &mut parts.headers;
@@ -951,13 +989,28 @@ pub(super) async fn security_headers_middleware(
     if !headers.contains_key(header::STRICT_TRANSPORT_SECURITY) {
         headers.insert(
             header::STRICT_TRANSPORT_SECURITY,
-            header::HeaderValue::from_static("max-age=31536000"),
+            header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         );
     }
     if !headers.contains_key(header::REFERRER_POLICY) {
         headers.insert(
             header::REFERRER_POLICY,
             header::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
+    if is_admin_api {
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        );
+    } else if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, no-store"),
         );
     }
     axum::response::Response::from_parts(parts, body)

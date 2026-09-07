@@ -6,7 +6,10 @@ use shardline_server_core::AuthorizedRepository;
 
 use crate::{
     BazelCacheKind, InvalidReconstructionResponseError, InvalidSerializedShardError, ServerError,
-    app::{parse_oci_path, parse_upload_content_range},
+    app::{
+        parse_admin_cursor_for_fuzzing, parse_admin_query_for_fuzzing, parse_oci_path,
+        parse_upload_content_range,
+    },
     bazel_cache_object_key,
     config::ShardMetadataLimits,
     lfs_object_key,
@@ -25,6 +28,24 @@ use crate::{
         reconstruction_v2_from_v1, retained_shard_chunk_hashes, validate_serialized_xorb,
     },
 };
+
+/// Exercise the bounded administration query and cursor parser.
+///
+/// # Errors
+///
+/// Returns the parser's bounded validation error for malformed input.
+pub fn fuzz_admin_api_query(input: &str) -> Result<(), ServerError> {
+    parse_admin_query_for_fuzzing(input)
+}
+
+/// Exercise deserialization and validation of the versioned cursor DTO and its newtypes.
+///
+/// # Errors
+///
+/// Returns the parser's bounded validation error for malformed input.
+pub fn fuzz_admin_api_cursor(input: &[u8]) -> Result<(), ServerError> {
+    parse_admin_cursor_for_fuzzing(input)
+}
 
 /// Summary of Git LFS frontend validation used by fuzz targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1348,10 +1369,13 @@ mod tests {
 
     #[test]
     fn fuzz_lifecycle_repair_summary_retention_none_missing() {
-        // release_after = None, object does not exist => DeleteMissing
+        // release_after = None (permanent hold), object does not exist => Keep:
+        // permanent holds are NEVER removed by lifecycle repair, even when the
+        // object is transiently missing — only operator intervention may.
         let result =
             fuzz_lifecycle_repair_summary(200, 100, &[], &[(None, 100, false)], &[]).unwrap();
-        assert_eq!(result.retention_delete_missing, 1);
+        assert_eq!(result.retention_delete_missing, 0);
+        assert_eq!(result.retention_keep, 1);
     }
 
     #[test]
@@ -1386,10 +1410,10 @@ mod tests {
             ],
             &[
                 (None, 0, true),        // Keep (indefinite hold, exists)
-                (None, 0, false),       // DeleteMissing (indefinite, missing)
+                (None, 0, false),       // Keep (indefinite hold never removed)
                 (Some(100), 50, true),  // DeleteExpired
                 (Some(300), 100, true), // Keep
-                (Some(100), 50, false), // DeleteMissing
+                (Some(100), 50, false), // DeleteMissing (time-bounded, missing)
             ],
             &[50, 150, 600],
         )
@@ -1402,10 +1426,11 @@ mod tests {
         //           (Some(100), 50, false) => 100 <= 200 => DeleteExpired checked first
         //           (Some(300), 100, true) => 300 > 200 => Keep (object exists)
         //           (None, 0, true) => Keep (indefinite, exists)
-        //           (None, 0, false) => DeleteMissing (indefinite, missing)
-        assert_eq!(result.retention_keep, 2);
+        //           (None, 0, false) => Keep (indefinite holds are never removed,
+        //             even when the object is missing — operator protection)
+        assert_eq!(result.retention_keep, 3);
         assert_eq!(result.retention_delete_expired, 2);
-        assert_eq!(result.retention_delete_missing, 1);
+        assert_eq!(result.retention_delete_missing, 0);
         // webhook: stale_cutoff=200-100=100, max=200+300=500
         //          50 <= 100 => DeleteStale
         //          150 > 100 && 150 <= 500 => Keep
@@ -1483,11 +1508,12 @@ mod tests {
 
     #[test]
     fn fuzz_lifecycle_repair_summary_retention_none_and_missing() {
-        // retention_none + object_missing => DeleteMissing
+        // retention_none + object_missing => Keep: permanent holds are never
+        // removed by lifecycle repair — only operator intervention may.
         let result =
             fuzz_lifecycle_repair_summary(200, 100, &[], &[(None, 0, false)], &[]).unwrap();
-        assert_eq!(result.retention_delete_missing, 1);
-        assert_eq!(result.retention_keep, 0);
+        assert_eq!(result.retention_delete_missing, 0);
+        assert_eq!(result.retention_keep, 1);
     }
 
     #[test]

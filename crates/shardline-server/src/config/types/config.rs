@@ -23,11 +23,11 @@ use super::defaults::{
     DEFAULT_S3_MAX_PART_BYTES, DEFAULT_S3_MIN_PART_BYTES, DEFAULT_S3_UPLOAD_MAX_ACTIVE_PART_FILES,
     DEFAULT_S3_UPLOAD_MAX_ACTIVE_SESSIONS, DEFAULT_S3_UPLOAD_SESSION_MAX_BYTES,
     DEFAULT_S3_UPLOAD_SESSION_TTL_SECONDS, DEFAULT_S3_UPLOAD_TOTAL_MAX_BYTES,
-    HUB_WEBHOOK_SECRET_KEY_BYTES, MAX_DEFAULT_TRANSFER_MAX_IN_FLIGHT_CHUNKS,
-    MAX_DEFAULT_UPLOAD_MAX_IN_FLIGHT_CHUNKS, MAX_ED25519_KEY_BYTES, MAX_METRICS_TOKEN_BYTES,
-    MAX_PROVIDER_API_KEY_BYTES, MAX_TOKEN_SIGNING_KEY_BYTES,
-    MIN_DEFAULT_TRANSFER_MAX_IN_FLIGHT_CHUNKS, MIN_DEFAULT_UPLOAD_MAX_IN_FLIGHT_CHUNKS,
-    MIN_S3_MAX_PART_BYTES,
+    HUB_WEBHOOK_SECRET_KEY_BYTES, MAX_ADMIN_READ_TOKEN_BYTES,
+    MAX_DEFAULT_TRANSFER_MAX_IN_FLIGHT_CHUNKS, MAX_DEFAULT_UPLOAD_MAX_IN_FLIGHT_CHUNKS,
+    MAX_ED25519_KEY_BYTES, MAX_METRICS_TOKEN_BYTES, MAX_PROVIDER_API_KEY_BYTES,
+    MAX_TOKEN_SIGNING_KEY_BYTES, MIN_DEFAULT_TRANSFER_MAX_IN_FLIGHT_CHUNKS,
+    MIN_DEFAULT_UPLOAD_MAX_IN_FLIGHT_CHUNKS, MIN_S3_MAX_PART_BYTES,
 };
 use super::enums::{
     AuthConfig, AuthProviderKind, CacheConfig, DeploymentMode, ObjectStorageAdapter, OciConfig,
@@ -49,6 +49,51 @@ pub use shardline_server_core::DEFAULT_SHARD_METADATA_LIMITS;
 /// Bounded-parser limits for native Xet shard metadata.
 pub use shardline_server_core::ShardMetadataLimits;
 
+/// Validated bearer token for the read-only administration boundary.
+///
+/// The SHA-256 digest is precomputed once at construction so per-request
+/// authorization compares against a static digest instead of re-hashing the
+/// operator's token on every admin API call.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AdminReadToken {
+    token: SecretBytes,
+    sha256: [u8; 32],
+}
+
+impl AdminReadToken {
+    fn new(value: SecretBytes) -> Result<Self, ServerConfigError> {
+        if value.expose_secret().is_empty() {
+            return Err(ServerConfigError::EmptyAdminReadToken);
+        }
+        ensure_secret_size_within_limit(
+            u64::try_from(value.len()).unwrap_or(u64::MAX),
+            MAX_ADMIN_READ_TOKEN_BYTES,
+            |observed_bytes, maximum_bytes| ServerConfigError::AdminReadTokenTooLarge {
+                observed_bytes,
+                maximum_bytes,
+            },
+        )?;
+        if !value.expose_secret().iter().all(u8::is_ascii_graphic) {
+            return Err(ServerConfigError::InvalidAdminReadToken);
+        }
+        use sha2::{Digest, Sha256};
+        let sha256: [u8; 32] = Sha256::digest(value.expose_secret()).into();
+        Ok(Self {
+            token: value,
+            sha256,
+        })
+    }
+
+    fn expose_secret(&self) -> &[u8] {
+        self.token.expose_secret()
+    }
+
+    /// The precomputed SHA-256 digest of the token bytes.
+    pub(crate) const fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+}
+
 /// Public server configuration.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -66,6 +111,7 @@ pub struct ServerConfig {
     pub(crate) transfer_max_in_flight_chunks: NonZeroUsize,
     pub(crate) index_postgres_url: Option<SecretString>,
     pub(crate) metrics_token: Option<SecretBytes>,
+    pub(crate) admin_read_token: Option<AdminReadToken>,
     pub(crate) deployment_mode: DeploymentMode,
     /// Whether the deployment mode was explicitly selected (e.g. via
     /// `SHARDLINE_DEPLOYMENT_MODE`), as opposed to the built-in insecure
@@ -141,6 +187,7 @@ impl ServerConfig {
             transfer_max_in_flight_chunks: default_transfer_max_in_flight_chunks(),
             index_postgres_url: None,
             metrics_token: None,
+            admin_read_token: None,
             deployment_mode: DeploymentMode::default(),
             deployment_mode_explicitly_set: false,
             allow_plaintext_secrets_in_production: false,
@@ -614,6 +661,27 @@ impl ServerConfig {
     #[must_use]
     pub fn metrics_token(&self) -> Option<&[u8]> {
         self.metrics_token.as_ref().map(SecretBytes::expose_secret)
+    }
+
+    /// Returns the optional bearer token protecting the read-only admin API.
+    #[must_use]
+    pub fn admin_read_token(&self) -> Option<&[u8]> {
+        self.admin_read_token
+            .as_ref()
+            .map(AdminReadToken::expose_secret)
+    }
+
+    /// Returns the precomputed SHA-256 digest of the admin read token.
+    ///
+    /// Authorization compares request tokens against this static digest, so
+    /// the operator's token is hashed once at config load rather than on
+    /// every admin API request.
+    #[must_use]
+    pub const fn admin_read_token_sha256(&self) -> Option<&[u8; 32]> {
+        match &self.admin_read_token {
+            Some(token) => Some(token.sha256()),
+            None => None,
+        }
     }
 
     /// Returns the deployment security mode.
@@ -1218,6 +1286,19 @@ impl ServerConfig {
         )?;
 
         self.metrics_token = Some(metrics_token);
+        Ok(self)
+    }
+
+    /// Enables the read-only administrative API with a dedicated bearer token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerConfigError::EmptyAdminReadToken`] when the token is empty.
+    pub fn with_admin_read_token(
+        mut self,
+        admin_read_token: impl Into<SecretBytes>,
+    ) -> Result<Self, ServerConfigError> {
+        self.admin_read_token = Some(AdminReadToken::new(admin_read_token.into())?);
         Ok(self)
     }
 
