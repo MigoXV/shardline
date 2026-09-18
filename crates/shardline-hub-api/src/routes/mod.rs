@@ -6,6 +6,7 @@ pub mod handlers;
 pub mod health;
 pub mod helpers;
 pub mod lfs;
+mod object_io;
 pub mod repos;
 pub mod resolve;
 pub mod router;
@@ -29,9 +30,10 @@ pub(crate) use self::helpers::{
 // adapters so sibling modules and `crate::routes::lfs_object_key` references
 // resolve to a single implementation (no duplicated key derivation).
 pub(crate) use self::lfs::*;
+pub(crate) use self::object_io::{read_object_prefix, stream_object};
 pub(crate) use self::repos::*;
 pub(crate) use self::resolve::*;
-pub use self::router::router;
+pub use self::router::{router, router_with_dataset_query};
 pub use self::state::HubState;
 pub(crate) use self::tokens::*;
 pub(crate) use self::tree::*;
