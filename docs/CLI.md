@@ -136,11 +136,14 @@ shardline db migrate up --steps 2
 shardline db migrate up --database-url postgres://user:password@db.example.com:5432/shardline
 shardline db migrate down --steps 1
 shardline db migrate status
+shardline db migrate local-up --root /var/lib/shardline
 ```
 
 `up` applies pending migrations, `down` reverts applied migrations (optionally limited
 by `--steps`), and `status` reports the applied and pending sets. `--database-url`
-overrides the configured Postgres metadata URL.
+overrides the configured Postgres metadata URL. `local-up` explicitly applies local
+SQLite migrations to the selected deployment root; server startup does not upgrade
+stale schemas automatically.
 
 Verify object-store and metadata integrity:
 
@@ -163,6 +166,19 @@ shardline repair
 shardline repair lifecycle
 shardline repair lifecycle --webhook-retention-seconds 604800
 ```
+
+Rebuild one corrupted local LFS patch evidence envelope only after verifying its
+materialized state and identity out of band:
+
+```bash
+shardline repair lfs-evidence --root /var/lib/shardline \
+  --state-file ./lfs-patch-recovery.json
+```
+
+The state file is a JSON encoding of `LfsPatchEvidenceRepairInput` and must include
+the OID, scope/session/target identity, total length, canonical ranges, staging length,
+and `.meta` timestamp. This command replaces reliability sidecars and Merkle journals
+only; ordinary reads and sweeps never perform this repair.
 
 Export an adapter-neutral recovery manifest:
 
