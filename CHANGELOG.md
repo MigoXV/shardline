@@ -4,6 +4,57 @@ All notable changes to Shardline are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [1.12.0] - 2026-10-16
+
+This update strengthens maintenance coordination and recovery while preserving
+existing deployment data, public reliability types, and normal startup behavior.
+
+### Changed
+
+- Upgraded to the StateChronicle and Penelope 0.2.0 umbrella crates, preserving
+  existing public types, evidence formats, signatures, and recovery compatibility.
+- Added PostgreSQL protection and history objects through the explicit owner
+  upgrade, preserving released migration entries. SQLite installs compatibility
+  guards during initialization.
+
+### Added
+
+- Added embedded maintenance tracking and administrative task history without
+  requiring another service or changing existing command output and exit behavior.
+- Added opt-in Linux `shardline maintenance` supervision with verified checkpoint
+  and result proofs, plus optional durable task-journal and process-runtime features.
+- Added compatibility vectors and required distributed-integrity CI checks covering
+  deployment faults and upgrades and rollbacks with the released 1.11.3 binary.
+- Added six-VM drills for maintenance takeover and simultaneous writes against
+  shared PostgreSQL and MinIO, with cross-node integrity checks after restarts.
+
+### Improved
+
+- Accelerated upload chunk-boundary scanning while preserving existing chunk identities.
+- Reused bounded validation output for full-file downloads while preserving
+  complete container checks and bounded streaming responses.
+- Reduced duplicate S3 requests and overlapped bounded upload read-back while
+  retaining full content verification.
+- Batched PostgreSQL version and latest metadata in the owning publication transaction
+  and reduced reference sorting, locking, and snapshot setup overhead during publication.
+- Strengthened upload and resumable lifecycle validation with native StateChronicle
+  profiles while preserving existing transition rules.
+- Stored PostgreSQL task history in shared metadata without additional payload-bucket
+  write permissions. Interrupted remote work remains explicitly unresolved.
+
+### Fixed
+
+- Blocked unreviewed workspace dependency overrides during crate publication.
+  The pinned Hyper HTTP/1 shutdown fix has an explicit release exception:
+  binaries include it, while crates.io consumers use released Hyper without it.
+  See [library distribution limits](docs/RELIABILITY_ARCHITECTURE.md#published-crates-and-hyper).
+- Prevented maintenance commands from continuing as the old owner after losing
+  their PostgreSQL ownership connection.
+- Blocked conflicting writes with a retryable error while an earlier remote delete
+  remains uncertain, until the exact attempt is reconciled.
+
 ## [1.11.3] - 2026-10-03
 
 This patch hardens storage, recovery, protocol handling, and the SDK, while reducing
@@ -1233,7 +1284,9 @@ There are no intentional breaking API or configuration changes from `1.0.0`.
 - Documented async storage TOCTOU races with 1.2M-run fuzz validation (`40ef000`)
 - Updated all architecture, deployment, and Hub API docs for 20-crate structure (`1203d8e`)
 
-[Unreleased]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.2...HEAD
+[Unreleased]: https://github.com/STEXS-Technologies/shardline/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.3...v1.12.0
+[1.11.3]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.2...v1.11.3
 [1.11.2]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.1...v1.11.2
 [1.11.1]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.0...v1.11.1
 [1.11.0]: https://github.com/STEXS-Technologies/shardline/compare/v1.10.0...v1.11.0
