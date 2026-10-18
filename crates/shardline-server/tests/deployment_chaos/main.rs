@@ -880,15 +880,17 @@ fn s3_object_count(store: &ServerObjectStore) -> usize {
     }
 }
 
-/// Waits until a new chunk object lands in the object store while the slow PUT
-/// is still streaming (provable mid-body evidence).
+/// Waits until a new immutable object lands while the slow PUT is still
+/// streaming (provable mid-body evidence for chunks or packed containers).
+/// Chunking and packing can take longer on busy CI runners, so this observes
+/// progress for a bounded interval instead of assuming a local-machine speed.
 async fn wait_s3_object_count_grows(
     store: &ServerObjectStore,
     baseline: usize,
     put_task: &JoinHandle<reqwest::Result<reqwest::Response>>,
 ) {
     let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(5))
+        .checked_add(Duration::from_secs(30))
         .expect("deadline overflow");
     loop {
         let count = s3_object_count(store);
@@ -901,7 +903,7 @@ async fn wait_s3_object_count_grows(
             );
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("no chunk evidence within 5s (object count {count} <= baseline {baseline})");
+            panic!("no chunk evidence within 30s (object count {count} <= baseline {baseline})");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1200,8 +1202,12 @@ async fn s3_delete(base: &str, token: &str, key: &str) -> reqwest::Response {
         .expect("s3 DELETE request")
 }
 
-/// Starts a slow PUT (streams one multipart-sized 8 MiB chunk, then stalls)
+/// Starts a slow PUT (streams 36 MiB, then stalls without sending EOF)
 /// and returns the body sender plus the in-flight request task.
+///
+/// The prefix crosses the 32 MiB direct-packing batch boundary so storage
+/// evidence exists before fault injection even when raw chunks are not written.
+/// The remaining bytes keep a second batch unfinished until the sender closes.
 ///
 /// The streamed bytes are derived from `first_chunk_seed` XOR a fresh
 /// nanosecond timestamp, so each invocation writes content the (persistent)
@@ -1235,7 +1241,7 @@ async fn start_slow_put(
             .await
     });
     tx.send(Ok(bytes::Bytes::from(deterministic_bytes(
-        8 * 1024 * 1024,
+        36 * 1024 * 1024,
         unique_seed,
     ))))
     .await
@@ -2172,6 +2178,26 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
 
     assert_s3_bytes(&node_b.base_url(), &token, "f-old", &old_bytes, "N-1 peer").await;
 
+    // Capture the predecessor's history availability before starting N. The
+    // predecessor may already support task history, so the exact notice is
+    // deployment state rather than a fixed expectation about its release.
+    let response = admin_get(
+        &node_a.base_url(),
+        "/api/v1/tasks/maintenance",
+        ADMIN_READ_TOKEN,
+    )
+    .await;
+    let predecessor_history = match response.status().as_u16() {
+        200 => {
+            let status: serde_json::Value = response.json().await.unwrap();
+            Some((status["history_notice"].clone(), status["tasks"].clone()))
+        }
+        // Releases before maintenance history was exposed do not serve this
+        // endpoint. Their explicit migration path is checked below instead.
+        403 | 404 => None,
+        status => panic!("unexpected N-1 task-history status: {status}"),
+    };
+
     // A format-preserving dependency upgrade needs no domain migration window.
     // Test overlap before optional owner setup, then upgraded history and rollback.
     let pool = sqlx::PgPool::connect(&stack.pg_url).await.unwrap();
@@ -2247,10 +2273,38 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
         .await;
         assert_eq!(response.status().as_u16(), 200);
         let status: serde_json::Value = response.json().await.unwrap();
-        assert!(status["history_notice"].is_string());
-        assert!(status["tasks"].as_array().unwrap().is_empty());
-        // The usual owner command installs optional history even when the
-        // domain migration ledger is already current. Startup never installs it.
+        if let Some((predecessor_history_notice, predecessor_tasks)) = predecessor_history.as_ref()
+        {
+            assert_eq!(
+                &status["history_notice"], predecessor_history_notice,
+                "starting N must not change the predecessor's task-history availability"
+            );
+            let tasks = status["tasks"].as_array().unwrap();
+            let predecessor_tasks = predecessor_tasks.as_array().unwrap();
+            for predecessor_task in predecessor_tasks {
+                assert!(
+                    tasks.iter().any(|task| task == predecessor_task),
+                    "starting N must preserve predecessor task history: {predecessor_task}"
+                );
+            }
+            for task in tasks.iter().filter(|task| {
+                !predecessor_tasks
+                    .iter()
+                    .any(|predecessor_task| predecessor_task["id"] == task["id"])
+            }) {
+                assert_eq!(task["operation"], "lfs-startup-session-sweep");
+                assert_eq!(task["state"], "completed");
+                assert_eq!(task["owner"]["pid"], node_a.child.id());
+            }
+        } else {
+            // Older compatible releases have no history endpoint/schema. N
+            // must keep history unavailable until its explicit owner command.
+            assert!(status["history_notice"].is_string());
+            assert!(status["tasks"].as_array().unwrap().is_empty());
+        }
+        // The explicit owner command may install optional history even when
+        // the domain migration ledger is current. Startup only appends its
+        // own completed maintenance evidence when history is already enabled.
         drop(node_a);
         migrate_chaos_postgres_with_binary(&current_binary, &stack.pg_url).await;
         node_a = DeploymentServer::spawn_at(
