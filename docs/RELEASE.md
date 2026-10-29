@@ -8,16 +8,24 @@ Cargo metadata.
 
 Run `python3 scripts/check-publish-dependencies.py` before preparing a release.
 Workspace `[patch]` and `[replace]` entries do not propagate to downstream
-crates.io consumers. Both the coordinated publisher and release workflow reject
-them before publication.
+crates.io consumers. This strict check rejects all such overrides. The
+coordinated publisher and release workflow use
+`python3 scripts/check-publish-dependencies.py --allow-reviewed-hyper-patch`:
+they permit only the exact reviewed Hyper revision and warn about the downstream
+limitation. Every other override still blocks publication.
 
 The temporary Hyper patch supplies the HTTP/1 connection-shutdown fix from
 [upstream PR 4222](https://github.com/hyperium/hyper/pull/4222). Until a published
-Hyper version contains that fix, crate publication remains blocked. Keep the
+Hyper version contains that fix, repository-built binaries and crates.io library
+consumers have different HTTP/1 shutdown behavior. Crate publication is allowed
+under the reviewed exception; it does not establish equivalent reliability for
+downstream applications. See
+[published crates and Hyper](RELIABILITY_ARCHITECTURE.md#published-crates-and-hyper)
+for the affected race and the downstream workspace patch option. Keep the
 patch for repository builds. When the fix is released, require that version in
 the manifests of published crates that depend on Hyper, update both lockfiles,
-remove the patches from both workspace manifests, and test a separate consumer
-without workspace overrides.
+remove the patches from both workspace manifests and the reviewed publication
+exception, and test a separate consumer without workspace overrides.
 Do not remove the patch merely to pass the publication check.
 
 Publishing is triggered only by pushing a release tag. Manual runs of the Release
@@ -44,13 +52,19 @@ before creating and pushing its version tag.
    - `[workspace.package] version = "X.Y.Z"`
    - `[workspace.dependencies]`: bump every `shardline-*` `version = "..."` (and
      `sdx`) to the new version so published manifests are coherent.
-2. Refresh the lockfile and confirm the workspace still builds:
+2. Refresh both lockfiles without updating unrelated dependencies and confirm
+   the workspace still builds:
    ```bash
-   cargo check --workspace
+   cargo update --workspace
+   cargo update --workspace --manifest-path e2e/Cargo.toml
+   cargo check --locked --workspace
+   cargo metadata --locked --manifest-path e2e/Cargo.toml --format-version 1 --no-deps
    ```
 3. Update `CHANGELOG.md`: the repo convention is to rename `## [Unreleased]` to a
    dated `## [<version>] - YYYY-MM-DD` section at release time. Do **not** add a dated
-   section yourself in a normal change.
+   section yourself in a normal change. Match the existing release introduction
+   and category headings, consolidate overlapping implementation notes, retain
+   upgrade/security limits, and update the version comparison links.
 4. Confirm formatting/clippy on the crates being published:
    ```bash
    cargo fmt --all -- --check

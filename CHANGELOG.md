@@ -4,7 +4,101 @@ All notable changes to Shardline are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.13.0] - 2026-10-29
+
+This update expands native client compatibility and reduces redundant upload and
+storage work while preserving content verification, durable publication, and
+recovery. See the [upgrade procedure](docs/ROLLING_UPGRADE.md) before rollout.
+
+### Changed
+
+- Store new native Xet uploads as verified Xorbs without redundant decoded chunk
+  objects. Existing uploads remain readable; upgrade every native chunk reader
+  before resuming writes. Old standalone-chunk readers cannot serve new uploads.
+- Install additive frontend metadata through the owner-run migration commands,
+  preserving the released core migration ledger and existing object records.
+- Use verified Git commit identities for Hub revisions. Route new identity
+  requests to upgraded replicas; retain legacy revision IDs before rollback.
+
+### Added
+
+- Support native Hugging Face Xet uploads, scoped CAS credentials, file HEAD,
+  JSON batch reconstruction, token refresh, and chunk-aligned delta uploads.
+- Support Hub refs, branches, tags, commit history, paths-info, expanded trees,
+  and bounded model-card validation with official client workflows.
+- Add durable Git LFS locks with owner checks, pagination, and shared PostgreSQL
+  state, including the Hub LFS routes.
+- Support atomic Git pushes, report-status-v2, push-options, shallow history,
+  partial clones, and protocol-v2 upload-pack for branch and repository views.
+  Snapshot-scoped credentials retain legacy negotiation.
+- Support OCI 1.1 referrer discovery with artifact filtering and pagination.
+- Add optional S3 SigV4 identities, presigned requests, signed browser uploads,
+  streaming checksums, multipart listing, and range-based UploadPartCopy.
+- Support S3 object tags, preserved HTTP metadata, checksum attributes and
+  response overrides, plus multipart COMPOSITE and FULL_OBJECT checksums.
+- Return compatible unversioned S3 listings and bucket-owner-enforced ACL
+  responses, rejecting unsupported mutations rather than acknowledging them.
+- Add optional shared repository-creation limits and creator denials through
+  `admin repository-policy`, with atomic checks across replicas.
+
+### Improved
+
+- Share immutable verified upload bodies across local and S3 persistence,
+  removing duplicate validation without weakening conflict or durability checks.
+- Authenticate native Xet members as frames arrive and reuse verified metadata
+  during storage and shard registration, with bounded shared memory admission.
+- Stream remote shard verification without scratch files and reuse authenticated
+  sources and SHA-256 prefix states while retaining complete-file identity checks.
+- Reduce native Xet retransmission through scoped deduplication and reuse verified
+  existing containers across protocol uploads with different compression encodings.
+- Authenticate selected Xorb members for small range reads, avoiding whole-container
+  transfer for supported formats while retaining legacy full-verification fallback.
+- Remove disposable staging copies from local packing, LFS PATCH, OCI, Bazel,
+  and S3 browser uploads while retaining ordered validation and recovery.
+- Combine final upload-state commits after durable publication, retaining every
+  recovery event; reduce PostgreSQL metadata, authorization, and lookup overhead.
+- Bound upload buffers through cancellation and transport release; free execution
+  slots during I/O and stop stalled HTTP readers and producers after five minutes.
+- Retain v1.12.1 direct packing, verified caches, batched S3 cleanup, and bounded
+  streaming comparisons, with real-client and released-binary qualification.
+
+### Fixed
+
+- Preserve Hub revision history, identities, and cross-scope authorized reads;
+  enforce snapshot boundaries without exposing ancestor objects or metadata.
+- Retry unconditional concurrent Hub commits without losing unrelated files;
+  retain explicit-parent conflicts and atomic Git reference publication.
+- Correct Hub download metadata, absolute links, Range and conditional responses,
+  native Xet discovery, LFS actions, and historical token refresh.
+- Return compatible whoami organization metadata, repository defaults, tree
+  pagination, Git/LFS URL aliases, and structured client errors.
+- Recover interrupted native uploads and indexed chunk reads while rejecting
+  pending deletes, corrupt sources, malformed footers, and mismatched term lengths.
+- Recognize native Xet layouts during FSCK, GC, repair, and rebuild, including
+  Hub-only deployments; preserve live content and fail on damaged sources.
+- Preserve retryable ownership, admission, and storage failures through native
+  upload progress and Hub download responses.
+- Keep PostgreSQL publication, multipart listing, and evidence reads consistent;
+  serialize frontend migration installation and native descriptor lock ordering.
+- Verify S3 streamed source digests and exact backend range lengths; retain
+  correct checksums, object metadata, and conditional request semantics.
+- Make fresh Compose initialization actionable and bounded, and fail required
+  qualification when clients, Docker services, or fault fixtures are missing.
+
+### Security
+
+- Authorize both Hub repository-creation routes against the exact repository or
+  an explicit namespace grant before metadata lookup or publication. Thanks to
+  Jannes Stubbemann (@stubbi, openxet) for privately reporting the vulnerability.
+- Bind Xet download capabilities to authorized repository, file, Xorb, and byte
+  ranges, with expiry limited by the credential. URLs terminate at Shardline,
+  never at the private object-store backend.
+- Enforce revision scope before metadata discovery, LFS actions, and Git
+  negotiation; require repository-wide credentials for repository administration.
+- Validate webhook DNS at connection time, reject private-address and proxy
+  bypasses, disable redirects, and keep credentials and signed URLs out of logs.
+- Update TLS certificate verification, trust roots, S3 storage, and XML parsing
+  dependencies to remove the documented security advisory exceptions.
 
 ## [1.12.1] - 2026-10-17
 
@@ -1345,7 +1439,9 @@ There are no intentional breaking API or configuration changes from `1.0.0`.
 - Documented async storage TOCTOU races with 1.2M-run fuzz validation (`40ef000`)
 - Updated all architecture, deployment, and Hub API docs for 20-crate structure (`1203d8e`)
 
-[Unreleased]: https://github.com/STEXS-Technologies/shardline/compare/v1.12.0...HEAD
+[Unreleased]: https://github.com/STEXS-Technologies/shardline/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/STEXS-Technologies/shardline/compare/v1.12.1...v1.13.0
+[1.12.1]: https://github.com/STEXS-Technologies/shardline/compare/v1.12.0...v1.12.1
 [1.12.0]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.3...v1.12.0
 [1.11.3]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.2...v1.11.3
 [1.11.2]: https://github.com/STEXS-Technologies/shardline/compare/v1.11.1...v1.11.2
