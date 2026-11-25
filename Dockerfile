@@ -11,19 +11,13 @@ ARG CARGO_REGISTRY_MIRROR=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 WORKDIR /workspace
 ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
 COPY . .
-# Keep using the original registry cache when it already covers the build.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
-    set -eu; \
-    if cargo tree --locked --offline -p shardline --edges normal,build >/dev/null 2>&1; then \
-        set -- --offline; \
-    else \
-        set -- --config 'source.crates-io.replace-with="mirror"' \
-            --config "source.mirror.registry=\"${CARGO_REGISTRY_MIRROR}\""; \
-    fi; \
-    cargo build "$@" --locked --release -p shardline --bin shardline; \
-    cp /workspace/target/release/shardline /tmp/shardline
+    cargo build --locked --release -p shardline --bin shardline \
+        --config 'source.crates-io.replace-with="mirror"' \
+        --config "source.mirror.registry=\"${CARGO_REGISTRY_MIRROR}\"" \
+    && cp /workspace/target/release/shardline /tmp/shardline
 
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG DEBIAN_MIRROR=http://mirrors.bfsu.edu.cn
