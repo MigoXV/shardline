@@ -3,8 +3,10 @@
 //! downloads and unsupported legacy footers retain complete-container validation.
 use super::{Bytes, ServerByteStream, ServerError, ServerObjectStore};
 use crate::admission::{BoundedPool, blocking_work_with_permit};
-use futures_util::{StreamExt, stream};
-use shardline_index::{FileRecord, StorageRepresentation, parse_xet_hash_hex};
+use futures_util::{StreamExt, TryStreamExt, stream};
+use shardline_index::{
+    FileChunkRecord, FileRecord, FileRecordStorageLayout, StorageRepresentation, parse_xet_hash_hex,
+};
 use shardline_protocol::ByteRange;
 use shardline_storage::{AsyncObjectStore, ObjectKey};
 use shardline_xet_adapter::{
@@ -14,6 +16,8 @@ use std::{io, sync::Arc};
 use tokio::sync::OwnedSemaphorePermit;
 
 const MAX_FOOTER_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_HUB_RANGE_BYTES: u64 = 1024 * 1024;
+const MAX_HUB_RANGE_TERMS: usize = 32;
 
 fn invalid() -> ServerError {
     ServerError::Io(io::Error::new(
@@ -70,12 +74,81 @@ pub(super) async fn file_stream(
     {
         return Ok(None);
     }
+    container_stream(store, &first.hash, &record.chunks, range, pool).await
+}
+
+/// Authenticate a small range of an already-authorized native Hub file.
+/// Each referenced term is bound to its Xorb Merkle root at shard registration.
+pub(crate) async fn native_file_range(
+    store: ServerObjectStore,
+    record: &FileRecord,
+    range: ByteRange,
+    pool: BoundedPool,
+) -> Result<Option<Bytes>, ServerError> {
+    let size = range.len().ok_or_else(invalid)?;
+    if !matches!(store, ServerObjectStore::S3(_))
+        || record.storage_layout() != FileRecordStorageLayout::ReferencedObjectTerms
+        || size > MAX_HUB_RANGE_BYTES
+    {
+        return Ok(None);
+    }
+    record.validate_reconstruction_plan()?;
+    if range.end_inclusive() >= record.total_bytes {
+        return Err(invalid());
+    }
+    let mut terms = Vec::new();
+    let mut position = 0;
+    for term in &record.chunks {
+        if term.offset != position {
+            return Err(invalid());
+        }
+        position = position.checked_add(term.length).ok_or_else(invalid)?;
+        if term.offset <= range.end_inclusive() && position > range.start() {
+            if terms.len() == MAX_HUB_RANGE_TERMS {
+                return Ok(None);
+            }
+            terms.push(term);
+        }
+    }
+    if position != record.total_bytes {
+        return Err(invalid());
+    }
+    let mut output = Vec::with_capacity(usize::try_from(size)?);
+    for term in terms {
+        let Some(mut members) = container_stream(
+            store.clone(),
+            &term.hash,
+            std::slice::from_ref(term),
+            range,
+            pool.clone(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        while let Some(bytes) = members.try_next().await? {
+            output.extend_from_slice(&bytes);
+        }
+    }
+    if u64::try_from(output.len())? != size {
+        return Err(invalid());
+    }
+    Ok(Some(Bytes::from(output)))
+}
+
+async fn container_stream(
+    store: ServerObjectStore,
+    hash: &str,
+    terms: &[FileChunkRecord],
+    range: ByteRange,
+    pool: BoundedPool,
+) -> Result<Option<ServerByteStream>, ServerError> {
     let memory = Arc::new(
         pool.acquire_buffer()
             .await
             .map_err(|error| ServerError::Io(io::Error::other(error)))?,
     );
-    let key = crate::xet_adapter::xorb_object_key(&first.hash)?;
+    let key = crate::xet_adapter::xorb_object_key(hash)?;
     let Some((trailer, total)) = AsyncObjectStore::read_suffix(&store, &key, 8).await? else {
         return Ok(None);
     };
@@ -96,8 +169,8 @@ pub(super) async fn file_stream(
         .map_err(|_range| invalid())?,
     )
     .await?;
-    let expected = parse_xet_hash_hex(&first.hash)?;
-    let record = record.clone();
+    let expected = parse_xet_hash_hex(hash)?;
+    let terms = terms.to_vec();
     let worker = pool
         .acquire()
         .await
@@ -106,7 +179,7 @@ pub(super) async fn file_stream(
         let Some(footer) = validate_serialized_xorb_footer(&bytes, total, expected)? else {
             return Ok(None);
         };
-        let selections = select(&record, range, &footer)?;
+        let selections = select(&terms, range, &footer)?;
         Ok(Some((footer, selections)))
     })
     .await?;
@@ -130,12 +203,12 @@ pub(super) async fn file_stream(
 }
 
 fn select(
-    record: &FileRecord,
+    terms: &[FileChunkRecord],
     range: ByteRange,
     footer: &AuthenticatedXorbFooter,
 ) -> Result<Vec<Selection>, ServerError> {
     let mut selections = Vec::new();
-    for term in &record.chunks {
+    for term in terms {
         let first = usize::try_from(term.range_start)?;
         let limit = usize::try_from(term.range_end)?;
         let members = footer.chunks().get(first..limit).ok_or_else(invalid)?;

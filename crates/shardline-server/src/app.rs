@@ -85,7 +85,7 @@ use admin_api::{
 };
 #[cfg(feature = "fuzzing")]
 pub(crate) use admin_api::{parse_admin_cursor_for_fuzzing, parse_admin_query_for_fuzzing};
-use hub_xet_download::download_hub_xet_file;
+use hub_xet_download::{download_hub_xet_file, download_hub_xet_members};
 use metadata_routes::{
     create_revision, delete_path, delete_revision, list_revisions, register_path, tree_lookup,
 };
@@ -861,6 +861,10 @@ fn register_xet_routes(
                 get(delta::file_chunk_hashes),
             )
             .route("/v1/hub/xet-files/{sha256}", get(download_hub_xet_file))
+            .route(
+                "/v1/hub/xet-files/{sha256}/range",
+                get(download_hub_xet_members),
+            )
             .route("/v2/reconstructions/{file_id}", get(reconstruction_v2))
             .route("/shards", post(upload_shard))
             .route("/v2/shards", post(shard_progress::upload))

@@ -118,6 +118,13 @@ pub(super) async fn download_hub_xet_file(
             .map_err(|_error| ServerError::InvalidRangeHeader)?,
     );
     response.headers_mut().insert(
+        "x-xet-hash",
+        identity
+            .file_id
+            .parse()
+            .map_err(|_error| ServerError::InvalidRangeHeader)?,
+    );
+    response.headers_mut().insert(
         header::ACCEPT_RANGES,
         "bytes"
             .parse()
@@ -126,6 +133,62 @@ pub(super) async fn download_hub_xet_file(
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         "application/octet-stream"
+            .parse()
+            .map_err(|_error| ServerError::InvalidRangeHeader)?,
+    );
+    Ok(response)
+}
+
+pub(super) async fn download_hub_xet_members(
+    State(state): State<Arc<AppState>>,
+    Path(sha256): Path<String>,
+    repo: XetRepository,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, ServerError> {
+    super::operational::reject_commit_token_for_unbound_object(repo.capability())?;
+    validate_hash_path(&sha256)?;
+    let scope = repo
+        .capability()
+        .namespace()
+        .filter(|scope| scope.revision().is_none())
+        .ok_or(ServerError::NotFound)?;
+    let admit = download_admission(&state.admission, std::time::Duration::from_secs(30)).await?;
+    let identity = state
+        .backend
+        .xet_file_identity(scope, &sha256)
+        .await?
+        .ok_or(ServerError::NotFound)?;
+    let total = identity.total_bytes;
+    let etag = format!("\"{sha256}\"");
+    let Selection::Partial(range) = select(&headers, &method, total, &etag)? else {
+        return Ok(StatusCode::NOT_IMPLEMENTED.into_response());
+    };
+    let Some(bytes) = state
+        .backend
+        .hub_repository_native_range(&identity, range)
+        .await?
+    else {
+        return Ok(StatusCode::NOT_IMPLEMENTED.into_response());
+    };
+    let length = u64::try_from(bytes.len())?;
+    let source = Box::pin(stream::once(async move { Ok(bytes) }));
+    let mut response = byte_range_stream_response(
+        admitted_stream(source, admit),
+        state.transfer_limiter.clone(),
+        range,
+        total,
+        length,
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        etag.parse()
+            .map_err(|_error| ServerError::InvalidRangeHeader)?,
+    );
+    response.headers_mut().insert(
+        "x-xet-hash",
+        identity
+            .file_id
             .parse()
             .map_err(|_error| ServerError::InvalidRangeHeader)?,
     );

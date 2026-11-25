@@ -688,6 +688,12 @@ to override that limit. An explicitly configured general body limit also applies
 to Xorbs unless the Xorb limit is set separately, preserving existing operator
 restrictions. Other upload routes retain the general limit.
 
+`SHARDLINE_BUFFERED_UPLOADS` controls the process-wide admission limit for
+buffered uploads, including native Xet Xorbs and shards. It defaults to two
+uploads and accepts values from one through eight. Size container memory for
+the selected concurrency and request body limits, including normalization
+and transport overhead.
+
 Both limits are enforced before normalization and validation. Large transfer
 bodies and footerless normalization use bounded temporary files; allow scratch
 space even with S3 storage. Immutable objects are persisted through the configured
