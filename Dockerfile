@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
+# Modified from upstream Shardline to use package mirrors and ship license notices.
+
 ARG RUST_VERSION=1.99.0
 ARG RUST_IMAGE=rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0
 ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
@@ -14,16 +16,27 @@ COPY Cargo.toml Cargo.lock README.md ./
 COPY .cargo/ .cargo/
 COPY crates/ crates/
 COPY migrations/ migrations/
+COPY scripts/generate-third-party-notices.py scripts/
+COPY scripts/licenses/ scripts/licenses/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
     cargo build --locked --release -p shardline --bin shardline \
         --config 'source.crates-io.replace-with="mirror"' \
         --config "source.mirror.registry=\"${CARGO_REGISTRY_MIRROR}\"" \
-    && cp /workspace/target/release/shardline /tmp/shardline
+    && cp /workspace/target/release/shardline /tmp/shardline \
+    && host_target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo metadata --locked --format-version 1 --filter-platform "${host_target}" \
+        --config 'source.crates-io.replace-with="mirror"' \
+        --config "source.mirror.registry=\"${CARGO_REGISTRY_MIRROR}\"" \
+        > /tmp/shardline-metadata.json \
+    && python3 scripts/generate-third-party-notices.py < /tmp/shardline-metadata.json \
+        > /tmp/THIRD_PARTY_NOTICES.txt \
+    && rm /tmp/shardline-metadata.json
 
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG DEBIAN_MIRROR=http://mirrors.bfsu.edu.cn
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 RUN sed -i "s|http://deb.debian.org/|${DEBIAN_MIRROR}/|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
@@ -35,6 +48,8 @@ RUN sed -i "s|http://deb.debian.org/|${DEBIAN_MIRROR}/|g" /etc/apt/sources.list.
     && chown -R shardline:shardline /var/lib/shardline
 
 COPY --from=builder /tmp/shardline /usr/local/bin/shardline
+COPY LICENSE-MIT LICENSE-APACHE NOTICE /usr/share/licenses/shardline/
+COPY --from=builder /tmp/THIRD_PARTY_NOTICES.txt /usr/share/licenses/shardline/
 
 USER 10001:10001
 # Ensure the container can run with arbitrary non-root UIDs

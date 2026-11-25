@@ -1,0 +1,32 @@
+Shardline
+
+Upstream copyright notice
+Copyright (c) 2026 stexs contributors
+
+This repository contains Shardline code from STEXS Technologies and its
+contributors. It is independently maintained and released. The original
+copyright notices and the MIT and Apache License 2.0 texts are retained in
+LICENSE-MIT and LICENSE-APACHE.
+
+上游项目 / Upstream
+https://github.com/STEXS-Technologies/shardline
+
+The original base was upstream commit a6847ad4aded16ce579f3cb3f4a36b54e2e2ef13.
+The upstream maintenance changes integrated during the repository
+reorganization were based on 59c959df6fd1ad172d74e1bc4e0d6086d6b6aca9.
+
+修改说明 / Modifications
+本仓库重组了工作树并压缩了部分上游开发历史。独立维护的改动包括
+容器构建与发布打包、Hub 和 Xet 的范围下载与预览、上传缓冲区控制、
+相应的部署说明及回归测试，以及 README 的中文翻译。
+
+This repository reorganizes the working tree and consolidates parts of the
+upstream development history. Independently maintained changes include
+container builds and release packaging, Hub and Xet range downloads and
+previews, upload buffer controls, related deployment guidance and regression
+tests, and the Chinese README translation.
+
+第三方依赖 / Third-party dependencies
+Third-party components retain their own licenses. Binary distributions include
+THIRD_PARTY_NOTICES.txt with component versions, license information and links
+to the corresponding source releases.

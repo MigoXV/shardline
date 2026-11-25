@@ -1,4 +1,7 @@
 //! Repository-wide credentials retain ordinary HTTP access to native files.
+
+// Modified from upstream Shardline to verify the native Hub HTTP range endpoint.
+
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

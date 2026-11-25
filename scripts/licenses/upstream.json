@@ -1,0 +1,27 @@
+{
+  "0a81fd6928ea3b33c8cd484aa4575d50ffb98012": {
+    "alloc-stdlib.txt": "https://github.com/dropbox/rust-alloc-no-stdlib/blob/0a81fd6928ea3b33c8cd484aa4575d50ffb98012/LICENSE"
+  },
+  "7e163021e59cca4f8e1e35a7c828b5c6b7915953": {
+    "flatbuffers.txt": "https://github.com/google/flatbuffers/blob/7e163021e59cca4f8e1e35a7c828b5c6b7915953/LICENSE"
+  },
+  "f1c457150d86d530a5907322c10f4f0d66c547f2": {
+    "stexs-MIT.txt": "https://github.com/STEXS-Technologies/penelope/blob/f1c457150d86d530a5907322c10f4f0d66c547f2/LICENSE-MIT",
+    "stexs-APACHE.txt": "https://github.com/STEXS-Technologies/penelope/blob/f1c457150d86d530a5907322c10f4f0d66c547f2/LICENSE-APACHE"
+  },
+  "edcc5b423e4919f51e4aa2cb820d9de68a684145": {
+    "stexs-MIT.txt": "https://github.com/STEXS-Technologies/penelope/blob/edcc5b423e4919f51e4aa2cb820d9de68a684145/LICENSE-MIT",
+    "stexs-APACHE.txt": "https://github.com/STEXS-Technologies/penelope/blob/edcc5b423e4919f51e4aa2cb820d9de68a684145/LICENSE-APACHE"
+  },
+  "3c9c90654901fad2581fe3f839d5a70a1309186b": {
+    "stexs-MIT.txt": "https://github.com/STEXS-Technologies/statechronicle/blob/3c9c90654901fad2581fe3f839d5a70a1309186b/LICENSE-MIT",
+    "stexs-APACHE.txt": "https://github.com/STEXS-Technologies/statechronicle/blob/3c9c90654901fad2581fe3f839d5a70a1309186b/LICENSE-APACHE"
+  },
+  "c418e98b91720188158c531cd5c2c4b8ab71cbcf": {
+    "stexs-MIT.txt": "https://github.com/STEXS-Technologies/statechronicle/blob/c418e98b91720188158c531cd5c2c4b8ab71cbcf/LICENSE-MIT",
+    "stexs-APACHE.txt": "https://github.com/STEXS-Technologies/statechronicle/blob/c418e98b91720188158c531cd5c2c4b8ab71cbcf/LICENSE-APACHE"
+  },
+  "b5f7280a3b44cba655862c9add2dafdfcbf10c63": {
+    "xet-core.txt": "https://github.com/huggingface/xet-core/blob/b5f7280a3b44cba655862c9add2dafdfcbf10c63/LICENSE"
+  }
+}
