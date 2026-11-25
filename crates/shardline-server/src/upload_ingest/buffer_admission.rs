@@ -1,4 +1,7 @@
 //! Aggregate admission for request bodies retained before publication.
+
+// Modified from upstream Shardline to allow a configurable buffered upload limit.
+
 use crate::{ServerError, admission::BoundedPool};
 use std::{num::NonZeroUsize, sync::LazyLock};
 use tokio::sync::OwnedSemaphorePermit;

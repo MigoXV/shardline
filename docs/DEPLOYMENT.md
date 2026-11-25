@@ -1,5 +1,8 @@
 # Deployment
 
+This copy of the upstream Shardline guide has been updated to document the
+configurable buffered upload limit. See [NOTICE](../NOTICE) for provenance.
+
 Shardline runs as a single Docker container by default, with external object storage and
 index storage selected by configuration.
 

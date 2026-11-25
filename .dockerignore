@@ -25,6 +25,9 @@ TODO_*.md
 docs
 .github
 
-# Developer tooling and the standalone E2E workspace are not binary inputs.
-scripts
+# Modified from upstream Shardline to include the license generator and its inputs.
+scripts/*
+!scripts/generate-third-party-notices.py
+!scripts/licenses/
+# The standalone E2E workspace is not a binary input.
 e2e

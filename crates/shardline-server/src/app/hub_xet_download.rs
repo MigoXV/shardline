@@ -1,5 +1,7 @@
 //! Plain HTTP downloads of Hub files published through native Xet.
 
+// Modified from upstream Shardline to return Xet file identities and serve verified ranges.
+
 use std::sync::Arc;
 
 use axum::{

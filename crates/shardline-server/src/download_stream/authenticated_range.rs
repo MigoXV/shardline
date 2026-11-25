@@ -1,6 +1,9 @@
 //! Authenticate selected decoded members against the independently trusted Xorb root.
 //! This proves returned bytes, not the health of unrequested payloads. Full-file
 //! downloads and unsupported legacy footers retain complete-container validation.
+
+// Modified from upstream Shardline to verify ranges spanning native Hub file terms.
+
 use super::{Bytes, ServerByteStream, ServerError, ServerObjectStore};
 use crate::admission::{BoundedPool, blocking_work_with_permit};
 use futures_util::{StreamExt, TryStreamExt, stream};

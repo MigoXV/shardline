@@ -1,5 +1,7 @@
 //! Authorize an immutable Hub file before selecting its native storage scope.
 
+// Modified from upstream Shardline to read verified native Hub file ranges.
+
 use axum::body::Bytes;
 use shardline_protocol::{ByteRange, RepositoryScope};
 
