@@ -2,7 +2,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     ReliabilityError,
-    snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain},
+    snapshot_event::{
+        SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain, verify_snapshot_chain_for,
+    },
 };
 
 /// One canonical log container for every durable snapshot state machine.
@@ -148,16 +150,7 @@ impl<S: SnapshotEvidence> SnapshotEvidenceLog<S> {
                 .ok_or(ReliabilityError::OperationMismatch)?;
             return super::snapshot_event::verify_snapshot_event(event, expected);
         }
-        verify_snapshot_chain(&self.events)?;
-        if self
-            .events
-            .last()
-            .is_some_and(|event| event.after == *expected)
-        {
-            Ok(())
-        } else {
-            Err(ReliabilityError::StateMismatch)
-        }
+        verify_snapshot_chain_for(&self.events, expected)
     }
 
     /// Returns the ordered evidence events.
@@ -176,6 +169,30 @@ impl<S: SnapshotEvidence> SnapshotEvidenceLog<S> {
     pub(crate) const fn events_mut(&mut self) -> &mut Vec<SnapshotEvidenceEvent<S>> {
         &mut self.events
     }
+}
+
+/// Reactivates from a verified prior snapshot, preserving its original fields.
+/// The domain decides which prior state permits reactivation.
+pub(crate) fn verify_and_reactivate_snapshot<S: SnapshotEvidence>(
+    mut evidence: SnapshotEvidenceLog<S>,
+    snapshot: S,
+    can_reactivate: impl FnOnce(&S) -> bool,
+) -> Result<(SnapshotEvidenceLog<S>, bool), ReliabilityError> {
+    if evidence.events.is_empty() {
+        return Ok((SnapshotEvidenceLog::baseline(snapshot)?, true));
+    }
+    if !evidence.head_only {
+        verify_snapshot_chain(&evidence.events)?;
+    }
+    let last = evidence
+        .events
+        .last()
+        .ok_or(ReliabilityError::OperationMismatch)?;
+    if !can_reactivate(&last.after) {
+        return Err(ReliabilityError::StateMismatch);
+    }
+    evidence.record(snapshot)?;
+    Ok((evidence, false))
 }
 
 /// Verifies a persisted snapshot log against the materialized state, or

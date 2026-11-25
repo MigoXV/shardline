@@ -1,15 +1,14 @@
-use std::collections::HashMap;
+use serde_json::from_value;
+use sqlx::{PgConnection, Row, postgres::PgRow, query};
 
-use serde_json::{from_value, to_value};
-use sqlx::{PgConnection, Row, postgres::PgRow, query, query_scalar};
-
-use super::{PostgresIndexStore, PostgresMetadataStoreError, u64_to_i64};
+use super::{
+    PostgresIndexStore, PostgresMetadataStoreError, index_store::persist_appended_events,
+    u64_to_i64,
+};
 use crate::{OciTagEntry, OciTagStore};
 use shardline_reliability::{
-    OciTagEvidenceLog, OciTagLifecycleEvent, OciTagSnapshot, OperationKind,
-    ReliabilityMerkleCommit, SnapshotEvidence, persisted_event_sequence,
-    reliability_merkle_commit_json_with_previous, verify_and_append_snapshot_transition,
-    verify_or_repair_snapshot_evidence, verify_persisted_merkle_commit_with_previous,
+    OciTagEvidenceLog, OciTagLifecycleEvent, OciTagSnapshot, OperationKind, SnapshotEvidence,
+    verify_and_append_snapshot_transition, verify_or_repair_snapshot_evidence,
     verify_snapshot_event, verify_snapshot_evidence,
 };
 
@@ -22,36 +21,16 @@ fn entry_from_row(row: &PgRow) -> Result<OciTagEntry, PostgresMetadataStoreError
     })
 }
 
-async fn load_tag_evidence(
-    connection: &mut PgConnection,
-    scope_namespace: &str,
-    repository: &str,
-    tag: &str,
-) -> Result<OciTagEvidenceLog, PostgresMetadataStoreError> {
-    let operation =
-        OciTagSnapshot::new(scope_namespace, repository, tag, None)?.evidence_operation()?;
-    let event = super::index_store::load_postgres_latest_evidence_event(
-        &mut *connection,
-        OperationKind::OciTag,
-        &operation.operation_id,
-    )
-    .await?;
-    let Some(event) = event else {
-        return Ok(OciTagEvidenceLog::default());
-    };
-    Ok(OciTagEvidenceLog::from_head(from_value(event)?)?)
-}
-
 async fn current_tag_evidence(
     connection: &mut PgConnection,
     scope_namespace: &str,
     repository: &str,
     tag: &str,
     digest_hex: Option<String>,
-) -> Result<OciTagEvidenceLog, PostgresMetadataStoreError> {
+) -> Result<(OciTagEvidenceLog, bool), PostgresMetadataStoreError> {
     let snapshot = OciTagSnapshot::new(scope_namespace, repository, tag, digest_hex)?;
-    let loaded = load_tag_evidence(connection, scope_namespace, repository, tag).await?;
-    Ok(verify_or_repair_snapshot_evidence(loaded, snapshot)?.0)
+    let loaded = super::load_postgres_snapshot_evidence_for(connection, &snapshot).await?;
+    Ok(verify_or_repair_snapshot_evidence(loaded, snapshot)?)
 }
 
 async fn verify_tag_evidence(
@@ -62,7 +41,7 @@ async fn verify_tag_evidence(
     digest_hex: Option<String>,
 ) -> Result<(), PostgresMetadataStoreError> {
     let snapshot = OciTagSnapshot::new(scope_namespace, repository, tag, digest_hex)?;
-    let evidence = load_tag_evidence(connection, scope_namespace, repository, tag).await?;
+    let evidence = super::load_postgres_snapshot_evidence_for(connection, &snapshot).await?;
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(())
 }
@@ -85,189 +64,25 @@ async fn verify_tag_listing_evidence(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let operations = snapshots
+    let operation_ids = snapshots
         .iter()
-        .map(OciTagSnapshot::evidence_operation)
-        .collect::<Result<Vec<_>, _>>()?;
-    let operation_ids = operations
-        .iter()
-        .map(|operation| operation.operation_id.clone())
-        .collect::<Vec<_>>();
-    let rows = query(
-        "WITH requested AS (
-             SELECT operation_id
-             FROM unnest($2::text[]) AS values(operation_id)
-         )
-         SELECT requested.operation_id,
-                latest.sequence,
-                latest.event_json,
-                latest.merkle_commit_json,
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM shardline_reliability_events AS missing
-                    WHERE missing.operation_kind = $1
-                      AND missing.operation_id = requested.operation_id
-                      AND missing.sequence < latest.sequence
-                      AND missing.merkle_commit_json IS NULL
-                ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE (
-                    SELECT previous.merkle_commit_json
-                    FROM shardline_reliability_events AS previous
-                    WHERE previous.operation_kind = $1
-                      AND previous.operation_id = requested.operation_id
-                      AND previous.sequence < latest.sequence
-                    ORDER BY previous.sequence DESC
-                    LIMIT 1
-                ) END AS previous_merkle_commit_json
-         FROM requested
-         LEFT JOIN LATERAL (
-             SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1
-               AND operation_id = requested.operation_id
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) AS latest ON TRUE",
+        .map(|snapshot| Ok(snapshot.evidence_operation()?.operation_id))
+        .collect::<Result<Vec<_>, PostgresMetadataStoreError>>()?;
+    let mut latest = super::load_postgres_latest_evidence_heads(
+        connection,
+        OperationKind::OciTag,
+        &operation_ids,
     )
-    .bind(OperationKind::OciTag.as_str())
-    .bind(&operation_ids)
-    .fetch_all(&mut *connection)
     .await?;
-    let mut latest = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let operation_id: String = row.try_get("operation_id")?;
-        latest.insert(
-            operation_id,
-            (
-                row.try_get::<i64, _>("sequence")?,
-                row.try_get::<serde_json::Value, _>("event_json")?,
-                row.try_get::<Option<serde_json::Value>, _>("merkle_commit_json")?,
-                row.try_get::<Option<serde_json::Value>, _>("previous_merkle_commit_json")?,
-            ),
-        );
-    }
-    for (snapshot, operation) in snapshots.into_iter().zip(operations) {
-        let operation_id = &operation.operation_id;
-        let Some((row_sequence, event_json, merkle_json, previous_merkle_json)) =
-            latest.remove(operation_id)
-        else {
+    for (snapshot, operation_id) in snapshots.iter().zip(operation_ids) {
+        let Some(event_json) = latest.remove(&operation_id) else {
             return Err(PostgresMetadataStoreError::Reliability(
                 shardline_reliability::ReliabilityError::OperationMismatch,
             ));
         };
-        let event_sequence = persisted_event_sequence(OperationKind::OciTag, event_json.clone())?;
-        if row_sequence != u64_to_i64(event_sequence)? {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::Merkle(
-                    "OCI tag listing evidence sequence mismatch".into(),
-                ),
-            ));
-        }
-        verify_persisted_merkle_commit_with_previous(
-            OperationKind::OciTag,
-            event_json.clone(),
-            merkle_json,
-            previous_merkle_json,
-        )?;
         let event: OciTagLifecycleEvent = from_value(event_json)?;
-        verify_snapshot_event(&event, &snapshot)?;
-        if event.operation != operation {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn persist_tag_evidence(
-    connection: &mut PgConnection,
-    evidence: &OciTagEvidenceLog,
-) -> Result<(), PostgresMetadataStoreError> {
-    let Some(first) = evidence.events().first() else {
-        return Ok(());
-    };
-    let persisted_sequence: Option<i64> = query_scalar(
-        "SELECT MAX(sequence)
-         FROM shardline_reliability_events
-         WHERE operation_kind = $1 AND operation_id = $2",
-    )
-    .bind(first.operation.kind.as_str())
-    .bind(&first.operation.operation_id)
-    .fetch_one(&mut *connection)
-    .await?;
-    let persisted_sequence = persisted_sequence.unwrap_or(-1);
-    if let Some(event) = evidence.events().last()
-        && persisted_sequence >= 0
-    {
-        let event_sequence = u64_to_i64(event.sequence)?;
-        if event_sequence <= persisted_sequence {
-            return Ok(());
-        }
-        if event_sequence == persisted_sequence.saturating_add(1) {
-            persist_tag_event(connection, event).await?;
-            return Ok(());
-        }
-    }
-    for event in evidence.events() {
-        if u64_to_i64(event.sequence)? <= persisted_sequence {
-            continue;
-        }
-        persist_tag_event(connection, event).await?;
-    }
-    Ok(())
-}
-
-async fn persist_tag_event(
-    connection: &mut PgConnection,
-    event: &OciTagLifecycleEvent,
-) -> Result<(), PostgresMetadataStoreError> {
-    event.verify_integrity()?;
-    let sequence = u64_to_i64(event.sequence)?;
-    let previous_json: Option<serde_json::Value> = query_scalar(
-        "SELECT CASE WHEN EXISTS (
-             SELECT 1 FROM shardline_reliability_events AS missing
-             WHERE missing.operation_kind = $1 AND missing.operation_id = $2
-               AND missing.sequence < $3
-               AND missing.merkle_commit_json IS NULL
-         ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE merkle_commit_json END
-         FROM shardline_reliability_events
-         WHERE operation_kind = $1 AND operation_id = $2 AND sequence < $3
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(event.operation.kind.as_str())
-    .bind(&event.operation.operation_id)
-    .bind(sequence)
-    .fetch_optional(&mut *connection)
-    .await?;
-    let previous = previous_json
-        .map(serde_json::from_value::<ReliabilityMerkleCommit>)
-        .transpose()?;
-    let merkle_commit_json =
-        reliability_merkle_commit_json_with_previous(event, previous.as_ref())?;
-    let result = query(
-        "INSERT INTO shardline_reliability_events
-            (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds,
-             merkle_commit_json)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (operation_kind, operation_id, sequence) DO UPDATE
-         SET merkle_commit_json = COALESCE(
-             shardline_reliability_events.merkle_commit_json,
-             EXCLUDED.merkle_commit_json
-         )
-         WHERE shardline_reliability_events.event_json = EXCLUDED.event_json",
-    )
-    .bind(event.operation.kind.as_str())
-    .bind(&event.operation.operation_id)
-    .bind(sequence)
-    .bind(to_value(event)?)
-    .bind(shardline_protocol::unix_now_seconds_lossy() as i64)
-    .bind(merkle_commit_json)
-    .execute(&mut *connection)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(PostgresMetadataStoreError::ReliabilityEventConflict(
-            event.operation.operation_id.clone(),
-        ));
+        // Event verification binds its operation identity to this exact snapshot.
+        verify_snapshot_event(&event, snapshot)?;
     }
     Ok(())
 }
@@ -282,13 +97,11 @@ pub(super) async fn record_tag_transition(
 ) -> Result<(), PostgresMetadataStoreError> {
     let before_snapshot = OciTagSnapshot::new(scope_namespace, repository, tag, before.clone())?;
     let after_snapshot = OciTagSnapshot::new(scope_namespace, repository, tag, after)?;
-    let evidence = verify_and_append_snapshot_transition(
-        current_tag_evidence(connection, scope_namespace, repository, tag, before).await?,
-        before_snapshot,
-        after_snapshot,
-    )?
-    .0;
-    persist_tag_evidence(connection, &evidence).await
+    let (stored_evidence, evidence_was_missing) =
+        current_tag_evidence(connection, scope_namespace, repository, tag, before).await?;
+    let evidence =
+        verify_and_append_snapshot_transition(stored_evidence, before_snapshot, after_snapshot)?.0;
+    persist_appended_events(connection, evidence.events(), evidence_was_missing).await
 }
 
 pub(super) async fn current_tag(
@@ -654,9 +467,7 @@ mod tests {
 
     use super::*;
 
-    async fn connect_postgres() -> Option<sqlx::PgPool> {
-        super::super::connect_isolated_postgres().await
-    }
+    use super::super::connect_isolated_postgres as connect_postgres;
 
     fn entry(digest: &str) -> OciTagEntry {
         OciTagEntry {
@@ -667,66 +478,12 @@ mod tests {
         }
     }
 
-    async fn cleanup_tags(pool: &sqlx::PgPool, scope: &str) {
-        sqlx::query(
-            "WITH fixture_rows AS (
-                 SELECT t.scope_namespace, t.repository, t.tag,
-                        COALESCE(MAX(e.sequence), -1) + 1 AS next_sequence
-                 FROM shardline_oci_tags AS t
-                 LEFT JOIN shardline_reliability_events AS e
-                   ON e.operation_kind = 'OciTag'
-                  AND e.operation_id = octet_length(t.scope_namespace)::text || ':' || t.scope_namespace
-                      || octet_length(t.repository)::text || ':' || t.repository
-                      || octet_length(t.tag)::text || ':' || t.tag
-                 WHERE t.scope_namespace = $1
-                 GROUP BY t.scope_namespace, t.repository, t.tag
-             )
-             INSERT INTO shardline_reliability_events
-                 (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds)
-             SELECT 'OciTag',
-                    octet_length(scope_namespace)::text || ':' || scope_namespace
-                        || octet_length(repository)::text || ':' || repository
-                        || octet_length(tag)::text || ':' || tag,
-                    next_sequence,
-                    jsonb_build_object(
-                        'after', jsonb_build_object(
-                            'scope_namespace', scope_namespace,
-                            'repository', repository,
-                            'tag', tag,
-                            'digest_hex', NULL
-                        )
-                    ),
-                    EXTRACT(EPOCH FROM now())::bigint
-             FROM fixture_rows
-             ON CONFLICT (operation_kind, operation_id, sequence) DO NOTHING",
-        )
-        .bind(scope)
-        .execute(pool)
-        .await
-        .expect("seed OCI tag deletion evidence");
-        query("DELETE FROM shardline_oci_tags WHERE scope_namespace = $1")
-            .bind(scope)
-            .execute(pool)
-            .await
-            .expect("clean OCI tag fixture");
-        query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id LIKE $2 || '%'",
-        )
-        .bind(shardline_reliability::OperationKind::OciTag.as_str())
-        .bind(format!("{}:{scope}", scope.len()))
-        .execute(pool)
-        .await
-        .expect("clean OCI tag evidence fixture");
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn pg_identical_oci_tag_replay_appends_evidence_without_new_row_version() {
         let Some(pool) = connect_postgres().await else {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        cleanup_tags(&pool, "oci-pg-replay").await;
         let store = PostgresIndexStore::new(pool);
         let original = OciTagEntry {
             scope_namespace: "oci-pg-replay".to_owned(),
@@ -820,7 +577,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        cleanup_tags(&pool, "oci-pg-cas").await;
         let deleting_store = PostgresIndexStore::new(pool.clone());
         let retargeting_store = PostgresIndexStore::new(pool);
         let old = entry(&"a".repeat(64));
@@ -854,42 +610,80 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        cleanup_tags(&pool, "oci-pg-tamper").await;
         let store = PostgresIndexStore::new(pool.clone());
-        let value = OciTagEntry {
-            scope_namespace: "oci-pg-tamper".to_owned(),
-            repository: "team/assets".to_owned(),
-            tag: "latest".to_owned(),
-            digest_hex: "a".repeat(64),
-        };
-        store.upsert_oci_tag(&value).await.unwrap();
-        query(
-            "UPDATE shardline_reliability_events
-             SET event_json = '{\"tampered\":true}'
-             WHERE operation_kind = 'OciTag'
-               AND event_json->'operation'->>'tenant' = $1",
-        )
-        .bind(&value.scope_namespace)
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(
-            store
-                .oci_tag(&value.scope_namespace, &value.repository, &value.tag)
+        for (case, mutation) in [
+            "UPDATE shardline_reliability_events SET event_json = '{\"tampered\":true}' WHERE operation_kind = 'OciTag'",
+            "UPDATE shardline_reliability_events SET sequence = sequence + 100 WHERE operation_kind = 'OciTag'",
+            "UPDATE shardline_reliability_events SET merkle_commit_json = NULL WHERE operation_kind = 'OciTag' AND sequence = 2",
+            "UPDATE shardline_reliability_events SET merkle_commit_json = NULL WHERE operation_kind = 'OciTag' AND sequence = 0",
+            "UPDATE shardline_reliability_events SET merkle_commit_json = '{}'::jsonb WHERE operation_kind = 'OciTag'",
+            "DELETE FROM shardline_reliability_events WHERE operation_kind = 'OciTag'",
+        ].into_iter().enumerate() {
+            let value = OciTagEntry {
+                scope_namespace: format!("oci-pg-tamper-{case}"),
+                repository: "team/assets".to_owned(),
+                tag: "latest".to_owned(),
+                digest_hex: "a".repeat(64),
+            };
+            for _ in 0..3 {
+                store.upsert_oci_tag(&value).await.unwrap();
+            }
+            assert_eq!(
+                store
+                    .list_oci_tags(&value.scope_namespace, &value.repository, None, 10)
+                    .await
+                    .unwrap(),
+                vec![value.clone()]
+            );
+            assert_eq!(
+                store
+                    .list_oci_tags_by_digest(
+                        &value.scope_namespace,
+                        &value.repository,
+                        &value.digest_hex
+                    )
+                    .await
+                    .unwrap(),
+                vec![value.clone()]
+            );
+            query(sqlx::AssertSqlSafe(mutation))
+                .execute(&pool)
                 .await
-                .is_err()
-        );
-        cleanup_tags(&pool, &value.scope_namespace).await;
+                .unwrap();
+            assert!(
+                store
+                    .oci_tag(&value.scope_namespace, &value.repository, &value.tag)
+                    .await
+                    .is_err(),
+                "{mutation}"
+            );
+            for result in [
+                store
+                    .list_oci_tags(&value.scope_namespace, &value.repository, None, 10)
+                    .await,
+                store
+                    .list_oci_tags_by_digest(
+                        &value.scope_namespace,
+                        &value.repository,
+                        &value.digest_hex,
+                    )
+                    .await,
+            ] {
+                assert!(
+                    result.is_err(),
+                    "listing accepted corrupted evidence: {mutation}"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pg_oci_tag_read_rejects_missing_baseline_evidence_without_writing() {
+    async fn pg_oci_tag_reads_reject_missing_evidence_and_writes_restore_baseline() {
         let Some(pool) = connect_postgres().await else {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
         let scope = "oci-pg-repair";
-        cleanup_tags(&pool, scope).await;
         let store = PostgresIndexStore::new(pool.clone());
         let value = OciTagEntry {
             scope_namespace: scope.to_owned(),
@@ -926,7 +720,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 0);
-        cleanup_tags(&pool, scope).await;
+
+        store.upsert_oci_tag(&value).await.unwrap();
+        let repaired_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shardline_reliability_events WHERE operation_kind = 'OciTag'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repaired_count, 2,
+            "writer must persist baseline and transition"
+        );
+        assert_eq!(
+            store
+                .oci_tag(&value.scope_namespace, &value.repository, &value.tag)
+                .await
+                .unwrap(),
+            Some(value)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -936,7 +748,6 @@ mod tests {
             return;
         };
         let scope = format!("oci-pg-mixed-version-{}", std::process::id());
-        cleanup_tags(&pool, &scope).await;
         let store = PostgresIndexStore::new(pool.clone());
         let value = OciTagEntry {
             scope_namespace: scope.clone(),
@@ -967,6 +778,5 @@ mod tests {
                 .expect("read after rejected write"),
             Some(value)
         );
-        cleanup_tags(&pool, &scope).await;
     }
 }

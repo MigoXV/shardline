@@ -304,35 +304,35 @@ impl TransferClient {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
+            .filter(|value| value.starts_with("multipart/byteranges"))
+            .map(str::to_owned);
 
-        if content_type.starts_with("multipart/byteranges") {
+        if let Some(content_type) = content_type {
             let body = read_response_bounded(response, body_limit).await?;
-            let parts = parse_multipart_byteranges(&content_type, &body)?;
-            let first = parts.first().ok_or_else(|| {
+            let parts = multipart_slices(&content_type, &body)?;
+            let (first_range, _) = parts.first().ok_or_else(|| {
                 TransferError::MalformedMultipart(
                     "multipart response contains no ranges".to_owned(),
                 )
             })?;
-            let start = first.range.start;
-            let mut end = first.range.end;
-            let mut data = Vec::new();
-            for (index, part) in parts.into_iter().enumerate() {
-                if part.range.is_empty()
-                    || part.range.len() != u64::try_from(part.data.len()).unwrap_or(u64::MAX)
+            let start = first_range.start;
+            let mut end = first_range.end;
+            let mut data = Vec::with_capacity(parts.iter().map(|(_, part)| part.len()).sum());
+            for (index, (part_range, part)) in parts.into_iter().enumerate() {
+                if part_range.is_empty()
+                    || part_range.len() != u64::try_from(part.len()).unwrap_or(u64::MAX)
                 {
                     return Err(TransferError::MalformedMultipart(
                         "multipart range length disagrees with its body".to_owned(),
                     ));
                 }
-                if index != 0 && end.checked_add(1) != Some(part.range.start) {
+                if index != 0 && end.checked_add(1) != Some(part_range.start) {
                     return Err(TransferError::MalformedMultipart(
                         "multipart ranges must be contiguous and non-overlapping".to_owned(),
                     ));
                 }
-                end = part.range.end;
-                data.extend_from_slice(&part.data);
+                end = part_range.end;
+                data.extend_from_slice(part);
             }
             return Ok(RangedXorb {
                 data,
@@ -354,8 +354,7 @@ impl TransferClient {
         } else {
             None
         };
-        let body = read_response_bounded(response, body_limit).await?;
-        let data = body;
+        let data = read_response_bounded(response, body_limit).await?;
         let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let full_body_end = length.checked_sub(1).ok_or_else(|| {
             TransferError::InvalidResponse("xorb range response contains no bytes".to_owned())
@@ -374,8 +373,7 @@ impl TransferClient {
     /// HTTP 404 is reported as `Ok(None)` — the global dedup query
     /// (`/v1/chunks/default-merkledb/{hash}`) treats 404 as a cache miss, not
     /// an error. Every other non-success status is mapped to a typed
-    /// [`TransferError`] (including 429, which is surfaced without retry; M4
-    /// adds retry policies).
+    /// [`TransferError`]. Retry policy belongs to the caller.
     ///
     /// # Errors
     ///
@@ -474,11 +472,7 @@ impl TransferClient {
         serialized: Bytes,
     ) -> Result<XorbUploadResponse, TransferError> {
         let url = format!("{}/v1/xorbs/default/{hash}", base_url.trim_end_matches('/'));
-        let length = u64::try_from(serialized.len()).unwrap_or(u64::MAX);
-        let body = reqwest::Body::wrap(SizedStreamBody::new(
-            xorb_progress_stream(serialized),
-            length,
-        ));
+        let body = reqwest::Body::wrap(XorbUploadBody(serialized));
         let response = self
             .with_session(self.client.post(&url).bearer_auth(token))
             .body(body)
@@ -504,12 +498,12 @@ impl TransferClient {
         &self,
         base_url: &str,
         token: &str,
-        body: Vec<u8>,
+        body: impl Into<Bytes>,
     ) -> Result<ShardUploadResponse, TransferError> {
         let url = format!("{}/v1/shards", base_url.trim_end_matches('/'));
         let response = self
             .with_session(self.client.post(&url).bearer_auth(token))
-            .body(body)
+            .body(body.into())
             .send()
             .await?;
         let response = ensure_success(response).await?;
@@ -518,19 +512,8 @@ impl TransferClient {
             .map_err(|error| transfer_error_from_json(&error))
     }
 
-    /// Issues an arbitrary CAS/API request (with the `X-Xet-Session-Id` and
-    /// bearer headers) and returns `(status, body)` for any status.
-    ///
-    /// This is the low-level primitive used by the path-namespace and revision
-    /// metadata layers (M5b). Non-2xx statuses are mapped to typed
-    /// [`TransferError`]s so the M4 [`RetryContext`] can classify them; the
-    /// caller matches specific statuses (e.g. 409 → `RevisionExists`) from the
-    /// error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransferError`] for transport failures and every non-2xx
-    /// status.
+    /// Test helper returning a bounded body after the normal request/status checks.
+    /// Transport failures and non-2xx statuses retain their typed errors.
     #[cfg(test)]
     pub(crate) async fn request_raw(
         &self,
@@ -577,9 +560,7 @@ impl TransferClient {
                 ),
             );
         if let Some(body) = body {
-            request = request
-                .header(header::CONTENT_TYPE, "application/json")
-                .json(body);
+            request = request.json(body);
         }
         ensure_success(request.send().await?).await
     }
@@ -592,17 +573,10 @@ impl TransferClient {
         range: Option<ByteRange>,
         api_version: &str,
     ) -> Result<Response, TransferError> {
-        let capacity = base_url
-            .len()
-            .saturating_add(api_version.len())
-            .saturating_add(file_id.len())
-            .saturating_add(32);
-        let mut url = String::with_capacity(capacity);
-        url.push_str(base_url.trim_end_matches('/'));
-        url.push('/');
-        url.push_str(api_version);
-        url.push_str("/reconstructions/");
-        url.push_str(file_id);
+        let url = format!(
+            "{}/{api_version}/reconstructions/{file_id}",
+            base_url.trim_end_matches('/'),
+        );
         let mut request = self
             .with_session(self.client.get(&url).bearer_auth(token))
             .header(header::ACCEPT, "application/json");
@@ -632,72 +606,34 @@ fn generate_session_id() -> String {
 /// Size of each progress block in a streamed xorb upload body.
 pub const XORB_UPLOAD_PROGRESS_BLOCK_SIZE: usize = 512 * 1024;
 
-/// Splits `serialized` into [`XORB_UPLOAD_PROGRESS_BLOCK_SIZE`] blocks for a
-/// streamed request body (progress granularity; the total length is carried by
-/// the explicit `Content-Length` header).
-fn xorb_progress_stream(
-    serialized: Bytes,
-) -> impl futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> {
-    futures_util::stream::unfold(serialized, |mut remaining| async move {
-        if remaining.is_empty() {
-            return None;
-        }
-        let take = XORB_UPLOAD_PROGRESS_BLOCK_SIZE.min(remaining.len());
-        let head = remaining.split_to(take);
-        Some((Ok(head), remaining))
-    })
-}
+/// Streams owned Xorb bytes in progress blocks while advertising their exact
+/// remaining length, so HTTP uses Content-Length rather than chunked framing.
+struct XorbUploadBody(Bytes);
 
-/// A streamed [`http_body::Body`] that advertises an exact total length, so the
-/// HTTP/1.1 layer frames it with an explicit `Content-Length` header while data
-/// is still delivered in streaming progress blocks.
-struct SizedStreamBody<S> {
-    inner: std::pin::Pin<Box<S>>,
-    remaining: u64,
-}
-
-impl<S> SizedStreamBody<S> {
-    fn new(stream: S, total: u64) -> Self {
-        Self {
-            inner: Box::pin(stream),
-            remaining: total,
-        }
-    }
-}
-
-impl<S> http_body::Body for SizedStreamBody<S>
-where
-    S: futures_util::Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static,
-{
+impl http_body::Body for XorbUploadBody {
     type Data = Bytes;
     type Error = std::convert::Infallible;
 
     fn poll_frame(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll_next(cx) {
-            std::task::Poll::Ready(Some(Ok(data))) => {
-                this.remaining = this
-                    .remaining
-                    .saturating_sub(u64::try_from(data.len()).unwrap_or(u64::MAX));
-                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))))
-            }
-            std::task::Poll::Ready(Some(Err(error))) => std::task::Poll::Ready(Some(Err(error))),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        let remaining = &mut self.get_mut().0;
+        let frame = if remaining.is_empty() {
+            None
+        } else {
+            let length = XORB_UPLOAD_PROGRESS_BLOCK_SIZE.min(remaining.len());
+            Some(Ok(http_body::Frame::data(remaining.split_to(length))))
+        };
+        std::task::Poll::Ready(frame)
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        let mut hint = http_body::SizeHint::default();
-        hint.set_exact(self.remaining);
-        hint
+        http_body::SizeHint::with_exact(u64::try_from(self.0.len()).unwrap_or(u64::MAX))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.remaining == 0
+        self.0.is_empty()
     }
 }
 
@@ -1052,15 +988,11 @@ fn transfer_error_from_json(error: &JsonDecodeError) -> TransferError {
 
 /// Parses a `Content-Range: bytes start-end/total` header (inclusive end).
 fn parse_content_range(value: &str) -> Result<ByteRange, TransferError> {
-    let spec = value.trim().strip_prefix("bytes ").ok_or_else(|| {
-        TransferError::InvalidResponse(format!("invalid Content-Range header: {value}"))
-    })?;
-    let (range_part, _total) = spec.split_once('/').ok_or_else(|| {
-        TransferError::InvalidResponse(format!("invalid Content-Range header: {value}"))
-    })?;
-    let (start, end) = range_part.split_once('-').ok_or_else(|| {
-        TransferError::InvalidResponse(format!("invalid Content-Range header: {value}"))
-    })?;
+    let malformed =
+        || TransferError::InvalidResponse(format!("invalid Content-Range header: {value}"));
+    let spec = value.trim().strip_prefix("bytes ").ok_or_else(malformed)?;
+    let (range_part, _total) = spec.split_once('/').ok_or_else(malformed)?;
+    let (start, end) = range_part.split_once('-').ok_or_else(malformed)?;
     let start = start.parse::<u64>().map_err(|error| {
         TransferError::InvalidResponse(format!("invalid Content-Range header {value}: {error}"))
     })?;
@@ -1095,6 +1027,21 @@ pub fn parse_multipart_byteranges(
     content_type: &str,
     body: &[u8],
 ) -> Result<Vec<MultipartPart>, TransferError> {
+    Ok(multipart_slices(content_type, body)?
+        .into_iter()
+        .map(|(range, data)| MultipartPart {
+            range,
+            data: data.to_vec(),
+        })
+        .collect())
+}
+
+// Downloads concatenate borrowed parts directly, avoiding an intermediate
+// allocation and copy for every part. The public parser retains owned output.
+fn multipart_slices<'body>(
+    content_type: &str,
+    body: &'body [u8],
+) -> Result<Vec<(ByteRange, &'body [u8])>, TransferError> {
     let boundary = extract_boundary(content_type).ok_or_else(|| {
         TransferError::MalformedMultipart(format!("no boundary in Content-Type: {content_type}"))
     })?;
@@ -1110,13 +1057,8 @@ pub fn parse_multipart_byteranges(
         TransferError::MalformedMultipart("boundary offset out of bounds".to_owned())
     })?;
     let mut parts = Vec::new();
-    loop {
-        if !remaining.starts_with(b"\r\n") {
-            break;
-        }
-        remaining = remaining
-            .get(2..)
-            .ok_or_else(|| TransferError::MalformedMultipart("truncated part".to_owned()))?;
+    while let Some(part) = remaining.strip_prefix(b"\r\n") {
+        remaining = part;
         let next_boundary = find_subsequence(remaining, delimiter.as_bytes());
         let part_bytes = match next_boundary {
             Some(position) => remaining.get(..position).ok_or_else(|| {
@@ -1139,10 +1081,7 @@ pub fn parse_multipart_byteranges(
             TransferError::MalformedMultipart("part data out of bounds".to_owned())
         })?;
         let range = parse_part_content_range(headers)?;
-        parts.push(MultipartPart {
-            range,
-            data: data.to_vec(),
-        });
+        parts.push((range, data));
         match next_boundary {
             Some(position) => {
                 let after = position.checked_add(delimiter.len()).ok_or_else(|| {
@@ -1155,16 +1094,16 @@ pub fn parse_multipart_byteranges(
             None => break,
         }
     }
-    parts.sort_by_key(|part| part.range.start);
+    parts.sort_by_key(|(range, _)| range.start);
     Ok(parts)
 }
 
-fn extract_boundary(content_type: &str) -> Option<String> {
+fn extract_boundary(content_type: &str) -> Option<&str> {
     content_type
         .split(';')
         .map(str::trim)
         .find_map(|part| part.strip_prefix("boundary="))
-        .map(|value| value.trim_matches('"').to_owned())
+        .map(|value| value.trim_matches('"'))
 }
 
 fn parse_part_content_range(headers: &[u8]) -> Result<ByteRange, TransferError> {
@@ -1172,9 +1111,10 @@ fn parse_part_content_range(headers: &[u8]) -> Result<ByteRange, TransferError> 
         TransferError::MalformedMultipart(format!("invalid part headers: {error}"))
     })?;
     for line in headers_text.split("\r\n") {
-        let lower = line.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-range:") {
-            return parse_content_range(value);
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-range")
+        {
+            return parse_content_range(&value.to_ascii_lowercase());
         }
     }
     Err(TransferError::MalformedMultipart(
@@ -1987,16 +1927,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_multipart_single_part() {
-        let boundary = "abc123";
-        let body = format!(
-            "--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-99/1000\r\n\r\nHello World\r\n--{boundary}--\r\n"
-        );
-        let content_type = format!("multipart/byteranges; boundary={boundary}");
-        let parts = parse_multipart_byteranges(&content_type, body.as_bytes()).unwrap();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].range, super::ByteRange::new(0, 99));
-        assert_eq!(parts[0].data, b"Hello World");
+    fn parse_multipart_single_part_preserves_headers_and_boundary_forms() {
+        for (boundary, quoted, headers, range, data) in [
+            (
+                "abc123",
+                false,
+                "Content-Type: application/octet-stream\r\nContent-Range: bytes 0-99/1000",
+                super::ByteRange::new(0, 99),
+                "Hello World",
+            ),
+            (
+                "quoted-boundary",
+                true,
+                "Content-Range: bytes 0-1/2",
+                super::ByteRange::new(0, 1),
+                "ab",
+            ),
+            (
+                "mixed",
+                false,
+                "X-Ignored: unrelated:value\r\ncOnTeNt-RaNgE: BYTES 0-1/2",
+                super::ByteRange::new(0, 1),
+                "ab",
+            ),
+        ] {
+            let body = format!("--{boundary}\r\n{headers}\r\n\r\n{data}\r\n--{boundary}--\r\n");
+            let parameter = if quoted {
+                format!("\"{boundary}\"")
+            } else {
+                boundary.to_owned()
+            };
+            let content_type = format!("multipart/byteranges; boundary={parameter}");
+            assert_eq!(
+                parse_multipart_byteranges(&content_type, body.as_bytes()).unwrap(),
+                vec![super::MultipartPart {
+                    range,
+                    data: data.as_bytes().to_vec()
+                }]
+            );
+        }
     }
 
     #[test]
@@ -2012,34 +1981,77 @@ mod tests {
         assert_eq!(parts[0].data, b"Part1Data");
         assert_eq!(parts[1].range, super::ByteRange::new(100, 199));
         assert_eq!(parts[1].data, b"Part2Data");
-    }
-
-    #[test]
-    fn parse_multipart_empty_body_missing_boundary() {
-        let content_type = "multipart/byteranges; boundary=xyz";
-        let result = parse_multipart_byteranges(content_type, b"");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_multipart_part_missing_header_separator() {
-        let boundary = "xyz";
-        let body = format!(
-            "--{boundary}\r\nContent-Range: bytes 0-9/100\r\nMISSING_SEPARATOR\r\n--{boundary}--\r\n"
+        let borrowed = super::multipart_slices(&content_type, body.as_bytes()).unwrap();
+        assert_eq!(
+            borrowed,
+            parts
+                .iter()
+                .map(|part| (part.range, part.data.as_slice()))
+                .collect::<Vec<_>>()
         );
-        let content_type = format!("multipart/byteranges; boundary={boundary}");
-        let result = parse_multipart_byteranges(&content_type, body.as_bytes());
-        assert!(result.is_err());
+        for (_, data) in borrowed {
+            assert!(body.as_bytes().as_ptr_range().contains(&data.as_ptr()));
+        }
     }
 
     #[test]
-    fn parse_multipart_quoted_boundary() {
-        let boundary = "quoted-boundary";
-        let body =
-            format!("--{boundary}\r\nContent-Range: bytes 0-1/2\r\n\r\nab\r\n--{boundary}--\r\n");
-        let content_type = format!("multipart/byteranges; boundary=\"{boundary}\"");
-        let parts = parse_multipart_byteranges(&content_type, body.as_bytes()).unwrap();
-        assert_eq!(parts[0].data, b"ab");
+    fn parse_multipart_rejects_missing_boundary_or_header_separator() {
+        for body in [
+            "",
+            "--xyz\r\nContent-Range: bytes 0-9/100\r\nMISSING_SEPARATOR\r\n--xyz--\r\n",
+        ] {
+            assert!(matches!(
+                parse_multipart_byteranges("multipart/byteranges; boundary=xyz", body.as_bytes()),
+                Err(super::TransferError::MalformedMultipart(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn xorb_upload_body_preserves_frames_and_exact_remaining_length() {
+        use super::{XORB_UPLOAD_PROGRESS_BLOCK_SIZE, XorbUploadBody};
+        use http_body::Body;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        for length in [
+            0,
+            1,
+            XORB_UPLOAD_PROGRESS_BLOCK_SIZE,
+            2 * XORB_UPLOAD_PROGRESS_BLOCK_SIZE + 3,
+        ] {
+            let data = Bytes::from(
+                (0..length)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>(),
+            );
+            let mut body = XorbUploadBody(data.clone());
+            let mut consumed = 0;
+            let mut context = Context::from_waker(Waker::noop());
+            while consumed < length {
+                assert!(!body.is_end_stream());
+                assert_eq!(body.size_hint().exact(), Some((length - consumed) as u64));
+                let frame = match Pin::new(&mut body).poll_frame(&mut context) {
+                    Poll::Ready(frame) => frame,
+                    Poll::Pending => None,
+                }
+                .expect("owned upload data must be immediately available")
+                .unwrap()
+                .into_data()
+                .unwrap();
+                let end = (consumed + XORB_UPLOAD_PROGRESS_BLOCK_SIZE).min(length);
+                assert_eq!(frame, data.slice(consumed..end));
+                consumed = end;
+            }
+            assert!(body.is_end_stream());
+            assert_eq!(body.size_hint().exact(), Some(0));
+            for _ in 0..2 {
+                assert!(matches!(
+                    Pin::new(&mut body).poll_frame(&mut context),
+                    Poll::Ready(None)
+                ));
+            }
+        }
     }
 
     /// Verifies at the wire level that `upload_xorb` sends an explicit

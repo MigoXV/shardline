@@ -10,11 +10,11 @@ use axum::body::Bytes;
 use sha2::{Digest, Sha256};
 use shardline_index::{
     CreateResumableSessionOutcome, FileRecord, OciObjectKey, OciTagEntry,
-    PublishResumablePartOutcome, RepoKey, ResourceLockKey, ResumableCompletionFence,
-    ResumablePartRange, ResumableSession, ResumableSessionPart, ResumableSessionState,
-    RevisionRecord, S3ObjectEntry, S3PublishCondition, TreeEntry, TreeKey,
+    PublishResumablePartOutcome, ResourceLockKey, ResumableCompletionFence, ResumablePartRange,
+    ResumableSession, ResumableSessionPart, ResumableSessionState, S3ObjectEntry,
+    S3PublishCondition,
 };
-use shardline_protocol::{ByteRange, RepositoryScope};
+use shardline_protocol::{ByteRange, RepositoryScope, parse_http_byte_range};
 use shardline_server_core::protocol_support::protocol_object_file_id;
 use shardline_storage::{
     AsyncObjectStore, DeleteOutcome, ObjectBody, ObjectIntegrity, ObjectKey, ObjectMetadata,
@@ -26,20 +26,25 @@ use std::sync::{LazyLock, Mutex};
 use crate::{
     LocalBackend, ObjectStorageAdapter, ObjectStoreError, PostgresBackend, ServerConfig,
     ServerError, ShardMetadataLimits, check_database_schema_compatibility,
-    download_stream::ServerByteStream,
+    download_stream::{ServerByteStream, object_byte_range_stream, object_byte_stream},
     model::{ServerStatsResponse, UploadFileResponse},
     object_store::{ServerObjectStore, object_store_from_config},
     reconstruction_cache::{
         ReconstructionCacheBenchReport, benchmark_memory_reconstruction_cache_with_loader,
     },
     upload_ingest::RequestBodyReader,
-    xet_adapter::{FileReconstructionResponse, ShardUploadResponse, XorbUploadResponse},
+    xet_adapter::{
+        FileReconstructionResponse, ShardUploadResponse, XorbUploadResponse,
+        build_reconstruction_response,
+    },
 };
 
 mod dedup;
 mod delta;
 mod hub_read;
 mod lfs_locks;
+mod protocol_index;
+mod tree;
 mod xorb_authorization;
 
 #[cfg(test)]
@@ -379,6 +384,7 @@ impl ServerBackend {
         object_key: &ObjectKey,
         digest_hex: &str,
         body: RequestBodyReader,
+        reuse_scope: Option<&RepositoryScope>,
     ) -> Result<PutOutcome, ServerError> {
         // Local metadata is SQLite-backed. Keep the existence probe, intent
         // transitions, and atomic record commit in one serialized operation so
@@ -414,12 +420,12 @@ impl ServerBackend {
         match self {
             Self::Local(backend) => {
                 backend
-                    .upload_digest_protocol_stream(&file_id, body, digest_hex)
+                    .upload_protocol_stream(&file_id, body, Some(digest_hex), reuse_scope)
                     .await?;
             }
             Self::Postgres(backend) => {
                 backend
-                    .upload_digest_protocol_stream(&file_id, body, digest_hex)
+                    .upload_protocol_stream(&file_id, body, Some(digest_hex), reuse_scope)
                     .await?;
             }
         }
@@ -442,6 +448,7 @@ impl ServerBackend {
         &self,
         object_key: &ObjectKey,
         body: RequestBodyReader,
+        reuse_scope: Option<&RepositoryScope>,
     ) -> Result<UploadFileResponse, ServerError> {
         // Local metadata is SQLite-backed. Keep the record commit in one
         // serialized operation so concurrent S3 uploads cannot race independent
@@ -452,8 +459,16 @@ impl ServerBackend {
         };
         let file_id = protocol_object_file_id(object_key);
         match self {
-            Self::Local(backend) => backend.upload_s3_protocol_stream(&file_id, body).await,
-            Self::Postgres(backend) => backend.upload_file_stream(&file_id, body, None, None).await,
+            Self::Local(backend) => {
+                backend
+                    .upload_protocol_stream(&file_id, body, None, reuse_scope)
+                    .await
+            }
+            Self::Postgres(backend) => {
+                backend
+                    .upload_protocol_stream(&file_id, body, None, reuse_scope)
+                    .await
+            }
         }
     }
 
@@ -466,12 +481,15 @@ impl ServerBackend {
         &self,
         object_key: &ObjectKey,
         body: RequestBodyReader,
+        reuse_scope: Option<&RepositoryScope>,
     ) -> Result<PreparedS3Object, ServerError> {
         let file_id = protocol_object_file_id(object_key);
         let Self::Postgres(backend) = self else {
             return Err(ServerError::StaleResourceFence);
         };
-        let (record, response) = backend.prepare_file_stream(&file_id, body, None).await?;
+        let (record, response) = backend
+            .prepare_file_stream(&file_id, body, None, reuse_scope)
+            .await?;
         Ok(PreparedS3Object { record, response })
     }
 
@@ -934,233 +952,6 @@ impl ServerBackend {
         }
     }
 
-    pub(crate) async fn upsert_s3_object_with_multipart_count(
-        &self,
-        entry: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<(), ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .upsert_s3_object_with_multipart_count(entry, part_count)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .upsert_s3_object_with_multipart_count(entry, part_count)
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_with_multipart_count(
-        &self,
-        expected: Option<&S3ObjectEntry>,
-        replacement: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .compare_and_swap_s3_object_with_multipart_count(
-                        expected,
-                        replacement,
-                        part_count,
-                    )
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .compare_and_swap_s3_object_with_multipart_count(
-                        expected,
-                        replacement,
-                        part_count,
-                    )
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_metadata(
-        &self,
-        expected: &S3ObjectEntry,
-        replacement: &S3ObjectEntry,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .compare_and_swap_s3_object_metadata(expected, replacement)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .compare_and_swap_s3_object_metadata(expected, replacement)
-                    .await
-            }
-        }
-    }
-
-    /// Deletes one S3 object listing-index row, returning whether a row was removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index delete fails.
-    pub(crate) async fn delete_s3_object(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => backend.delete_s3_object(scope_namespace, object_key).await,
-            Self::Postgres(backend) => backend.delete_s3_object(scope_namespace, object_key).await,
-        }
-    }
-
-    /// Scans S3 object listing rows for a scope namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index scan fails.
-    pub(crate) async fn scan_s3_objects(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .scan_s3_objects(scope_namespace, prefix, cursor, limit)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .scan_s3_objects(scope_namespace, prefix, cursor, limit)
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn scan_s3_objects_from(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        start: Option<shardline_index::S3ObjectScanStart<'_>>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .scan_s3_objects_from(scope_namespace, prefix, start, limit)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .scan_s3_objects_from(scope_namespace, prefix, start, limit)
-                    .await
-            }
-        }
-    }
-
-    /// Resolves exactly one S3 object listing row by its full raw key (no
-    /// prefix matching), for the S3 frontend's conditional-object semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index lookup fails.
-    pub(crate) async fn scan_s3_object_exact(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<S3ObjectEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .scan_s3_object_exact(scope_namespace, object_key)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .scan_s3_object_exact(scope_namespace, object_key)
-                    .await
-            }
-        }
-    }
-
-    async fn scan_s3_object_exact_with_multipart_count(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<(S3ObjectEntry, Option<u32>)>, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .scan_s3_object_exact_with_multipart_count(scope_namespace, object_key)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .scan_s3_object_exact_with_multipart_count(scope_namespace, object_key)
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn insert_oci_tag_if_absent(
-        &self,
-        entry: &OciTagEntry,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => backend.insert_oci_tag_if_absent(entry).await,
-            Self::Postgres(backend) => backend.insert_oci_tag_if_absent(entry).await,
-        }
-    }
-
-    pub(crate) async fn oci_tag(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        tag: &str,
-    ) -> Result<Option<OciTagEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => backend.oci_tag(scope_namespace, repository, tag).await,
-            Self::Postgres(backend) => backend.oci_tag(scope_namespace, repository, tag).await,
-        }
-    }
-
-    pub(crate) async fn list_oci_tags(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<OciTagEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .list_oci_tags(scope_namespace, repository, cursor, limit)
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .list_oci_tags(scope_namespace, repository, cursor, limit)
-                    .await
-            }
-        }
-    }
-
-    /// Returns whether an immutable OCI object is hidden by a durable tombstone.
-    pub(crate) async fn oci_object_is_deleted(
-        &self,
-        key: &OciObjectKey,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => backend.oci_object_is_deleted(key).await,
-            Self::Postgres(backend) => backend.oci_object_is_deleted(key).await,
-        }
-    }
-
     /// Publishes immutable OCI bytes through the metadata session that owns
     /// the repository fence. Clearing a prior tombstone and retargeting tags
     /// form one database transaction.
@@ -1305,28 +1096,27 @@ impl ServerBackend {
         range_header: &str,
         repository_scope: Option<&RepositoryScope>,
     ) -> Result<FileReconstructionResponse, ServerError> {
-        match self {
-            Self::Local(backend) => {
+        let (record, public_base_url) = match self {
+            Self::Local(backend) => (
                 backend
-                    .reconstruction_http_range(
-                        file_id,
-                        content_hash,
-                        range_header,
-                        repository_scope,
-                    )
-                    .await
-            }
-            Self::Postgres(backend) => {
+                    .read_record(file_id, content_hash, repository_scope)
+                    .await?,
+                backend.public_base_url(),
+            ),
+            Self::Postgres(backend) => (
                 backend
-                    .reconstruction_http_range(
-                        file_id,
-                        content_hash,
-                        range_header,
-                        repository_scope,
-                    )
-                    .await
-            }
-        }
+                    .read_record(file_id, content_hash, repository_scope)
+                    .await?,
+                backend.public_base_url(),
+            ),
+        };
+        let requested_range =
+            parse_http_byte_range(range_header, record.total_bytes).map_err(ServerError::from)?;
+        Ok(build_reconstruction_response(
+            public_base_url,
+            &record,
+            Some(requested_range),
+        )?)
     }
 
     pub(crate) async fn file_total_bytes(
@@ -1363,25 +1153,68 @@ impl ServerBackend {
         }
     }
 
+    /// Fully verifies the stored xorb before callers authorize a requested range.
     pub(crate) async fn prepare_xorb_range(
         &self,
         hash_hex: &str,
         total_length: Option<u64>,
     ) -> Result<crate::download_stream::VerifiedXorb, ServerError> {
-        match self {
-            Self::Local(backend) => backend.prepare_xorb_range(hash_hex, total_length).await,
-            Self::Postgres(backend) => backend.prepare_xorb_range(hash_hex, total_length).await,
-        }
+        let object_store = self.object_store();
+        let object_key = crate::xet_adapter::xorb_object_key(hash_hex)?;
+        crate::download_stream::prepare_xorb_byte_range(
+            &object_store,
+            &object_key,
+            hash_hex,
+            total_length,
+            self.stream_work_pool().clone(),
+        )
+        .await
+    }
+
+    /// Attempts an authenticated serialized-byte range read for opt-in transfers.
+    pub(crate) async fn prepare_selective_xorb_range(
+        &self,
+        hash_hex: &str,
+        range: shardline_protocol::ByteRange,
+        coverage: Option<&crate::record_store::XorbRangeCoverage>,
+    ) -> Result<Option<(u64, ServerByteStream)>, ServerError> {
+        crate::download_stream::authenticated_range::serialized_stream(
+            &self.object_store(),
+            hash_hex,
+            range,
+            coverage,
+            self.stream_work_pool().clone(),
+        )
+        .await
     }
 
     pub(crate) async fn read_dedupe_shard_stream(
         &self,
         hash_hex: &str,
     ) -> Result<(ServerByteStream, u64), ServerError> {
-        match self {
-            Self::Local(backend) => backend.read_dedupe_shard_stream(hash_hex).await,
-            Self::Postgres(backend) => backend.read_dedupe_shard_stream(hash_hex).await,
-        }
+        let object_store = self.object_store();
+        let (object_key, total_length) = match self {
+            Self::Local(backend) => {
+                crate::xet_adapter::resolve_dedupe_shard_object(
+                    backend.index_store(),
+                    &object_store,
+                    hash_hex,
+                )
+                .await?
+            }
+            Self::Postgres(backend) => {
+                crate::xet_adapter::resolve_dedupe_shard_object(
+                    backend.index_store(),
+                    &object_store,
+                    hash_hex,
+                )
+                .await?
+            }
+        };
+        let stream =
+            crate::download_stream::object_byte_stream(object_store, object_key, total_length)
+                .await?;
+        Ok((stream, total_length))
     }
 
     pub(crate) async fn first_xorb_coverage(
@@ -1465,6 +1298,13 @@ impl ServerBackend {
         }
     }
 
+    pub(crate) const fn stream_work_pool(&self) -> &crate::admission::BoundedPool {
+        match self {
+            Self::Local(backend) => &backend.stream_work_pool,
+            Self::Postgres(backend) => &backend.stream_work_pool,
+        }
+    }
+
     pub(crate) const fn backend_name(&self) -> &'static str {
         match self {
             Self::Local(_backend) => "local",
@@ -1481,10 +1321,7 @@ impl ServerBackend {
     }
 
     pub(crate) fn uses_s3_object_store(&self) -> bool {
-        match self {
-            Self::Local(backend) => matches!(backend.object_store(), ServerObjectStore::S3(_)),
-            Self::Postgres(backend) => matches!(backend.object_store(), ServerObjectStore::S3(_)),
-        }
+        matches!(self.object_store(), ServerObjectStore::S3(_))
     }
 
     pub(crate) async fn put_object_bytes_if_absent(
@@ -1527,6 +1364,7 @@ impl ServerBackend {
             object_key,
             digest_hex,
             RequestBodyReader::from_bytes(bytes.into()),
+            None,
         )
         .await
     }
@@ -1548,23 +1386,15 @@ impl ServerBackend {
         if direct_length.is_ok() {
             if let Some(digest_hex) = destination.as_str().strip_prefix("objects/sha256/") {
                 let total_length = direct_length?;
-                let source_stream = match self {
-                    Self::Local(backend) => {
-                        backend
-                            .read_object_stream(source, total_length, None)
-                            .await?
-                    }
-                    Self::Postgres(backend) => {
-                        backend
-                            .read_object_stream(source, total_length, None)
-                            .await?
-                    }
-                };
+                let source_stream = self
+                    .direct_object_stream(source, total_length, None)
+                    .await?;
                 return self
                     .put_sha256_addressed_object_stream_if_absent(
                         destination,
                         digest_hex,
                         RequestBodyReader::from_stream(source_stream),
+                        None,
                     )
                     .await;
             }
@@ -1626,6 +1456,7 @@ impl ServerBackend {
         digest_hex: &str,
         path: &Path,
         _integrity: &shardline_storage::ObjectIntegrity,
+        reuse_scope: Option<&RepositoryScope>,
     ) -> Result<PutOutcome, ServerError> {
         use tokio::io::AsyncReadExt as _;
 
@@ -1645,6 +1476,7 @@ impl ServerBackend {
             object_key,
             digest_hex,
             RequestBodyReader::from_stream(stream),
+            reuse_scope,
         )
         .await
     }
@@ -1677,10 +1509,8 @@ impl ServerBackend {
     }
 
     pub(crate) async fn read_object(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ServerError> {
-        let direct = match self {
-            Self::Local(backend) => backend.read_object(object_key).await,
-            Self::Postgres(backend) => backend.read_object(object_key).await,
-        };
+        let direct =
+            crate::object_store::read_small_object(self.object_store(), object_key.clone()).await;
         match direct {
             Ok(bytes) => Ok(bytes),
             Err(ServerError::NotFound) => match self {
@@ -1697,6 +1527,21 @@ impl ServerBackend {
             },
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) async fn direct_object_stream(
+        &self,
+        object_key: &ObjectKey,
+        total_length: u64,
+        range: Option<ByteRange>,
+    ) -> Result<ServerByteStream, ServerError> {
+        let object_store = self.object_store();
+        if let Some(range) = range {
+            return object_byte_range_stream(object_store, object_key.clone(), total_length, range)
+                .await;
+        }
+
+        object_byte_stream(object_store, object_key.clone(), total_length).await
     }
 
     pub(crate) async fn read_object_stream(
@@ -1725,18 +1570,9 @@ impl ServerBackend {
     ) -> Result<ServerByteStream, ServerError> {
         if snapshot.representation == ObjectReadRepresentation::Direct {
             crate::metrics::record_object_read_by_repr("direct_object", snapshot.total_length);
-            return match self {
-                Self::Local(backend) => {
-                    backend
-                        .read_object_stream(object_key, snapshot.total_length, range)
-                        .await
-                }
-                Self::Postgres(backend) => {
-                    backend
-                        .read_object_stream(object_key, snapshot.total_length, range)
-                        .await
-                }
-            };
+            return self
+                .direct_object_stream(object_key, snapshot.total_length, range)
+                .await;
         }
         let file_id = protocol_object_file_id(object_key);
         let (stream, record_length) = match self {
@@ -1884,9 +1720,11 @@ impl ServerBackend {
     where
         Visitor: FnMut(ObjectMetadata) -> Result<(), ServerError>,
     {
+        let visit =
+            || crate::object_store::visit_object_prefix(&self.object_store(), prefix, visitor);
         match self {
-            Self::Local(backend) => backend.visit_object_prefix(prefix, visitor),
-            Self::Postgres(backend) => backend.visit_object_prefix(prefix, visitor),
+            Self::Local(_) => tokio::task::block_in_place(visit),
+            Self::Postgres(_) => visit(),
         }
     }
 
@@ -1896,13 +1734,14 @@ impl ServerBackend {
         start_after: Option<&ObjectKey>,
         limit: usize,
     ) -> Result<Vec<ObjectMetadata>, ServerError> {
+        let list = || {
+            Ok(self
+                .object_store()
+                .list_flat_namespace_page(prefix, start_after, limit)?)
+        };
         match self {
-            Self::Local(backend) => {
-                backend.list_object_flat_namespace_page(prefix, start_after, limit)
-            }
-            Self::Postgres(backend) => {
-                backend.list_object_flat_namespace_page(prefix, start_after, limit)
-            }
+            Self::Local(_) => tokio::task::block_in_place(list),
+            Self::Postgres(_) => list(),
         }
     }
 
@@ -1910,10 +1749,7 @@ impl ServerBackend {
         &self,
         object_key: &ObjectKey,
     ) -> Result<DeleteOutcome, ServerError> {
-        let direct = match self {
-            Self::Local(backend) => backend.delete_object_if_present(object_key).await,
-            Self::Postgres(backend) => backend.delete_object_if_present(object_key).await,
-        }?;
+        let direct = self.delete_direct_object_if_present(object_key).await?;
         let file_id = protocol_object_file_id(object_key);
         let record_deleted = self.delete_file_reference(&file_id).await?;
         if direct == DeleteOutcome::Deleted || record_deleted {
@@ -1996,113 +1832,6 @@ impl ServerBackend {
             }
         }
     }
-
-    pub(crate) async fn resolve_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-    ) -> Result<Option<TreeEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => backend.resolve_tree_path(key, path).await,
-            Self::Postgres(backend) => backend.resolve_tree_path(key, path).await,
-        }
-    }
-
-    pub(crate) async fn scan_tree_raw(
-        &self,
-        key: &TreeKey,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<TreeEntry>, ServerError> {
-        match self {
-            Self::Local(backend) => backend.scan_tree_raw(key, prefix, cursor, limit).await,
-            Self::Postgres(backend) => backend.scan_tree_raw(key, prefix, cursor, limit).await,
-        }
-    }
-
-    pub(crate) async fn register_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-        file_id: &str,
-        scope: Option<&RepositoryScope>,
-        max_revisions_per_repo: NonZeroUsize,
-        max_tree_entries_per_repo: NonZeroUsize,
-    ) -> Result<RegisterPathOutcome, ServerError> {
-        match self {
-            Self::Local(backend) => {
-                backend
-                    .register_tree_path(
-                        key,
-                        path,
-                        file_id,
-                        scope,
-                        max_revisions_per_repo,
-                        max_tree_entries_per_repo,
-                    )
-                    .await
-            }
-            Self::Postgres(backend) => {
-                backend
-                    .register_tree_path(
-                        key,
-                        path,
-                        file_id,
-                        scope,
-                        max_revisions_per_repo,
-                        max_tree_entries_per_repo,
-                    )
-                    .await
-            }
-        }
-    }
-
-    pub(crate) async fn delete_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-        recursive: bool,
-    ) -> Result<u64, ServerError> {
-        match self {
-            Self::Local(backend) => backend.delete_tree_path(key, path, recursive).await,
-            Self::Postgres(backend) => backend.delete_tree_path(key, path, recursive).await,
-        }
-    }
-
-    pub(crate) async fn list_revisions(
-        &self,
-        key: &RepoKey,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<RevisionRecord>, ServerError> {
-        match self {
-            Self::Local(backend) => backend.list_revisions(key, cursor, limit).await,
-            Self::Postgres(backend) => backend.list_revisions(key, cursor, limit).await,
-        }
-    }
-
-    pub(crate) async fn create_revision(
-        &self,
-        rev: &RevisionRecord,
-        max_revisions: usize,
-    ) -> Result<shardline_index::RevisionCreationOutcome, ServerError> {
-        match self {
-            Self::Local(backend) => backend.create_revision(rev, max_revisions).await,
-            Self::Postgres(backend) => backend.create_revision(rev, max_revisions).await,
-        }
-    }
-
-    pub(crate) async fn delete_revision(
-        &self,
-        key: &RepoKey,
-        rev: &str,
-    ) -> Result<bool, ServerError> {
-        match self {
-            Self::Local(backend) => backend.delete_revision(key, rev).await,
-            Self::Postgres(backend) => backend.delete_revision(key, rev).await,
-        }
-    }
 }
 
 async fn verify_sha256_body(
@@ -2124,25 +1853,14 @@ impl shardline_oci_adapter::OciBackend for ServerBackend {
         &self,
         object_key: &ObjectKey,
     ) -> Result<Option<String>, shardline_oci_adapter::OciAdapterError> {
-        match self {
-            Self::Local(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => Ok(Some(
-                    store
-                        .create_resumable_upload(object_key)
-                        .await
-                        .map_err(shardline_oci_adapter::OciAdapterError::from)?,
-                )),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(None),
-            },
-            Self::Postgres(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => Ok(Some(
-                    store
-                        .create_resumable_upload(object_key)
-                        .await
-                        .map_err(shardline_oci_adapter::OciAdapterError::from)?,
-                )),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(None),
-            },
+        match self.object_store() {
+            ServerObjectStore::S3(store) => Ok(Some(
+                store
+                    .create_resumable_upload(object_key)
+                    .await
+                    .map_err(shardline_oci_adapter::OciAdapterError::from)?,
+            )),
+            ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(None),
         }
     }
 
@@ -2153,25 +1871,14 @@ impl shardline_oci_adapter::OciBackend for ServerBackend {
         part_idx: usize,
         bytes: Bytes,
     ) -> Result<String, shardline_oci_adapter::OciAdapterError> {
-        match self {
-            Self::Local(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .upload_resumable_part(object_key, upload_id, part_idx, bytes)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
-                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
-                }
-            },
-            Self::Postgres(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .upload_resumable_part(object_key, upload_id, part_idx, bytes)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
-                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
-                }
-            },
+        match self.object_store() {
+            ServerObjectStore::S3(store) => store
+                .upload_resumable_part(object_key, upload_id, part_idx, bytes)
+                .await
+                .map_err(shardline_oci_adapter::OciAdapterError::from),
+            ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                Err(shardline_oci_adapter::OciAdapterError::NotFound)
+            }
         }
     }
 
@@ -2181,25 +1888,14 @@ impl shardline_oci_adapter::OciBackend for ServerBackend {
         upload_id: &str,
         parts: Vec<(usize, String)>,
     ) -> Result<(), shardline_oci_adapter::OciAdapterError> {
-        match self {
-            Self::Local(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .complete_resumable_upload(object_key, upload_id, parts)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
-                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
-                }
-            },
-            Self::Postgres(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .complete_resumable_upload(object_key, upload_id, parts)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
-                    Err(shardline_oci_adapter::OciAdapterError::NotFound)
-                }
-            },
+        match self.object_store() {
+            ServerObjectStore::S3(store) => store
+                .complete_resumable_upload(object_key, upload_id, parts)
+                .await
+                .map_err(shardline_oci_adapter::OciAdapterError::from),
+            ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => {
+                Err(shardline_oci_adapter::OciAdapterError::NotFound)
+            }
         }
     }
 
@@ -2208,21 +1904,12 @@ impl shardline_oci_adapter::OciBackend for ServerBackend {
         object_key: &ObjectKey,
         upload_id: &str,
     ) -> Result<(), shardline_oci_adapter::OciAdapterError> {
-        match self {
-            Self::Local(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .abort_resumable_upload(object_key, upload_id)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(()),
-            },
-            Self::Postgres(backend) => match backend.object_store() {
-                ServerObjectStore::S3(store) => store
-                    .abort_resumable_upload(object_key, upload_id)
-                    .await
-                    .map_err(shardline_oci_adapter::OciAdapterError::from),
-                ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(()),
-            },
+        match self.object_store() {
+            ServerObjectStore::S3(store) => store
+                .abort_resumable_upload(object_key, upload_id)
+                .await
+                .map_err(shardline_oci_adapter::OciAdapterError::from),
+            ServerObjectStore::Local(_) | ServerObjectStore::Blackhole => Ok(()),
         }
     }
 
@@ -2268,16 +1955,9 @@ impl shardline_oci_adapter::OciBackend for ServerBackend {
         &self,
         object_key: &ObjectKey,
     ) -> Result<DeleteOutcome, shardline_oci_adapter::OciAdapterError> {
-        match self {
-            Self::Local(backend) => backend
-                .delete_object_if_present(object_key)
-                .await
-                .map_err(server_error_to_oci),
-            Self::Postgres(backend) => backend
-                .delete_object_if_present(object_key)
-                .await
-                .map_err(server_error_to_oci),
-        }
+        self.delete_direct_object_if_present(object_key)
+            .await
+            .map_err(server_error_to_oci)
     }
 }
 
@@ -2638,10 +2318,7 @@ mod tests {
         let chunk_size = NonZeroUsize::new(128).unwrap_or(NonZeroUsize::MIN);
         let upload_budget = NonZeroUsize::new(128).unwrap_or(NonZeroUsize::MIN);
         let bind_addr = "127.0.0.1:8080".parse();
-        assert!(bind_addr.is_ok());
-        let Ok(bind_addr) = bind_addr else {
-            return;
-        };
+        let bind_addr = bind_addr.expect("expected valid bind_addr");
         let config = ServerConfig::new(
             bind_addr,
             "http://127.0.0.1:8080".to_owned(),
@@ -2651,17 +2328,11 @@ mod tests {
         .with_chunk_size(chunk_size)
         .with_upload_max_in_flight_chunks(upload_budget);
         let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
+        let storage = storage.expect("expected valid storage");
 
         let backend =
             BenchmarkBackend::from_config(&config, storage.path().to_path_buf(), "run-0001").await;
-        assert!(backend.is_ok());
-        let Ok(backend) = backend else {
-            return;
-        };
+        let backend = backend.expect("expected valid backend");
 
         assert_eq!(backend.metadata_backend_name(), "local");
         assert_eq!(backend.object_backend_name(), "local");
@@ -3066,6 +2737,7 @@ mod tests {
                 &first_key,
                 &first_digest,
                 RequestBodyReader::from_bytes(first.clone().into()),
+                None,
             )
             .await
             .unwrap();
@@ -3074,6 +2746,7 @@ mod tests {
                 &second_key,
                 &second_digest,
                 RequestBodyReader::from_bytes(second.clone().into()),
+                None,
             )
             .await
             .unwrap();
@@ -3155,6 +2828,7 @@ mod tests {
                         &key,
                         &digest,
                         RequestBodyReader::from_bytes(body.into()),
+                        None,
                     )
                     .await
             }

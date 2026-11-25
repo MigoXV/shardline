@@ -16,6 +16,8 @@ mod scale;
 mod short_circuit;
 #[cfg(test)]
 mod snapshot;
+#[cfg(test)]
+mod test_support;
 
 /// Discovery only: a nonempty candidate proves membership, not range access.
 pub(crate) async fn first_xorb_coverage<Store>(
@@ -278,6 +280,7 @@ mod tests {
             .unwrap();
         let hash = "a".repeat(64);
         let mut record = FileRecord {
+            deduplication_domain: None,
             file_id: "first".into(),
             content_hash: "b".repeat(64),
             total_bytes: 4,

@@ -205,7 +205,7 @@ pub(super) fn capture_user_metadata(headers: &HeaderMap) -> Result<Vec<(String, 
         let Some(suffix) = name.as_str().strip_prefix(META_PREFIX) else {
             continue;
         };
-        if checksum::is_internal_metadata(&suffix.to_ascii_lowercase()) {
+        if checksum::is_internal_metadata(suffix) {
             return Err(S3Error::invalid_argument("Reserved S3 user metadata name"));
         }
         let mut values = Vec::new();
@@ -214,7 +214,7 @@ pub(super) fn capture_user_metadata(headers: &HeaderMap) -> Result<Vec<(String, 
                 .map_err(|_error| S3Error::invalid_argument("Invalid UTF-8 user metadata"))?;
             values.push(decode_metadata_value(text));
         }
-        metadata.push((suffix.to_ascii_lowercase(), values.join(",")));
+        metadata.push((suffix.to_owned(), values.join(",")));
     }
     metadata.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(metadata)
@@ -1083,7 +1083,7 @@ pub(super) async fn s3_upload_object_body(
     let (uploaded, prepared) = if resource_guard.is_some() {
         match state
             .backend
-            .prepare_s3_object_stream(&context.object_key, body)
+            .prepare_s3_object_stream(&context.object_key, body, context.auth.namespace())
             .await
         {
             Ok(prepared) => (prepared.response.clone(), Some(prepared)),
@@ -1100,7 +1100,7 @@ pub(super) async fn s3_upload_object_body(
     } else {
         match state
             .backend
-            .put_s3_object_stream(&context.object_key, body)
+            .put_s3_object_stream(&context.object_key, body, context.auth.namespace())
             .await
         {
             Ok(uploaded) => (uploaded, None),

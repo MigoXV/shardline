@@ -29,8 +29,8 @@ use shardline_xet_core::xorb_object::{
 };
 
 use super::{
-    ProviderEventsError, ProviderWebhookOutcomeKind, apply_provider_webhook_with_stores,
-    duplicate_webhook_outcome,
+    ProviderEventsError, ProviderWebhookOutcome, ProviderWebhookOutcomeKind,
+    apply_provider_webhook_with_stores,
 };
 use shardline_index::LocalRecordStore;
 
@@ -67,151 +67,83 @@ async fn local_latest_record_bytes(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_deleted_creates_holds_for_matching_repository_versions() {
-    let result = exercise_repository_deleted_creates_holds_for_matching_repository_versions().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository deletion hold flow failed: {error:?}"
-    );
+async fn repository_deleted_removes_stale_latest_without_version_record()
+-> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_repository_deleted_removes_stale_latest_without_version_record(chunk_size).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_deleted_removes_stale_latest_without_version_record() {
-    let result = exercise_repository_deleted_removes_stale_latest_without_version_record().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository deletion stale latest cleanup failed: {error:?}"
-    );
+async fn access_changed_records_provider_repository_state_without_mutating_file_metadata()
+-> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_access_changed_records_provider_repository_state_without_mutating_file_metadata(
+            chunk_size,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_deleted_holds_native_xet_xorb_and_unpacked_chunks() {
-    let result = exercise_repository_deleted_holds_native_xet_xorb_and_unpacked_chunks().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository deletion native xet retention failed: {error:?}"
-    );
+async fn revision_pushed_records_provider_repository_state_without_mutating_file_metadata()
+-> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_revision_pushed_records_provider_repository_state_without_mutating_file_metadata(
+            chunk_size,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn access_changed_records_provider_repository_state_without_mutating_file_metadata() {
-    let result =
-        exercise_access_changed_records_provider_repository_state_without_mutating_file_metadata()
-            .await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook access-changed state update contract failed: {error:?}"
-    );
+async fn duplicate_webhook_delivery_is_ignored_after_first_application()
+-> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_duplicate_webhook_delivery_is_ignored_after_first_application(chunk_size).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn revision_pushed_records_provider_repository_state_without_mutating_file_metadata() {
-    let result =
-        exercise_revision_pushed_records_provider_repository_state_without_mutating_file_metadata()
-            .await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook revision-pushed state update contract failed: {error:?}"
-    );
+async fn repository_rename_migrates_records_to_new_scope() -> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_repository_rename_migrates_records_to_new_scope(chunk_size).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn access_change_and_revision_push_state_survives_reordering() {
-    let result = exercise_access_change_and_revision_push_state_survives_reordering().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook state reordering flow failed: {error:?}"
-    );
+async fn repository_rename_removes_old_scope_latest_without_version_record()
+-> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_repository_rename_removes_old_scope_latest_without_version_record(chunk_size)
+            .await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn duplicate_webhook_delivery_is_ignored_after_first_application() {
-    let result = exercise_duplicate_webhook_delivery_is_ignored_after_first_application().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "duplicate webhook delivery no-op flow failed: {error:?}"
-    );
+async fn previously_recorded_webhook_delivery_is_a_no_op() -> Result<(), Box<dyn Error>> {
+    // Preserve both the core and former server fixture layouts.
+    for chunk_size in [4, 128] {
+        exercise_previously_recorded_webhook_delivery_is_a_no_op(chunk_size).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn matching_delivery_ids_in_different_repositories_are_not_replay_collisions() {
-    let result =
-        exercise_matching_delivery_ids_in_different_repositories_are_not_replay_collisions().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "repository-scoped webhook replay flow failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_webhook_application_can_retry_same_delivery() {
-    let result = exercise_failed_webhook_application_can_retry_same_delivery().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "failed webhook retry flow failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_rename_migrates_records_to_new_scope() {
-    let result = exercise_repository_rename_migrates_records_to_new_scope().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository rename migration failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_rename_removes_old_scope_latest_without_version_record() {
-    let result = exercise_repository_rename_removes_old_scope_latest_without_version_record().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository rename stale latest cleanup failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repository_rename_rejects_conflicting_target_metadata() {
-    let result = exercise_repository_rename_rejects_conflicting_target_metadata().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "provider webhook repository rename conflict detection failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn previously_recorded_webhook_delivery_is_a_no_op() {
-    let result = exercise_previously_recorded_webhook_delivery_is_a_no_op().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "pre-recorded webhook delivery no-op flow failed: {error:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn webhook_failure_with_failed_cleanup_logs_warning() {
-    let result = exercise_webhook_failure_with_failed_cleanup_logs_warning().await;
-    let error = result.as_ref().err().map(ToString::to_string);
-    assert!(
-        result.is_ok(),
-        "webhook failure with failed cleanup flow failed: {error:?}"
-    );
-}
-
-async fn exercise_repository_deleted_creates_holds_for_matching_repository_versions()
+#[allow(clippy::panic_in_result_fn)]
+async fn repository_deleted_creates_holds_for_matching_repository_versions()
 -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
@@ -229,6 +161,7 @@ async fn exercise_repository_deleted_creates_holds_for_matching_repository_versi
     let other_scope =
         RepositoryScope::new(RepositoryProvider::GitHub, "team", "other", Some("main"))?;
     let matching_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 8,
@@ -257,6 +190,7 @@ async fn exercise_repository_deleted_creates_holds_for_matching_repository_versi
         ],
     };
     let matching_release_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset-release.bin".to_owned(),
         content_hash: "f".repeat(64),
         total_bytes: 4,
@@ -274,6 +208,7 @@ async fn exercise_repository_deleted_creates_holds_for_matching_repository_versi
         }],
     };
     let other_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "d".repeat(64),
         total_bytes: 4,
@@ -360,18 +295,20 @@ async fn exercise_repository_deleted_creates_holds_for_matching_repository_versi
     Ok(())
 }
 
-async fn exercise_repository_deleted_removes_stale_latest_without_version_record()
--> Result<(), Box<dyn Error>> {
+async fn exercise_repository_deleted_removes_stale_latest_without_version_record(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let stale_record = FileRecord {
+        deduplication_domain: None,
         file_id: "stale.bin".to_owned(),
         content_hash: "e".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope.clone()),
         chunks: vec![FileChunkRecord {
@@ -385,10 +322,11 @@ async fn exercise_repository_deleted_removes_stale_latest_without_version_record
         }],
     };
     let healthy_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope),
         chunks: vec![FileChunkRecord {
@@ -435,8 +373,10 @@ async fn exercise_repository_deleted_removes_stale_latest_without_version_record
     Ok(())
 }
 
-async fn exercise_repository_deleted_holds_native_xet_xorb_and_unpacked_chunks()
--> Result<(), Box<dyn Error>> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn repository_deleted_holds_native_xet_xorb_and_unpacked_chunks() -> Result<(), Box<dyn Error>>
+{
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
@@ -463,6 +403,7 @@ async fn exercise_repository_deleted_holds_native_xet_xorb_and_unpacked_chunks()
 
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: validated.unpacked_length(),
@@ -479,6 +420,32 @@ async fn exercise_repository_deleted_holds_native_xet_xorb_and_unpacked_chunks()
             packed_end: u64::try_from(normalized_xorb.len())?,
         }],
     };
+    let fixed = FileRecord {
+        file_id: "fixed.bin".into(),
+        chunk_size: record.total_bytes,
+        ..record.clone()
+    };
+    let shared = FileRecord {
+        file_id: "shared.bin".into(),
+        ..record.clone()
+    };
+    let mut expected_hashes = chunk_hashes.clone();
+    expected_hashes.insert(xorb_hash.clone());
+    let mut expected_keys = std::collections::HashSet::new();
+    expected_keys.insert(xorb_object_key(&xorb_hash)?.as_str().to_owned());
+    for hash in &expected_hashes {
+        expected_keys.insert(chunk_object_key(hash)?.as_str().to_owned());
+    }
+    for records in [[&fixed, &record, &shared], [&shared, &record, &fixed]] {
+        let references = crate::records::collect_deleted_repository_references(
+            &object_store,
+            records.into_iter(),
+        )?;
+        assert_eq!(references.file_versions, 3);
+        assert_eq!(references.chunk_hashes, expected_hashes);
+        assert_eq!(references.held_object_keys, expected_keys);
+    }
+
     RecordMutation::write_version_record(&record_store, &record).await?;
     RecordMutation::write_latest_record(&record_store, &record).await?;
 
@@ -516,18 +483,20 @@ async fn exercise_repository_deleted_holds_native_xet_xorb_and_unpacked_chunks()
     Ok(())
 }
 
-async fn exercise_access_changed_records_provider_repository_state_without_mutating_file_metadata()
--> Result<(), Box<dyn Error>> {
+async fn exercise_access_changed_records_provider_repository_state_without_mutating_file_metadata(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope),
         chunks: vec![FileChunkRecord {
@@ -591,18 +560,20 @@ async fn exercise_access_changed_records_provider_repository_state_without_mutat
     Ok(())
 }
 
-async fn exercise_revision_pushed_records_provider_repository_state_without_mutating_file_metadata()
--> Result<(), Box<dyn Error>> {
+async fn exercise_revision_pushed_records_provider_repository_state_without_mutating_file_metadata(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope),
         chunks: vec![FileChunkRecord {
@@ -669,8 +640,9 @@ async fn exercise_revision_pushed_records_provider_repository_state_without_muta
     Ok(())
 }
 
-async fn exercise_access_change_and_revision_push_state_survives_reordering()
--> Result<(), Box<dyn Error>> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn access_change_and_revision_push_state_survives_reordering() -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
@@ -739,18 +711,20 @@ async fn exercise_access_change_and_revision_push_state_survives_reordering()
     Ok(())
 }
 
-async fn exercise_duplicate_webhook_delivery_is_ignored_after_first_application()
--> Result<(), Box<dyn Error>> {
+async fn exercise_duplicate_webhook_delivery_is_ignored_after_first_application(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope),
         chunks: vec![FileChunkRecord {
@@ -798,7 +772,9 @@ async fn exercise_duplicate_webhook_delivery_is_ignored_after_first_application(
     Ok(())
 }
 
-async fn exercise_matching_delivery_ids_in_different_repositories_are_not_replay_collisions()
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn matching_delivery_ids_in_different_repositories_are_not_replay_collisions()
 -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
@@ -862,8 +838,9 @@ async fn exercise_matching_delivery_ids_in_different_repositories_are_not_replay
     Ok(())
 }
 
-async fn exercise_failed_webhook_application_can_retry_same_delivery() -> Result<(), Box<dyn Error>>
-{
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn failed_webhook_application_can_retry_same_delivery() -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store =
@@ -871,6 +848,7 @@ async fn exercise_failed_webhook_application_can_retry_same_delivery() -> Result
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
@@ -932,7 +910,9 @@ async fn exercise_failed_webhook_application_can_retry_same_delivery() -> Result
     Ok(())
 }
 
-async fn exercise_repository_rename_migrates_records_to_new_scope() -> Result<(), Box<dyn Error>> {
+async fn exercise_repository_rename_migrates_records_to_new_scope(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
@@ -946,10 +926,11 @@ async fn exercise_repository_rename_migrates_records_to_new_scope() -> Result<()
         Some("release"),
     )?;
     let main_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(main_scope.clone()),
         chunks: vec![FileChunkRecord {
@@ -963,10 +944,11 @@ async fn exercise_repository_rename_migrates_records_to_new_scope() -> Result<()
         }],
     };
     let release_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "c".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(release_scope.clone()),
         chunks: vec![FileChunkRecord {
@@ -1039,17 +1021,20 @@ async fn exercise_repository_rename_migrates_records_to_new_scope() -> Result<()
     Ok(())
 }
 
-async fn exercise_previously_recorded_webhook_delivery_is_a_no_op() -> Result<(), Box<dyn Error>> {
+async fn exercise_previously_recorded_webhook_delivery_is_a_no_op(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(scope),
         chunks: vec![FileChunkRecord {
@@ -1109,13 +1094,16 @@ async fn exercise_previously_recorded_webhook_delivery_is_a_no_op() -> Result<()
     Ok(())
 }
 
-async fn exercise_webhook_failure_with_failed_cleanup_logs_warning() -> Result<(), Box<dyn Error>> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn webhook_failure_with_failed_cleanup_logs_warning() -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = FailAlwaysStore::new(LocalIndexStore::new(storage.path().to_path_buf())?);
     let object_store = ServerObjectStore::local(storage.path().join("chunks"))?;
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
@@ -1162,8 +1150,9 @@ async fn exercise_webhook_failure_with_failed_cleanup_logs_warning() -> Result<(
     Ok(())
 }
 
-async fn exercise_repository_rename_removes_old_scope_latest_without_version_record()
--> Result<(), Box<dyn Error>> {
+async fn exercise_repository_rename_removes_old_scope_latest_without_version_record(
+    chunk_size: u64,
+) -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
@@ -1171,10 +1160,11 @@ async fn exercise_repository_rename_removes_old_scope_latest_without_version_rec
     let main_scope =
         RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
     let stale_record = FileRecord {
+        deduplication_domain: None,
         file_id: "stale.bin".to_owned(),
         content_hash: "e".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(main_scope.clone()),
         chunks: vec![FileChunkRecord {
@@ -1188,10 +1178,11 @@ async fn exercise_repository_rename_removes_old_scope_latest_without_version_rec
         }],
     };
     let healthy_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
-        chunk_size: 4,
+        chunk_size,
         storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
         repository_scope: Some(main_scope),
         chunks: vec![FileChunkRecord {
@@ -1244,8 +1235,9 @@ async fn exercise_repository_rename_removes_old_scope_latest_without_version_rec
     Ok(())
 }
 
-async fn exercise_repository_rename_rejects_conflicting_target_metadata()
--> Result<(), Box<dyn Error>> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::panic_in_result_fn)]
+async fn repository_rename_rejects_conflicting_target_metadata() -> Result<(), Box<dyn Error>> {
     let storage = tempfile::tempdir()?;
     let record_store = LocalRecordStore::open(storage.path().to_path_buf());
     let index_store = LocalIndexStore::new(storage.path().to_path_buf())?;
@@ -1259,6 +1251,7 @@ async fn exercise_repository_rename_rejects_conflicting_target_metadata()
         Some("main"),
     )?;
     let source_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
@@ -1276,6 +1269,7 @@ async fn exercise_repository_rename_rejects_conflicting_target_metadata()
         }],
     };
     let conflicting_target_record = FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "c".repeat(64),
         total_bytes: 4,
@@ -1881,6 +1875,7 @@ async fn apply_webhook_with_generic_provider_revision_pushed() {
     let scope =
         RepositoryScope::new(RepositoryProvider::Generic, "myorg", "myrepo", Some("main")).unwrap();
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "data.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 4,
@@ -1965,80 +1960,59 @@ impl TestInvariantError {
 }
 
 // ---------------------------------------------------------------------------
-// Tests moved from lib.rs: duplicate_webhook_outcome unit tests
+// Zero-count outcomes for replayed events
 // ---------------------------------------------------------------------------
 
 #[test]
-fn duplicate_webhook_outcome_for_deleted() {
-    let event = RepositoryWebhookEvent::new(
-        RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap(),
-        WebhookDeliveryId::new("delivery-dup").unwrap(),
-        RepositoryWebhookEventKind::RepositoryDeleted,
-    );
-    let outcome = duplicate_webhook_outcome(&event);
-    assert_eq!(outcome.provider, ProviderKind::GitHub);
-    assert_eq!(outcome.owner, "org");
-    assert_eq!(outcome.repo, "repo");
-    assert_eq!(
-        outcome.event_kind,
-        ProviderWebhookOutcomeKind::RepositoryDeleted
-    );
-    assert_eq!(outcome.affected_file_versions, 0);
-    assert_eq!(outcome.affected_chunks, 0);
-    assert_eq!(outcome.applied_holds, 0);
-    assert_eq!(outcome.retention_seconds, None);
-}
-
-#[test]
-fn duplicate_webhook_outcome_for_renamed() {
-    let new_repo = RepositoryRef::new(ProviderKind::GitHub, "new-org", "new-repo").unwrap();
-    let event = RepositoryWebhookEvent::new(
-        RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap(),
-        WebhookDeliveryId::new("delivery-dup-rename").unwrap(),
-        RepositoryWebhookEventKind::RepositoryRenamed {
-            new_repository: new_repo,
-        },
-    );
-    let outcome = duplicate_webhook_outcome(&event);
-    assert_eq!(
-        outcome.event_kind,
-        ProviderWebhookOutcomeKind::RepositoryRenamed {
-            new_owner: "new-org".to_owned(),
-            new_repo: "new-repo".to_owned(),
-        }
-    );
-}
-
-#[test]
-fn duplicate_webhook_outcome_for_revision_pushed() {
-    let event = RepositoryWebhookEvent::new(
-        RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap(),
-        WebhookDeliveryId::new("delivery-dup-rev").unwrap(),
-        RepositoryWebhookEventKind::RevisionPushed {
-            revision: RevisionRef::new("refs/heads/main").unwrap(),
-        },
-    );
-    let outcome = duplicate_webhook_outcome(&event);
-    assert_eq!(
-        outcome.event_kind,
-        ProviderWebhookOutcomeKind::RevisionPushed {
-            revision: "refs/heads/main".to_owned(),
-        }
-    );
-}
-
-#[test]
-fn duplicate_webhook_outcome_for_access_changed() {
-    let event = RepositoryWebhookEvent::new(
-        RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap(),
-        WebhookDeliveryId::new("delivery-dup-access").unwrap(),
-        RepositoryWebhookEventKind::AccessChanged,
-    );
-    let outcome = duplicate_webhook_outcome(&event);
-    assert_eq!(
-        outcome.event_kind,
-        ProviderWebhookOutcomeKind::AccessChanged
-    );
+fn replay_outcomes_preserve_event_identity_and_have_zero_counts() {
+    for (kind, expected_kind) in [
+        (
+            RepositoryWebhookEventKind::RepositoryDeleted,
+            ProviderWebhookOutcomeKind::RepositoryDeleted,
+        ),
+        (
+            RepositoryWebhookEventKind::AccessChanged,
+            ProviderWebhookOutcomeKind::AccessChanged,
+        ),
+        (
+            RepositoryWebhookEventKind::RepositoryRenamed {
+                new_repository: RepositoryRef::new(ProviderKind::GitHub, "new-org", "new-repo")
+                    .unwrap(),
+            },
+            ProviderWebhookOutcomeKind::RepositoryRenamed {
+                new_owner: "new-org".to_owned(),
+                new_repo: "new-repo".to_owned(),
+            },
+        ),
+        (
+            RepositoryWebhookEventKind::RevisionPushed {
+                revision: RevisionRef::new("refs/heads/main").unwrap(),
+            },
+            ProviderWebhookOutcomeKind::RevisionPushed {
+                revision: "refs/heads/main".to_owned(),
+            },
+        ),
+    ] {
+        let event = RepositoryWebhookEvent::new(
+            RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap(),
+            WebhookDeliveryId::new("delivery-dup").unwrap(),
+            kind,
+        );
+        assert_eq!(
+            ProviderWebhookOutcome::for_event(&event),
+            ProviderWebhookOutcome {
+                provider: ProviderKind::GitHub,
+                owner: "org".to_owned(),
+                repo: "repo".to_owned(),
+                delivery_id: "delivery-dup".to_owned(),
+                event_kind: expected_kind,
+                affected_file_versions: 0,
+                affected_chunks: 0,
+                applied_holds: 0,
+                retention_seconds: None,
+            }
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2046,125 +2020,87 @@ fn duplicate_webhook_outcome_for_access_changed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn provider_events_error_display_all_variants() {
-    let cases: &[(ProviderEventsError, &str)] = &[
-        (ProviderEventsError::Overflow, "overflow"),
-        (ProviderEventsError::InvalidContentHash, "hash"),
+fn provider_events_error_display_messages() {
+    for (error, expected) in [
+        (ProviderEventsError::Overflow, "arithmetic overflow"),
+        (
+            ProviderEventsError::InvalidContentHash,
+            "content hash must be 64 hexadecimal characters",
+        ),
         (
             ProviderEventsError::InvalidProviderWebhookPayload,
-            "payload",
+            "provider webhook payload was invalid",
         ),
         (
             ProviderEventsError::ConflictingRenameTargetRecord,
-            "conflicting",
+            "repository rename target already contains conflicting metadata",
         ),
         (
             ProviderEventsError::Json(
                 serde_json::from_str::<serde_json::Value>("invalid json...").unwrap_err(),
             ),
-            "json",
+            "json operation failed",
         ),
         (
             ProviderEventsError::NumericConversion(u64::try_from(-1i32).unwrap_err()),
-            "bounds",
+            "numeric conversion exceeded supported bounds",
         ),
         (
             ProviderEventsError::RetentionHold(RetentionHoldError::EmptyReason),
-            "hold",
+            "retention hold input was invalid",
         ),
         (
             ProviderEventsError::WebhookDelivery(
                 shardline_index::WebhookDeliveryError::EmptyDeliveryId,
             ),
-            "delivery",
+            "webhook delivery metadata was invalid",
         ),
         (
             ProviderEventsError::ObjectStore(
                 shardline_server_core::ServerObjectStoreError::NotFound,
             ),
-            "object",
+            "object storage operation failed",
         ),
-    ];
-    for (error, substring) in cases {
-        let msg = error.to_string();
-        assert!(!msg.is_empty(), "empty display for {error:?}");
-        assert!(
-            msg.contains(substring),
-            "expected '{substring}' in '{msg}' from {error:?}"
-        );
+        (
+            ProviderEventsError::XetAdapter(shardline_xet_adapter::XetAdapterError::NotFound),
+            "xet adapter operation failed",
+        ),
+        (
+            ProviderEventsError::IndexStore(
+                shardline_index::LocalIndexStoreError::InvalidLegacyImportState,
+            ),
+            "index adapter operation failed",
+        ),
+        (
+            ProviderEventsError::MemoryIndexStore(
+                shardline_index::MemoryIndexStoreError::LockPoisoned("test".to_owned()),
+            ),
+            "memory index adapter operation failed",
+        ),
+        (
+            ProviderEventsError::MemoryRecordStore(
+                shardline_index::MemoryRecordStoreError::LockPoisoned("test".to_owned()),
+            ),
+            "memory record adapter operation failed",
+        ),
+        (
+            ProviderEventsError::ParseStoredFileRecord(
+                shardline_server_core::ParseStoredFileRecordError::StoredFileMetadataTooLarge {
+                    observed_bytes: 999,
+                    maximum_bytes: 100,
+                },
+            ),
+            "stored file record parsing failed",
+        ),
+        (
+            ProviderEventsError::PostgresMetadata(
+                shardline_index::PostgresMetadataStoreError::HashParse(
+                    shardline_protocol::HashParseError::InvalidCharacter("test".to_owned()),
+                ),
+            ),
+            "postgres metadata adapter operation failed",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected, "{error:?}");
     }
-}
-
-#[test]
-fn provider_events_error_xet_adapter_display() {
-    let error = ProviderEventsError::XetAdapter(shardline_xet_adapter::XetAdapterError::NotFound);
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-}
-
-#[test]
-fn provider_events_error_index_store_display() {
-    let error = ProviderEventsError::IndexStore(
-        shardline_index::LocalIndexStoreError::InvalidLegacyImportState,
-    );
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-}
-
-#[test]
-fn provider_events_error_memory_index_store_display() {
-    let error = ProviderEventsError::MemoryIndexStore(
-        shardline_index::MemoryIndexStoreError::LockPoisoned("test".to_owned()),
-    );
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-}
-
-#[test]
-fn provider_events_error_memory_record_store_display() {
-    let error = ProviderEventsError::MemoryRecordStore(
-        shardline_index::MemoryRecordStoreError::LockPoisoned("test".to_owned()),
-    );
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-}
-
-#[test]
-fn provider_events_error_parse_stored_file_record_display() {
-    let error = ProviderEventsError::ParseStoredFileRecord(
-        shardline_server_core::ParseStoredFileRecordError::StoredFileMetadataTooLarge {
-            observed_bytes: 999,
-            maximum_bytes: 100,
-        },
-    );
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-}
-
-#[test]
-fn provider_events_error_postgres_metadata_display() {
-    let error = ProviderEventsError::PostgresMetadata(
-        shardline_index::PostgresMetadataStoreError::HashParse(
-            shardline_protocol::HashParseError::InvalidCharacter("test".to_owned()),
-        ),
-    );
-    let msg = error.to_string();
-    assert_eq!(msg, "postgres metadata adapter operation failed");
-}
-
-#[test]
-fn provider_events_error_xet_adapter_display_nonempty() {
-    let error = ProviderEventsError::XetAdapter(shardline_xet_adapter::XetAdapterError::NotFound);
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
-    assert!(msg.contains("xet"));
-}
-
-#[test]
-fn provider_events_error_index_store_display_nonempty() {
-    let error = ProviderEventsError::IndexStore(
-        shardline_index::LocalIndexStoreError::InvalidLegacyImportState,
-    );
-    let msg = error.to_string();
-    assert!(!msg.is_empty());
 }

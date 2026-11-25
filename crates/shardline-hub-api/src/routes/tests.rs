@@ -24,45 +24,30 @@ async fn decode_creation_response(
 }
 
 #[test]
-fn parse_csv_line_simple_fields() {
-    let result = parse_csv_line("a,b,c");
-    assert_eq!(result, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn parse_csv_line_quoted_field_with_comma() {
-    let result = parse_csv_line(r#""hello, world",b"#);
-    assert_eq!(result, vec!["hello, world", "b"]);
-}
-
-#[test]
-fn parse_csv_line_escaped_quote() {
-    let result = parse_csv_line(r#""say ""hello""",done"#);
-    assert_eq!(result, vec![r#"say ""hello"""#, "done"]);
-}
-
-#[test]
-fn parse_csv_line_trailing_comma() {
-    let result = parse_csv_line("a,b,");
-    assert_eq!(result, vec!["a", "b", ""]);
-}
-
-#[test]
-fn parse_csv_line_single_field() {
-    let result = parse_csv_line("only");
-    assert_eq!(result, vec!["only"]);
-}
-
-#[test]
-fn parse_csv_line_empty_field() {
-    let result = parse_csv_line("a,,c");
-    assert_eq!(result, vec!["a", "", "c"]);
-}
-
-#[test]
-fn parse_csv_line_unterminated_quote() {
-    let result = parse_csv_line(r#""unterminated,a"#);
-    assert_eq!(result, vec!["unterminated,a"]);
+fn csv_fields_preserve_quoting_separators_and_unterminated_input() {
+    let cases: &[(&str, &[&str])] = &[
+        ("", &[]),
+        ("目录,é,🦀", &["目录", "é", "🦀"]),
+        ("a,b,c", &["a", "b", "c"]),
+        (r#""hello, world",b"#, &["hello, world", "b"]),
+        (r#""say ""hello""",done"#, &[r#"say ""hello"""#, "done"]),
+        ("a,b,", &["a", "b", ""]),
+        ("only", &["only"]),
+        ("a,,c", &["a", "", "c"]),
+        (r#""unterminated,a"#, &["unterminated,a"]),
+        (r#""a","b","c""#, &["a", "b", "c"]),
+        (r#"a,"say ""hello""",b"#, &["a", r#"say ""hello"""#, "b"]),
+        ("a,,,c", &["a", "", "", "c"]),
+        (",a,b", &["", "a", "b"]),
+        (r#""unterm,,"#, &["unterm,,", ""]),
+        (r#""say ""hi""",done"#, &[r#"say ""hi"""#, "done"]),
+        (r#""a","#, &["a", ""]),
+        (",,", &["", "", ""]),
+        ("\"", &[""]),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(parse_csv_line(input), *expected, "{input:?}");
+    }
 }
 
 // --- repo_delete endpoint logic tests ---
@@ -81,112 +66,82 @@ fn make_delete_test_store() -> (tempfile::TempDir, BoxedHubStore) {
     (ts, boxed)
 }
 
-/// Helper: returns (TempDir, HubState) with no auth.
-pub(super) fn make_test_state() -> (tempfile::TempDir, HubState) {
-    let (td, store) = make_delete_test_store();
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
+fn state_with_store(root: &std::path::Path, store: BoxedHubStore) -> HubState {
+    let object_store = shardline_server_core::ServerObjectStore::local(root.join("lfs"))
         .expect("local object store");
-    let state = HubState {
+    HubState {
         store,
         object_store,
+        recovery_archive: None,
         auth: None,
         http_client: None,
         webhook_secret_cipher: None,
         public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    }
+}
+
+/// Helper: returns (TempDir, HubState) with no auth.
+pub(super) fn make_test_state() -> (tempfile::TempDir, HubState) {
+    let (td, store) = make_delete_test_store();
+    let state = state_with_store(td.path(), store);
     (td, state)
 }
 
 #[test]
-fn repo_delete_cleans_up_revisions() {
-    let (_ts, store) = make_delete_test_store();
-
-    use shardline_index::hub::{HubFileEntry, HubRepoType};
-
-    store
-        .create_repo(HubRepoType::Model, "org/model", false)
-        .unwrap();
-    let initial_sha = "4b825dc642cb6eb9a060e54bf899d69f8f5ce8e3";
-
-    // Add a commit
-    store
-        .create_revision(
-            "org/model",
-            Some(initial_sha),
-            "sha1",
-            "main",
-            "first commit",
-        )
-        .unwrap();
-
-    // Store files for the commit
-    let files = vec![HubFileEntry {
-        path: "README.md".into(),
-        size: 100,
-        sha: "sha_readme".into(),
-        is_lfs: false,
-    }];
-    store.store_files("sha1", &files).unwrap();
-
-    // Verify data exists
-    assert_eq!(store.list_revisions("org/model").unwrap().len(), 2);
-    assert_eq!(store.get_files("sha1").unwrap().len(), 1);
-
-    // Delete — mirrors what repo_delete handler does
-    store.delete_repo("org/model").unwrap();
-
-    // Verify everything is gone
-    assert!(store.get_repo("org/model").unwrap().is_none());
-    assert!(store.list_revisions("org/model").unwrap().is_empty());
-    assert!(store.get_files("sha1").unwrap().is_empty());
-}
-
-#[test]
-fn repo_delete_cleans_up_webhooks() {
-    let (_ts, store) = make_delete_test_store();
-
-    use shardline_index::hub::HubRepoType;
-
-    store
-        .create_repo(HubRepoType::Model, "org/model", false)
-        .unwrap();
-
-    // Create webhook
-    store
-        .create_webhook(
-            "org/model",
-            "https://example.com/hook",
-            &["push".into()],
-            None,
-        )
-        .unwrap();
-
-    assert_eq!(store.list_webhooks("org/model").unwrap().len(), 1);
-
-    // Delete
-    store.delete_repo("org/model").unwrap();
-
-    // Verify webhook is gone
-    assert!(store.list_webhooks("org/model").unwrap().is_empty());
-}
-
-#[test]
-fn repo_delete_idempotent() {
-    let (_ts, store) = make_delete_test_store();
-
-    use shardline_index::hub::HubRepoType;
-
-    store
-        .create_repo(HubRepoType::Model, "org/model", false)
-        .unwrap();
-
-    // First delete succeeds
-    store.delete_repo("org/model").unwrap();
-    assert!(store.get_repo("org/model").unwrap().is_none());
-
-    // Second delete is also fine (no-op, no rows affected)
-    store.delete_repo("org/model").unwrap();
-    assert!(store.get_repo("org/model").unwrap().is_none());
+fn repo_delete_cleans_up_related_rows_and_remains_idempotent() {
+    for (with_revision, with_webhook) in
+        [(true, false), (false, true), (false, false), (true, true)]
+    {
+        let (_td, store) = make_delete_test_store();
+        store
+            .create_repo(HubRepoType::Model, "org/model", false)
+            .unwrap();
+        if with_revision {
+            store
+                .create_revision(
+                    "org/model",
+                    Some("4b825dc642cb6eb9a060e54bf899d69f8f5ce8e3"),
+                    "sha1",
+                    "main",
+                    "first commit",
+                )
+                .unwrap();
+            store
+                .store_files(
+                    "sha1",
+                    &[HubFileEntry {
+                        path: "README.md".into(),
+                        size: 100,
+                        sha: "sha_readme".into(),
+                        is_lfs: false,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(store.list_revisions("org/model").unwrap().len(), 2);
+            assert_eq!(store.get_files("sha1").unwrap().len(), 1);
+        }
+        if with_webhook {
+            store
+                .create_webhook(
+                    "org/model",
+                    "https://example.com/hook",
+                    &["push".into()],
+                    None,
+                )
+                .unwrap();
+            assert_eq!(store.list_webhooks("org/model").unwrap().len(), 1);
+        }
+        for deletion in 1..=2 {
+            store.delete_repo("org/model").unwrap();
+            assert!(
+                store.get_repo("org/model").unwrap().is_none(),
+                "revision={with_revision}, webhook={with_webhook}, deletion={deletion}"
+            );
+            assert!(store.list_revisions("org/model").unwrap().is_empty());
+            assert!(store.get_files("sha1").unwrap().is_empty());
+            assert!(store.list_webhooks("org/model").unwrap().is_empty());
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -194,30 +149,14 @@ fn repo_delete_idempotent() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn repo_type_path_model() {
-    assert_eq!(repo_type_path(HubRepoType::Model), "models");
-}
-
-#[test]
-fn repo_type_path_dataset() {
-    assert_eq!(repo_type_path(HubRepoType::Dataset), "datasets");
-}
-
-#[test]
-fn repo_type_path_space() {
-    assert_eq!(repo_type_path(HubRepoType::Space), "spaces");
-}
-
-// -----------------------------------------------------------------------
-// sanitize_log_url
-// -----------------------------------------------------------------------
-
-#[test]
-fn sanitize_log_url_omits_long_private_paths() {
-    let base = "https://example.com/";
-    let long = format!("{}{}", base, "a".repeat(300));
-    let result = sanitize_log_url(&long);
-    assert_eq!(result, "https://example.com");
+fn repo_type_paths_preserve_plural_api_segments() {
+    for (repo_type, expected) in [
+        (HubRepoType::Model, "models"),
+        (HubRepoType::Dataset, "datasets"),
+        (HubRepoType::Space, "spaces"),
+    ] {
+        assert_eq!(repo_type_path(repo_type), expected);
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -225,64 +164,51 @@ fn sanitize_log_url_omits_long_private_paths() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn repo_response_from_hub_model() {
-    use shardline_index::hub::HubRepoType;
-    let hub_repo = HubRepo {
-        repo_id: "org/my-model".to_owned(),
-        repo_type: HubRepoType::Model,
-        private: false,
-        default_branch: "main".to_owned(),
-        created_at_unix_seconds: 1_700_000_000,
-        updated_at_unix_seconds: 1_700_000_001,
-    };
-    let resp = repo_response_from_hub(&hub_repo);
-    assert_eq!(resp.id, "org/my-model");
-    assert_eq!(resp.repo_type, RepoType::Model);
-    assert!(!resp.private);
-    assert_eq!(resp.url, "/org/my-model");
-    assert_eq!(resp.default_branch.as_deref(), Some("main"));
-    let lm = resp
-        .last_modified
-        .as_deref()
-        .expect("last_modified should be Some");
-    // Should be a valid RFC 3339 timestamp around 2023-11-14
-    assert!(
-        lm.contains("2023-11-14T22"),
-        "expected 2023-11-14T22... got {lm}"
-    );
-}
-
-#[test]
-fn repo_response_from_hub_dataset() {
-    use shardline_index::hub::HubRepoType;
-    let hub_repo = HubRepo {
-        repo_id: "org/data".to_owned(),
-        repo_type: HubRepoType::Dataset,
-        private: true,
-        default_branch: "main".to_owned(),
-        created_at_unix_seconds: 0,
-        updated_at_unix_seconds: 0,
-    };
-    let resp = repo_response_from_hub(&hub_repo);
-    assert_eq!(resp.repo_type, RepoType::Dataset);
-    assert!(resp.private);
-    assert_eq!(resp.url, "/datasets/org/data");
-}
-
-#[test]
-fn repo_response_from_hub_space() {
-    use shardline_index::hub::HubRepoType;
-    let hub_repo = HubRepo {
-        repo_id: "org/space1".to_owned(),
-        repo_type: HubRepoType::Space,
-        private: false,
-        default_branch: "main".to_owned(),
-        created_at_unix_seconds: 0,
-        updated_at_unix_seconds: 0,
-    };
-    let resp = repo_response_from_hub(&hub_repo);
-    assert_eq!(resp.repo_type, RepoType::Space);
-    assert_eq!(resp.url, "/spaces/org/space1");
+fn repo_responses_preserve_type_visibility_url_and_timestamp() {
+    for (repo_type, expected_type, id, private, url, updated, timestamp) in [
+        (
+            HubRepoType::Model,
+            RepoType::Model,
+            "org/my-model",
+            false,
+            "/org/my-model",
+            1_700_000_001,
+            "2023-11-14T22:13:21.000Z",
+        ),
+        (
+            HubRepoType::Dataset,
+            RepoType::Dataset,
+            "org/data",
+            true,
+            "/datasets/org/data",
+            0,
+            "1970-01-01T00:00:00.000Z",
+        ),
+        (
+            HubRepoType::Space,
+            RepoType::Space,
+            "org/space1",
+            false,
+            "/spaces/org/space1",
+            0,
+            "1970-01-01T00:00:00.000Z",
+        ),
+    ] {
+        let response = repo_response_from_hub(HubRepo {
+            repo_id: id.to_owned(),
+            repo_type,
+            private,
+            default_branch: "main".to_owned(),
+            created_at_unix_seconds: 0,
+            updated_at_unix_seconds: updated,
+        });
+        assert_eq!(response.id, id);
+        assert_eq!(response.repo_type, expected_type);
+        assert_eq!(response.private, private);
+        assert_eq!(response.url, url);
+        assert_eq!(response.default_branch.as_deref(), Some("main"));
+        assert_eq!(response.last_modified.as_deref(), Some(timestamp));
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -302,7 +228,7 @@ fn webhook_response_from_hub_basic() {
         active: true,
         created_at_unix_seconds: 42,
     };
-    let resp = webhook_response_from_hub(&hook);
+    let resp = webhook_response_from_hub(hook);
     assert_eq!(resp.id, "wh_123");
     assert_eq!(resp.url, "https://example.com/hook");
     assert_eq!(resp.events, vec!["push"]);
@@ -322,7 +248,7 @@ fn webhook_response_from_hub_inactive() {
         active: false,
         created_at_unix_seconds: 99,
     };
-    let resp = webhook_response_from_hub(&hook);
+    let resp = webhook_response_from_hub(hook);
     assert!(!resp.active);
     assert_eq!(resp.events.len(), 2);
 }
@@ -332,69 +258,55 @@ fn webhook_response_from_hub_inactive() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn parse_yaml_frontmatter_valid_simple() {
-    let content = b"---\nkey: value\n---\n# README\nHello";
-    let result = parse_yaml_frontmatter(content);
-    assert!(result.is_some());
-    let obj = result.unwrap();
-    assert_eq!(obj.get("key").and_then(|v| v.as_str()), Some("value"));
+fn parse_yaml_frontmatter_preserves_scalar_types_and_quoting() {
+    for (content, expected) in [
+        (
+            "---\nkey: value\n---\n# README\nHello",
+            serde_json::json!({"key": "value"}),
+        ),
+        (
+            "---\ntitle: 'My Model'\n---\nbody",
+            serde_json::json!({"title": "My Model"}),
+        ),
+        (
+            "---\nlikes: 42\n---\nbody",
+            serde_json::json!({"likes": 42}),
+        ),
+        (
+            "---\nprivate: true\n---\nbody",
+            serde_json::json!({"private": true}),
+        ),
+        (
+            "---\nname: \"hello world\"\n---\nbody",
+            serde_json::json!({"name": "hello world"}),
+        ),
+        ("---\nkey: value\n---", serde_json::json!({"key": "value"})),
+        (
+            "---\ncount: 42\nactive: true\n---\n",
+            serde_json::json!({"count": 42, "active": true}),
+        ),
+    ] {
+        assert_eq!(
+            parse_yaml_frontmatter(content.as_bytes()),
+            Some(expected),
+            "{content:?}"
+        );
+    }
 }
 
 #[test]
-fn parse_yaml_frontmatter_with_quoted_value() {
-    let content = b"---\ntitle: 'My Model'\n---\nbody";
-    let result = parse_yaml_frontmatter(content);
-    assert!(result.is_some());
-    let obj = result.unwrap();
-    assert_eq!(obj.get("title").and_then(|v| v.as_str()), Some("My Model"));
-}
-
-#[test]
-fn parse_yaml_frontmatter_no_frontmatter() {
-    let content = b"Just a README\nno frontmatter";
-    assert!(parse_yaml_frontmatter(content).is_none());
-}
-
-#[test]
-fn parse_yaml_frontmatter_empty_yaml() {
-    let content = b"---\n---\nbody";
-    assert!(parse_yaml_frontmatter(content).is_none());
-}
-
-#[test]
-fn parse_yaml_frontmatter_only_comments() {
-    let content = b"---\n# just a comment\n---\nbody";
-    assert!(parse_yaml_frontmatter(content).is_none());
-}
-
-#[test]
-fn parse_yaml_frontmatter_numeric_value() {
-    let content = b"---\nlikes: 42\n---\nbody";
-    let result = parse_yaml_frontmatter(content).unwrap();
-    assert_eq!(result.get("likes").and_then(|v| v.as_u64()), Some(42));
-}
-
-#[test]
-fn parse_yaml_frontmatter_boolean_value() {
-    let content = b"---\nprivate: true\n---\nbody";
-    let result = parse_yaml_frontmatter(content).unwrap();
-    assert_eq!(result.get("private").and_then(|v| v.as_bool()), Some(true));
-}
-
-#[test]
-fn parse_yaml_frontmatter_double_quoted_value() {
-    let content = b"---\nname: \"hello world\"\n---\nbody";
-    let result = parse_yaml_frontmatter(content).unwrap();
-    assert_eq!(
-        result.get("name").and_then(|v| v.as_str()),
-        Some("hello world")
-    );
-}
-
-#[test]
-fn parse_yaml_frontmatter_not_utf8() {
-    let content = b"\xff\xfe\x00\x01";
-    assert!(parse_yaml_frontmatter(content).is_none());
+fn parse_yaml_frontmatter_omits_absent_empty_and_non_utf8_metadata() {
+    for content in [
+        b"Just a README\nno frontmatter".as_slice(),
+        b"---\n---\nbody",
+        b"---\n# just a comment\n---\nbody",
+        b"---\nno-colon-here\n---\nbody",
+        b"\xff\xfe\x00\x01",
+        b"---\nkey: value\n",
+        b"---\nkey: value\nno_colon_line\nother: val\n---\n",
+    ] {
+        assert!(parse_yaml_frontmatter(content).is_none(), "{content:?}");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -511,22 +423,35 @@ fn tree_entries_recursive_root() {
 #[test]
 fn tree_entries_recursive_nested() {
     use shardline_index::hub::HubFileEntry;
-    let files = vec![
-        HubFileEntry {
-            path: "src/main.rs".into(),
-            size: 200,
-            sha: "b".into(),
-            is_lfs: false,
-        },
-        HubFileEntry {
-            path: "src/lib.rs".into(),
-            size: 300,
-            sha: "c".into(),
-            is_lfs: true,
-        },
-    ];
+    let files: Vec<_> = [
+        ("src/main.rs", 200, "b", false),
+        ("src/lib.rs", 300, "c", true),
+        ("src/目录/z.txt", 10, "d", false),
+        ("src/目录/a.txt", 20, "e", false),
+    ]
+    .into_iter()
+    .map(|(path, size, sha, is_lfs)| HubFileEntry {
+        path: path.into(),
+        size,
+        sha: sha.into(),
+        is_lfs,
+    })
+    .collect();
     let entries = tree_entries_recursive(&files, "src").unwrap();
-    assert_eq!(entries.len(), 2);
+    let paths: Vec<_> = entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.entry_type.as_str()))
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            ("src/lib.rs", "file"),
+            ("src/main.rs", "file"),
+            ("src/目录", "directory"),
+            ("src/目录/a.txt", "file"),
+            ("src/目录/z.txt", "file"),
+        ]
+    );
 }
 
 #[test]
@@ -555,59 +480,40 @@ fn tree_entries_recursive_empty() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn find_dataset_file_default_train() {
-    use shardline_index::hub::HubFileEntry;
-    let files = vec![HubFileEntry {
-        path: "data/train/data.jsonl".into(),
-        size: 100,
-        sha: "abc".into(),
-        is_lfs: false,
-    }];
-    let result = find_dataset_file(&files, "default", "train");
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().path, "data/train/data.jsonl");
-}
-
-#[test]
-fn find_dataset_file_config_split() {
-    use shardline_index::hub::HubFileEntry;
-    let files = vec![HubFileEntry {
-        path: "myconfig/test/data.parquet".into(),
-        size: 200,
-        sha: "def".into(),
-        is_lfs: false,
-    }];
-    let result = find_dataset_file(&files, "myconfig", "test");
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().path, "myconfig/test/data.parquet");
-}
-
-#[test]
-fn find_dataset_file_split_only() {
-    use shardline_index::hub::HubFileEntry;
-    let files = vec![HubFileEntry {
-        path: "train/data.csv".into(),
-        size: 300,
-        sha: "ghi".into(),
-        is_lfs: false,
-    }];
-    let result = find_dataset_file(&files, "default", "train");
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().path, "train/data.csv");
-}
-
-#[test]
-fn find_dataset_file_root() {
-    use shardline_index::hub::HubFileEntry;
-    let files = vec![HubFileEntry {
-        path: "data.parquet".into(),
-        size: 400,
-        sha: "jkl".into(),
-        is_lfs: false,
-    }];
-    let result = find_dataset_file(&files, "default", "train");
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().path, "data.parquet");
+fn find_dataset_file_respects_layout_and_format_priority() {
+    let paths = [
+        "myconfig/train/data.parquet",
+        "myconfig/train/data.csv",
+        "myconfig/train/data.jsonl",
+        "data/train/data.parquet",
+        "data/train/data.csv",
+        "data/train/data.jsonl",
+        "train/data.parquet",
+        "train/data.csv",
+        "train/data.jsonl",
+        "data.parquet",
+        "data.csv",
+        "data.jsonl",
+    ];
+    let files: Vec<_> = paths
+        .iter()
+        .rev()
+        .map(|path| HubFileEntry {
+            path: (*path).to_owned(),
+            size: 100,
+            sha: "abc".to_owned(),
+            is_lfs: false,
+        })
+        .collect();
+    for (index, expected) in paths.iter().enumerate() {
+        let remaining = &files[..files.len() - index];
+        assert_eq!(
+            find_dataset_file(remaining, "myconfig", "train")
+                .unwrap()
+                .path,
+            *expected,
+        );
+    }
 }
 
 #[test]
@@ -623,148 +529,6 @@ fn find_dataset_file_not_found() {
 }
 
 // -----------------------------------------------------------------------
-// parse_jsonl_rows
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_jsonl_rows_simple() {
-    let text = "{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}";
-    let rows = parse_jsonl_rows(text, 0, 10).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].columns.get("a"), Some(&serde_json::json!(1)));
-    assert_eq!(rows[1].columns.get("b"), Some(&serde_json::json!(4)));
-}
-
-#[test]
-fn parse_jsonl_rows_with_offset_and_limit() {
-    let text = "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n{\"n\":5}";
-    let rows = parse_jsonl_rows(text, 2, 2).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].columns.get("n"), Some(&serde_json::json!(3)));
-    assert_eq!(rows[1].columns.get("n"), Some(&serde_json::json!(4)));
-}
-
-#[test]
-fn parse_jsonl_rows_empty_lines() {
-    let text = "{\"a\":1}\n\n{\"a\":2}\n";
-    let rows = parse_jsonl_rows(text, 0, 10).unwrap();
-    assert_eq!(rows.len(), 2);
-}
-
-#[test]
-fn parse_jsonl_rows_invalid_json() {
-    let text = "{\"a\":1}\nnot_json\n{\"a\":2}";
-    let result = parse_jsonl_rows(text, 0, 10);
-    assert!(result.is_err());
-}
-
-#[test]
-fn parse_jsonl_rows_empty_input() {
-    let rows = parse_jsonl_rows("", 0, 10).unwrap();
-    assert!(rows.is_empty());
-}
-
-#[test]
-fn parse_jsonl_rows_limit_bounds() {
-    let text = "{\"x\":1}\n{\"x\":2}\n{\"x\":3}";
-    let rows = parse_jsonl_rows(text, 0, 0).unwrap();
-    assert!(rows.is_empty());
-}
-
-// -----------------------------------------------------------------------
-// parse_csv_rows
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_csv_rows_simple() {
-    let text = "name,age\nAlice,30\nBob,25";
-    let rows = parse_csv_rows(text, 0, 10).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0].columns.get("name"),
-        Some(&serde_json::json!("Alice"))
-    );
-    assert_eq!(rows[1].columns.get("age"), Some(&serde_json::json!(25)));
-}
-
-#[test]
-fn parse_csv_rows_with_offset_and_limit() {
-    let text = "n\n1\n2\n3\n4\n5";
-    let rows = parse_csv_rows(text, 2, 2).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].columns.get("n"), Some(&serde_json::json!(3)));
-    assert_eq!(rows[1].columns.get("n"), Some(&serde_json::json!(4)));
-}
-
-#[test]
-fn parse_csv_rows_quoted_fields() {
-    let text = r#"name,description
-Alice,"hello, world"
-Bob,"say ""hi"""#;
-    let rows = parse_csv_rows(text, 0, 10).unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0].columns.get("description"),
-        Some(&serde_json::json!("hello, world"))
-    );
-}
-
-#[test]
-fn parse_csv_rows_empty_input() {
-    let result = parse_csv_rows("", 0, 10);
-    assert!(result.is_err()); // no header
-}
-
-#[test]
-fn parse_csv_rows_header_only() {
-    let rows = parse_csv_rows("a,b,c", 0, 10).unwrap();
-    assert!(rows.is_empty());
-}
-
-#[test]
-fn parse_csv_rows_skip_empty() {
-    let text = "a\n1\n\n2\n";
-    let rows = parse_csv_rows(text, 0, 10).unwrap();
-    assert_eq!(rows.len(), 2);
-}
-
-// -----------------------------------------------------------------------
-// parse_rows_from_content (routing function)
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_rows_from_content_jsonl() {
-    let content = b"{\"x\":1}";
-    let rows = parse_rows_from_content(content, "data.jsonl", 0, 10).unwrap();
-    assert_eq!(rows.len(), 1);
-}
-
-#[test]
-fn parse_rows_from_content_csv() {
-    let content = b"a,b\n1,2";
-    let rows = parse_rows_from_content(content, "data.csv", 0, 10).unwrap();
-    assert_eq!(rows.len(), 1);
-}
-
-#[test]
-fn parse_rows_from_content_unsupported_format() {
-    let content = b"some data";
-    let result = parse_rows_from_content(content, "data.txt", 0, 10);
-    assert!(result.is_err());
-}
-
-#[test]
-fn parse_rows_from_content_invalid_utf8() {
-    let content = b"\xff\xfe\x00";
-    let result = parse_rows_from_content(content, "data.csv", 0, 10);
-    assert!(result.is_err());
-}
-
-// -----------------------------------------------------------------------
-// is_cgnat
-// -----------------------------------------------------------------------
-
-// -----------------------------------------------------------------------
 // authorize (route-level helper)
 // -----------------------------------------------------------------------
 
@@ -774,60 +538,6 @@ fn route_authorize_without_auth_is_permissive() {
     let headers = HeaderMap::new();
     assert!(authorize(&state, &headers, TokenScope::Write).is_ok());
 }
-
-// -----------------------------------------------------------------------
-// parse_csv_line — additional edge cases
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_csv_line_multiple_quoted_fields() {
-    let result = parse_csv_line(r#""a","b","c""#);
-    assert_eq!(result, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn parse_csv_line_escaped_quote_middle() {
-    let result = parse_csv_line(r#"a,"say ""hello""",b"#);
-    // The escped quote inside: ""hello"" contains two double-quotes
-    assert_eq!(result[0], "a");
-    assert!(result[1].contains("say"));
-    assert_eq!(result[2], "b");
-}
-
-#[test]
-fn parse_csv_line_consecutive_commas() {
-    let result = parse_csv_line("a,,,c");
-    assert_eq!(result, vec!["a", "", "", "c"]);
-}
-
-#[test]
-fn parse_csv_line_starts_with_comma() {
-    let result = parse_csv_line(",a,b");
-    assert_eq!(result, vec!["", "a", "b"]);
-}
-
-#[test]
-fn parse_csv_line_ends_with_unterminated_quote_comma() {
-    // Input: "unterm,, (starts with quote, no closing quote found, ends with comma)
-    // The unterminated quote branch pushes content after opening quote: "unterm,,"
-    // Then trailing comma adds an extra empty field
-    let result = parse_csv_line(r#""unterm,,"#);
-    assert_eq!(result, vec!["unterm,,", ""]);
-}
-
-#[test]
-fn parse_csv_line_quoted_escaped_quote_at_end() {
-    let result = parse_csv_line(r#""say ""hi""",done"#);
-    assert_eq!(result.len(), 2);
-}
-
-// -----------------------------------------------------------------------
-// is_private_ip — IPv4-mapped IPv6
-// -----------------------------------------------------------------------
-
-// -----------------------------------------------------------------------
-// validate_webhook_url — edge cases
-// -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------
 // HubState debug
@@ -841,63 +551,8 @@ fn hub_state_debug_redacts_auth() {
 }
 
 // -----------------------------------------------------------------------
-// parse_csv_line — remaining edge cases
-// -----------------------------------------------------------------------
-
-#[test]
-fn parse_csv_line_quoted_field_with_trailing_comma() {
-    // After closing quote, comma should be skipped
-    let result = parse_csv_line(r#""a","#);
-    assert_eq!(result, vec!["a", ""]);
-}
-
-#[test]
-fn parse_csv_line_only_commas() {
-    let result = parse_csv_line(",,");
-    assert_eq!(result, vec!["", "", ""]);
-}
-
-#[test]
-fn parse_csv_line_unterminated_quote_only() {
-    let result = parse_csv_line("\"");
-    assert_eq!(result, vec![""]);
-}
-
-// -----------------------------------------------------------------------
 // parse_yaml_frontmatter — additional edge cases
 // -----------------------------------------------------------------------
-
-#[test]
-fn parse_yaml_frontmatter_no_closing_delimiter() {
-    let content = b"---\nkey: value\n";
-    assert!(parse_yaml_frontmatter(content).is_none());
-}
-
-#[test]
-fn parse_yaml_frontmatter_closing_on_same_line() {
-    // Closing --- on its own line (no trailing newline) is valid.
-    let content = b"---\nkey: value\n---";
-    let result = parse_yaml_frontmatter(content);
-    assert!(result.is_some(), "closing --- on its own line is valid");
-    assert_eq!(
-        result.unwrap().get("key").and_then(|v| v.as_str()),
-        Some("value")
-    );
-}
-
-#[test]
-fn parse_yaml_frontmatter_malformed_line_omits_metadata() {
-    let content = b"---\nkey: value\nno_colon_line\nother: val\n---\n";
-    assert!(parse_yaml_frontmatter(content).is_none());
-}
-
-#[test]
-fn parse_yaml_frontmatter_json_number_and_bool_values() {
-    let content = b"---\ncount: 42\nactive: true\n---\n";
-    let result = parse_yaml_frontmatter(content).unwrap();
-    assert_eq!(result.get("count").and_then(|v| v.as_u64()), Some(42));
-    assert_eq!(result.get("active").and_then(|v| v.as_bool()), Some(true));
-}
 
 // -----------------------------------------------------------------------
 // tree_entries_at_path — LFS file at root level
@@ -993,10 +648,6 @@ fn store_test_content(td: &tempfile::TempDir, sha: &str, content: &[u8]) {
         .expect("store test content");
 }
 
-fn default_headers() -> HeaderMap {
-    HeaderMap::new()
-}
-
 // ------------------------------------------------------------------
 // health
 // ------------------------------------------------------------------
@@ -1012,13 +663,23 @@ async fn handler_health_returns_ok() {
 // ------------------------------------------------------------------
 
 #[tokio::test]
-async fn handler_whoami_anonymous_without_auth() {
-    let (_td, state) = make_test_state();
-    let result = whoami(State(state), default_headers()).await;
-    assert!(result.is_ok());
-    let resp = result.unwrap();
-    assert_eq!(resp.name, "anonymous");
-    assert!(!resp.is_admin);
+async fn handler_whoami_returns_identity_without_admin_privileges() {
+    for (authenticated, expected_name) in [(false, "anonymous"), (true, "alice")] {
+        let (_td, state) = if authenticated {
+            make_alice_auth_state()
+        } else {
+            make_test_state()
+        };
+        let headers = if authenticated {
+            alice_headers()
+        } else {
+            HeaderMap::new()
+        };
+        let response = whoami(State(state), headers).await.unwrap();
+        assert_eq!(response.name, expected_name);
+        assert_eq!(response.auth.identity.account.name, expected_name);
+        assert!(!response.is_admin);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -1028,7 +689,7 @@ async fn handler_whoami_anonymous_without_auth() {
 #[tokio::test]
 async fn handler_repo_list_empty() {
     let (_td, state) = make_test_state();
-    let result = repo_list(State(state.clone()), test_repo(&state, &default_headers()))
+    let result = repo_list(State(state.clone()), test_repo(&state, &HeaderMap::new()))
         .await
         .unwrap();
     assert!(result.repos.is_empty());
@@ -1040,17 +701,8 @@ async fn handler_repo_list_with_repos() {
     store
         .create_repo(HubRepoType::Dataset, "org/data-b", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
-    let result = repo_list(State(state.clone()), test_repo(&state, &default_headers()))
+    let state = state_with_store(_td.path(), store);
+    let result = repo_list(State(state.clone()), test_repo(&state, &HeaderMap::new()))
         .await
         .unwrap();
     assert_eq!(result.repos.len(), 2);
@@ -1061,51 +713,31 @@ async fn handler_repo_list_with_repos() {
 // ------------------------------------------------------------------
 
 #[tokio::test]
-async fn handler_repo_search_short_query_rejected() {
-    let (_td, state) = make_test_state();
-    let result = repo_search(
-        State(state.clone()),
-        test_repo(&state, &default_headers()),
-        Path("models".to_string()),
-        Query(RepoSearchQuery {
-            q: "x".into(),
-            author: None,
-            sort: None,
-            direction: None,
-            limit: 50,
-        }),
-    )
-    .await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(&err, HubApiError::PathValidation(msg) if msg.contains("at least 2")),
-        "expected PathValidation, got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn handler_repo_search_invalid_type() {
-    let (_td, state) = make_test_state();
-    let result = repo_search(
-        State(state.clone()),
-        test_repo(&state, &default_headers()),
-        Path("invalid".to_string()),
-        Query(RepoSearchQuery {
-            q: "test".into(),
-            author: None,
-            sort: None,
-            direction: None,
-            limit: 50,
-        }),
-    )
-    .await;
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        matches!(&err, HubApiError::PathValidation(msg) if msg.contains("invalid repo type")),
-        "expected PathValidation, got {err:?}"
-    );
+async fn handler_repo_search_rejects_invalid_query_or_type() {
+    for (repo_type, query, message) in [
+        ("models", "x", "at least 2"),
+        ("invalid", "test", "invalid repo type"),
+    ] {
+        let (_td, state) = make_test_state();
+        let result = repo_search(
+            State(state.clone()),
+            test_repo(&state, &HeaderMap::new()),
+            Path(repo_type.to_owned()),
+            Query(RepoSearchQuery {
+                q: query.into(),
+                author: None,
+                sort: None,
+                direction: None,
+                limit: 50,
+            }),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, HubApiError::PathValidation(msg) if msg.contains(message)),
+            "repo_type={repo_type}, query={query}: expected {message}, got {err:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1114,20 +746,11 @@ async fn handler_repo_search_finds_matching() {
     store
         .create_repo(HubRepoType::Model, "other/other", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // The search uses LIKE 'q%' on repo_id, so prefix-match the full ID.
     let result = repo_search(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("models".to_string()),
         Query(RepoSearchQuery {
             q: "org/my-model".into(),
@@ -1220,19 +843,11 @@ fn make_scoped_alice_auth_state_with_creation(
     store
         .create_repo(HubRepoType::Model, "alice/other", true)
         .expect("create alice other private repo");
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(AliceProvider {
-            scope,
-            namespace_creation,
-        }))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let mut state = state_with_store(td.path(), store);
+    state.auth = Some(HubAuth::new(Box::new(AliceProvider {
+        scope,
+        namespace_creation,
+    })));
     (td, state)
 }
 
@@ -1542,16 +1157,8 @@ async fn repo_list_hides_oidc_owner_same_namespace_private_repos() {
     store
         .create_repo(HubRepoType::Model, "oidc/shared", false)
         .expect("create oidc public repo");
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(OidcUser1Provider))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let mut state = state_with_store(td.path(), store);
+    state.auth = Some(HubAuth::new(Box::new(OidcUser1Provider)));
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::AUTHORIZATION,
@@ -1580,30 +1187,20 @@ async fn handler_repo_info_missing_repo() {
     let (_td, state) = make_test_state();
     let result = repo_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "missing".into(), "nope".into())),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::RepoNotFound));
 }
 
 #[tokio::test]
 async fn handler_repo_info_returns_repo() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/existing");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "existing".into())),
     )
     .await
@@ -1632,19 +1229,10 @@ async fn handler_repo_info_with_card_data() {
         blake3::hash(readme_content).to_hex().as_str(),
         readme_content,
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "card-model".into())),
     )
     .await
@@ -1666,34 +1254,23 @@ async fn handler_repo_modelcard_missing_repo() {
     let (_td, state) = make_test_state();
     let result = repo_modelcard(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "such".into())),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::RepoNotFound));
 }
 
 #[tokio::test]
 async fn handler_repo_modelcard_no_readme() {
     let (_td, store) = make_store_with_revision(HubRepoType::Model, "org/no-readme", "sha_nr", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_modelcard(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "no-readme".into())),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::NotFound));
 }
 
@@ -1716,19 +1293,10 @@ async fn handler_repo_modelcard_with_readme() {
         "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b",
         content,
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_modelcard(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "my-model".into())),
     )
     .await
@@ -1752,19 +1320,10 @@ async fn handler_repo_modelcard_with_readme() {
 async fn handler_repo_revisions_with_revisions() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/has-revs", "sha_rev1", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_revisions(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "has-revs".into())),
     )
     .await
@@ -1780,28 +1339,32 @@ async fn handler_repo_revisions_with_revisions() {
 // ------------------------------------------------------------------
 
 #[tokio::test]
-async fn handler_repo_create_model() {
-    let (_td, state) = make_test_state();
-    let req = RepoCreateRequest {
-        repo_type: RepoType::Model,
-        name: "ns/new-repo".to_owned(),
-        organization: None,
-        private: false,
-        visibility: None,
-    };
-    let (status, json) = decode_creation_response(
-        repo_create(
-            State(state.clone()),
-            default_headers(),
-            test_repo(&state, &default_headers()),
-            Json(req),
+async fn handler_repo_create_model_with_optional_organization() {
+    for (name, organization, expected_id) in [
+        ("ns/new-repo", None, "ns/new-repo"),
+        ("my-repo", Some("org"), "org/my-repo"),
+    ] {
+        let (_td, state) = make_test_state();
+        let request = RepoCreateRequest {
+            repo_type: RepoType::Model,
+            name: name.to_owned(),
+            organization: organization.map(str::to_owned),
+            private: false,
+            visibility: None,
+        };
+        let (status, json) = decode_creation_response(
+            repo_create(
+                State(state.clone()),
+                test_repo(&state, &HeaderMap::new()),
+                Json(request),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(json["id"], "ns/new-repo");
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["id"], expected_id);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -1813,13 +1376,11 @@ async fn handler_repo_create_type_invalid_type() {
     let (_td, state) = make_test_state();
     let result = repo_create_type(
         State(state.clone()),
-        default_headers(),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("invalid".into(), "ns".into(), "repo".into())),
         Json(serde_json::json!({})),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(_)),
@@ -1828,42 +1389,34 @@ async fn handler_repo_create_type_invalid_type() {
 }
 
 #[tokio::test]
-async fn handler_repo_create_type_success() {
-    let (_td, state) = make_test_state();
-    let (status, json) = decode_creation_response(
-        repo_create_type(
-            State(state.clone()),
-            default_headers(),
-            test_repo(&state, &default_headers()),
-            Path(("models".into(), "ns".into(), "my-repo".into())),
-            Json(serde_json::json!({})),
+async fn handler_repo_create_type_preserves_type_and_privacy() {
+    for (api_type, name, options, expected_type, private) in [
+        ("models", "my-repo", serde_json::json!({}), "model", false),
+        (
+            "datasets",
+            "secret-data",
+            serde_json::json!({"private": true}),
+            "dataset",
+            true,
+        ),
+    ] {
+        let (_td, state) = make_test_state();
+        let (status, json) = decode_creation_response(
+            repo_create_type(
+                State(state.clone()),
+                test_repo(&state, &HeaderMap::new()),
+                Path((api_type.into(), "ns".into(), name.into())),
+                Json(options),
+            )
+            .await
+            .unwrap(),
         )
-        .await
-        .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(json["id"], "ns/my-repo");
-    assert_eq!(json["type"], "model");
-}
-
-#[tokio::test]
-async fn handler_repo_create_type_private() {
-    let (_td, state) = make_test_state();
-    let (_, json) = decode_creation_response(
-        repo_create_type(
-            State(state.clone()),
-            default_headers(),
-            test_repo(&state, &default_headers()),
-            Path(("datasets".into(), "ns".into(), "secret-data".into())),
-            Json(serde_json::json!({"private": true})),
-        )
-        .await
-        .unwrap(),
-    )
-    .await;
-    assert_eq!(json["private"], true);
-    assert_eq!(json["type"], "dataset");
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(json["id"], format!("ns/{name}"));
+        assert_eq!(json["type"], expected_type);
+        assert_eq!(json["private"], private);
+    }
 }
 
 // ------------------------------------------------------------------
@@ -1875,7 +1428,7 @@ async fn handler_repo_delete_missing_repo() {
     let (_td, state) = make_test_state();
     let result = repo_delete(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "exist".into())),
     )
     .await;
@@ -1885,19 +1438,10 @@ async fn handler_repo_delete_missing_repo() {
 #[tokio::test]
 async fn handler_repo_delete_success() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/to-delete");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_delete(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "to-delete".into())),
     )
     .await;
@@ -1923,7 +1467,7 @@ async fn handler_preupload_too_many_files() {
         .collect();
     let result = preupload(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "ns".into(), "r".into(), "main".into())),
         Json(PreuploadRequest {
             files,
@@ -1932,7 +1476,6 @@ async fn handler_preupload_too_many_files() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("exceeds maximum")),
@@ -1954,19 +1497,10 @@ async fn handler_preupload_checks_existence() {
             is_lfs: false,
         }],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = preupload(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2015,13 +1549,12 @@ async fn handler_commit_wrong_content_type() {
     // No Content-Type header → rejection
     let result = commit(
         State(state.clone()),
-        default_headers(),
-        test_repo(&state, &default_headers()),
+        HeaderMap::new(),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "ns".into(), "r".into(), "main".into())),
         axum::body::Body::from("{}"),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("Content-Type")),
@@ -2042,16 +1575,7 @@ fn ndjson_headers() -> HeaderMap {
 async fn handler_commit_inline_file_success() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/commit-test", "parent_sha_001", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let body = r#"{"header":{"message":"add readme"}}
 {"file":{"path":"README.md","content":"SGVsbG8gV29ybGQ="}}
 "#;
@@ -2078,16 +1602,7 @@ async fn handler_commit_inline_file_success() {
 async fn handler_commit_lfs_pointer_success() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/lfs-commit", "parent_lfs", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // Valid SHA-256 OID (64 hex chars)
     let oid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     let body = format!(
@@ -2127,16 +1642,7 @@ async fn handler_commit_delete_file() {
         }],
     );
     store_test_content(&_td, blake3::hash(content).to_hex().as_str(), content);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let body = r#"{"header":{"message":"delete file"}}
 {"deletedEntry":{"path":"old.txt"}}
 "#;
@@ -2164,16 +1670,7 @@ async fn handler_commit_parent_mismatch() {
         "actual_parent_sha",
         &[],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // Body specifies parentCommit that does NOT match URL resolution
     let body = r#"{"header":{"message":"mismatch","parentCommit":"wrong_parent_sha"}}
 {"file":{"path":"f.txt","content":"dGVzdA=="}}
@@ -2191,7 +1688,6 @@ async fn handler_commit_parent_mismatch() {
         axum::body::Body::from(body),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::Conflict(msg) if msg.contains("parentCommit mismatch")),
@@ -2207,16 +1703,7 @@ async fn handler_commit_parent_mismatch() {
 async fn handler_apply_commit_inline_file() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/apply-test", "parent_apply", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let parsed = ParsedCommit {
         message: "apply inline".into(),
         parent_commit: None,
@@ -2251,16 +1738,7 @@ async fn handler_apply_commit_inline_file() {
 async fn handler_apply_commit_lfs_pointer() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/apply-lfs", "parent_lfs2", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let oid = "1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff";
     let parsed = ParsedCommit {
         message: "add lfs".into(),
@@ -2301,16 +1779,7 @@ async fn handler_apply_commit_delete() {
             is_lfs: false,
         }],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     store_test_content(&_td, blake3::hash(content).to_hex().as_str(), content);
     let parsed = ParsedCommit {
         message: "delete file".into(),
@@ -2337,16 +1806,7 @@ async fn handler_apply_commit_delete() {
 async fn handler_apply_commit_parent_mismatch() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/apply-mismatch", "actual_sha", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let parsed = ParsedCommit {
         message: "bad parent".into(),
         parent_commit: Some("different_sha".into()),
@@ -2361,7 +1821,6 @@ async fn handler_apply_commit_parent_mismatch() {
         repo.capability(),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::Conflict(msg) if msg.contains("parentCommit mismatch")),
@@ -2394,20 +1853,11 @@ async fn handler_file_tree_basic() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     materialize_tree_fixture(&state, "sha_tree");
     let entries = file_tree(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2472,20 +1922,11 @@ async fn handler_file_tree_recursive() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     materialize_tree_fixture(&state, "sha_tree_rec");
     let entries = file_tree(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2533,20 +1974,11 @@ async fn handler_file_tree_with_limit_and_cursor() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     materialize_tree_fixture(&state, "sha_tree_lim");
     let entries = file_tree(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2588,19 +2020,10 @@ async fn handler_resolve_file_inline() {
     );
     // Pre-load file content into ObjectStore
     store_test_content(&_td, blake3::hash(content).to_hex().as_str(), content);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = resolve_file(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2638,20 +2061,12 @@ async fn handler_resolve_large_lfs_file_returns_absolute_redirect_and_metadata()
         }],
     );
     store_test_content(&_td, &oid, &content);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "https://hub.example.test/".to_owned(),
-    };
+    let mut state = state_with_store(_td.path(), store);
+    state.public_base_url = "https://hub.example.test/".to_owned();
 
     let response = resolve_file(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2692,19 +2107,10 @@ async fn handler_resolve_large_lfs_file_returns_absolute_redirect_and_metadata()
 async fn handler_resolve_file_not_found() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/resolve-miss", "sha_miss", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = resolve_file(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -2715,7 +2121,6 @@ async fn handler_resolve_file_not_found() {
         HeaderMap::new(),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::NotFound));
 }
 
@@ -2723,27 +2128,12 @@ async fn handler_resolve_file_not_found() {
 // lfs_batch
 // ------------------------------------------------------------------
 
-fn make_lfs_state() -> (tempfile::TempDir, HubState) {
-    let (td, store) = make_delete_test_store();
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
-    (td, state)
-}
-
 #[tokio::test]
 async fn handler_lfs_batch_upload_new_object() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -2781,7 +2171,7 @@ async fn handler_lfs_batch_upload_new_object() {
 #[cfg(unix)]
 #[tokio::test]
 async fn handler_lfs_batch_propagates_object_store_existence_failures() {
-    let (td, state) = make_lfs_state();
+    let (td, state) = make_test_state();
     let root = td.path().join("lfs");
     let moved_root = td.path().join("lfs-real");
     std::fs::rename(&root, &moved_root).unwrap();
@@ -2789,7 +2179,7 @@ async fn handler_lfs_batch_propagates_object_store_existence_failures() {
 
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -2835,7 +2225,7 @@ async fn handler_lfs_upload_rejects_content_that_does_not_match_its_sha256_oid()
     use sha2::Digest;
     use shardline_storage::ObjectStore;
 
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let content = b"actual uploaded bytes";
     let oid = hex::encode(sha2::Sha256::digest(b"different expected bytes"));
     let result = lfs_upload(
@@ -2857,7 +2247,7 @@ async fn handler_lfs_upload_rejects_content_that_does_not_match_its_sha256_oid()
 
 #[tokio::test]
 async fn handler_lfs_batch_download_existing_object() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     // Store an LFS object in the object store (global namespace, matching the
     // permissive-mode read path).
     use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectStore};
@@ -2876,7 +2266,7 @@ async fn handler_lfs_batch_download_existing_object() {
         .unwrap();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Download,
             ref_: LfsBatchRef {
@@ -2909,10 +2299,10 @@ async fn handler_lfs_batch_download_existing_object() {
 
 #[tokio::test]
 async fn handler_lfs_batch_download_missing_object() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Download,
             ref_: LfsBatchRef {
@@ -2940,7 +2330,7 @@ async fn handler_lfs_batch_download_missing_object() {
 
 #[tokio::test]
 async fn handler_lfs_batch_verify_existing() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     // Store an LFS object in the object store (global namespace).
     use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectStore};
     let key = crate::routes::lfs_object_key(
@@ -2958,7 +2348,7 @@ async fn handler_lfs_batch_verify_existing() {
         .unwrap();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Verify,
             ref_: LfsBatchRef {
@@ -2981,10 +2371,10 @@ async fn handler_lfs_batch_verify_existing() {
 
 #[tokio::test]
 async fn handler_lfs_batch_verify_missing() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Verify,
             ref_: LfsBatchRef {
@@ -3026,16 +2416,8 @@ async fn handler_lfs_batch_prefers_xet_when_offered_with_write_auth() {
     }
 
     let (td, store) = make_delete_test_store();
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(XetProvider))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let mut state = state_with_store(td.path(), store);
+    state.auth = Some(HubAuth::new(Box::new(XetProvider)));
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -3081,11 +2463,11 @@ async fn handler_lfs_batch_prefers_xet_when_offered_with_write_auth() {
 
 #[tokio::test]
 async fn handler_lfs_batch_xet_transfer_falls_back_without_auth() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
 
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3105,14 +2487,18 @@ async fn handler_lfs_batch_xet_transfer_falls_back_without_auth() {
         result.transfer, "basic",
         "should fall back to basic without auth"
     );
+    assert_eq!(result.objects.len(), 1);
+    let object = &result.objects[0];
+    assert!(object.error.is_none());
+    assert!(object.actions.as_ref().unwrap().upload.is_some());
 }
 
 #[tokio::test]
 async fn handler_lfs_batch_rejects_xet_only_without_cas_auth() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3134,39 +2520,11 @@ async fn handler_lfs_batch_rejects_xet_only_without_cas_auth() {
 }
 
 #[tokio::test]
-async fn handler_lfs_batch_xet_transfer_with_basic_fallback() {
-    let (_td, state) = make_lfs_state();
-
-    let result = lfs_batch(
-        State(state.clone()),
-        test_repo(&state, &default_headers()),
-        Json(LfsBatchRequest {
-            operation: LfsBatchOperation::Upload,
-            ref_: LfsBatchRef {
-                name: "main".into(),
-            },
-            objects: vec![LfsObjectRequest {
-                oid: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0".into(),
-                size: 1000,
-            }],
-            transfers: vec!["xet".into(), "basic".into()],
-            hash_algo: None,
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        result.transfer, "basic",
-        "should fall back to basic when xet-only without auth"
-    );
-}
-
-#[tokio::test]
 async fn handler_lfs_batch_accepts_official_javascript_sha256_alias() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3188,10 +2546,10 @@ async fn handler_lfs_batch_accepts_official_javascript_sha256_alias() {
 
 #[tokio::test]
 async fn handler_lfs_batch_rejects_unsupported_hash_algo() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3211,7 +2569,7 @@ async fn handler_lfs_batch_rejects_unsupported_hash_algo() {
 
 #[tokio::test]
 async fn handler_lfs_batch_rejects_too_many_objects() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let objects: Vec<LfsObjectRequest> = (0..1025)
         .map(|i| LfsObjectRequest {
             oid: format!("{i:064x}"),
@@ -3220,7 +2578,7 @@ async fn handler_lfs_batch_rejects_too_many_objects() {
         .collect();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3256,16 +2614,8 @@ async fn handler_lfs_batch_xet_upload_missing_reconstruction_requires_upload_act
     }
 
     let (td, store) = make_delete_test_store();
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(XetProvider))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let mut state = state_with_store(td.path(), store);
+    state.auth = Some(HubAuth::new(Box::new(XetProvider)));
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -3298,10 +2648,10 @@ async fn handler_lfs_batch_xet_upload_missing_reconstruction_requires_upload_act
 
 #[tokio::test]
 async fn handler_lfs_batch_returns_hash_algo() {
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let result = lfs_batch(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(LfsBatchRequest {
             operation: LfsBatchOperation::Upload,
             ref_: LfsBatchRef {
@@ -3335,7 +2685,6 @@ async fn handler_lfs_upload_invalid_oid() {
         axum::body::Body::from(bytes::Bytes::from_static(b"data")),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(_)),
@@ -3417,7 +2766,7 @@ async fn handler_lfs_duplicate_local_upload_streams_without_tempfile_staging() {
     use shardline_protocol::ShardlineHash;
     use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectStore};
 
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let data: Vec<u8> = (0..2 * 1024 * 1024)
         .map(|index| ((index * 43 + index / 113) % 256) as u8)
         .collect();
@@ -3477,7 +2826,7 @@ async fn handler_lfs_duplicate_local_upload_rejects_corrupt_existing_content() {
     use shardline_protocol::ShardlineHash;
     use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectStore};
 
-    let (_td, state) = make_lfs_state();
+    let (_td, state) = make_test_state();
     let uploaded = b"content addressed by the request oid";
     let corrupt = b"corrupt content at the same object key";
     let oid = hex::encode(sha2::Sha256::digest(uploaded));
@@ -3549,13 +2898,12 @@ async fn handler_lfs_download_missing() {
     let (_td, state) = make_test_state();
     let result = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5".to_string()),
         axum::http::Method::GET,
         HeaderMap::new(),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::NotFound));
 }
 
@@ -3580,7 +2928,7 @@ async fn handler_lfs_download_success() {
         .unwrap();
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_string()),
         axum::http::Method::GET,
         HeaderMap::new(),
@@ -3619,7 +2967,7 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
     headers.insert(axum::http::header::RANGE, "bytes=3-7".parse().unwrap());
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_owned()),
         axum::http::Method::GET,
         headers,
@@ -3659,7 +3007,7 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
     );
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_owned()),
         axum::http::Method::GET,
         headers,
@@ -3680,7 +3028,7 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
     );
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_owned()),
         axum::http::Method::GET,
         headers,
@@ -3706,7 +3054,7 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
     );
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_owned()),
         axum::http::Method::GET,
         headers,
@@ -3721,7 +3069,7 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
     headers.insert(axum::http::header::RANGE, "bytes=99-".parse().unwrap());
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid.to_owned()),
         axum::http::Method::GET,
         headers,
@@ -3745,19 +3093,10 @@ async fn handler_lfs_download_supports_single_ranges_and_if_range() {
 #[tokio::test]
 async fn handler_repo_revisions_has_initial() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/init-rev");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_revisions(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "init-rev".into())),
     )
     .await
@@ -3771,19 +3110,10 @@ async fn handler_repo_revisions_has_initial() {
 async fn handler_git_head_with_revision() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/has-head", "sha_head123", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = git_head(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "has-head".into())),
     )
     .await
@@ -3799,16 +3129,7 @@ async fn handler_git_head_with_revision() {
 #[tokio::test]
 async fn handler_commit_no_revision() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/no-rev");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // "nonexistent_rev" isn't a known ref or SHA → revision not found
     let result = commit(
         State(state.clone()),
@@ -3823,7 +3144,6 @@ async fn handler_commit_no_revision() {
         axum::body::Body::from(r#"{"header":{"message":"x"}}"#),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::RevisionNotFound));
 }
 
@@ -3848,19 +3168,10 @@ async fn handler_dataset_parquet_lists_files() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_parquet(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "data".into())),
     )
     .await
@@ -3896,19 +3207,10 @@ async fn handler_dataset_parquet_csv_and_jsonl_included() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_parquet(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "multi".into())),
     )
     .await
@@ -3924,19 +3226,10 @@ async fn handler_dataset_parquet_csv_and_jsonl_included() {
 async fn handler_dataset_first_rows_empty_dataset() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Dataset, "org/empty-ds", "sha_empty_ds", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_first_rows(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "empty-ds".into())),
         Query(DatasetFirstRowsQuery {
             config: "default".into(),
@@ -3969,19 +3262,10 @@ async fn handler_dataset_first_rows_with_jsonl() {
         "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d",
         jsonl_content,
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_first_rows(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "jsonl-ds".into())),
         Query(DatasetFirstRowsQuery {
             config: "default".into(),
@@ -4020,19 +3304,10 @@ async fn handler_dataset_viewer_with_data() {
         "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
         csv_content,
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_viewer(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "viewer-ds".into(), "train".into())),
         Query(DatasetViewerQuery {
             config: "default".into(),
@@ -4067,19 +3342,10 @@ async fn handler_dataset_viewer_pagination() {
         "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
         csv_content,
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_viewer(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "viewer-pag".into(), "test".into())),
         Query(DatasetViewerQuery {
             config: "data".into(),
@@ -4102,19 +3368,10 @@ async fn handler_dataset_viewer_pagination() {
 #[tokio::test]
 async fn handler_webhook_create_success() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/wh-test");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let (status, resp) = webhook_create(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-test".into())),
         Json(WebhookCreateRequest {
             url: "https://example.com/hook".into(),
@@ -4132,19 +3389,10 @@ async fn handler_webhook_create_success() {
 #[tokio::test]
 async fn handler_webhook_create_invalid_url() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/wh-badurl");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = webhook_create(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-badurl".into())),
         Json(WebhookCreateRequest {
             url: "ftp://bad.com/hook".into(),
@@ -4153,7 +3401,6 @@ async fn handler_webhook_create_invalid_url() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("scheme")),
@@ -4164,20 +3411,11 @@ async fn handler_webhook_create_invalid_url() {
 #[tokio::test]
 async fn handler_webhook_create_too_many_events() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/wh-toomany");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let events: Vec<String> = (0..51).map(|i| format!("event_{i}")).collect();
     let result = webhook_create(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-toomany".into())),
         Json(WebhookCreateRequest {
             url: "https://example.com/hook".into(),
@@ -4186,7 +3424,6 @@ async fn handler_webhook_create_too_many_events() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("exceeds maximum")),
@@ -4201,19 +3438,10 @@ async fn handler_webhook_create_too_many_events() {
 #[tokio::test]
 async fn handler_webhook_list_empty() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/wh-list-empty");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = webhook_list(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-list-empty".into())),
     )
     .await
@@ -4240,19 +3468,10 @@ async fn handler_webhook_list_with_webhooks() {
             Some("secret"),
         )
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = webhook_list(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-list-full".into())),
     )
     .await
@@ -4275,19 +3494,10 @@ async fn handler_webhook_delete_success() {
             None,
         )
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = webhook_delete(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -4326,21 +3536,10 @@ fn route_authorize_with_auth_and_no_header_is_err() {
             Ok("token".into())
         }
     }
-    let (object_store_td, store) = make_delete_test_store();
-    let object_store =
-        shardline_server_core::ServerObjectStore::local(object_store_td.path().join("lfs"))
-            .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(MockProvider))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let (_td, mut state) = make_test_state();
+    state.auth = Some(HubAuth::new(Box::new(MockProvider)));
     let headers = HeaderMap::new();
     let result = authorize(&state, &headers, TokenScope::Read);
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::Unauthorized),
@@ -4356,16 +3555,7 @@ fn route_authorize_with_auth_and_no_header_is_err() {
 async fn handler_apply_commit_empty_instructions() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/empty-inst", "parent_empty", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let parsed = ParsedCommit {
         message: "empty commit".into(),
         parent_commit: None,
@@ -4392,23 +3582,13 @@ async fn handler_apply_commit_empty_instructions() {
 async fn handler_dataset_parquet_non_dataset_repo_errors() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/model-repo", "sha_model", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_parquet(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "model-repo".into())),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("not a dataset")),
@@ -4424,19 +3604,10 @@ async fn handler_dataset_parquet_non_dataset_repo_errors() {
 async fn handler_dataset_first_rows_non_dataset_errors() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/model-ds", "sha_model_ds", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_first_rows(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "model-ds".into())),
         Query(DatasetFirstRowsQuery {
             config: "default".into(),
@@ -4445,7 +3616,6 @@ async fn handler_dataset_first_rows_non_dataset_errors() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("not a dataset")),
@@ -4461,19 +3631,10 @@ async fn handler_dataset_first_rows_non_dataset_errors() {
 async fn handler_dataset_viewer_non_dataset_errors() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/model-view", "sha_model_view", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_viewer(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "model-view".into(), "train".into())),
         Query(DatasetViewerQuery {
             config: "default".into(),
@@ -4482,7 +3643,6 @@ async fn handler_dataset_viewer_non_dataset_errors() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("not a dataset")),
@@ -4500,19 +3660,10 @@ async fn handler_repo_search_sort_by_last_modified_asc() {
     store
         .create_repo(HubRepoType::Model, "org/model-b", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_search(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("models".to_string()),
         Query(RepoSearchQuery {
             q: "org/".into(),
@@ -4533,20 +3684,11 @@ async fn handler_repo_search_sort_likes_noop() {
     store
         .create_repo(HubRepoType::Model, "org/likes-b", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // "likes" sort is currently a no-op — just verify it doesn't error.
     let result = repo_search(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("models".to_string()),
         Query(RepoSearchQuery {
             q: "org/likes".into(),
@@ -4567,20 +3709,11 @@ async fn handler_repo_search_sort_downloads_noop() {
     store
         .create_repo(HubRepoType::Model, "org/dl-b", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     // "downloads" sort is currently a no-op — just verify it doesn't error.
     let result = repo_search(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("models".to_string()),
         Query(RepoSearchQuery {
             q: "org/dl".into(),
@@ -4605,19 +3738,10 @@ async fn handler_repo_search_unknown_sort_keeps_default_order() {
     store
         .create_repo(HubRepoType::Model, "org/order-b", false)
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = repo_search(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path("models".to_string()),
         Query(RepoSearchQuery {
             q: "org/order".into(),
@@ -4641,11 +3765,10 @@ async fn handler_repo_info_invalid_type() {
     let (_td, state) = make_test_state();
     let result = repo_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("invalid_type".into(), "ns".into(), "repo".into())),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("invalid repo type")),
@@ -4670,19 +3793,10 @@ async fn handler_dataset_first_rows_content_not_inline() {
             is_lfs: false,
         }],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_first_rows(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "no-inline".into())),
         Query(DatasetFirstRowsQuery {
             config: "default".into(),
@@ -4702,19 +3816,10 @@ async fn handler_dataset_first_rows_content_not_inline() {
 async fn handler_dataset_viewer_split_not_found() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Dataset, "org/no-split", "sha_no_split", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = dataset_viewer(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "no-split".into(), "nonexistent".into())),
         Query(DatasetViewerQuery {
             config: "default".into(),
@@ -4723,7 +3828,6 @@ async fn handler_dataset_viewer_split_not_found() {
         }),
     )
     .await;
-    assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
         matches!(&err, HubApiError::PathValidation(msg) if msg.contains("no data file")),
@@ -4740,7 +3844,7 @@ async fn handler_webhook_create_repo_not_found() {
     let (_td, state) = make_test_state();
     let result = webhook_create(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "repo".into())),
         Json(WebhookCreateRequest {
             url: "https://example.com/hook".into(),
@@ -4749,27 +3853,7 @@ async fn handler_webhook_create_repo_not_found() {
         }),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::RepoNotFound));
-}
-
-// ------------------------------------------------------------------
-// is_private_ip — broadcast and documentation IPs
-// ------------------------------------------------------------------
-
-// ------------------------------------------------------------------
-// validate_webhook_url — scheme edge cases
-// ------------------------------------------------------------------
-
-// ------------------------------------------------------------------
-// parse_yaml_frontmatter — key without colon separator
-// ------------------------------------------------------------------
-
-#[test]
-fn parse_yaml_frontmatter_line_without_colon_skipped_and_map_empty() {
-    // Only a line without colon → map is empty → None
-    let content = b"---\nno-colon-here\n---\nbody";
-    assert!(parse_yaml_frontmatter(content).is_none());
 }
 
 // ------------------------------------------------------------------
@@ -4781,7 +3865,7 @@ async fn handler_webhook_list_repo_not_found_returns_empty() {
     let (_td, state) = make_test_state();
     let result = webhook_list(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "repo".into())),
     )
     .await
@@ -4798,11 +3882,10 @@ async fn handler_repo_revisions_missing_repo() {
     let (_td, state) = make_test_state();
     let result = repo_revisions(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "such_repo".into())),
     )
     .await;
-    assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), HubApiError::RepoNotFound));
 }
 
@@ -4824,20 +3907,11 @@ async fn handler_repo_revision_info_returns_siblings() {
             is_lfs: false,
         }],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     store_test_content(&_td, blake3::hash(content).to_hex().as_str(), content);
     let result = repo_revision_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -4859,7 +3933,7 @@ async fn handler_repo_revision_info_missing_repo() {
     let (_td, state) = make_test_state();
     let result = repo_revision_info(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "repo".into(), "main".into())),
     )
     .await;
@@ -4873,19 +3947,10 @@ async fn handler_repo_revision_info_missing_repo() {
 #[tokio::test]
 async fn handler_repo_delete_compat_success() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/compat-del");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store: store.clone(),
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store.clone());
     let result = repo_delete_compat(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(RepoDeleteRequest {
             repo_type: Some(RepoType::Model),
             name: "org/compat-del".to_owned(),
@@ -4900,19 +3965,10 @@ async fn handler_repo_delete_compat_success() {
 #[tokio::test]
 async fn handler_repo_delete_compat_with_organization() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/compat-org");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store: store.clone(),
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store.clone());
     let result = repo_delete_compat(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(RepoDeleteRequest {
             repo_type: Some(RepoType::Model),
             name: "compat-org".to_owned(),
@@ -4941,20 +3997,11 @@ async fn handler_file_tree_at_root_returns_files() {
             is_lfs: false,
         }],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     materialize_tree_fixture(&state, "sha_root_tree");
     let entries = file_tree_at_root(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path((
             "models".into(),
             "org".into(),
@@ -4980,19 +4027,10 @@ async fn handler_file_tree_at_root_returns_files() {
 async fn handler_git_head_returns_ref() {
     let (_td, store) =
         make_store_with_revision(HubRepoType::Model, "org/git-head", "sha_head", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = git_head(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "git-head".into())),
     )
     .await
@@ -5006,7 +4044,7 @@ async fn handler_git_head_nonexistent_repo_returns_zero_sha() {
     let (_td, state) = make_test_state();
     let result = git_head(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "no".into(), "repo".into())),
     )
     .await
@@ -5016,47 +4054,13 @@ async fn handler_git_head_nonexistent_repo_returns_zero_sha() {
 }
 
 // ------------------------------------------------------------------
-// repo_create with organization and conflict
+// repo_create conflict
 // ------------------------------------------------------------------
-
-#[tokio::test]
-async fn handler_repo_create_with_organization() {
-    let (_td, state) = make_test_state();
-    let req = RepoCreateRequest {
-        repo_type: RepoType::Model,
-        name: "my-repo".to_owned(),
-        organization: Some("org".to_owned()),
-        private: false,
-        visibility: None,
-    };
-    let (status, json) = decode_creation_response(
-        repo_create(
-            State(state.clone()),
-            default_headers(),
-            test_repo(&state, &default_headers()),
-            Json(req),
-        )
-        .await
-        .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(json["id"], "org/my-repo");
-}
 
 #[tokio::test]
 async fn handler_repo_create_conflict() {
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "ns/existing");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let req = RepoCreateRequest {
         repo_type: RepoType::Model,
         name: "ns/existing".to_owned(),
@@ -5066,8 +4070,7 @@ async fn handler_repo_create_conflict() {
     };
     let result = repo_create(
         State(state.clone()),
-        default_headers(),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Json(req),
     )
     .await;
@@ -5100,7 +4103,6 @@ async fn repo_create_conflict_other_tenant_returns_forbidden_without_metadata() 
     };
     let result = repo_create(
         State(state.clone()),
-        alice_headers(),
         test_repo(&state, &alice_headers()),
         Json(req),
     )
@@ -5123,7 +4125,6 @@ async fn repo_create_conflict_own_repo_keeps_full_body() {
     let (status, json) = decode_creation_response(
         repo_create(
             State(state.clone()),
-            alice_headers(),
             test_repo(&state, &alice_headers()),
             Json(req),
         )
@@ -5160,7 +4161,6 @@ async fn repo_creation_requires_exact_scope_or_explicit_namespace_grant() {
     for name in ["bob/new-private", "alice/new-sibling"] {
         let result = repo_create(
             State(state.clone()),
-            alice_headers(),
             test_repo(&state, &alice_headers()),
             Json(write_repo(name)),
         )
@@ -5178,7 +4178,6 @@ async fn repo_creation_requires_exact_scope_or_explicit_namespace_grant() {
         make_scoped_alice_auth_state_with_creation(TokenScope::Write, true);
     let created = repo_create(
         State(granted.clone()),
-        alice_headers(),
         test_repo(&granted, &alice_headers()),
         Json(write_repo("alice/new-sibling")),
     )
@@ -5190,7 +4189,6 @@ async fn repo_creation_requires_exact_scope_or_explicit_namespace_grant() {
 
     let cross_namespace = repo_create(
         State(granted.clone()),
-        alice_headers(),
         test_repo(&granted, &alice_headers()),
         Json(write_repo("bob/still-forbidden")),
     )
@@ -5213,7 +4211,6 @@ async fn type_specific_repo_creation_uses_the_same_namespace_boundary() {
     for namespace in ["bob", "alice"] {
         let result = repo_create_type(
             State(state.clone()),
-            default_headers(),
             test_repo(&state, &alice_headers()),
             Path(("models".into(), namespace.into(), "new-repo".into())),
             Json(serde_json::json!({"private": true})),
@@ -5236,7 +4233,6 @@ async fn type_specific_repo_creation_uses_the_same_namespace_boundary() {
         make_scoped_alice_auth_state_with_creation(TokenScope::Write, true);
     let created = repo_create_type(
         State(granted.clone()),
-        default_headers(),
         test_repo(&granted, &alice_headers()),
         Path(("models".into(), "alice".into(), "new-repo".into())),
         Json(serde_json::json!({"private": true})),
@@ -5249,7 +4245,6 @@ async fn type_specific_repo_creation_uses_the_same_namespace_boundary() {
 
     let cross_namespace = repo_create_type(
         State(granted.clone()),
-        default_headers(),
         test_repo(&granted, &alice_headers()),
         Path(("models".into(), "bob".into(), "new-repo".into())),
         Json(serde_json::json!({"private": true})),
@@ -5266,7 +4261,7 @@ async fn type_specific_repo_creation_uses_the_same_namespace_boundary() {
 #[tokio::test]
 async fn handler_xet_read_token_missing_auth_returns_unauthorized() {
     let (_td, state) = make_test_state();
-    let repo = test_repo::<false, true>(&state, &default_headers());
+    let repo = test_repo::<false, true>(&state, &HeaderMap::new());
     let result = xet_read_token(
         State(state),
         repo,
@@ -5280,7 +4275,7 @@ async fn handler_xet_read_token_missing_auth_returns_unauthorized() {
 #[tokio::test]
 async fn handler_xet_write_token_missing_auth_returns_unauthorized() {
     let (_td, state) = make_test_state();
-    let repo = test_repo::<true, true>(&state, &default_headers());
+    let repo = test_repo::<true, true>(&state, &HeaderMap::new());
     let result = xet_write_token(
         State(state),
         repo,
@@ -5331,20 +4326,12 @@ fn make_revision_scoped_xet_token_state(
     }
 
     let (td, store) = make_store_with_revision(HubRepoType::Model, "alice/own", "sha_main", &[]);
-    let object_store = shardline_server_core::ServerObjectStore::local(td.path().join("lfs"))
-        .expect("local object store");
     let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let state = HubState {
-        store,
-        object_store,
-        auth: Some(HubAuth::new(Box::new(CapturingProvider {
-            token_revision: token_revision.map(ToOwned::to_owned),
-            minted: minted.clone(),
-        }))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let mut state = state_with_store(td.path(), store);
+    state.auth = Some(HubAuth::new(Box::new(CapturingProvider {
+        token_revision: token_revision.map(ToOwned::to_owned),
+        minted: minted.clone(),
+    })));
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::AUTHORIZATION,
@@ -5612,7 +4599,7 @@ fn repo_response_for_public_base_dataset_url() {
         created_at_unix_seconds: 0,
         updated_at_unix_seconds: 0,
     };
-    let resp = repo_response_for_public_base("https://hub.example.com/", &repo);
+    let resp = repo_response_for_public_base("https://hub.example.com/", repo);
     assert_eq!(resp.url, "https://hub.example.com/datasets/org/mydata");
     assert_eq!(resp.repo_type, RepoType::Dataset);
 }
@@ -5628,7 +4615,7 @@ fn repo_response_for_public_base_space_url() {
         created_at_unix_seconds: 0,
         updated_at_unix_seconds: 0,
     };
-    let resp = repo_response_for_public_base("https://hub.example.com", &repo);
+    let resp = repo_response_for_public_base("https://hub.example.com", repo);
     assert_eq!(resp.url, "https://hub.example.com/spaces/org/myspace");
     assert_eq!(resp.repo_type, RepoType::Space);
 }
@@ -5648,19 +4635,10 @@ async fn handler_webhook_create_duplicate_url() {
             None,
         )
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let result = webhook_create(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-dup".into())),
         Json(WebhookCreateRequest {
             url: "https://example.com/dup".into(),
@@ -5681,16 +4659,7 @@ async fn handler_lfs_upload_and_download_roundtrip() {
     let data = b"lfs file content";
     let oid = hex::encode(sha2::Sha256::digest(data));
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/lfs-io");
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store: store.clone(),
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store.clone());
     // Upload
     let result = lfs_upload(
         State(state.clone()),
@@ -5705,7 +4674,7 @@ async fn handler_lfs_upload_and_download_roundtrip() {
     // Download
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid),
         axum::http::Method::GET,
         HeaderMap::new(),
@@ -5726,16 +4695,7 @@ async fn handler_large_lfs_upload_roundtrips_through_local_filesystem_staging() 
     let oid = hex::encode(sha2::Sha256::digest(&data));
     let (_td, store) = make_store_with_repo(HubRepoType::Model, "org/lfs-large-local");
     let object_root = _td.path().join("lfs");
-    let object_store = shardline_server_core::ServerObjectStore::local(object_root.clone())
-        .expect("local object store");
-    let state = HubState {
-        store: store.clone(),
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store.clone());
 
     let result = lfs_upload(
         State(state.clone()),
@@ -5749,7 +4709,7 @@ async fn handler_large_lfs_upload_roundtrips_through_local_filesystem_staging() 
 
     let response = lfs_download(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(oid),
         axum::http::Method::GET,
         HeaderMap::new(),
@@ -5786,19 +4746,10 @@ async fn handler_dataset_parquet_finds_data_files() {
             },
         ],
     );
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let resp = dataset_parquet(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("org".into(), "ds-parquet".into())),
     )
     .await
@@ -5830,19 +4781,10 @@ async fn handler_webhook_list_with_hooks() {
             None,
         )
         .unwrap();
-    let object_store = shardline_server_core::ServerObjectStore::local(_td.path().join("lfs"))
-        .expect("local object store");
-    let state = HubState {
-        store,
-        object_store,
-        auth: None,
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
+    let state = state_with_store(_td.path(), store);
     let resp = webhook_list(
         State(state.clone()),
-        test_repo(&state, &default_headers()),
+        test_repo(&state, &HeaderMap::new()),
         Path(("models".into(), "org".into(), "wh-list".into())),
     )
     .await

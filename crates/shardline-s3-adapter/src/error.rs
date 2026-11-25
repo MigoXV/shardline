@@ -355,6 +355,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructor_code_and_status_contract() {
+        for (error, code, status) in [
+            (S3Error::access_denied(), "AccessDenied", 403),
+            (S3Error::invalid_range(), "InvalidRange", 416),
+            (S3Error::no_such_upload(), "NoSuchUpload", 404),
+            (S3Error::invalid_part(), "InvalidPart", 400),
+            (S3Error::entity_too_small(), "EntityTooSmall", 400),
+            (S3Error::not_implemented(), "NotImplemented", 501),
+            (S3Error::internal(), "InternalError", 500),
+            (S3Error::precondition_failed(), "PreconditionFailed", 412),
+        ] {
+            assert_eq!(error.code, code);
+            assert_eq!(error.status.as_u16(), status, "{code}");
+        }
+    }
+
+    #[test]
     fn no_such_key_constructor_maps_to_404() {
         let error = S3Error::no_such_key("data/model.pt");
         assert_eq!(error.code, "NoSuchKey");
@@ -371,55 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn access_denied_constructor_maps_to_403() {
-        let error = S3Error::access_denied();
-        assert_eq!(error.code, "AccessDenied");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn invalid_range_constructor_maps_to_416() {
-        let error = S3Error::invalid_range();
-        assert_eq!(error.code, "InvalidRange");
-        assert_eq!(error.status, StatusCode::RANGE_NOT_SATISFIABLE);
-    }
-
-    #[test]
-    fn no_such_upload_constructor_maps_to_404() {
-        let error = S3Error::no_such_upload();
-        assert_eq!(error.code, "NoSuchUpload");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn invalid_part_constructor_maps_to_400() {
-        let error = S3Error::invalid_part();
-        assert_eq!(error.code, "InvalidPart");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn entity_too_small_constructor_maps_to_400() {
-        let error = S3Error::entity_too_small();
-        assert_eq!(error.code, "EntityTooSmall");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn not_implemented_constructor_maps_to_501() {
-        let error = S3Error::not_implemented();
-        assert_eq!(error.code, "NotImplemented");
-        assert_eq!(error.status, StatusCode::NOT_IMPLEMENTED);
-    }
-
-    #[test]
-    fn internal_constructor_maps_to_500() {
-        let error = S3Error::internal();
-        assert_eq!(error.code, "InternalError");
-        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
     fn malformed_xml_constructor_maps_to_400() {
         let error = S3Error::malformed_xml();
         assert_eq!(error.code, "MalformedXML");
@@ -429,13 +397,6 @@ mod tests {
             "{}",
             error.message
         );
-    }
-
-    #[test]
-    fn precondition_failed_constructor_maps_to_412() {
-        let error = S3Error::precondition_failed();
-        assert_eq!(error.code, "PreconditionFailed");
-        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]
@@ -457,53 +418,27 @@ mod tests {
         assert!(body.contains("</Error>"));
     }
 
-    /// A stand-in for `shardline_server::error::ServerError` that mirrors the
-    /// classification the server crate applies; exercising the full
-    /// `ServerError` → `S3Error` mapping matrix through the generic `From`.
-    #[derive(Debug, Clone, Copy)]
-    enum TestServerError {
-        RangeNotSatisfiable,
-        NotFound,
-        AccessDenied,
-        Internal,
-    }
+    /// Exercises the generic server-error conversion independently of constructors.
+    struct TestServerError(S3ErrorClass);
 
     impl S3ErrorClassify for TestServerError {
         fn s3_class(&self) -> S3ErrorClass {
-            match self {
-                Self::RangeNotSatisfiable => S3ErrorClass::RangeNotSatisfiable,
-                Self::NotFound => S3ErrorClass::NotFound,
-                Self::AccessDenied => S3ErrorClass::AccessDenied,
-                Self::Internal => S3ErrorClass::Internal,
-            }
+            self.0
         }
     }
 
     #[test]
-    fn server_error_mapping_matrix_range_not_satisfiable() {
-        let error = S3Error::from(TestServerError::RangeNotSatisfiable);
-        assert_eq!(error.code, "InvalidRange");
-        assert_eq!(error.status, StatusCode::RANGE_NOT_SATISFIABLE);
-    }
-
-    #[test]
-    fn server_error_mapping_matrix_not_found() {
-        let error = S3Error::from(TestServerError::NotFound);
-        assert_eq!(error.code, "NoSuchKey");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn server_error_mapping_matrix_access_denied() {
-        let error = S3Error::from(TestServerError::AccessDenied);
-        assert_eq!(error.code, "AccessDenied");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn server_error_mapping_matrix_internal() {
-        let error = S3Error::from(TestServerError::Internal);
-        assert_eq!(error.code, "InternalError");
-        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    fn classified_server_error_code_and_status_contract() {
+        for (class, code, status) in [
+            (S3ErrorClass::RangeNotSatisfiable, "InvalidRange", 416),
+            (S3ErrorClass::NotFound, "NoSuchKey", 404),
+            (S3ErrorClass::AccessDenied, "AccessDenied", 403),
+            (S3ErrorClass::BadDigest, "BadDigest", 400),
+            (S3ErrorClass::Internal, "InternalError", 500),
+        ] {
+            let error = S3Error::from(TestServerError(class));
+            assert_eq!(error.code, code);
+            assert_eq!(error.status.as_u16(), status, "{code}");
+        }
     }
 }

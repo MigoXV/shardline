@@ -37,11 +37,8 @@ impl Request {
         for line in lines {
             let line = std::str::from_utf8(line).map_err(|_error| invalid())?;
             let fields: Vec<_> = line.split_whitespace().collect();
-            match fields.first().copied() {
-                Some("shallow") => {
-                    let [_, boundary] = fields.as_slice() else {
-                        return Err(invalid());
-                    };
+            match fields.as_slice() {
+                ["shallow", boundary] => {
                     if boundary.len() != 40
                         || !boundary.bytes().all(|byte| byte.is_ascii_hexdigit())
                     {
@@ -49,25 +46,15 @@ impl Request {
                     }
                     request.boundaries.insert(boundary.to_ascii_lowercase());
                 }
-                Some("deepen") => {
-                    if depth_seen || fields.len() != 2 {
-                        return Err(invalid());
-                    }
+                ["deepen", depth] if !depth_seen => {
                     depth_seen = true;
-                    let depth: u32 = fields
-                        .get(1)
-                        .ok_or_else(invalid)?
-                        .parse()
-                        .map_err(|_error| invalid())?;
+                    let depth: u32 = depth.parse().map_err(|_error| invalid())?;
                     if depth > i32::MAX as u32 {
                         return Err(invalid());
                     }
                     request.depth = (depth > 0).then_some(depth);
                 }
-                Some("deepen-since") => {
-                    let [_, timestamp] = fields.as_slice() else {
-                        return Err(invalid());
-                    };
+                ["deepen-since", timestamp] => {
                     if request.since.is_some()
                         || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
                     {
@@ -79,27 +66,20 @@ impl Request {
                     }
                     request.since = Some(timestamp);
                 }
-                Some("deepen-not") => {
-                    let [_, reference] = fields.as_slice() else {
-                        return Err(invalid());
-                    };
+                ["deepen-not", reference] => {
                     if request.exclude_refs.len() >= 10_000 || reference.len() > 1024 {
                         return Err(invalid());
                     }
                     request.exclude_refs.push((*reference).to_owned());
                 }
-                Some("deepen-relative") if !request.relative => {
-                    if fields.len() != 1 {
-                        return Err(invalid());
-                    }
-                    request.relative = true;
+                ["deepen-relative"] if !request.relative => request.relative = true,
+                ["want", _, capabilities @ ..] => {
+                    request.relative |= capabilities.contains(&"deepen-relative");
                 }
-                Some("want") => {
-                    request.relative |= fields
-                        .iter()
-                        .skip(2)
-                        .any(|field| *field == "deepen-relative");
+                ["shallow" | "deepen" | "deepen-since" | "deepen-not", ..] => {
+                    return Err(invalid());
                 }
+                ["deepen-relative", ..] if !request.relative => return Err(invalid()),
                 _ => {}
             }
         }
@@ -352,7 +332,6 @@ pub(super) fn negotiate(
         updates.extend_from_slice(FLUSH.as_bytes());
     }
     let reachable = |roots: &[String], known: bool| -> Result<HashSet<String>, HubApiError> {
-        let mut visited = HashSet::new();
         let mut pending_objects: Vec<_> = roots
             .iter()
             .filter(|id| {
@@ -364,7 +343,6 @@ pub(super) fn negotiate(
             .collect();
         let mut discovered: HashSet<_> = pending_objects.iter().cloned().collect();
         while let Some(id) = pending_objects.pop() {
-            visited.insert(id.clone());
             if let Some(object) = by_id.get(&id) {
                 for child in super::super::projection::object_children(object)? {
                     if let Some(child_object) = by_id.get(&child) {
@@ -384,7 +362,7 @@ pub(super) fn negotiate(
                 }
             }
         }
-        Ok(visited)
+        Ok(discovered)
     };
     let wanted = reachable(wants, false)?;
     let known = reachable(haves, true)?;

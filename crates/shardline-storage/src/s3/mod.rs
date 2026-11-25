@@ -21,12 +21,12 @@ mod ownership_tests;
 #[cfg(test)]
 pub(crate) use operations::{
     chunk_hash, existing_copy_outcome, existing_object_outcome_from_file, stream_payload_for_range,
-    temporary_upload_location, validated_external_range, verify_file_length, verify_integrity,
+    validated_external_range, verify_file_length, verify_integrity,
 };
 
 pub use config::S3ObjectStoreConfig;
 pub use error::{S3ObjectReadError, S3ObjectStoreError};
-pub use operations::S3ObjectStore;
+pub use operations::{S3ObjectStore, S3RangeSnapshot};
 pub use types::{BeginMultipartUploadResult, S3ByteStream, S3MultipartUploadWriter};
 
 pub(crate) use types::{

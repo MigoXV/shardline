@@ -42,6 +42,7 @@ Select the auth provider with environment variables:
 SHARDLINE_AUTH_PROVIDER=local          # local | ed25519 | oidc | jwks | passthrough
 SHARDLINE_AUTH_OIDC_ISSUER=https://accounts.google.com   # required when provider=oidc
 SHARDLINE_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json  # required when provider=jwks
+SHARDLINE_AUTH_JWKS_AUDIENCE=storage  # required when provider=jwks
 ```
 
 ### Clock synchronization and expiry
@@ -181,6 +182,7 @@ Set the issuer URL and point `SHARDLINE_AUTH_PROVIDER=oidc`:
 ```bash
 SHARDLINE_AUTH_PROVIDER=oidc
 SHARDLINE_AUTH_OIDC_ISSUER=https://accounts.google.com
+SHARDLINE_AUTH_OIDC_AUDIENCE=storage
 ```
 
 The provider fetches the issuer's JWKS signing keys at startup and caches them.
@@ -197,8 +199,69 @@ SHARDLINE_AUTH_OIDC_JWKS_HOST_ALLOWLIST=www.googleapis.com
 ```
 
 Set `SHARDLINE_AUTH_OIDC_AUDIENCE` to require a specific `aud`
-claim (and reject tokens that omit it). Token minting is not supported; use an
-external identity provider to issue tokens.
+claim (and reject tokens that omit it). This audience is required at startup.
+The identity provider issues external JWTs; see internal token issuance below.
+
+### External resource claims
+
+OIDC and JWKS can read a signed repository assignment independently of `sub`.
+Configure the exact top-level claim names:
+
+```bash
+SHARDLINE_AUTH_JWT_REPOSITORY_CLAIM=repository
+SHARDLINE_AUTH_JWT_SCOPE_CLAIM=permissions
+```
+
+For example, the verified JWT payload can contain:
+
+```json
+{
+  "iss": "https://identity.example",
+  "aud": "storage",
+  "sub": "identity|opaque-user-id",
+  "exp": 1893456000,
+  "repository": {
+    "provider": "generic",
+    "owner": "customer",
+    "name": "models",
+    "revision": "main"
+  },
+  "permissions": "read"
+}
+```
+
+The repository uses the existing validated `RepositoryScope` format; `revision`
+is optional. Claim names may also be namespaced JSON keys. These settings select
+whole top-level keys, not JSON paths. The issuer must assign the caller's
+repository and permissions; a valid signature alone does not establish that the
+issuer's assignment policy is correct.
+
+With repository mapping enabled, missing or malformed assignments are rejected
+and never fall back to `sub`. The selected permission claim must be `read` or `write`; `admin`, unknown, or
+missing permissions are rejected. If the permission claim name is unset, it defaults to `scope`.
+A configured permission name is also strict when used without repository mapping.
+The verified subject remains the actor, and internally issued credentials retain
+its assigned repository and permission. A platform administrator role is not a
+storage permission. External issuers that previously used `admin` must issue explicit
+`read` or `write` permissions; `admin` is rejected even with legacy claim mapping.
+
+Without these settings, the legacy subject-derived `oidc/<sub>` or `jwks/<sub>`
+repository mapping and read-default permission handling remain available. Use
+explicit resource claims when an identity can act on assigned repositories.
+
+Equivalent TOML settings are:
+
+```toml
+[auth]
+provider = "jwks"
+jwt_repository_claim = "repository"
+jwt_scope_claim = "permissions"
+
+[auth.jwks]
+url = "https://identity.example/jwks"
+issuer = "https://identity.example"
+audience = "storage"
+```
 
 ### JWKS
 
@@ -207,11 +270,18 @@ Set a static JWKS endpoint URL:
 ```bash
 SHARDLINE_AUTH_PROVIDER=jwks
 SHARDLINE_AUTH_JWKS_URL=https://auth.example.com/.well-known/jwks.json
+SHARDLINE_AUTH_JWKS_ISSUER=https://auth.example.com
+SHARDLINE_AUTH_JWKS_AUDIENCE=storage
 ```
+
+JWKS server startup requires a nonblank audience. Tokens with a missing or
+different `aud` are rejected. Existing JWKS deployments must set this value
+before upgrading. Programmatic `JwksProvider` users can pin an audience with
+`with_audience`; the legacy constructor retains issuer-only verification.
 
 Keys are fetched and refreshed every 300 seconds. This is useful when you have an
 external service that already issues JWTs signed with keys published at a JWKS endpoint.
-Token minting is not supported.
+External JWT issuance remains the identity provider's responsibility.
 
 Refresh failures retain the last successfully fetched keys; the refresh interval
 is not a cache expiry deadline. Static JWKS verification does not enforce an
@@ -229,6 +299,29 @@ must declare P-256, and ES384 keys must declare P-384. Optional
 purpose and algorithm metadata may be omitted, but conflicting declarations
 are rejected, including when a JWKS contains encryption and signing keys with
 the same key ID.
+
+### Internal token issuance with OIDC or JWKS
+
+Set `SHARDLINE_TOKEN_SIGNING_KEY` alongside the external verifier configuration
+when clients need LFS/Xet or Hub credential exchange. This existing key setting
+then controls Shardline's internal HMAC credentials independently of the external
+JWT signing keys. Use at least 32 bytes and configure the same secret on all
+replicas that issue or verify these credentials. Do not generate a key per process.
+
+External JWTs still pass through the configured OIDC/JWKS verifier, including its
+issuer, audience and key checks. Internal credentials pass through the existing
+native verifier. Their distinct envelopes select one verifier; failed validation
+never falls back to the other. Standalone LFS and Hub share this configured
+provider, preserving repository, ref, permission and expiry restrictions. Hub
+read-only Xet credentials retain their existing CAS-only restrictions.
+
+Without an internal key, external verification still works. Standalone LFS
+selects basic transfer when the authorized client offers it and internal token
+issuance is unavailable; Xet-only requests and Hub credential exchange fail
+explicitly. Permission errors and invalid or expired credentials never trigger
+this transfer fallback.
+Changing the internal key invalidates previously issued internal credentials;
+external JWT verification continues using the identity provider's keys.
 
 ### Passthrough
 

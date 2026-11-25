@@ -15,6 +15,240 @@ fn entry(owner: &str, revision: &str, path: &str, timestamp: u64) -> TreeEntry {
     }
 }
 
+async fn tree_scan_contract<S: TreeStore>(store: &S, owner: &str)
+where
+    S::Error: std::fmt::Debug,
+{
+    let namespace = TreeKey::new("generic", owner, "repo", "main");
+    let mut inserted = Vec::new();
+    let mut paths = vec![
+        "aaa",
+        "aaa/early",
+        "literal%",
+        "literal%/child",
+        "literal_/child",
+        "literal_neighbor",
+        "ζ",
+        "ζ/child",
+        "ζ/last",
+        "ζ-other",
+        "\u{d7ff}",
+        "\u{d7ff}/child",
+        "\u{e000}/neighbor",
+        "\u{10ffff}",
+        "\u{10ffff}/child",
+        "\u{10ffff}\u{10ffff}/child",
+    ];
+    paths.sort_unstable();
+    for path in &paths {
+        let row = entry(owner, "main", path, 1);
+        store.upsert_tree_entry(&row).await.unwrap();
+        inserted.push(row);
+    }
+    for mut scoped in [
+        entry(owner, "feature", "outside/revision", 1),
+        entry(owner, "main", "outside/provider", 1),
+        entry(owner, "main", "outside/owner", 1),
+        entry(owner, "main", "outside/repo", 1),
+    ] {
+        if scoped.path.ends_with("provider") {
+            scoped.provider = "other".to_owned();
+        }
+        if scoped.path.ends_with("owner") {
+            scoped.owner = format!("{owner}-other");
+        }
+        if scoped.path.ends_with("repo") {
+            scoped.repo = "other".to_owned();
+        }
+        store.upsert_tree_entry(&scoped).await.unwrap();
+        inserted.push(scoped);
+    }
+    for prefix in [
+        "",
+        "aaa",
+        "literal%",
+        "literal_",
+        "ζ",
+        "\u{d7ff}",
+        "\u{10ffff}",
+        "\u{10ffff}\u{10ffff}",
+        "missing",
+    ] {
+        for cursor in [None, Some("literal%"), Some("ζ/child"), Some("\u{10ffff}")] {
+            for limit in [0, 1, 2, 100] {
+                let expected = paths
+                    .iter()
+                    .copied()
+                    .filter(|path| {
+                        prefix.is_empty()
+                            || *path == prefix
+                            || path
+                                .strip_prefix(prefix)
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+                    .filter(|path| cursor.is_none_or(|after| *path > after))
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                let actual = store
+                    .scan_tree(&namespace, prefix, cursor, limit)
+                    .await
+                    .unwrap();
+                let actual_paths = actual
+                    .iter()
+                    .map(|row| row.path.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual_paths, expected,
+                    "prefix={prefix:?} cursor={cursor:?} limit={limit}"
+                );
+            }
+        }
+    }
+    for row in inserted {
+        let row_namespace = TreeKey::new(&row.provider, &row.owner, &row.repo, &row.revision);
+        assert_eq!(
+            store
+                .delete_tree_entries(&row_namespace, &row.path, false)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+}
+
+async fn revision_listing_contract<S: TreeStore>(store: &S, owner: &str)
+where
+    S::Error: std::fmt::Debug,
+{
+    let repo = RepoKey::new("generic", owner, "repo");
+    let names = ["rev-00", "rev-01", "rev-02", "rev-03", "rev-04"];
+    for name in names.into_iter().rev() {
+        let revision = RevisionRecord {
+            provider: repo.provider.clone(),
+            owner: repo.owner.clone(),
+            repo: repo.repo.clone(),
+            revision: name.to_owned(),
+            created_at_unix_seconds: 1,
+            updated_at_unix_seconds: 1,
+        };
+        assert!(store.upsert_revision(&revision).await.unwrap());
+    }
+    for cursor in [None, Some(""), Some("rev-02"), Some("rev-025"), Some("z")] {
+        for limit in [0, 1, 3, 100] {
+            let expected: Vec<_> = names
+                .iter()
+                .copied()
+                .filter(|name| cursor.is_none_or(|cursor| *name > cursor))
+                .take(limit)
+                .collect();
+            let actual = store.list_revisions(&repo, cursor, limit).await.unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|record| record.revision.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "cursor={cursor:?} limit={limit}"
+            );
+        }
+    }
+    for name in names {
+        assert_eq!(store.delete_revision(&repo, name).await.unwrap(), 1);
+    }
+}
+
+async fn revision_pruning_contract<S: TreeStore>(store: &S, owner: &str)
+where
+    S::Error: std::fmt::Debug,
+{
+    let repo = RepoKey::new("generic", owner, "repo");
+    let other_repo = RepoKey::new("generic", owner, "other-repo");
+    for (revisions, survivors, cap) in [
+        (
+            [
+                ("rev-b", 200),
+                ("rev-a", 500),
+                ("rev-c", 300),
+                ("rev-e", 100),
+                ("rev-d", 400),
+            ],
+            vec!["rev-a", "rev-d"],
+            2,
+        ),
+        (
+            [
+                ("rev-00", 7),
+                ("rev-01", 7),
+                ("rev-02", 7),
+                ("rev-03", 7),
+                ("rev-04", 7),
+            ],
+            vec!["rev-02", "rev-03", "rev-04"],
+            3,
+        ),
+    ] {
+        for (revision, timestamp) in revisions {
+            store
+                .register_tree_entry(&entry(owner, revision, "file", timestamp), 10, 10)
+                .await
+                .unwrap();
+        }
+        let mut other = entry(owner, "main", "file", 1);
+        other.repo = other_repo.repo.clone();
+        store.register_tree_entry(&other, 10, 10).await.unwrap();
+        for untouched_cap in [5, 10] {
+            assert_eq!(
+                store
+                    .prune_revisions_over_cap(&repo, untouched_cap)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(store.count_revisions(&repo).await.unwrap(), 5);
+            assert_eq!(store.count_tree_entries(&repo).await.unwrap(), 5);
+        }
+        assert_eq!(
+            store.prune_revisions_over_cap(&repo, cap).await.unwrap(),
+            5_u64.saturating_sub(cap as u64)
+        );
+        let remaining = store.list_revisions(&repo, None, 100).await.unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|row| row.revision.as_str())
+                .collect::<Vec<_>>(),
+            survivors
+        );
+        assert_eq!(store.count_revisions(&repo).await.unwrap(), cap as u64);
+        for (revision, _) in revisions {
+            let tree = TreeKey::new("generic", owner, "repo", revision);
+            assert_eq!(
+                store.scan_tree(&tree, "", None, 100).await.unwrap().len(),
+                usize::from(survivors.contains(&revision))
+            );
+        }
+        assert_eq!(store.count_revisions(&other_repo).await.unwrap(), 1);
+        let other_revisions = store.list_revisions(&other_repo, None, 100).await.unwrap();
+        assert_eq!(other_revisions.first().unwrap().revision, "main");
+        assert_eq!(
+            store
+                .tree_entry(
+                    &TreeKey::new("generic", owner, "other-repo", "main"),
+                    "file"
+                )
+                .await
+                .unwrap(),
+            Some(other)
+        );
+        for key in [&repo, &other_repo] {
+            let count = store.count_revisions(key).await.unwrap();
+            assert_eq!(store.prune_revisions_over_cap(key, 0).await.unwrap(), count);
+            assert_eq!(store.count_revisions(key).await.unwrap(), 0);
+            assert_eq!(store.count_tree_entries(key).await.unwrap(), 0);
+        }
+    }
+}
+
 async fn transactional_registration<S: TreeStore>(store: &S, owner: &str)
 where
     S::Error: std::fmt::Debug,
@@ -311,6 +545,9 @@ where
 #[tokio::test]
 async fn memory_tree_registration_transaction_contract() {
     let store = crate::MemoryIndexStore::new();
+    tree_scan_contract(&store, "memory-scan-contract").await;
+    revision_listing_contract(&store, "memory-listing-contract").await;
+    revision_pruning_contract(&store, "memory-pruning-contract").await;
     transactional_registration(&store, "memory").await;
     concurrent_register_delete(&store, "memory-race").await;
     concurrent_register_prune(&store, "memory-prune").await;
@@ -323,6 +560,9 @@ async fn memory_tree_registration_transaction_contract() {
 async fn sqlite_tree_registration_transaction_contract() {
     let tmp = tempfile::tempdir().unwrap();
     let store = crate::LocalIndexStore::open(tmp.path().to_path_buf());
+    tree_scan_contract(&store, "sqlite-scan-contract").await;
+    revision_listing_contract(&store, "sqlite-listing-contract").await;
+    revision_pruning_contract(&store, "sqlite-pruning-contract").await;
     transactional_registration(&store, "sqlite").await;
     registration_rollback(&store, "sqlite-rollback").await;
     concurrent_register_delete(&store, "sqlite-race").await;
@@ -344,6 +584,9 @@ async fn postgres_tree_registration_transaction_contract() {
         .unwrap();
     let store = crate::PostgresIndexStore::new(pool.clone());
     let owner = format!("registration-{}", std::process::id());
+    tree_scan_contract(&store, &format!("{owner}-scan-contract")).await;
+    revision_listing_contract(&store, &format!("{owner}-listing-contract")).await;
+    revision_pruning_contract(&store, &format!("{owner}-pruning-contract")).await;
     transactional_registration(&store, &owner).await;
     registration_rollback(&store, &format!("{owner}-rollback")).await;
     concurrent_register_delete(&store, &format!("{owner}-race")).await;

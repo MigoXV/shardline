@@ -325,22 +325,13 @@ impl super::PostgresRecordStore {
         )
         .await?;
         let completion_identity = if let Some(fence) = completion_fence {
-            let owns_completion = query(
-                "SELECT scope_namespace, target_key FROM shardline_resumable_sessions
-                 WHERE session_id = $1 AND state = 'completing' AND fence_epoch = $2
-                 AND expires_at > clock_timestamp()
-                 FOR UPDATE",
-            )
-            .bind(fence.session_id())
-            .bind(super::u64_to_i64(fence.epoch().get())?)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            let Some(owns_completion) = owns_completion else {
+            let completion_identity =
+                super::resumable_sessions::lock_completion_identity(&mut transaction, fence)
+                    .await?;
+            let Some((scope_namespace, target_key)) = completion_identity else {
                 transaction.rollback().await?;
                 return Ok(false);
             };
-            let scope_namespace: String = owns_completion.try_get("scope_namespace")?;
-            let target_key: String = owns_completion.try_get("target_key")?;
             Some((scope_namespace, target_key))
         } else {
             None
@@ -1114,9 +1105,25 @@ impl RecordTraversal for super::PostgresRecordStore {
         Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(
-            async move { repository_candidates::visit(self, repository, hash_hex, visitor).await },
-        )
+        Box::pin(async move {
+            let domain = crate::DeduplicationDomain::from_scope(Some(repository));
+            self.visit_deduplication_hash_records(&domain, hash_hex, visitor)
+                .await
+        })
+    }
+    fn visit_deduplication_hash_records<'operation, Visitor, VisitorError>(
+        &'operation self,
+        domain: &'operation crate::DeduplicationDomain,
+        hash_hex: &'operation str,
+        visitor: Visitor,
+    ) -> RecordStoreFuture<'operation, (), VisitorError>
+    where
+        Self: Sync,
+        Self::Error: Into<VisitorError> + 'operation,
+        Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
+        VisitorError: Send + 'operation,
+    {
+        Box::pin(async move { repository_candidates::visit(self, domain, hash_hex, visitor).await })
     }
     fn first_repository_hash_record<'operation>(
         &'operation self,
@@ -1519,6 +1526,7 @@ mod tests {
 
     fn sample_record(repo_scope: Option<RepositoryScope>) -> FileRecord {
         FileRecord {
+            deduplication_domain: None,
             file_id: "test.bin".to_owned(),
             content_hash: "a".repeat(64),
             total_bytes: 100,

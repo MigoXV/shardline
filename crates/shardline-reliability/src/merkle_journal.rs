@@ -30,6 +30,39 @@ pub struct PersistedMerkleJournalRecord {
     pub snapshot_merkle_commits: Vec<Value>,
 }
 
+impl PersistedMerkleJournalRecord {
+    /// Combines an ordered, committed journal prefix without changing event order.
+    #[must_use]
+    pub fn from_records(records: &[Self]) -> Self {
+        let mut combined = Self::default();
+        for record in records {
+            combined.evidence.extend(record.evidence.iter().cloned());
+            combined
+                .merkle_commits
+                .extend(record.merkle_commits.iter().cloned());
+            combined
+                .snapshot_evidence
+                .extend(record.snapshot_evidence.iter().cloned());
+            combined
+                .snapshot_merkle_commits
+                .extend(record.snapshot_merkle_commits.iter().cloned());
+        }
+        combined
+    }
+
+    /// Verifies lifecycle and snapshot commitments against their complete event chains.
+    ///
+    /// # Errors
+    /// Returns an error for malformed events, missing commitments, or broken links.
+    pub fn verify_chains<T: DeserializeOwned + EvidenceEventMetadata>(
+        &self,
+        operation_kind: OperationKind,
+    ) -> Result<(), ReliabilityError> {
+        verify_persisted_merkle_chain(operation_kind, &self.evidence, &self.merkle_commits)?;
+        verify_typed_merkle_chain::<T>(&self.snapshot_evidence, &self.snapshot_merkle_commits)
+    }
+}
+
 /// Builds a sequence of linked commitments from typed persisted event JSON.
 ///
 /// # Errors
@@ -52,9 +85,8 @@ pub fn build_persisted_merkle_chain_with_previous(
     events: &[Value],
     previous: Option<&Value>,
 ) -> Result<Vec<Value>, ReliabilityError> {
-    let mut previous = previous.cloned();
     let mut result = Vec::with_capacity(events.len());
-    let mut expected_sequence = match previous.as_ref() {
+    let mut expected_sequence = match previous {
         Some(commit) => Some(
             persisted_commit_sequence(commit)?
                 .checked_add(1)
@@ -71,14 +103,13 @@ pub fn build_persisted_merkle_chain_with_previous(
         let commit = build_persisted_merkle_commit_with_previous(
             operation_kind,
             event.clone(),
-            previous.clone(),
+            result.last().or(previous).cloned(),
         )?;
         expected_sequence = Some(
             sequence
                 .checked_add(1)
                 .ok_or_else(|| ReliabilityError::Merkle("Merkle sequence overflow".into()))?,
         );
-        previous = Some(commit.clone());
         result.push(commit);
     }
     Ok(result)
@@ -118,8 +149,7 @@ pub fn build_typed_merkle_chain<T: DeserializeOwned + EvidenceEventMetadata>(
     events: &[Value],
     previous: Option<&Value>,
 ) -> Result<Vec<Value>, ReliabilityError> {
-    let mut previous = previous.cloned();
-    let mut expected_sequence = match previous.as_ref() {
+    let mut expected_sequence = match previous {
         Some(commit) => Some(
             persisted_commit_sequence(commit)?
                 .checked_add(1)
@@ -129,14 +159,15 @@ pub fn build_typed_merkle_chain<T: DeserializeOwned + EvidenceEventMetadata>(
     };
     let mut result = Vec::with_capacity(events.len());
     for event_json in events {
-        let event = serde_json::from_value::<T>(event_json.clone())?;
+        let event = T::deserialize(event_json)?;
         let sequence = event.sequence_number();
         if expected_sequence.is_some_and(|expected| expected != sequence) {
             return Err(ReliabilityError::ChainDiscontinuity);
         }
-        let previous_commit = previous
-            .as_ref()
-            .map(|value| serde_json::from_value::<ReliabilityMerkleCommit>(value.clone()))
+        let previous_commit = result
+            .last()
+            .or(previous)
+            .map(ReliabilityMerkleCommit::deserialize)
             .transpose()?;
         let commit =
             reliability_merkle_commit_json_with_previous(&event, previous_commit.as_ref())?;
@@ -145,7 +176,6 @@ pub fn build_typed_merkle_chain<T: DeserializeOwned + EvidenceEventMetadata>(
                 .checked_add(1)
                 .ok_or_else(|| ReliabilityError::Merkle("Merkle sequence overflow".into()))?,
         );
-        previous = Some(commit.clone());
         result.push(commit);
     }
     Ok(result)
@@ -167,12 +197,9 @@ pub fn verify_typed_merkle_chain<T: DeserializeOwned + EvidenceEventMetadata>(
     }
     let expected = build_typed_merkle_chain::<T>(events, None)?;
     for (observed, expected_json) in merkle_commits.iter().zip(expected) {
-        let observed = serde_json::from_value::<ReliabilityMerkleCommit>(observed.clone())?;
+        let observed = ReliabilityMerkleCommit::deserialize(observed)?;
         let expected_commit = serde_json::from_value::<ReliabilityMerkleCommit>(expected_json)?;
-        if observed.schema_version > crate::RELIABILITY_MERKLE_SCHEMA_VERSION
-            || observed.body != expected_commit.body
-            || observed.event != expected_commit.event
-        {
+        if !observed.matches_expected(&expected_commit) {
             return Err(ReliabilityError::Merkle(
                 "persisted Merkle commitment mismatch".into(),
             ));
@@ -197,20 +224,48 @@ mod tests {
 
     #[test]
     fn persisted_merkle_chain_uses_the_declared_event_kind() {
-        let first = upload_lifecycle_event(
-            "tenant",
-            "repository",
-            "upload-merkle-journal",
-            "object",
-            "f".repeat(64),
-            UploadLifecycleState::Created,
-            UploadLifecycleState::Storing,
-        )
-        .unwrap();
-        let event = serde_json::to_value(&first).unwrap();
-        let commit =
-            crate::build_persisted_merkle_commit(OperationKind::Upload, event.clone()).unwrap();
-
-        verify_persisted_merkle_chain(OperationKind::Upload, &[event], &[commit]).unwrap();
+        let events = [
+            (UploadLifecycleState::Created, UploadLifecycleState::Storing),
+            (UploadLifecycleState::Storing, UploadLifecycleState::Stored),
+            (
+                UploadLifecycleState::Stored,
+                UploadLifecycleState::MetadataCommitted,
+            ),
+        ]
+        .into_iter()
+        .map(|(before, after)| {
+            serde_json::to_value(
+                upload_lifecycle_event(
+                    "tenant",
+                    "repository",
+                    "upload-merkle-journal",
+                    "object",
+                    "f".repeat(64),
+                    before,
+                    after,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+        let commits = build_persisted_merkle_chain(OperationKind::Upload, &events).unwrap();
+        verify_persisted_merkle_chain(OperationKind::Upload, &events, &commits).unwrap();
+        assert_eq!(
+            build_typed_merkle_chain::<crate::LifecycleEvent>(&events, None).unwrap(),
+            commits
+        );
+        let (_, suffix) = events.split_first().unwrap();
+        let (head, expected_suffix) = commits.split_first().unwrap();
+        assert_eq!(
+            build_persisted_merkle_chain_with_previous(OperationKind::Upload, suffix, Some(head))
+                .unwrap(),
+            expected_suffix
+        );
+        assert_eq!(
+            build_typed_merkle_chain::<crate::LifecycleEvent>(suffix, Some(head)).unwrap(),
+            expected_suffix
+        );
+        assert!(build_persisted_merkle_chain(OperationKind::ProviderEvent, &events).is_err());
     }
 }

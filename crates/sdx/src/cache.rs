@@ -114,31 +114,23 @@ type CacheKey = (String, u64, u64);
 struct CacheState {
     entries: std::collections::HashMap<CacheKey, CacheEntry>,
     total_bytes: u64,
+    last_access: u64,
 }
 
-/// Monotonic access clock shared across a process.
-///
-/// Based on system-time millis (so startup-seeded entries — whose
-/// `last_accessed` comes from file mtimes — share a comparable scale) plus a
-/// per-call counter that strictly increases within the same millisecond.
-/// Millisecond clock granularity alone would produce ties that make LRU
-/// eviction order arbitrary.
-fn clock_tick() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().try_into().unwrap_or(u64::MAX)
-        });
-    let counter = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-    let tick = now.saturating_add(counter);
-    let previous = LAST_TICK.fetch_max(tick, Ordering::Relaxed);
-    previous.max(tick)
-}
+impl CacheState {
+    fn remove(&mut self, key: &CacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.size);
+        }
+    }
 
-/// Last value handed out by [`clock_tick`] (monotonic ratchet).
-static LAST_TICK: AtomicU64 = AtomicU64::new(0);
-/// Strictly increasing per-call counter (disambiguates same-millisecond ticks).
-static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+    // The state mutex serializes access. Seed from restored mtimes, then use
+    // logical ticks so wall-clock changes cannot reverse eviction order.
+    const fn next_access(&mut self) -> u64 {
+        self.last_access = self.last_access.saturating_add(1);
+        self.last_access
+    }
+}
 
 /// On-disk chunk cache for decoded xorb ranges, keyed by the 64-hex xorb hash.
 ///
@@ -241,7 +233,7 @@ impl ChunkCache {
         }
         validate_key(xorb_hash)?;
         let key = cache_key(xorb_hash, chunk_range);
-        let path = self.item_path(&key)?;
+        let path = item_path(&self.cache_dir, &key)?;
 
         let permit = self
             .io_slots
@@ -262,30 +254,20 @@ impl ChunkCache {
             }
 
             let mut state = state.blocking_lock();
-            let (cached, was_corrupt) = match read_entry_bounded(&path, decoded_limit) {
-                Ok(Some(cached)) if cached.chunk_range == chunk_range => (Some(cached), false),
-                Ok(Some(_)) => (None, true),
-                Ok(None) => (None, false),
-                Err(_) => (None, true),
-            };
-            if was_corrupt {
-                drop(remove_entry_file(&path));
-            }
-
-            if was_corrupt {
-                // Drop the stale index entry so `total_bytes` accounting stays
-                // accurate after the corrupt file is deleted.
-                if let Some(existing) = state.entries.remove(&key) {
-                    state.total_bytes = state.total_bytes.saturating_sub(existing.size);
+            let cached = match read_entry_bounded(&path, decoded_limit) {
+                Ok(Some(cached)) if cached.chunk_range == chunk_range => cached,
+                Ok(None) => return Ok(None),
+                Ok(Some(_)) | Err(_) => {
+                    drop(remove_entry_file(&path));
+                    // Remove stale accounting when discarding a corrupt file.
+                    state.remove(&key);
+                    return Ok(None);
                 }
-                return Ok(None);
-            }
-            let Some(cached) = cached else {
-                return Ok(None);
             };
             // File reads and index updates share the lock with writes and eviction.
+            let last_accessed = state.next_access();
             if let Some(entry) = state.entries.get_mut(&key) {
-                entry.last_accessed = clock_tick();
+                entry.last_accessed = last_accessed;
             }
             Ok(Some(cached))
         })
@@ -338,7 +320,7 @@ impl ChunkCache {
             return Ok(());
         }
         let key = cache_key(xorb_hash, chunk_range);
-        let path = self.item_path(&key)?;
+        let path = item_path(&self.cache_dir, &key)?;
         // Admission precedes the owned copy, bounding queued payloads. The
         // worker retains its permit if its awaiting caller is cancelled.
         let permit = self
@@ -373,38 +355,32 @@ impl ChunkCache {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut state = state.blocking_lock();
-            let serialized = serialize_entry(chunk_range, &offsets, &owned_data);
-            write_atomic(&path, &serialized)?;
-            if let Some(existing) = state.entries.get(&key) {
-                state.total_bytes = state.total_bytes.saturating_sub(existing.size);
-            }
-            state.total_bytes = state.total_bytes.saturating_add(size);
-            state.entries.insert(
+            let metadata = serialize_entry_metadata(chunk_range, &offsets, &owned_data);
+            write_atomic(&path, &metadata, &owned_data)?;
+            let last_accessed = state.next_access();
+            if let Some(existing) = state.entries.insert(
                 key,
                 CacheEntry {
                     size,
-                    last_accessed: clock_tick(),
+                    last_accessed,
                 },
-            );
+            ) {
+                state.total_bytes = state.total_bytes.saturating_sub(existing.size);
+            }
+            state.total_bytes = state.total_bytes.saturating_add(size);
             while state.total_bytes > budget_bytes {
-                let Some((oldest_key, oldest_size)) = state
+                let Some(oldest_key) = state
                     .entries
                     .iter()
                     .min_by_key(|(_, entry)| entry.last_accessed)
-                    .map(|(oldest_key, entry)| (oldest_key.clone(), entry.size))
+                    .map(|(oldest_key, _)| oldest_key.clone())
                 else {
                     break;
                 };
-                state.entries.remove(&oldest_key);
-                state.total_bytes = state.total_bytes.saturating_sub(oldest_size);
+                state.remove(&oldest_key);
                 // Keep physical eviction under the same lock as publication:
                 // another writer must not recreate a file before its deletion.
-                let (hash, ..) = &oldest_key;
-                if let Some(prefix) = hash.get(..2) {
-                    let evicted_path = cache_dir
-                        .join("xorbs")
-                        .join(prefix)
-                        .join(entry_file_name(&oldest_key));
+                if let Ok(evicted_path) = item_path(&cache_dir, &oldest_key) {
                     drop(remove_entry_file(&evicted_path));
                 }
             }
@@ -413,20 +389,19 @@ impl ChunkCache {
         .await
         .map_err(|error| SdxError::StreamInternal(format!("cache write worker failed: {error}")))?
     }
+}
 
-    /// Resolves the on-disk path for a cache key
-    /// (`{cache_dir}/xorbs/{prefix2}/{hash}.{start}-{end}`).
-    fn item_path(&self, key: &CacheKey) -> Result<PathBuf, SdxError> {
-        let (xorb_hash, ..) = key;
-        let prefix2 = xorb_hash.get(..2).ok_or_else(|| {
-            SdxError::StreamInternal("cache key shorter than two characters".to_owned())
-        })?;
-        Ok(self
-            .cache_dir
-            .join("xorbs")
-            .join(prefix2)
-            .join(entry_file_name(key)))
-    }
+/// Resolves the on-disk path for a cache key
+/// (`{cache_dir}/xorbs/{prefix2}/{hash}.{start}-{end}`).
+fn item_path(cache_dir: &Path, key: &CacheKey) -> Result<PathBuf, SdxError> {
+    let (xorb_hash, ..) = key;
+    let prefix2 = xorb_hash.get(..2).ok_or_else(|| {
+        SdxError::StreamInternal("cache key shorter than two characters".to_owned())
+    })?;
+    Ok(cache_dir
+        .join("xorbs")
+        .join(prefix2)
+        .join(entry_file_name(key)))
 }
 
 // A per-instance test gate makes executor progress and cancelled-worker
@@ -541,33 +516,32 @@ fn validate_offsets(
     Ok(())
 }
 
-/// Serializes an entry: fixed header followed by the payload (offsets + data).
-fn serialize_entry(chunk_range: (u64, u64), chunk_offsets: &[u32], data: &[u8]) -> Vec<u8> {
-    // Hash the payload directly, avoiding a full temporary payload copy while
-    // the worker already owns the decoded data and final serialized entry.
-    let mut checksum = crc32fast::Hasher::new();
-    for offset in chunk_offsets {
-        checksum.update(&offset.to_le_bytes());
-    }
-    checksum.update(data);
-    let payload_len = chunk_offsets
-        .len()
-        .saturating_mul(4)
-        .saturating_add(data.len());
-    let crc = checksum.finalize();
+/// Serializes the fixed header and offsets; the worker writes data separately.
+fn serialize_entry_metadata(
+    chunk_range: (u64, u64),
+    chunk_offsets: &[u32],
+    data: &[u8],
+) -> Vec<u8> {
     let num_offsets = u32::try_from(chunk_offsets.len()).unwrap_or(u32::MAX);
     let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-    let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(payload_len));
+    let mut out =
+        Vec::with_capacity(HEADER_LEN.saturating_add(chunk_offsets.len().saturating_mul(4)));
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&chunk_range.0.to_le_bytes());
     out.extend_from_slice(&chunk_range.1.to_le_bytes());
     out.extend_from_slice(&num_offsets.to_le_bytes());
     out.extend_from_slice(&data_len.to_le_bytes());
-    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&[0; 4]); // Filled after the offsets are serialized.
     for offset in chunk_offsets {
         out.extend_from_slice(&offset.to_le_bytes());
     }
-    out.extend_from_slice(data);
+    // Hash the serialized offsets in one call, without copying the payload.
+    let (header, offsets) = out.split_at_mut(HEADER_LEN);
+    let mut checksum = crc32fast::Hasher::new();
+    checksum.update(offsets);
+    checksum.update(data);
+    let (_, crc) = header.split_at_mut(HEADER_LEN - 4);
+    crc.copy_from_slice(&checksum.finalize().to_le_bytes());
     out
 }
 
@@ -585,12 +559,8 @@ fn read_entry_bounded(
     };
     let mut fixed_header = [0u8; HEADER_LEN];
     file.read_exact(&mut fixed_header)?;
-    let header = parse_header(&fixed_header).ok_or_else(|| {
-        SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache entry header is corrupt",
-        ))
-    })?;
+    let header = parse_header(&fixed_header)
+        .ok_or_else(|| invalid_entry("cache entry header is corrupt"))?;
     // Read the fixed header before allocating payload or offset storage. A
     // sparse file or forged data_len must not turn a cache lookup into an
     // allocation larger than the active download's reservation.
@@ -603,36 +573,22 @@ fn read_entry_bounded(
                 .saturating_sub(header.chunk_range.0)
                 .saturating_add(1)
     {
-        return Err(SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache entry exceeds decoded bounds",
-        )));
+        return Err(invalid_entry("cache entry exceeds decoded bounds"));
     }
     let offsets_len = header
         .num_offsets
         .checked_mul(4)
         .and_then(|len| usize::try_from(len).ok())
-        .ok_or_else(|| {
-            SdxError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cache entry offsets length overflow",
-            ))
-        })?;
-    let total = HEADER_LEN
+        .ok_or_else(|| invalid_entry("cache entry offsets length overflow"))?;
+    let offsets_end = HEADER_LEN
         .checked_add(offsets_len)
-        .and_then(|len| u64::try_from(len).ok())
+        .ok_or_else(|| invalid_entry("cache offsets end overflow"))?;
+    let total = u64::try_from(offsets_end)
+        .ok()
         .and_then(|len| len.checked_add(header.data_len))
-        .ok_or_else(|| {
-            SdxError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cache entry length overflow",
-            ))
-        })?;
+        .ok_or_else(|| invalid_entry("cache entry length overflow"))?;
     if file.metadata()?.len() != total {
-        return Err(SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache entry length does not match header",
-        )));
+        return Err(invalid_entry("cache entry length does not match header"));
     }
     let length =
         usize::try_from(total).map_err(|error| SdxError::Io(std::io::Error::other(error)))?;
@@ -643,74 +599,48 @@ fn read_entry_bounded(
     file.take(total.saturating_sub(HEADER_LEN as u64).saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() != length {
-        return Err(SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache entry changed during read",
-        )));
+        return Err(invalid_entry("cache entry changed during read"));
     }
     // The CRC covers the payload that starts right after the fixed header:
     // the offsets table followed by the data.
-    let payload = bytes.get(HEADER_LEN..).ok_or_else(|| {
-        SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache payload out of bounds",
-        ))
-    })?;
+    let payload = bytes
+        .get(HEADER_LEN..)
+        .ok_or_else(|| invalid_entry("cache payload out of bounds"))?;
     if crc32fast::hash(payload) != header.crc {
-        return Err(SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache entry checksum mismatch",
-        )));
+        return Err(invalid_entry("cache entry checksum mismatch"));
     }
-    let offsets_end = HEADER_LEN.checked_add(offsets_len).ok_or_else(|| {
-        SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache offsets end overflow",
-        ))
-    })?;
-    let offsets_bytes = bytes.get(HEADER_LEN..offsets_end).ok_or_else(|| {
-        SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache offsets out of bounds",
-        ))
-    })?;
+
+    let offsets_bytes = bytes
+        .get(HEADER_LEN..offsets_end)
+        .ok_or_else(|| invalid_entry("cache offsets out of bounds"))?;
     let chunk_offsets: Vec<u32> = offsets_bytes
         .as_chunks::<4>()
         .0
         .iter()
         .map(|window| u32::from_le_bytes(*window))
         .collect();
-    let data_start = offsets_end;
-    let data_end = offsets_end
-        .checked_add(usize::try_from(header.data_len).unwrap_or(usize::MAX))
-        .ok_or_else(|| {
-            SdxError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cache data end overflow",
-            ))
-        })?;
-    let data = bytes.get(data_start..data_end).ok_or_else(|| {
-        SdxError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache data out of bounds",
-        ))
-    })?;
+    // The checked total above already includes the header, offsets, and data.
+    let data = bytes
+        .get(offsets_end..length)
+        .ok_or_else(|| invalid_entry("cache data out of bounds"))?;
     validate_offsets(header.chunk_range, &chunk_offsets, data)?;
     Ok(Some(CachedXorbRange {
         chunk_range: header.chunk_range,
         chunk_offsets,
-        data: Bytes::from(bytes).slice(data_start..data_end),
+        data: Bytes::from(bytes).slice(offsets_end..length),
     }))
+}
+
+fn invalid_entry(message: &'static str) -> SdxError {
+    SdxError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
 }
 
 /// Parses and structurally validates the fixed entry header.
 fn parse_header(bytes: &[u8]) -> Option<EntryHeader> {
-    if bytes.get(..MAGIC.len())? != MAGIC.as_slice() {
-        return None;
-    }
-    let mut cursor = Cursor::new(bytes);
-    let mut magic = [0u8; 8];
-    cursor.read_exact(&mut magic).ok()?;
+    let mut cursor = Cursor::new(bytes.strip_prefix(MAGIC.as_slice())?);
     let mut buf = [0u8; 8];
     cursor.read_exact(&mut buf).ok()?;
     let chunk_start = u64::from_le_bytes(buf);
@@ -737,8 +667,8 @@ fn parse_header(bytes: &[u8]) -> Option<EntryHeader> {
     })
 }
 
-/// Writes `data` to `path` atomically (temp file + rename).
-fn write_atomic(path: &Path, data: &[u8]) -> Result<(), SdxError> {
+/// Writes metadata and data atomically (temp file + sync + rename).
+fn write_atomic(path: &Path, metadata: &[u8], data: &[u8]) -> Result<(), SdxError> {
     let dir = path
         .parent()
         .ok_or_else(|| SdxError::StreamInternal("cache path has no parent directory".to_owned()))?;
@@ -751,15 +681,15 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), SdxError> {
     let temp_path = dir.join(temp_name);
     let write_result = (|| {
         let mut file = File::create(&temp_path)?;
+        file.write_all(metadata)?;
         file.write_all(data)?;
         file.sync_all()?;
-        Ok::<(), std::io::Error>(())
+        // Close before renaming, including on platforms that disallow moving
+        // an open file. Both write and rename failures share cleanup below.
+        drop(file);
+        std::fs::rename(&temp_path, path)
     })();
     if let Err(error) = write_result {
-        drop(std::fs::remove_file(&temp_path));
-        return Err(SdxError::Io(error));
-    }
-    if let Err(error) = std::fs::rename(&temp_path, path) {
         drop(std::fs::remove_file(&temp_path));
         return Err(SdxError::Io(error));
     }
@@ -773,19 +703,16 @@ fn remove_entry_file(path: &Path) -> Result<(), SdxError> {
     {
         return Err(SdxError::Io(error));
     }
-    // Remove the (now possibly empty) `{hash}` dir, then the `{prefix2}` dir.
+    // Remove empty prefix and xorbs directories. remove_dir itself checks
+    // emptiness, including files published since the entry was removed.
     let mut dir = path.parent();
     for _ in 0..2 {
         let Some(current) = dir else {
             break;
         };
-        let empty = std::fs::read_dir(current)
-            .map(|mut read_dir| read_dir.next().is_none())
-            .unwrap_or(false);
-        if !empty {
+        if std::fs::remove_dir(current).is_err() {
             break;
         }
-        drop(std::fs::remove_dir(current));
         dir = current.parent();
     }
     Ok(())
@@ -835,15 +762,15 @@ fn scan_directory(cache_dir: &Path, budget_bytes: u64) -> Result<CacheState, Sdx
                     continue;
                 }
             }
-            let size = entry_path.metadata().map_or(0, |metadata| metadata.len());
-            let last_accessed = entry_path
-                .metadata()
-                .ok()
+            let metadata = entry_path.metadata().ok();
+            let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+            let last_accessed = metadata
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |duration| {
                     duration.as_millis().try_into().unwrap_or(u64::MAX)
                 });
+            state.last_access = state.last_access.max(last_accessed);
             if state
                 .entries
                 .insert(
@@ -859,22 +786,23 @@ fn scan_directory(cache_dir: &Path, budget_bytes: u64) -> Result<CacheState, Sdx
             }
         }
     }
-    // Apply the budget over the scanned state, oldest first.
-    while state.total_bytes > budget_bytes {
-        let Some((oldest_key, size)) = state
+    // Order once when reopening over budget, rather than scanning the whole
+    // index again for every evicted entry.
+    if state.total_bytes > budget_bytes {
+        let mut oldest_first: Vec<_> = state
             .entries
             .iter()
-            .min_by_key(|(_, entry)| entry.last_accessed)
-            .map(|(oldest_key, entry)| (oldest_key.clone(), entry.size))
-        else {
-            break;
-        };
-        state.entries.remove(&oldest_key);
-        state.total_bytes = state.total_bytes.saturating_sub(size);
-        let prefix2 = oldest_key.0.get(..2);
-        let dir = prefix2.map(|prefix| cache_dir.join("xorbs").join(prefix));
-        if let Some(dir) = dir {
-            drop(std::fs::remove_file(dir.join(entry_file_name(&oldest_key))));
+            .map(|(key, entry)| (key.clone(), *entry))
+            .collect();
+        oldest_first.sort_unstable_by_key(|(_, entry)| entry.last_accessed);
+        for (key, _) in oldest_first {
+            if state.total_bytes <= budget_bytes {
+                break;
+            }
+            state.remove(&key);
+            if let Ok(path) = item_path(cache_dir, &key) {
+                drop(std::fs::remove_file(path));
+            }
         }
     }
     Ok(state)
@@ -916,6 +844,21 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn serialized_metadata_preserves_v1_bytes_and_payload_checksum() {
+        // SDXCHNK1; range 2..4; three offsets; five payload bytes; CRC32;
+        // little-endian offsets [0, 2, 5]. The payload is stored separately.
+        let expected = b"SDXCHNK1\x02\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\xc1.\x81\xa0\x00\x00\x00\x00\x02\x00\x00\x00\x05\x00\x00\x00";
+        assert_eq!(
+            serialize_entry_metadata((2, 4), &[0, 2, 5], b"abcde"),
+            expected
+        );
+        assert_ne!(
+            serialize_entry_metadata((2, 4), &[0, 2, 5], b"abcdf"),
+            expected
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocked_cache_worker_keeps_executor_responsive_and_retains_cancelled_permit() {
@@ -975,7 +918,7 @@ mod tests {
             let cache = ChunkCache::new(directory.path(), 1024).unwrap();
             cache.put(&key, (0, 1), &[0, 5], b"wrong").await.unwrap();
             cache.put(&key, (1, 2), &[0, 5], b"valid").await.unwrap();
-            let malformed_path = cache.item_path(&cache_key(&key, (0, 1))).unwrap();
+            let malformed_path = item_path(&cache.cache_dir, &cache_key(&key, (0, 1))).unwrap();
             // A structurally valid header with unchanged payload CRC must
             // still match the filename's identity.
             overwrite_header_range(&malformed_path, (2, 3));
@@ -1031,8 +974,7 @@ mod tests {
             Err(SdxError::StreamInternal(_))
         ));
         assert!(
-            !cache
-                .item_path(&cache_key(&key, (0, 8193)))
+            !item_path(&cache.cache_dir, &cache_key(&key, (0, 8193)))
                 .unwrap()
                 .exists()
         );
@@ -1058,10 +1000,23 @@ mod tests {
         let cache = ChunkCache::new(directory.path(), 1024).unwrap();
         put(&cache, &hash('a'), b"first").await;
         put(&cache, &hash('b'), b"second").await;
+        put(&cache, &hash('c'), b"third").await;
+        put(&cache, &hash('d'), b"fourth").await;
+        for (digit, seconds) in [('a', 1), ('b', 2), ('c', 3), ('d', 4)] {
+            let path = item_path(&cache.cache_dir, &cache_key(&hash(digit), (0, 1))).unwrap();
+            let times = std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds));
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
         drop(cache);
         let reopened = ChunkCache::new(directory.path(), 1024).unwrap();
-        assert_eq!(reopened.entry_count().await.unwrap(), 2);
-        assert_eq!(reopened.total_bytes().await.unwrap(), 107);
+        assert_eq!(reopened.entry_count().await.unwrap(), 4);
+        assert_eq!(reopened.total_bytes().await.unwrap(), 214);
         assert_eq!(
             get(&reopened, &hash('a')).await.unwrap().data.as_ref(),
             b"first"
@@ -1070,6 +1025,13 @@ mod tests {
         let reduced = ChunkCache::new(directory.path(), 54).unwrap();
         assert_eq!(reduced.entry_count().await.unwrap(), 1);
         assert!(reduced.total_bytes().await.unwrap() <= 54);
+        assert!(get(&reduced, &hash('a')).await.is_none());
+        assert!(get(&reduced, &hash('b')).await.is_none());
+        assert!(get(&reduced, &hash('c')).await.is_none());
+        assert_eq!(
+            get(&reduced, &hash('d')).await.unwrap().data.as_ref(),
+            b"fourth"
+        );
         drop(reduced);
         let checked = ChunkCache::new(directory.path(), 1024).unwrap();
         assert_eq!(checked.entry_count().await.unwrap(), 1);
@@ -1147,7 +1109,7 @@ mod tests {
         let key = hash('1');
         for forged_header in [false, true] {
             put(&cache, &key, b"valid").await;
-            let path = cache.item_path(&cache_key(&key, (0, 1))).unwrap();
+            let path = item_path(&cache.cache_dir, &cache_key(&key, (0, 1))).unwrap();
             let mut file = File::options().read(true).write(true).open(&path).unwrap();
             if forged_header {
                 use std::io::{Seek, SeekFrom};
@@ -1221,20 +1183,37 @@ mod tests {
         assert_eq!(cached.chunk_offsets, vec![0, 11]);
         assert_eq!(cached.data.as_ref(), b"hello world");
         assert_eq!(cached.chunk_range, (0, 1));
+        let path = item_path(&cache.cache_dir, &cache_key(&key, (0, 1))).unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"SDXCHNK1\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x0b\x00\x00\x00\x00\x00\x00\x00\xf8\xcf\x31\x62\x00\x00\x00\x00\x0b\x00\x00\x00hello world"
+        );
     }
 
     #[tokio::test]
-    async fn put_returns_identical_data_after_reopen() {
+    async fn replacement_accounting_and_data_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(dir.path().to_path_buf(), 1024).unwrap();
+        let cache = ChunkCache::new(dir.path(), 1024).unwrap();
         let key = hash('b');
-        let data = vec![42u8; 256];
-        put(&cache, &key, &data).await;
+        for length in [256, 512, 64] {
+            let data = vec![42u8; length];
+            put(&cache, &key, &data).await;
+            let expected_size = u64::try_from(HEADER_LEN + 8 + length).unwrap();
+            assert_eq!(cache.entry_count().await.unwrap(), 1);
+            assert_eq!(cache.total_bytes().await.unwrap(), expected_size);
+            assert_eq!(
+                get(&cache, &key).await.unwrap().data.as_ref(),
+                data.as_slice()
+            );
 
-        // A fresh instance rescans the directory and still serves the entry.
-        let reopened = ChunkCache::new(dir.path().to_path_buf(), 1024).unwrap();
-        let cached = get(&reopened, &key).await.unwrap();
-        assert_eq!(cached.data.as_ref(), data.as_slice());
+            let reopened = ChunkCache::new(dir.path(), 1024).unwrap();
+            assert_eq!(reopened.entry_count().await.unwrap(), 1);
+            assert_eq!(reopened.total_bytes().await.unwrap(), expected_size);
+            assert_eq!(
+                get(&reopened, &key).await.unwrap().data.as_ref(),
+                data.as_slice()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1284,45 +1263,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_file_returns_miss_and_is_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(dir.path().to_path_buf(), 1024).unwrap();
-        let key = hash('d');
-        put(&cache, &key, b"some cached data").await;
-        assert!(get(&cache, &key).await.is_some());
-
-        // Overwrite the entry with garbage.
-        let path = cache.item_path(&cache_key(&key, (0, 1))).unwrap();
-        std::fs::write(&path, b"garbage that is not a cache entry").unwrap();
-
-        // get must report a miss and delete the corrupt file.
-        assert!(get(&cache, &key).await.is_none());
-        assert!(!path.exists());
+    async fn corrupt_and_truncated_files_are_deleted_and_untracked() {
+        for (digit, payload, truncate) in [
+            ('d', b"some cached data".as_slice(), false),
+            ('e', b"truncate me later".as_slice(), true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = ChunkCache::new(dir.path(), 1024).unwrap();
+            let key = hash(digit);
+            put(&cache, &key, payload).await;
+            assert!(get(&cache, &key).await.is_some());
+            let path = item_path(&cache.cache_dir, &cache_key(&key, (0, 1))).unwrap();
+            let damaged = if truncate {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes.truncate(bytes.len().saturating_sub(10));
+                bytes
+            } else {
+                b"garbage that is not a cache entry".to_vec()
+            };
+            std::fs::write(&path, damaged).unwrap();
+            assert!(get(&cache, &key).await.is_none());
+            assert!(!path.exists());
+            assert_eq!(cache.entry_count().await.unwrap(), 0);
+            assert_eq!(cache.total_bytes().await.unwrap(), 0);
+        }
     }
 
     #[tokio::test]
-    async fn truncated_file_returns_miss_and_is_deleted() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(dir.path().to_path_buf(), 1024).unwrap();
-        let key = hash('e');
-        put(&cache, &key, b"truncate me later").await;
-
-        let path = cache.item_path(&cache_key(&key, (0, 1))).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        std::fs::write(&path, &bytes[..bytes.len().saturating_sub(10)]).unwrap();
-
-        assert!(get(&cache, &key).await.is_none());
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn budget_zero_disables_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(dir.path().to_path_buf(), 0).unwrap();
-        let key = hash('f');
-        put(&cache, &key, b"nope").await;
-        assert!(get(&cache, &key).await.is_none());
-        assert_eq!(cache.total_bytes().await.unwrap(), 0);
+    async fn disabled_and_oversized_writes_leave_cache_empty() {
+        for (budget, digit, data) in [(0, 'f', b"nope".to_vec()), (32, '8', vec![0; 1024])] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = ChunkCache::new(dir.path(), budget).unwrap();
+            let key = hash(digit);
+            put(&cache, &key, &data).await;
+            assert!(get(&cache, &key).await.is_none());
+            assert_eq!(cache.entry_count().await.unwrap(), 0);
+            assert_eq!(cache.total_bytes().await.unwrap(), 0);
+        }
     }
 
     #[tokio::test]
@@ -1375,24 +1352,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversize_entry_is_not_stored() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ChunkCache::new(dir.path().to_path_buf(), 32).unwrap();
-        let key = hash('8');
-        let data = vec![0u8; 1024];
-        cache
-            .put(&key, (0, 1), &offsets_for(&data), &data)
-            .await
-            .unwrap();
-        assert!(get(&cache, &key).await.is_none());
-    }
-
-    #[test]
-    fn clock_tick_is_monotonic() {
-        // Sanity: clock_tick strictly increases (or holds) within a process.
-        let first = clock_tick();
-        std::thread::sleep(Duration::from_millis(5));
-        let second = clock_tick();
-        assert!(second >= first);
+    async fn reopened_cache_orders_new_accesses_after_future_file_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new(directory.path(), 128).unwrap();
+        let first = hash('a');
+        let second = hash('b');
+        let newest = hash('c');
+        for key in [&first, &second] {
+            put(&cache, key, &[7; 16]).await;
+            let path = item_path(&cache.cache_dir, &cache_key(key, (0, 1))).unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(4_102_444_800)),
+                )
+                .unwrap();
+        }
+        drop(cache);
+        let cache = ChunkCache::new(directory.path(), 128).unwrap();
+        assert!(get(&cache, &first).await.is_some());
+        put(&cache, &newest, &[9; 16]).await;
+        assert!(get(&cache, &second).await.is_none());
+        assert!(get(&cache, &first).await.is_some());
+        assert!(get(&cache, &newest).await.is_some());
+        assert_eq!(cache.entry_count().await.unwrap(), 2);
+        assert_eq!(cache.total_bytes().await.unwrap(), 128);
     }
 }

@@ -173,33 +173,24 @@ fn local_endpoint(
     root: Option<&Path>,
     side: &'static str,
 ) -> Result<StorageMigrationEndpoint, StorageMigrationRuntimeError> {
-    if let Some(root) = root {
-        ensure_directory_path_components_are_not_symlinked(root).map_err(|source| {
-            StorageMigrationRuntimeError::InvalidLocalRoot {
+    let root = match root {
+        Some(root) => root.to_path_buf(),
+        None if side == "source" => effective_root(None)?,
+        None => {
+            return Err(StorageMigrationRuntimeError::MissingLocalRoot {
+                flag: "--to-root",
                 side,
-                path: root.to_path_buf(),
-                source,
-            }
-        })?;
-        return Ok(StorageMigrationEndpoint::LocalStateRoot(root.to_path_buf()));
-    }
-
-    if side == "source" {
-        let resolved_root = effective_root(None)?;
-        ensure_directory_path_components_are_not_symlinked(&resolved_root).map_err(|source| {
-            StorageMigrationRuntimeError::InvalidLocalRoot {
-                side,
-                path: resolved_root.clone(),
-                source,
-            }
-        })?;
-        return Ok(StorageMigrationEndpoint::LocalStateRoot(resolved_root));
-    }
-
-    Err(StorageMigrationRuntimeError::MissingLocalRoot {
-        flag: "--to-root",
-        side,
-    })
+            });
+        }
+    };
+    ensure_directory_path_components_are_not_symlinked(&root).map_err(|source| {
+        StorageMigrationRuntimeError::InvalidLocalRoot {
+            side,
+            path: root.clone(),
+            source,
+        }
+    })?;
+    Ok(StorageMigrationEndpoint::LocalStateRoot(root))
 }
 
 fn load_s3_config(prefix: &str) -> Result<S3ObjectStoreConfig, StorageMigrationRuntimeError> {
@@ -324,15 +315,11 @@ fn read_s3_credential_file(
                 name: name.clone(),
                 source,
             })?;
-    ensure_s3_credential_size_within_limit(name.clone(), metadata.len())?;
+    ensure_s3_credential_size_within_limit(&name, metadata.len())?;
 
     run_before_s3_credential_read_hook_for_tests(path);
 
     let bytes = read_bounded_s3_credential_file(&name, &mut file, metadata.len())?;
-    ensure_s3_credential_size_within_limit(
-        name.clone(),
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-    )?;
 
     let s = String::from_utf8(bytes)
         .map_err(|_error| StorageMigrationRuntimeError::S3CredentialUtf8 { name })?;
@@ -428,12 +415,12 @@ fn read_bounded_s3_credential_file(
 }
 
 fn ensure_s3_credential_size_within_limit(
-    name: String,
+    name: &str,
     observed_bytes: u64,
 ) -> Result<(), StorageMigrationRuntimeError> {
     if observed_bytes > MAX_S3_CREDENTIAL_BYTES {
         return Err(StorageMigrationRuntimeError::S3CredentialTooLarge {
-            name,
+            name: name.to_owned(),
             observed_bytes,
             maximum_bytes: MAX_S3_CREDENTIAL_BYTES,
         });
@@ -542,10 +529,7 @@ mod tests {
     #[test]
     fn local_endpoint_rejects_symlinked_root() {
         let sandbox = tempfile::tempdir();
-        assert!(sandbox.is_ok());
-        let Ok(sandbox) = sandbox else {
-            return;
-        };
+        let sandbox = sandbox.expect("expected valid sandbox");
         let target = sandbox.path().join("target-root");
         let create_target = fs::create_dir_all(&target);
         assert!(create_target.is_ok());
@@ -564,10 +548,7 @@ mod tests {
     #[test]
     fn local_endpoint_accepts_real_root() {
         let sandbox = tempfile::tempdir();
-        assert!(sandbox.is_ok());
-        let Ok(sandbox) = sandbox else {
-            return;
-        };
+        let sandbox = sandbox.expect("expected valid sandbox");
 
         let endpoint = local_endpoint(Some(sandbox.path()), "source");
 
@@ -647,10 +628,7 @@ mod tests {
     #[test]
     fn build_s3_config_accepts_file_backed_credentials_without_debug_leak() {
         let access_key_file = tempfile::NamedTempFile::new();
-        assert!(access_key_file.is_ok());
-        let Ok(access_key_file) = access_key_file else {
-            return;
-        };
+        let access_key_file = access_key_file.expect("expected valid access_key_file");
         let write = fs::write(access_key_file.path(), b"file-access-key");
         assert!(write.is_ok());
 
@@ -720,10 +698,7 @@ mod tests {
     #[test]
     fn build_s3_config_rejects_invalid_utf8_file_backed_credential() {
         let access_key_file = tempfile::NamedTempFile::new();
-        assert!(access_key_file.is_ok());
-        let Ok(access_key_file) = access_key_file else {
-            return;
-        };
+        let access_key_file = access_key_file.expect("expected valid access_key_file");
         let write = fs::write(access_key_file.path(), [0xff, 0xfe]);
         assert!(write.is_ok());
 
@@ -744,10 +719,7 @@ mod tests {
     #[test]
     fn build_s3_config_rejects_credential_file_growth_after_validation() {
         let access_key_file = tempfile::NamedTempFile::new();
-        assert!(access_key_file.is_ok());
-        let Ok(access_key_file) = access_key_file else {
-            return;
-        };
+        let access_key_file = access_key_file.expect("expected valid access_key_file");
         let write = fs::write(access_key_file.path(), b"access");
         assert!(write.is_ok());
         let path = access_key_file.path().to_path_buf();
@@ -798,13 +770,12 @@ mod tests {
 
     #[test]
     fn s3_credential_size_within_limit_accepts_small_value() {
-        assert!(super::ensure_s3_credential_size_within_limit("test".to_owned(), 100).is_ok());
+        assert!(super::ensure_s3_credential_size_within_limit("test", 100).is_ok());
     }
 
     #[test]
     fn s3_credential_size_within_limit_rejects_too_large_value() {
-        let result =
-            super::ensure_s3_credential_size_within_limit("ACCESS_KEY_ID".to_owned(), 5000);
+        let result = super::ensure_s3_credential_size_within_limit("ACCESS_KEY_ID", 5000);
         assert!(matches!(
             result,
             Err(StorageMigrationRuntimeError::S3CredentialTooLarge {
@@ -817,7 +788,7 @@ mod tests {
 
     #[test]
     fn s3_credential_size_within_limit_accepts_exact_maximum() {
-        assert!(super::ensure_s3_credential_size_within_limit("test".to_owned(), 4096).is_ok());
+        assert!(super::ensure_s3_credential_size_within_limit("test", 4096).is_ok());
     }
 
     // ── StorageMigrationRuntimeError Display ───────────────────────────────
@@ -1178,7 +1149,6 @@ mod tests {
     fn endpoint_local_with_root_returns_local_endpoint() {
         let sandbox = tempfile::tempdir().unwrap();
         let result = super::endpoint(ObjectStorageAdapter::Local, Some(sandbox.path()), "source");
-        assert!(result.is_ok());
         let endpoint = result.unwrap();
         assert!(matches!(
             endpoint,
@@ -1285,13 +1255,6 @@ mod tests {
             "NONEXISTENT_SECRET",
         );
         assert!(result.unwrap().is_none());
-    }
-
-    // ── ensure_s3_credential_size_within_limit with exact boundary ────────
-
-    #[test]
-    fn ensure_s3_credential_size_within_limit_at_boundary() {
-        assert!(super::ensure_s3_credential_size_within_limit("test".to_owned(), 4096).is_ok());
     }
 
     // ── env_key with prefix and name ──────────────────────────────────────

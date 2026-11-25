@@ -9,8 +9,8 @@ use thiserror::Error;
 
 use crate::{
     AuthorizationDecision, CanonicalCloneUrl, ProviderKind, ProviderSubject, RepositoryAccess,
-    RepositoryMetadata, RepositoryRef, RepositoryVisibility, RevisionRef, VcsReferenceError,
-    WebhookDeliveryId,
+    RepositoryMetadata, RepositoryRef, RepositoryVisibility, RepositoryWebhookEvent,
+    RepositoryWebhookEventKind, RevisionRef, VcsReferenceError, WebhookDeliveryId,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -252,6 +252,29 @@ pub(crate) fn normalize_default_revision(value: &str) -> Result<RevisionRef, Vcs
     RevisionRef::new(&format!("refs/heads/{value}"))
 }
 
+// GitHub and Gitea-compatible providers use the same rename change fields.
+pub(crate) fn parse_repository_rename(
+    payload: &Value,
+    repository: RepositoryRef,
+    delivery_id: WebhookDeliveryId,
+) -> Result<Option<RepositoryWebhookEvent>, BuiltInProviderError> {
+    let Some(previous_name) = value_str(payload, &["changes", "repository", "name", "from"])
+        .or_else(|| value_str(payload, &["changes", "name", "from"]))
+    else {
+        return Ok(None);
+    };
+    let previous = RepositoryRef::new(repository.provider(), repository.owner(), previous_name)
+        .map_err(|_error| BuiltInProviderError::InvalidRepositoryPayload)?;
+
+    Ok(Some(RepositoryWebhookEvent::new(
+        previous,
+        delivery_id,
+        RepositoryWebhookEventKind::RepositoryRenamed {
+            new_repository: repository,
+        },
+    )))
+}
+
 pub(crate) fn parse_delivery_id(value: &str) -> Result<WebhookDeliveryId, BuiltInProviderError> {
     WebhookDeliveryId::new(value).map_err(|_error| BuiltInProviderError::InvalidWebhookPayload)
 }
@@ -266,12 +289,10 @@ pub(crate) fn verify_prefixed_hmac_sha256(
     prefix: &str,
     body: &[u8],
 ) -> Result<(), BuiltInProviderError> {
-    let Some(header) = header else {
-        return Err(BuiltInProviderError::MissingWebhookAuthentication);
-    };
-    let Some(signature_hex) = header.strip_prefix(prefix) else {
-        return Err(BuiltInProviderError::InvalidWebhookAuthentication);
-    };
+    let header = header.ok_or(BuiltInProviderError::MissingWebhookAuthentication)?;
+    let signature_hex = header
+        .strip_prefix(prefix)
+        .ok_or(BuiltInProviderError::InvalidWebhookAuthentication)?;
     if signature_hex.len() != HMAC_SHA256_HEX_BYTES {
         return Err(BuiltInProviderError::InvalidWebhookAuthentication);
     }
@@ -299,9 +320,7 @@ pub(crate) fn verify_constant_time_secret(
     expected: &str,
     actual: Option<&str>,
 ) -> Result<(), BuiltInProviderError> {
-    let Some(actual) = actual else {
-        return Err(BuiltInProviderError::MissingWebhookAuthentication);
-    };
+    let actual = actual.ok_or(BuiltInProviderError::MissingWebhookAuthentication)?;
     // Always perform constant-time comparison to avoid leaking secret length
     // via timing side-channel. Pad the shorter value with zeros to equal length.
     let max_len = expected.len().max(actual.len());
@@ -343,16 +362,13 @@ mod tests {
 
     #[test]
     fn catalog_rejects_duplicate_repository_registration() {
-        let mut catalog = BuiltInProviderCatalog::new("integration");
+        let catalog = BuiltInProviderCatalog::new("integration");
         let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
         let subject = ProviderSubject::new("user-1");
 
-        assert!(catalog.is_ok());
-        assert!(repository.is_ok());
-        assert!(subject.is_ok());
-        let (Ok(catalog), Ok(repository), Ok(subject)) = (&mut catalog, repository, subject) else {
-            return;
-        };
+        let mut catalog = catalog.expect("expected valid catalog");
+        let repository = repository.expect("expected valid repository");
+        let subject = subject.expect("expected valid subject");
         let metadata = configured_metadata(
             repository,
             RepositoryVisibility::Private,
@@ -360,10 +376,7 @@ mod tests {
             "https://example.invalid/team/assets.git",
         );
 
-        assert!(metadata.is_ok());
-        let Ok(metadata) = metadata else {
-            return;
-        };
+        let metadata = metadata.expect("expected valid metadata");
         let first = catalog.register(ProviderRepositoryPolicy::new(
             metadata.clone(),
             HashSet::from([subject.clone()]),
@@ -381,20 +394,15 @@ mod tests {
 
     #[test]
     fn catalog_returns_allow_and_deny_from_repository_policy() {
-        let mut catalog = BuiltInProviderCatalog::new("integration");
+        let catalog = BuiltInProviderCatalog::new("integration");
         let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
         let allowed = ProviderSubject::new("user-1");
         let denied = ProviderSubject::new("user-2");
 
-        assert!(catalog.is_ok());
-        assert!(repository.is_ok());
-        assert!(allowed.is_ok());
-        assert!(denied.is_ok());
-        let (Ok(catalog), Ok(repository), Ok(allowed), Ok(denied)) =
-            (&mut catalog, repository, allowed, denied)
-        else {
-            return;
-        };
+        let mut catalog = catalog.expect("expected valid catalog");
+        let repository = repository.expect("expected valid repository");
+        let allowed = allowed.expect("expected valid allowed");
+        let denied = denied.expect("expected valid denied");
         let metadata = configured_metadata(
             repository.clone(),
             RepositoryVisibility::Private,
@@ -402,10 +410,7 @@ mod tests {
             "https://example.invalid/team/assets.git",
         );
 
-        assert!(metadata.is_ok());
-        let Ok(metadata) = metadata else {
-            return;
-        };
+        let metadata = metadata.expect("expected valid metadata");
         let register = catalog.register(ProviderRepositoryPolicy::new(
             metadata,
             HashSet::from([allowed.clone()]),
@@ -439,10 +444,7 @@ mod tests {
     fn parser_builds_repository_from_full_name() {
         let repository = parse_repository_from_full_name(ProviderKind::GitLab, "team/assets");
 
-        assert!(repository.is_ok());
-        let Ok(repository) = repository else {
-            return;
-        };
+        let repository = repository.expect("expected valid repository");
 
         assert_eq!(repository.owner(), "team");
         assert_eq!(repository.name(), "assets");
@@ -547,22 +549,16 @@ mod tests {
         let repo = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
         let subject = ProviderSubject::new("user-1");
         let other = ProviderSubject::new("user-2");
-        assert!(repo.is_ok());
-        assert!(subject.is_ok());
-        assert!(other.is_ok());
-        let (Ok(repo), Ok(subject), Ok(other)) = (repo, subject, other) else {
-            return;
-        };
+        let repo = repo.expect("expected valid repo");
+        let subject = subject.expect("expected valid subject");
+        let other = other.expect("expected valid other");
         let metadata = configured_metadata(
             repo,
             RepositoryVisibility::Private,
             "main",
             "https://example.invalid/team/assets.git",
         );
-        assert!(metadata.is_ok());
-        let Ok(metadata) = metadata else {
-            return;
-        };
+        let metadata = metadata.expect("expected valid metadata");
         let policy = ProviderRepositoryPolicy::new(
             metadata,
             HashSet::from([subject.clone()]),
@@ -577,21 +573,15 @@ mod tests {
     fn provider_repository_policy_allows_write_subjects() {
         let repo = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
         let subject = ProviderSubject::new("user-1");
-        assert!(repo.is_ok());
-        assert!(subject.is_ok());
-        let (Ok(repo), Ok(subject)) = (repo, subject) else {
-            return;
-        };
+        let repo = repo.expect("expected valid repo");
+        let subject = subject.expect("expected valid subject");
         let metadata = configured_metadata(
             repo,
             RepositoryVisibility::Private,
             "main",
             "https://example.invalid/team/assets.git",
         );
-        assert!(metadata.is_ok());
-        let Ok(metadata) = metadata else {
-            return;
-        };
+        let metadata = metadata.expect("expected valid metadata");
         let policy = ProviderRepositoryPolicy::new(
             metadata,
             HashSet::new(),
@@ -630,19 +620,15 @@ mod tests {
     #[test]
     fn normalize_default_revision_prepends_refs_heads() {
         let result = super::normalize_default_revision("main");
-        assert!(result.is_ok());
-        if let Ok(rev) = result {
-            assert_eq!(rev.as_str(), "refs/heads/main");
-        }
+        let rev = result.expect("expected valid rev");
+        assert_eq!(rev.as_str(), "refs/heads/main");
     }
 
     #[test]
     fn normalize_default_revision_preserves_refs_prefix() {
         let result = super::normalize_default_revision("refs/tags/v1.0");
-        assert!(result.is_ok());
-        if let Ok(rev) = result {
-            assert_eq!(rev.as_str(), "refs/tags/v1.0");
-        }
+        let rev = result.expect("expected valid rev");
+        assert_eq!(rev.as_str(), "refs/tags/v1.0");
     }
 
     #[test]
@@ -660,15 +646,9 @@ mod tests {
     #[test]
     fn catalog_rejects_unknown_repository() {
         let catalog = BuiltInProviderCatalog::new("integration");
-        assert!(catalog.is_ok());
-        let Ok(catalog) = catalog else {
-            return;
-        };
+        let catalog = catalog.expect("expected valid catalog");
         let unknown_repo = RepositoryRef::new(ProviderKind::GitHub, "unknown", "repo");
-        assert!(unknown_repo.is_ok());
-        let Ok(unknown_repo) = unknown_repo else {
-            return;
-        };
+        let unknown_repo = unknown_repo.expect("expected valid unknown_repo");
         assert_eq!(
             catalog.repository(&unknown_repo),
             Err(BuiltInProviderError::UnknownRepository)
@@ -735,10 +715,7 @@ mod tests {
     #[test]
     fn configured_metadata_accepts_empty_default_revision_as_refs_heads() {
         let repo = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
-        assert!(repo.is_ok());
-        let Ok(repo) = repo else {
-            return;
-        };
+        let repo = repo.expect("expected valid repo");
         let result = configured_metadata(
             repo,
             RepositoryVisibility::Public,
@@ -754,10 +731,7 @@ mod tests {
     #[test]
     fn configured_metadata_rejects_control_characters_in_clone_url() {
         let repo = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
-        assert!(repo.is_ok());
-        let Ok(repo) = repo else {
-            return;
-        };
+        let repo = repo.expect("expected valid repo");
         let result = configured_metadata(
             repo,
             RepositoryVisibility::Public,
@@ -837,10 +811,8 @@ mod tests {
     #[test]
     fn normalize_default_revision_accepts_empty_as_refs_heads() {
         let result = super::normalize_default_revision("");
-        assert!(result.is_ok());
-        if let Ok(rev) = result {
-            assert_eq!(rev.as_str(), "refs/heads/");
-        }
+        let rev = result.expect("expected valid rev");
+        assert_eq!(rev.as_str(), "refs/heads/");
     }
 
     #[test]
@@ -973,8 +945,7 @@ mod tests {
     #[test]
     fn parse_webhook_json_accepts_valid_json() {
         let result = super::parse_webhook_json(b"{\"key\":\"value\"}");
-        assert!(result.is_ok());
-        let Ok(val) = result else { return };
+        let val = result.expect("expected valid val");
         assert_eq!(val["key"], "value");
     }
 
@@ -1034,8 +1005,7 @@ mod tests {
     fn parse_repository_from_full_name_handles_multiple_slashes_as_name() {
         // split_once only splits on the first '/', so "a/b/c" becomes owner="a", name="b/c"
         let result = parse_repository_from_full_name(ProviderKind::GitHub, "a/b/c");
-        assert!(result.is_ok());
-        let Ok(repo) = result else { return };
+        let repo = result.expect("expected valid repo");
         assert_eq!(repo.owner(), "a");
         assert_eq!(repo.name(), "b/c");
     }
@@ -1148,8 +1118,7 @@ mod tests {
             "refs/heads/main",
             "https://example.com/repo.git",
         );
-        assert!(result.is_ok());
-        let Ok(meta) = result else { return };
+        let meta = result.expect("expected valid meta");
         assert_eq!(meta.default_revision().as_str(), "refs/heads/main");
     }
 
@@ -1440,8 +1409,7 @@ mod tests {
     #[test]
     fn parse_repository_from_full_name_handles_unicode() {
         let result = parse_repository_from_full_name(ProviderKind::GitHub, "üser/repo");
-        assert!(result.is_ok());
-        let Ok(repo) = result else { return };
+        let repo = result.expect("expected valid repo");
         assert_eq!(repo.owner(), "üser");
         assert_eq!(repo.name(), "repo");
     }

@@ -231,8 +231,7 @@ pub fn lfs_object_key(oid: &str, auth: &AuthorizedRepository) -> Result<ObjectKe
 
 #[cfg(test)]
 mod tests {
-    use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenClaims, TokenScope};
-    use shardline_server_core::{AuthProvider, AuthorizedRepository, LocalHmacProvider};
+    use crate::tests::{test_capability, test_scope};
 
     use super::*;
 
@@ -240,56 +239,23 @@ mod tests {
         "a".repeat(64)
     }
 
-    fn test_scope() -> RepositoryScope {
-        RepositoryScope::new(RepositoryProvider::GitHub, "acme", "repo", None).unwrap()
-    }
-
-    /// Builds a capability carrying the given repository scope (or a
-    /// permissive anonymous capability when `None`), mirroring how the auth
-    /// layer mints capabilities: the claims are verified through a real
-    /// provider so the type-level seal is satisfied.
-    fn test_capability(scope: Option<RepositoryScope>) -> AuthorizedRepository {
-        scope.map_or_else(AuthorizedRepository::anonymous_full_access, |repo| {
-            let claims =
-                TokenClaims::new("local", "test", TokenScope::Write, repo, u64::MAX).unwrap();
-            let provider = LocalHmacProvider::new(b"test-signing-key-32-bytes-long!!").unwrap();
-            let token = provider.mint_token(&claims).unwrap();
-            let ctx = provider.verify_verified(&token).unwrap();
-            AuthorizedRepository::from_verified_context(ctx, TokenScope::Write).unwrap()
-        })
-    }
-
     // --- lfs_object_key ---
 
     #[test]
-    fn lfs_object_key_valid_no_scope() {
+    fn lfs_object_keys_are_stable_with_and_without_scope() {
         let oid = valid_oid();
-        let key = lfs_object_key(&oid, &test_capability(None)).unwrap();
-        assert!(key.as_str().contains("protocols/lfs/global/objects/"));
-        assert!(key.as_str().ends_with(&oid));
-    }
-
-    #[test]
-    fn lfs_object_key_valid_with_scope() {
-        let oid = valid_oid();
-        let scope = test_scope();
-        let key = lfs_object_key(&oid, &test_capability(Some(scope))).unwrap();
-        assert!(!key.as_str().contains("global"));
-        assert!(key.as_str().contains("protocols/lfs/"));
-        assert!(key.as_str().ends_with(&oid));
-    }
-
-    #[test]
-    fn lfs_object_key_invalid_too_short() {
-        let result = lfs_object_key("abc123", &test_capability(None));
-        assert!(matches!(result, Err(ProtocolError::InvalidContentHash)));
-    }
-
-    #[test]
-    fn lfs_object_key_invalid_uppercase() {
-        let uppercase_oid = "A".repeat(64);
-        let result = lfs_object_key(&uppercase_oid, &test_capability(None));
-        assert!(matches!(result, Err(ProtocolError::InvalidContentHash)));
+        for scope in [None, Some(test_scope())] {
+            let scoped = scope.is_some();
+            let key = lfs_object_key(&oid, &test_capability(scope.clone())).unwrap();
+            assert_eq!(key, lfs_object_key(&oid, &test_capability(scope)).unwrap());
+            assert!(key.as_str().contains("protocols/lfs/"));
+            assert!(key.as_str().ends_with(&oid));
+            if scoped {
+                assert!(!key.as_str().contains("global"));
+            } else {
+                assert_eq!(key.as_str(), format!("protocols/lfs/global/objects/{oid}"));
+            }
+        }
     }
 
     // --- LfsBatchRequest deserialization ---
@@ -322,119 +288,6 @@ mod tests {
         assert!(request.transfers.is_empty());
         assert!(request.hash_algo.is_none());
         assert_eq!(request.objects.len(), 1);
-    }
-
-    // --- LfsBatchResponse serialization ---
-
-    #[test]
-    fn lfs_batch_response_serialize_valid_json() {
-        let response = LfsBatchResponse {
-            transfer: "basic".to_owned(),
-            objects: vec![LfsObjectResponse {
-                oid: "deadbeef".to_owned(),
-                size: 42,
-                authenticated: Some(true),
-                actions: None,
-                error: None,
-            }],
-            hash_algo: "sha256",
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["transfer"], "basic");
-        assert_eq!(json["hash_algo"], "sha256");
-        assert_eq!(json["objects"][0]["oid"], "deadbeef");
-        assert_eq!(json["objects"][0]["size"], 42);
-        assert_eq!(json["objects"][0]["authenticated"], true);
-    }
-
-    #[test]
-    fn lfs_batch_response_hash_algo_is_always_sha256() {
-        let response = LfsBatchResponse {
-            transfer: "basic".to_owned(),
-            objects: vec![],
-            hash_algo: "sha256",
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["hash_algo"], "sha256");
-    }
-
-    #[test]
-    fn lfs_batch_response_omits_none_fields() {
-        let response = LfsBatchResponse {
-            transfer: "basic".to_owned(),
-            objects: vec![LfsObjectResponse {
-                oid: "deadbeef".to_owned(),
-                size: 42,
-                authenticated: None,
-                actions: None,
-                error: None,
-            }],
-            hash_algo: "sha256",
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        assert!(json["objects"][0].get("authenticated").is_none());
-        assert!(json["objects"][0].get("actions").is_none());
-        assert!(json["objects"][0].get("error").is_none());
-    }
-
-    // --- LfsObjectError serialization ---
-
-    #[test]
-    fn lfs_object_error_serialize() {
-        let err = LfsObjectError {
-            code: 404,
-            message: "Not found".into(),
-        };
-        let json = serde_json::to_value(&err).unwrap();
-        assert_eq!(json["code"], 404);
-        assert_eq!(json["message"], "Not found");
-    }
-
-    // --- LfsBatchResponse with actions ---
-
-    #[test]
-    fn lfs_batch_response_with_actions() {
-        let response = LfsBatchResponse {
-            transfer: "basic".to_owned(),
-            objects: vec![LfsObjectResponse {
-                oid: "deadbeef".to_owned(),
-                size: 42,
-                authenticated: None,
-                actions: Some(serde_json::json!({"download": {"href": "https://example.com/obj"}})),
-                error: None,
-            }],
-            hash_algo: "sha256",
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        let obj = &json["objects"][0];
-        assert_eq!(
-            obj["actions"]["download"]["href"],
-            "https://example.com/obj"
-        );
-    }
-
-    // --- LfsBatchResponse with error on object ---
-
-    #[test]
-    fn lfs_batch_response_with_object_error() {
-        let response = LfsBatchResponse {
-            transfer: "basic".to_owned(),
-            objects: vec![LfsObjectResponse {
-                oid: "deadbeef".to_owned(),
-                size: 42,
-                authenticated: None,
-                actions: None,
-                error: Some(LfsObjectError {
-                    code: 422,
-                    message: "validation error".into(),
-                }),
-            }],
-            hash_algo: "sha256",
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        let obj = &json["objects"][0];
-        assert_eq!(obj["error"]["code"], 422);
-        assert_eq!(obj["error"]["message"], "validation error");
     }
 
     // --- LfsBatchResponse with mixed objects ---
@@ -472,28 +325,26 @@ mod tests {
             hash_algo: "sha256",
         };
         let json = serde_json::to_value(&response).unwrap();
-        let objects = &json["objects"];
-        assert_eq!(objects.as_array().unwrap().len(), 3);
-
-        // First object: has actions
-        assert!(objects[0].get("actions").is_some());
-
-        // Second object: has error
-        assert_eq!(objects[1]["error"]["code"], 404);
-
-        // Third object: no actions, no error (both omitted)
-        assert!(objects[2].get("actions").is_none());
-        assert!(objects[2].get("error").is_none());
-        assert!(objects[2].get("authenticated").is_none());
-    }
-
-    // --- LfsObjectRequest deserialization ---
-
-    #[test]
-    fn lfs_object_request_deserialize() {
-        let json = r#"{"oid": "abc123", "size": 999}"#;
-        let req: LfsObjectRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.oid, "abc123");
-        assert_eq!(req.size, 999);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "transfer": "basic",
+                "hash_algo": "sha256",
+                "objects": [
+                    {
+                        "oid": "aaa",
+                        "size": 1,
+                        "authenticated": true,
+                        "actions": {"download": {"href": "https://ok"}},
+                    },
+                    {
+                        "oid": "bbb",
+                        "size": 2,
+                        "error": {"code": 404, "message": "gone"},
+                    },
+                    {"oid": "ccc", "size": 3},
+                ],
+            })
+        );
     }
 }

@@ -10,24 +10,33 @@ use super::environment::var;
 use super::file::ShardlineTomlConfig;
 use super::secrets::{
     configure_provider_runtime_from_paths, ensure_secret_size_within_limit,
+    load_hub_recovery_archive_s3_config, load_hub_recovery_signing_key_from_file,
     load_redis_tls_config_from_env, load_s3_object_store_config_from_env, read_secret_file_bytes,
+    recovery_config_error,
 };
 use super::{
     AuthProviderKind, CONFIG_SECRET_KEY_BYTES, DEFAULT_LFS_PATCH_MAX_ACTIVE_SESSIONS,
     DEFAULT_LFS_PATCH_MAX_SEEK_AHEAD_BYTES, DEFAULT_LFS_PATCH_TOTAL_MAX_BYTES,
     DEFAULT_LFS_PATCH_TTL_SECONDS, DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_MAX_REVISIONS_PER_REPO,
     DEFAULT_MAX_SHARD_FILES, DEFAULT_MAX_SHARD_RECONSTRUCTION_TERMS, DEFAULT_MAX_SHARD_XORB_CHUNKS,
-    DEFAULT_MAX_SHARD_XORBS, DEFAULT_MAX_TREE_ENTRIES_PER_REPO, DEFAULT_S3_MAX_PART_BYTES,
-    DEFAULT_S3_MIN_PART_BYTES, DEFAULT_S3_UPLOAD_MAX_ACTIVE_PART_FILES,
-    DEFAULT_S3_UPLOAD_MAX_ACTIVE_SESSIONS, DEFAULT_S3_UPLOAD_SESSION_MAX_BYTES,
-    DEFAULT_S3_UPLOAD_SESSION_TTL_SECONDS, DEFAULT_S3_UPLOAD_TOTAL_MAX_BYTES, DeploymentMode,
-    HUB_WEBHOOK_SECRET_KEY_BYTES, MAX_ADMIN_READ_TOKEN_BYTES, MAX_ED25519_KEY_BYTES,
-    MAX_METRICS_TOKEN_BYTES, MAX_TOKEN_SIGNING_KEY_BYTES, ObjectStorageAdapter, ServerConfig,
-    ServerConfigError, ShardMetadataLimits, default_transfer_max_in_flight_chunks,
+    DEFAULT_MAX_SHARD_XORBS, DEFAULT_MAX_TREE_ENTRIES_PER_REPO,
+    DEFAULT_OCI_REGISTRY_TOKEN_TTL_SECONDS, DEFAULT_OCI_UPLOAD_MAX_ACTIVE_SESSIONS,
+    DEFAULT_OCI_UPLOAD_SESSION_TTL_SECONDS, DEFAULT_S3_MAX_PART_BYTES, DEFAULT_S3_MIN_PART_BYTES,
+    DEFAULT_S3_UPLOAD_MAX_ACTIVE_PART_FILES, DEFAULT_S3_UPLOAD_MAX_ACTIVE_SESSIONS,
+    DEFAULT_S3_UPLOAD_SESSION_MAX_BYTES, DEFAULT_S3_UPLOAD_SESSION_TTL_SECONDS,
+    DEFAULT_S3_UPLOAD_TOTAL_MAX_BYTES, DeploymentMode, HUB_WEBHOOK_SECRET_KEY_BYTES,
+    MAX_ADMIN_READ_TOKEN_BYTES, MAX_ED25519_KEY_BYTES, MAX_METRICS_TOKEN_BYTES,
+    MAX_TOKEN_SIGNING_KEY_BYTES, ObjectStorageAdapter, ServerConfig, ServerConfigError,
+    ShardMetadataLimits, default_transfer_max_in_flight_chunks,
     default_upload_max_in_flight_chunks, parse_byte_size,
 };
 use crate::{
-    reconstruction_cache::ReconstructionCacheAdapter, server_frontend::ServerFrontend,
+    jwt_keys::is_secure_url as is_secure_jwks_url,
+    reconstruction_cache::{
+        DEFAULT_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES, DEFAULT_RECONSTRUCTION_CACHE_TTL_SECONDS,
+        ReconstructionCacheAdapter,
+    },
+    server_frontend::ServerFrontend,
     server_role::ServerRole,
 };
 
@@ -58,51 +67,51 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         ObjectStorageAdapter::Local => None,
         ObjectStorageAdapter::S3 => Some(load_s3_object_store_config_from_env()?),
     };
-    let raw_max_request_body_bytes = var("SHARDLINE_MAX_REQUEST_BODY_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_MAX_REQUEST_BODY_BYTES.get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::MaxRequestBodyBytes)?;
-    let Some(max_request_body_bytes) = NonZeroUsize::new(raw_max_request_body_bytes) else {
-        return Err(ServerConfigError::ZeroMaxRequestBodyBytes);
-    };
+    let max_request_body_bytes = load_non_zero_usize_env(
+        "SHARDLINE_MAX_REQUEST_BODY_BYTES",
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+        ServerConfigError::MaxRequestBodyBytes,
+        ServerConfigError::ZeroMaxRequestBodyBytes,
+    )?;
     let max_xorb_body_bytes = max_xorb_body_bytes_from_env(max_request_body_bytes)?;
+    let selective_serialized_xorb_ranges = selective_serialized_xorb_ranges_from_env()?;
     let shard_metadata_limits = ShardMetadataLimits::new(
         load_non_zero_usize_env(
             "SHARDLINE_MAX_SHARD_FILES",
             DEFAULT_MAX_SHARD_FILES,
             ServerConfigError::MaxShardFiles,
-            || ServerConfigError::ZeroMaxShardFiles,
+            ServerConfigError::ZeroMaxShardFiles,
         )?,
         load_non_zero_usize_env(
             "SHARDLINE_MAX_SHARD_XORBS",
             DEFAULT_MAX_SHARD_XORBS,
             ServerConfigError::MaxShardXorbs,
-            || ServerConfigError::ZeroMaxShardXorbs,
+            ServerConfigError::ZeroMaxShardXorbs,
         )?,
         load_non_zero_usize_env(
             "SHARDLINE_MAX_SHARD_RECONSTRUCTION_TERMS",
             DEFAULT_MAX_SHARD_RECONSTRUCTION_TERMS,
             ServerConfigError::MaxShardReconstructionTerms,
-            || ServerConfigError::ZeroMaxShardReconstructionTerms,
+            ServerConfigError::ZeroMaxShardReconstructionTerms,
         )?,
         load_non_zero_usize_env(
             "SHARDLINE_MAX_SHARD_XORB_CHUNKS",
             DEFAULT_MAX_SHARD_XORB_CHUNKS,
             ServerConfigError::MaxShardXorbChunks,
-            || ServerConfigError::ZeroMaxShardXorbChunks,
+            ServerConfigError::ZeroMaxShardXorbChunks,
         )?,
     );
     let max_revisions_per_repo = load_non_zero_usize_env(
         "SHARDLINE_MAX_REVISIONS_PER_REPO",
         DEFAULT_MAX_REVISIONS_PER_REPO,
         ServerConfigError::MaxRevisionsPerRepo,
-        || ServerConfigError::ZeroMaxRevisionsPerRepo,
+        ServerConfigError::ZeroMaxRevisionsPerRepo,
     )?;
     let max_tree_entries_per_repo = load_non_zero_usize_env(
         "SHARDLINE_MAX_TREE_ENTRIES_PER_REPO",
         DEFAULT_MAX_TREE_ENTRIES_PER_REPO,
         ServerConfigError::MaxTreeEntriesPerRepo,
-        || ServerConfigError::ZeroMaxTreeEntriesPerRepo,
+        ServerConfigError::ZeroMaxTreeEntriesPerRepo,
     )?;
     let raw_chunk_size_str = var("SHARDLINE_CHUNK_SIZE")
         .or_else(|_| var("SHARDLINE_CHUNK_SIZE_BYTES"))
@@ -111,166 +120,123 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     let Some(chunk_size) = NonZeroUsize::new(raw_chunk_size) else {
         return Err(ServerConfigError::ZeroChunkSize);
     };
-    let raw_upload_max_in_flight_chunks = var("SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS")
-        .unwrap_or_else(|_error| default_upload_max_in_flight_chunks().get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::UploadMaxInFlightChunks)?;
-    let raw_upload_max_in_flight_chunks = raw_upload_max_in_flight_chunks.min(1_000_000);
-    let Some(upload_max_in_flight_chunks) = NonZeroUsize::new(raw_upload_max_in_flight_chunks)
-    else {
-        return Err(ServerConfigError::ZeroUploadMaxInFlightChunks);
-    };
-    let raw_transfer_max_in_flight_chunks = var("SHARDLINE_TRANSFER_MAX_IN_FLIGHT_CHUNKS")
-        .unwrap_or_else(|_error| default_transfer_max_in_flight_chunks().get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::TransferMaxInFlightChunks)?;
-    let raw_transfer_max_in_flight_chunks = raw_transfer_max_in_flight_chunks.min(1_000_000);
-    let Some(transfer_max_in_flight_chunks) = NonZeroUsize::new(raw_transfer_max_in_flight_chunks)
-    else {
-        return Err(ServerConfigError::ZeroTransferMaxInFlightChunks);
-    };
+    let upload_max_in_flight_chunks = load_in_flight_limit_env(
+        "SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS",
+        default_upload_max_in_flight_chunks(),
+        ServerConfigError::UploadMaxInFlightChunks,
+        ServerConfigError::ZeroUploadMaxInFlightChunks,
+    )?;
+    let transfer_max_in_flight_chunks = load_in_flight_limit_env(
+        "SHARDLINE_TRANSFER_MAX_IN_FLIGHT_CHUNKS",
+        default_transfer_max_in_flight_chunks(),
+        ServerConfigError::TransferMaxInFlightChunks,
+        ServerConfigError::ZeroTransferMaxInFlightChunks,
+    )?;
     let reconstruction_cache_adapter = ReconstructionCacheAdapter::parse(
         &var("SHARDLINE_RECONSTRUCTION_CACHE_ADAPTER").unwrap_or_else(|_error| "memory".to_owned()),
     )?;
-    let raw_reconstruction_cache_ttl_seconds = var("SHARDLINE_RECONSTRUCTION_CACHE_TTL_SECONDS")
-        .unwrap_or_else(|_error| "30".to_owned())
-        .parse::<u64>()
-        .map_err(ServerConfigError::ReconstructionCacheTtl)?;
-    let Some(reconstruction_cache_ttl_seconds) =
-        NonZeroU64::new(raw_reconstruction_cache_ttl_seconds)
-    else {
-        return Err(ServerConfigError::ZeroReconstructionCacheTtlSeconds);
-    };
-    let raw_reconstruction_cache_memory_max_entries =
-        var("SHARDLINE_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES")
-            .unwrap_or_else(|_error| "4096".to_owned())
-            .parse::<usize>()
-            .map_err(ServerConfigError::ReconstructionCacheMemoryMaxEntries)?;
-    let Some(reconstruction_cache_memory_max_entries) =
-        NonZeroUsize::new(raw_reconstruction_cache_memory_max_entries)
-    else {
-        return Err(ServerConfigError::ZeroReconstructionCacheMemoryMaxEntries);
-    };
-    let raw_oci_upload_session_ttl_seconds = var("SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS")
-        .unwrap_or_else(|_error| "3600".to_owned())
-        .parse::<u64>()
-        .map_err(ServerConfigError::OciUploadSessionTtl)?;
-    let Some(oci_upload_session_ttl_seconds) = NonZeroU64::new(raw_oci_upload_session_ttl_seconds)
-    else {
-        return Err(ServerConfigError::ZeroOciUploadSessionTtlSeconds);
-    };
-    let raw_oci_upload_max_active_sessions = var("SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS")
-        .unwrap_or_else(|_error| "1024".to_owned())
-        .parse::<usize>()
-        .map_err(ServerConfigError::OciUploadMaxActiveSessions)?;
-    let Some(oci_upload_max_active_sessions) =
-        NonZeroUsize::new(raw_oci_upload_max_active_sessions)
-    else {
-        return Err(ServerConfigError::ZeroOciUploadMaxActiveSessions);
-    };
-    let raw_oci_registry_token_ttl_seconds = var("SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS")
-        .unwrap_or_else(|_error| "300".to_owned())
-        .parse::<u64>()
-        .map_err(ServerConfigError::OciRegistryTokenTtl)?;
-    let Some(oci_registry_token_ttl_seconds) = NonZeroU64::new(raw_oci_registry_token_ttl_seconds)
-    else {
-        return Err(ServerConfigError::ZeroOciRegistryTokenTtlSeconds);
-    };
-    let raw_oci_registry_token_max_in_flight_requests =
-        var("SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS")
-            .unwrap_or_else(|_error| "64".to_owned())
-            .parse::<usize>()
-            .map_err(ServerConfigError::OciRegistryTokenMaxInFlightRequests)?;
-    let raw_oci_registry_token_max_in_flight_requests =
-        raw_oci_registry_token_max_in_flight_requests.min(1_000_000);
-    let Some(oci_registry_token_max_in_flight_requests) =
-        NonZeroUsize::new(raw_oci_registry_token_max_in_flight_requests)
-    else {
-        return Err(ServerConfigError::ZeroOciRegistryTokenMaxInFlightRequests);
-    };
-    let raw_s3_max_part_bytes = var("SHARDLINE_S3_MAX_PART_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_S3_MAX_PART_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::S3MaxPartBytes)?;
-    let Some(s3_max_part_bytes) = NonZeroU64::new(raw_s3_max_part_bytes) else {
-        return Err(ServerConfigError::ZeroS3MaxPartBytes);
-    };
-    let raw_s3_upload_session_ttl_seconds = var("SHARDLINE_S3_UPLOAD_SESSION_TTL_SECONDS")
-        .unwrap_or_else(|_error| DEFAULT_S3_UPLOAD_SESSION_TTL_SECONDS.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::S3UploadSessionTtl)?;
-    let Some(s3_upload_session_ttl_seconds) = NonZeroU64::new(raw_s3_upload_session_ttl_seconds)
-    else {
-        return Err(ServerConfigError::ZeroS3UploadSessionTtlSeconds);
-    };
-    let raw_s3_upload_max_active_sessions = var("SHARDLINE_S3_UPLOAD_MAX_ACTIVE_SESSIONS")
-        .unwrap_or_else(|_error| DEFAULT_S3_UPLOAD_MAX_ACTIVE_SESSIONS.get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::S3UploadMaxActiveSessions)?;
-    let Some(s3_upload_max_active_sessions) = NonZeroUsize::new(raw_s3_upload_max_active_sessions)
-    else {
-        return Err(ServerConfigError::ZeroS3UploadMaxActiveSessions);
-    };
-    let raw_s3_min_part_bytes = var("SHARDLINE_S3_MIN_PART_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_S3_MIN_PART_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::S3MinPartBytes)?;
-    let Some(s3_min_part_bytes) = NonZeroU64::new(raw_s3_min_part_bytes) else {
-        return Err(ServerConfigError::ZeroS3MinPartBytes);
-    };
-    let raw_s3_upload_session_max_bytes = var("SHARDLINE_S3_UPLOAD_SESSION_MAX_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_S3_UPLOAD_SESSION_MAX_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::S3UploadSessionMaxBytes)?;
-    let Some(s3_upload_session_max_bytes) = NonZeroU64::new(raw_s3_upload_session_max_bytes) else {
-        return Err(ServerConfigError::ZeroS3UploadSessionMaxBytes);
-    };
-    let raw_s3_upload_total_max_bytes = var("SHARDLINE_S3_UPLOAD_TOTAL_MAX_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_S3_UPLOAD_TOTAL_MAX_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::S3UploadTotalMaxBytes)?;
-    let Some(s3_upload_total_max_bytes) = NonZeroU64::new(raw_s3_upload_total_max_bytes) else {
-        return Err(ServerConfigError::ZeroS3UploadTotalMaxBytes);
-    };
-    let raw_s3_upload_max_active_part_files = var("SHARDLINE_S3_UPLOAD_MAX_ACTIVE_PART_FILES")
-        .unwrap_or_else(|_error| DEFAULT_S3_UPLOAD_MAX_ACTIVE_PART_FILES.get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::S3UploadMaxActivePartFiles)?;
-    let Some(s3_upload_max_active_part_files) =
-        NonZeroUsize::new(raw_s3_upload_max_active_part_files)
-    else {
-        return Err(ServerConfigError::ZeroS3UploadMaxActivePartFiles);
-    };
-    let raw_lfs_patch_ttl_seconds = var("SHARDLINE_LFS_PATCH_TTL_SECONDS")
-        .unwrap_or_else(|_error| DEFAULT_LFS_PATCH_TTL_SECONDS.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::LfsPatchTtl)?;
-    let Some(lfs_patch_ttl_seconds) = NonZeroU64::new(raw_lfs_patch_ttl_seconds) else {
-        return Err(ServerConfigError::ZeroLfsPatchTtlSeconds);
-    };
-    let raw_lfs_patch_max_active_sessions = var("SHARDLINE_LFS_PATCH_MAX_ACTIVE_SESSIONS")
-        .unwrap_or_else(|_error| DEFAULT_LFS_PATCH_MAX_ACTIVE_SESSIONS.get().to_string())
-        .parse::<usize>()
-        .map_err(ServerConfigError::LfsPatchMaxActiveSessions)?;
-    let Some(lfs_patch_max_active_sessions) = NonZeroUsize::new(raw_lfs_patch_max_active_sessions)
-    else {
-        return Err(ServerConfigError::ZeroLfsPatchMaxActiveSessions);
-    };
-    let raw_lfs_patch_total_max_bytes = var("SHARDLINE_LFS_PATCH_TOTAL_MAX_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_LFS_PATCH_TOTAL_MAX_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::LfsPatchTotalMaxBytes)?;
-    let Some(lfs_patch_total_max_bytes) = NonZeroU64::new(raw_lfs_patch_total_max_bytes) else {
-        return Err(ServerConfigError::ZeroLfsPatchTotalMaxBytes);
-    };
-    let raw_lfs_patch_max_seek_ahead_bytes = var("SHARDLINE_LFS_PATCH_MAX_SEEK_AHEAD_BYTES")
-        .unwrap_or_else(|_error| DEFAULT_LFS_PATCH_MAX_SEEK_AHEAD_BYTES.get().to_string())
-        .parse::<u64>()
-        .map_err(ServerConfigError::LfsPatchMaxSeekAheadBytes)?;
-    let Some(lfs_patch_max_seek_ahead_bytes) = NonZeroU64::new(raw_lfs_patch_max_seek_ahead_bytes)
-    else {
-        return Err(ServerConfigError::ZeroLfsPatchMaxSeekAheadBytes);
-    };
+    let reconstruction_cache_ttl_seconds = load_non_zero_u64_env(
+        "SHARDLINE_RECONSTRUCTION_CACHE_TTL_SECONDS",
+        DEFAULT_RECONSTRUCTION_CACHE_TTL_SECONDS,
+        ServerConfigError::ReconstructionCacheTtl,
+        ServerConfigError::ZeroReconstructionCacheTtlSeconds,
+    )?;
+    let reconstruction_cache_memory_max_entries = load_non_zero_usize_env(
+        "SHARDLINE_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES",
+        DEFAULT_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES,
+        ServerConfigError::ReconstructionCacheMemoryMaxEntries,
+        ServerConfigError::ZeroReconstructionCacheMemoryMaxEntries,
+    )?;
+    let oci_upload_session_ttl_seconds = load_non_zero_u64_env(
+        "SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS",
+        DEFAULT_OCI_UPLOAD_SESSION_TTL_SECONDS,
+        ServerConfigError::OciUploadSessionTtl,
+        ServerConfigError::ZeroOciUploadSessionTtlSeconds,
+    )?;
+    let oci_upload_max_active_sessions = load_non_zero_usize_env(
+        "SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS",
+        DEFAULT_OCI_UPLOAD_MAX_ACTIVE_SESSIONS,
+        ServerConfigError::OciUploadMaxActiveSessions,
+        ServerConfigError::ZeroOciUploadMaxActiveSessions,
+    )?;
+    let oci_registry_token_ttl_seconds = load_non_zero_u64_env(
+        "SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS",
+        DEFAULT_OCI_REGISTRY_TOKEN_TTL_SECONDS,
+        ServerConfigError::OciRegistryTokenTtl,
+        ServerConfigError::ZeroOciRegistryTokenTtlSeconds,
+    )?;
+    let oci_registry_token_max_in_flight_requests = load_in_flight_limit_env(
+        "SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS",
+        super::DEFAULT_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS,
+        ServerConfigError::OciRegistryTokenMaxInFlightRequests,
+        ServerConfigError::ZeroOciRegistryTokenMaxInFlightRequests,
+    )?;
+    let s3_max_part_bytes = load_non_zero_u64_env(
+        "SHARDLINE_S3_MAX_PART_BYTES",
+        DEFAULT_S3_MAX_PART_BYTES,
+        ServerConfigError::S3MaxPartBytes,
+        ServerConfigError::ZeroS3MaxPartBytes,
+    )?;
+    let s3_upload_session_ttl_seconds = load_non_zero_u64_env(
+        "SHARDLINE_S3_UPLOAD_SESSION_TTL_SECONDS",
+        DEFAULT_S3_UPLOAD_SESSION_TTL_SECONDS,
+        ServerConfigError::S3UploadSessionTtl,
+        ServerConfigError::ZeroS3UploadSessionTtlSeconds,
+    )?;
+    let s3_upload_max_active_sessions = load_non_zero_usize_env(
+        "SHARDLINE_S3_UPLOAD_MAX_ACTIVE_SESSIONS",
+        DEFAULT_S3_UPLOAD_MAX_ACTIVE_SESSIONS,
+        ServerConfigError::S3UploadMaxActiveSessions,
+        ServerConfigError::ZeroS3UploadMaxActiveSessions,
+    )?;
+    let s3_min_part_bytes = load_non_zero_u64_env(
+        "SHARDLINE_S3_MIN_PART_BYTES",
+        DEFAULT_S3_MIN_PART_BYTES,
+        ServerConfigError::S3MinPartBytes,
+        ServerConfigError::ZeroS3MinPartBytes,
+    )?;
+    let s3_upload_session_max_bytes = load_non_zero_u64_env(
+        "SHARDLINE_S3_UPLOAD_SESSION_MAX_BYTES",
+        DEFAULT_S3_UPLOAD_SESSION_MAX_BYTES,
+        ServerConfigError::S3UploadSessionMaxBytes,
+        ServerConfigError::ZeroS3UploadSessionMaxBytes,
+    )?;
+    let s3_upload_total_max_bytes = load_non_zero_u64_env(
+        "SHARDLINE_S3_UPLOAD_TOTAL_MAX_BYTES",
+        DEFAULT_S3_UPLOAD_TOTAL_MAX_BYTES,
+        ServerConfigError::S3UploadTotalMaxBytes,
+        ServerConfigError::ZeroS3UploadTotalMaxBytes,
+    )?;
+    let s3_upload_max_active_part_files = load_non_zero_usize_env(
+        "SHARDLINE_S3_UPLOAD_MAX_ACTIVE_PART_FILES",
+        DEFAULT_S3_UPLOAD_MAX_ACTIVE_PART_FILES,
+        ServerConfigError::S3UploadMaxActivePartFiles,
+        ServerConfigError::ZeroS3UploadMaxActivePartFiles,
+    )?;
+    let lfs_patch_ttl_seconds = load_non_zero_u64_env(
+        "SHARDLINE_LFS_PATCH_TTL_SECONDS",
+        DEFAULT_LFS_PATCH_TTL_SECONDS,
+        ServerConfigError::LfsPatchTtl,
+        ServerConfigError::ZeroLfsPatchTtlSeconds,
+    )?;
+    let lfs_patch_max_active_sessions = load_non_zero_usize_env(
+        "SHARDLINE_LFS_PATCH_MAX_ACTIVE_SESSIONS",
+        DEFAULT_LFS_PATCH_MAX_ACTIVE_SESSIONS,
+        ServerConfigError::LfsPatchMaxActiveSessions,
+        ServerConfigError::ZeroLfsPatchMaxActiveSessions,
+    )?;
+    let lfs_patch_total_max_bytes = load_non_zero_u64_env(
+        "SHARDLINE_LFS_PATCH_TOTAL_MAX_BYTES",
+        DEFAULT_LFS_PATCH_TOTAL_MAX_BYTES,
+        ServerConfigError::LfsPatchTotalMaxBytes,
+        ServerConfigError::ZeroLfsPatchTotalMaxBytes,
+    )?;
+    let lfs_patch_max_seek_ahead_bytes = load_non_zero_u64_env(
+        "SHARDLINE_LFS_PATCH_MAX_SEEK_AHEAD_BYTES",
+        DEFAULT_LFS_PATCH_MAX_SEEK_AHEAD_BYTES,
+        ServerConfigError::LfsPatchMaxSeekAheadBytes,
+        ServerConfigError::ZeroLfsPatchMaxSeekAheadBytes,
+    )?;
     let reconstruction_cache_redis_url = var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL").ok();
     let reconstruction_cache_redis_tls = load_redis_tls_config_from_env()?;
     let index_postgres_url = var("SHARDLINE_INDEX_POSTGRES_URL").ok();
@@ -285,7 +251,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         // material when the file's last byte is 0x0A.
         false,
         ServerConfigError::EmptyTokenSigningKey,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::TokenSigningKey,
         |observed, maximum| ServerConfigError::TokenSigningKeyTooLarge {
             observed_bytes: observed,
@@ -304,7 +269,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         HUB_WEBHOOK_SECRET_KEY_BYTES,
         true,
         ServerConfigError::EmptyHubWebhookSecretKey,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::HubWebhookSecretKey,
         |observed, maximum| ServerConfigError::HubWebhookSecretKeyTooLarge {
             observed_bytes: observed,
@@ -323,7 +287,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         CONFIG_SECRET_KEY_BYTES,
         true,
         ServerConfigError::EmptyConfigSecretKey,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::ConfigSecretKey,
         |observed, maximum| ServerConfigError::ConfigSecretKeyTooLarge {
             observed_bytes: observed,
@@ -342,7 +305,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         MAX_ED25519_KEY_BYTES,
         false,
         ServerConfigError::EmptyEd25519PrivateKey,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::Ed25519PrivateKey,
         |observed, maximum| ServerConfigError::Ed25519PrivateKeyTooLarge {
             observed_bytes: observed,
@@ -361,7 +323,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         MAX_ED25519_KEY_BYTES,
         false,
         ServerConfigError::EmptyEd25519PublicKey,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::Ed25519PublicKey,
         |observed, maximum| ServerConfigError::Ed25519PublicKeyTooLarge {
             observed_bytes: observed,
@@ -377,7 +338,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         MAX_METRICS_TOKEN_BYTES,
         false,
         ServerConfigError::EmptyMetricsToken,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::MetricsToken,
         |observed, maximum| ServerConfigError::MetricsTokenTooLarge {
             observed_bytes: observed,
@@ -396,7 +356,6 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         MAX_ADMIN_READ_TOKEN_BYTES,
         false,
         ServerConfigError::EmptyAdminReadToken,
-        |env, file_env| ServerConfigError::SecretSourceConflict { env, file_env },
         ServerConfigError::AdminReadToken,
         |observed, maximum| ServerConfigError::AdminReadTokenTooLarge {
             observed_bytes: observed,
@@ -420,6 +379,7 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         .with_object_storage(object_storage_adapter, s3_object_store_config)
         .with_max_request_body_bytes(max_request_body_bytes)
         .with_max_xorb_body_bytes(max_xorb_body_bytes)
+        .with_selective_serialized_xorb_ranges(selective_serialized_xorb_ranges)
         .with_shard_metadata_limits(shard_metadata_limits)
         .with_upload_max_in_flight_chunks(upload_max_in_flight_chunks)
         .with_transfer_max_in_flight_chunks(transfer_max_in_flight_chunks)
@@ -503,6 +463,12 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         .filter(|hosts| !hosts.is_empty());
     let auth_jwks_url = var("SHARDLINE_AUTH_JWKS_URL").ok();
     let auth_jwks_issuer = var("SHARDLINE_AUTH_JWKS_ISSUER").ok();
+    let auth_jwks_audience = var("SHARDLINE_AUTH_JWKS_AUDIENCE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let auth_jwt_repository_claim = var("SHARDLINE_AUTH_JWT_REPOSITORY_CLAIM").ok();
+    let auth_jwt_scope_claim = var("SHARDLINE_AUTH_JWT_SCOPE_CLAIM").ok();
     match auth_provider {
         AuthProviderKind::Oidc => match auth_oidc_issuer.as_deref() {
             None => return Err(ServerConfigError::MissingOidcIssuer),
@@ -551,6 +517,15 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
     }
     if let Some(issuer) = auth_jwks_issuer {
         config = config.with_auth_jwks_issuer(issuer);
+    }
+    if let Some(value) = auth_jwks_audience {
+        config = config.with_auth_jwks_audience(value);
+    }
+    if let Some(value) = auth_jwt_repository_claim {
+        config = config.with_auth_jwt_repository_claim(value);
+    }
+    if let Some(value) = auth_jwt_scope_claim {
+        config = config.with_auth_jwt_scope_claim(value);
     }
     if let Some(key) = ed25519_private_key {
         config = config.with_ed25519_private_key(key)?;
@@ -621,45 +596,108 @@ pub(super) fn load_server_config_from_env() -> Result<ServerConfig, ServerConfig
         provider_ttl_seconds,
     )?;
 
+    config = configure_hub_recovery_from_env(config)?;
+
     Ok(config)
+}
+
+fn configure_hub_recovery_from_env(
+    config: ServerConfig,
+) -> Result<ServerConfig, ServerConfigError> {
+    let mode = match var("SHARDLINE_HUB_RECOVERY_MODE") {
+        Ok(value) => parse_hub_recovery_mode(&value)?,
+        Err(_) => return Ok(config),
+    };
+    if mode == super::HubRecoveryMode::Off {
+        return Ok(config.with_hub_recovery(mode, None));
+    }
+
+    let deployment_id = var("SHARDLINE_HUB_RECOVERY_DEPLOYMENT_ID")
+        .map_err(|_error| recovery_config_error("Hub recovery deployment_id is required"))?;
+    if deployment_id.is_empty()
+        || deployment_id.len() > 256
+        || deployment_id.chars().any(char::is_control)
+    {
+        return Err(recovery_config_error("invalid Hub recovery deployment_id"));
+    }
+    let key_id = var("SHARDLINE_HUB_RECOVERY_KEY_ID")
+        .map_err(|_error| recovery_config_error("Hub recovery key_id is required"))?;
+    shardline_reliability::validate_hub_ref_archive_key_id(&key_id)
+        .map_err(|_error| recovery_config_error("invalid Hub recovery key_id"))?;
+    let key_path = var("SHARDLINE_HUB_RECOVERY_SIGNING_KEY_FILE")
+        .map_err(|_error| recovery_config_error("Hub recovery signing_key_path is required"))?;
+    let signing_key = load_hub_recovery_signing_key_from_file(Path::new(&key_path))?;
+    let archive_adapter = ObjectStorageAdapter::parse(
+        &var("SHARDLINE_HUB_RECOVERY_OBJECT_STORAGE_ADAPTER")
+            .map_err(|_error| recovery_config_error("Hub recovery archive adapter is required"))?,
+    )?;
+    if archive_adapter != ObjectStorageAdapter::S3 {
+        return Err(recovery_config_error(
+            "Hub recovery archive requires a separately configured S3 target",
+        ));
+    }
+    let archive_s3 = load_hub_recovery_archive_s3_config()?;
+    if config
+        .s3_object_store_config()
+        .is_some_and(|payload| payload.overlaps_object_namespace(&archive_s3))
+    {
+        return Err(recovery_config_error(
+            "Hub recovery archive target overlaps the payload S3 namespace",
+        ));
+    }
+
+    Ok(config.with_hub_recovery(
+        mode,
+        Some(super::types::config::HubRecoveryRuntimeConfig {
+            deployment_id,
+            key_id,
+            signing_key,
+            archive_s3,
+        }),
+    ))
+}
+
+fn parse_hub_recovery_mode(value: &str) -> Result<super::HubRecoveryMode, ServerConfigError> {
+    if value.trim().eq_ignore_ascii_case("off") {
+        Ok(super::HubRecoveryMode::Off)
+    } else if value.trim().eq_ignore_ascii_case("shadow") {
+        Ok(super::HubRecoveryMode::Shadow)
+    } else {
+        Err(recovery_config_error(
+            "invalid Hub recovery mode; expected off or shadow",
+        ))
+    }
+}
+
+fn selective_serialized_xorb_ranges_from_env() -> Result<bool, ServerConfigError> {
+    match var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES") {
+        Err(_) => Ok(false),
+        Ok(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Ok(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Ok(value) => Err(ServerConfigError::InvalidSelectiveXorbRangeMode { value }),
+    }
 }
 
 /// Loads a bounded pool size, warning and falling back to `default` for zero,
 /// invalid syntax, or capacities above the batch-count/Tokio representable limit.
 pub(crate) fn bounded_pool_size_from_env(name: &str, default: usize) -> NonZeroUsize {
     let fallback = NonZeroUsize::new(default).unwrap_or(NonZeroUsize::MIN);
-    var(name).map_or_else(
-        |_| fallback,
-        |v| {
-            v.parse::<NonZeroUsize>()
-                .ok()
-                .filter(|capacity| capacity.get() <= crate::admission::maximum_counted_capacity())
-                .unwrap_or_else(|| {
-                    tracing::warn!("invalid {name} value '{v}', using default {default}");
-                    fallback
-                })
-        },
-    )
+    let Ok(value) = var(name) else {
+        return fallback;
+    };
+    match value.parse::<NonZeroUsize>() {
+        Ok(capacity) if capacity.get() <= crate::admission::maximum_counted_capacity() => capacity,
+        _ => {
+            tracing::warn!("invalid {name} value '{value}', using default {default}");
+            fallback
+        }
+    }
 }
 
 /// Parses `SHARDLINE_ADMISSION_MAX_WEIGHT`, warning and falling back to 256 for
 /// invalid syntax, zero, or capacities above the batch-count/Tokio limit.
 pub(crate) fn admission_max_weight_from_env() -> NonZeroUsize {
-    let fallback = NonZeroUsize::new(256).unwrap_or(NonZeroUsize::MIN);
-    var("SHARDLINE_ADMISSION_MAX_WEIGHT").map_or_else(
-        |_| fallback,
-        |v| {
-            v.parse::<NonZeroUsize>()
-                .ok()
-                .filter(|capacity| capacity.get() <= crate::admission::maximum_counted_capacity())
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "invalid SHARDLINE_ADMISSION_MAX_WEIGHT value '{v}', using default 256"
-                    );
-                    fallback
-                })
-        },
-    )
+    bounded_pool_size_from_env("SHARDLINE_ADMISSION_MAX_WEIGHT", 256)
 }
 
 /// Parses the `SHARDLINE_DEPLOYMENT_MODE` environment variable.
@@ -695,30 +733,6 @@ fn is_https_url(value: &str) -> bool {
     url::Url::parse(value).is_ok_and(|parsed| parsed.scheme() == "https")
 }
 
-/// Returns true when `value` is an https URL, or an http URL whose host is
-/// loopback (`127.0.0.1`, `::1`, or `localhost`).
-///
-/// JWKS key transport must be encrypted (RFC 8414 §2); plain-http is
-/// tolerated only for loopback hosts so local development and test tooling
-/// (which cannot serve TLS) keep working. Non-loopback http is rejected.
-fn is_secure_jwks_url(value: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(value) else {
-        return false;
-    };
-    if parsed.scheme() == "https" {
-        return true;
-    }
-    if parsed.scheme() != "http" {
-        return false;
-    }
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-        None => false,
-    }
-}
-
 fn parse_server_frontends_env(value: &str) -> Result<Vec<ServerFrontend>, ServerConfigError> {
     let mut parsed = Vec::new();
     for token in value.split(',').map(str::trim) {
@@ -750,16 +764,11 @@ fn parse_server_frontends_env(value: &str) -> Result<Vec<ServerFrontend>, Server
 /// (e.g. the 32-byte Hub webhook secret); variable-length secrets (e.g. the
 /// token signing key) must pass `false` so a trailing newline is never silently
 /// altered.
-// The shared loader legitimately carries several error-mapping callbacks; the
-// additional `strip_trailing_newline` flag keeps it one argument over clippy's
-// default threshold.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn load_secret_from_env_or_file_with_conflict_check(
     env_names: (&'static str, &'static str),
     maximum_bytes: u64,
     strip_trailing_newline: bool,
     empty_error: ServerConfigError,
-    source_conflict_error: impl Fn(&'static str, &'static str) -> ServerConfigError + Copy,
     read_error: impl Fn(IoError) -> ServerConfigError + Copy,
     too_large_error: impl Fn(u64, u64) -> ServerConfigError + Copy,
     length_mismatch_error: impl Fn(u64, u64) -> ServerConfigError + Copy,
@@ -768,7 +777,10 @@ pub(super) fn load_secret_from_env_or_file_with_conflict_check(
     let direct = var(env_name).ok();
     let file = var(file_env_name).ok();
     match (direct, file) {
-        (Some(_direct), Some(_file)) => Err(source_conflict_error(env_name, file_env_name)),
+        (Some(_direct), Some(_file)) => Err(ServerConfigError::SecretSourceConflict {
+            env: env_name,
+            file_env: file_env_name,
+        }),
         (Some(value), None) => {
             let bytes = SecretBytes::new(value.into_bytes());
             if bytes.expose_secret().is_empty() {
@@ -810,7 +822,7 @@ fn max_xorb_body_bytes_from_env(
             super::DEFAULT_MAX_XORB_BODY_BYTES
         },
         ServerConfigError::MaxXorbBodyBytes,
-        || ServerConfigError::ZeroMaxXorbBodyBytes,
+        ServerConfigError::ZeroMaxXorbBodyBytes,
     )
 }
 
@@ -818,13 +830,34 @@ fn load_non_zero_usize_env(
     name: &str,
     default: NonZeroUsize,
     parse_error: fn(ParseIntError) -> ServerConfigError,
-    zero_error: impl FnOnce() -> ServerConfigError,
+    zero_error: ServerConfigError,
 ) -> Result<NonZeroUsize, ServerConfigError> {
-    let raw = var(name)
-        .unwrap_or_else(|_error| default.get().to_string())
-        .parse::<usize>()
-        .map_err(parse_error)?;
-    NonZeroUsize::new(raw).ok_or_else(zero_error)
+    match var(name) {
+        Ok(value) => NonZeroUsize::new(value.parse().map_err(parse_error)?).ok_or(zero_error),
+        Err(_) => Ok(default),
+    }
+}
+
+fn load_in_flight_limit_env(
+    name: &str,
+    default: NonZeroUsize,
+    parse_error: fn(ParseIntError) -> ServerConfigError,
+    zero_error: ServerConfigError,
+) -> Result<NonZeroUsize, ServerConfigError> {
+    let limit = load_non_zero_usize_env(name, default, parse_error, zero_error)?;
+    Ok(limit.min(NonZeroUsize::new(1_000_000).unwrap_or(NonZeroUsize::MIN)))
+}
+
+fn load_non_zero_u64_env(
+    name: &str,
+    default: NonZeroU64,
+    parse_error: fn(ParseIntError) -> ServerConfigError,
+    zero_error: ServerConfigError,
+) -> Result<NonZeroU64, ServerConfigError> {
+    match var(name) {
+        Ok(value) => NonZeroU64::new(value.parse().map_err(parse_error)?).ok_or(zero_error),
+        Err(_) => Ok(default),
+    }
 }
 
 /// Loads server configuration from environment variables, applying optional
@@ -874,6 +907,10 @@ pub fn load_server_config_from_env_with_toml(
         set_if_unset(
             "SHARDLINE_MAX_XORB_BODY_BYTES",
             srv.max_xorb_body_bytes.map(|v| v.to_string()),
+        );
+        set_if_unset(
+            "SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES",
+            srv.selective_serialized_xorb_ranges.map(|v| v.to_string()),
         );
         set_if_unset(
             "SHARDLINE_CHUNK_SIZE_BYTES",
@@ -950,8 +987,18 @@ pub fn load_server_config_from_env_with_toml(
             "SHARDLINE_PROVIDER_TOKEN_TTL_SECONDS",
             auth.provider_token_ttl_seconds.map(|v| v.to_string()),
         );
+        set_if_unset(
+            "SHARDLINE_AUTH_JWT_REPOSITORY_CLAIM",
+            auth.jwt_repository_claim.clone(),
+        );
+        set_if_unset(
+            "SHARDLINE_AUTH_JWT_SCOPE_CLAIM",
+            auth.jwt_scope_claim.clone(),
+        );
         if let Some(jwks) = &auth.jwks {
             set_if_unset("SHARDLINE_AUTH_JWKS_URL", jwks.url.clone());
+            set_if_unset("SHARDLINE_AUTH_JWKS_ISSUER", jwks.issuer.clone());
+            set_if_unset("SHARDLINE_AUTH_JWKS_AUDIENCE", jwks.audience.clone());
         }
         if let Some(oidc) = &auth.oidc {
             set_if_unset("SHARDLINE_AUTH_OIDC_ISSUER", oidc.issuer_url.clone());
@@ -972,6 +1019,43 @@ pub fn load_server_config_from_env_with_toml(
                 "SHARDLINE_ED25519_PUBLIC_KEY_FILE",
                 ed25519.public_key_path.clone(),
             );
+        }
+    }
+
+    if let Some(hub) = toml
+        .recovery
+        .as_ref()
+        .and_then(|recovery| recovery.hub.as_ref())
+    {
+        set_if_unset("SHARDLINE_HUB_RECOVERY_MODE", hub.mode.clone());
+        set_if_unset(
+            "SHARDLINE_HUB_RECOVERY_DEPLOYMENT_ID",
+            hub.deployment_id.clone(),
+        );
+        set_if_unset("SHARDLINE_HUB_RECOVERY_KEY_ID", hub.key_id.clone());
+        set_if_unset(
+            "SHARDLINE_HUB_RECOVERY_SIGNING_KEY_FILE",
+            hub.signing_key_path.clone(),
+        );
+        if let Some(archive) = &hub.archive {
+            set_if_unset(
+                "SHARDLINE_HUB_RECOVERY_OBJECT_STORAGE_ADAPTER",
+                archive.adapter.clone(),
+            );
+            if let Some(s3) = &archive.s3 {
+                set_if_unset("SHARDLINE_HUB_RECOVERY_S3_ENDPOINT", s3.endpoint.clone());
+                set_if_unset("SHARDLINE_HUB_RECOVERY_S3_REGION", s3.region.clone());
+                set_if_unset("SHARDLINE_HUB_RECOVERY_S3_BUCKET", s3.bucket.clone());
+                set_if_unset("SHARDLINE_HUB_RECOVERY_S3_KEY_PREFIX", s3.prefix.clone());
+                set_if_unset(
+                    "SHARDLINE_HUB_RECOVERY_S3_ALLOW_HTTP",
+                    s3.allow_http.map(|value| value.to_string()),
+                );
+                set_if_unset(
+                    "SHARDLINE_HUB_RECOVERY_S3_VIRTUAL_HOSTED_STYLE_REQUEST",
+                    s3.virtual_hosted_style.map(|value| value.to_string()),
+                );
+            }
         }
     }
 
@@ -1015,34 +1099,23 @@ pub fn load_index_postgres_url_from_toml(toml: &ShardlineTomlConfig) -> Option<S
 /// environment. Returns the original value when no patterns are found.
 fn interpolate_env_vars(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-
-    'outer: while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            loop {
-                match chars.next() {
-                    Some('}') => {
-                        let resolved =
-                            var(&var_name).unwrap_or_else(|_| format!("${{{var_name}}}"));
-                        result.push_str(&resolved);
-                        break;
-                    }
-                    Some(c) => var_name.push(c),
-                    None => {
-                        // Unclosed ${ — preserve original text
-                        result.push('$');
-                        result.push('{');
-                        result.push_str(&var_name);
-                        break 'outer;
-                    }
-                }
+    let mut remaining = value;
+    while let Some(start) = remaining.find("${") {
+        let placeholder = &remaining[start..];
+        let Some((expression, tail)) = placeholder.split_once('}') else {
+            break;
+        };
+        result.push_str(&remaining[..start]);
+        match var(&expression[2..]) {
+            Ok(resolved) => result.push_str(&resolved),
+            Err(_) => {
+                result.push_str(expression);
+                result.push('}');
             }
-        } else {
-            result.push(ch);
         }
+        remaining = tail;
     }
+    result.push_str(remaining);
     result
 }
 
@@ -1067,71 +1140,55 @@ mod interpolate_tests {
     }
 
     #[test]
-    fn test_no_vars() {
-        assert_eq!(interpolate_env_vars("plain text"), "plain text");
-    }
+    fn interpolation_preserves_literals_and_expands_known_variables_once() {
+        use super::super::environment::{remove_test_var, set_test_var};
 
-    #[test]
-    fn test_known_var() {
-        let content = "_TEST_INTERP_VAR=resolved".to_owned();
-        let _ = dotenvy::from_read(std::io::Cursor::new(content.as_bytes()));
-        assert_eq!(
-            interpolate_env_vars("prefix-${_TEST_INTERP_VAR}-suffix"),
-            "prefix-resolved-suffix"
-        );
-    }
-
-    #[test]
-    fn test_missing_var() {
-        assert_eq!(
-            interpolate_env_vars("${_NONEXISTENT_VAR_XYZ}"),
-            "${_NONEXISTENT_VAR_XYZ}"
-        );
-    }
-
-    #[test]
-    fn test_empty_var_name() {
-        assert_eq!(interpolate_env_vars("${}"), "${}");
-    }
-
-    #[test]
-    fn test_dollar_without_brace() {
-        assert_eq!(interpolate_env_vars("$VAR"), "$VAR");
-        assert_eq!(interpolate_env_vars("$$"), "$$");
-    }
-
-    #[test]
-    fn test_multiple_vars() {
-        let content = "_TEST_A=hello\n_TEST_B=world";
-        let _ = dotenvy::from_read(std::io::Cursor::new(content.as_bytes()));
-        let result = interpolate_env_vars("${_TEST_A} ${_TEST_B}");
-        assert_eq!(result, "hello world");
-    }
-
-    #[test]
-    fn test_unclosed_brace_preserves_text() {
-        // Malformed input without closing } should be preserved
-        assert_eq!(interpolate_env_vars("${HOST"), "${HOST");
-    }
-
-    #[test]
-    fn test_unclosed_brace_at_end() {
-        assert_eq!(interpolate_env_vars("prefix-${VAR"), "prefix-${VAR");
-    }
-
-    #[test]
-    fn test_nested_dollar_signs() {
-        assert_eq!(interpolate_env_vars("$${VAR}"), "$${VAR}");
-    }
-
-    #[test]
-    fn test_empty_input() {
-        assert_eq!(interpolate_env_vars(""), "");
-    }
-
-    #[test]
-    fn test_only_brace_no_var() {
-        assert_eq!(interpolate_env_vars("${}"), "${}");
+        for (name, value) in [
+            ("_TEST_INTERP_VAR", "resolved"),
+            ("_TEST_A", "hello"),
+            ("_TEST_B", "world"),
+            ("_TEST_INTERP_LITERAL", "${_TEST_INTERP_LITERAL}"),
+        ] {
+            set_test_var(name, value);
+        }
+        for name in ["_NONEXISTENT_VAR_XYZ", "VAR", "_MISSING_INTERP_雪"] {
+            remove_test_var(name);
+        }
+        for (input, expected) in [
+            ("plain text", "plain text"),
+            (
+                "prefix-${_TEST_INTERP_VAR}-suffix",
+                "prefix-resolved-suffix",
+            ),
+            ("${_NONEXISTENT_VAR_XYZ}", "${_NONEXISTENT_VAR_XYZ}"),
+            ("${}", "${}"),
+            ("$VAR", "$VAR"),
+            ("$$", "$$"),
+            ("${_TEST_A} ${_TEST_B}", "hello world"),
+            ("${HOST", "${HOST"),
+            ("prefix-${VAR", "prefix-${VAR"),
+            ("$${VAR}", "$${VAR}"),
+            ("", ""),
+            (
+                "雪-${_TEST_INTERP_LITERAL}-é",
+                "雪-${_TEST_INTERP_LITERAL}-é",
+            ),
+            (
+                "${_TEST_INTERP_LITERAL}${unfinished",
+                "${_TEST_INTERP_LITERAL}${unfinished",
+            ),
+            ("é-${_MISSING_INTERP_雪}-雪", "é-${_MISSING_INTERP_雪}-雪"),
+        ] {
+            assert_eq!(interpolate_env_vars(input), expected, "input: {input:?}");
+        }
+        for name in [
+            "_TEST_INTERP_VAR",
+            "_TEST_A",
+            "_TEST_B",
+            "_TEST_INTERP_LITERAL",
+        ] {
+            remove_test_var(name);
+        }
     }
 }
 
@@ -1186,6 +1243,38 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_limit_preserves_default_errors_and_clamping() {
+        let name = "SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS";
+        let load = || {
+            super::load_in_flight_limit_env(
+                name,
+                std::num::NonZeroUsize::MIN,
+                super::ServerConfigError::UploadMaxInFlightChunks,
+                super::ServerConfigError::ZeroUploadMaxInFlightChunks,
+            )
+        };
+        remove_env_var(name);
+        assert_eq!(load().unwrap().get(), 1);
+        for (input, expected) in [("17", 17), ("1000000", 1_000_000), ("1000001", 1_000_000)] {
+            set_env_var(name, input);
+            assert_eq!(load().unwrap().get(), expected);
+        }
+        set_env_var(name, "0");
+        assert!(matches!(
+            load(),
+            Err(super::ServerConfigError::ZeroUploadMaxInFlightChunks)
+        ));
+        for input in ["invalid", "-1", "18446744073709551616"] {
+            set_env_var(name, input);
+            assert!(matches!(
+                load(),
+                Err(super::ServerConfigError::UploadMaxInFlightChunks(_))
+            ));
+        }
+        remove_env_var(name);
+    }
+
+    #[test]
     fn resource_capacity_environment_rejects_overflow_with_existing_fallback() {
         let maximum = crate::admission::maximum_counted_capacity();
         for value in [
@@ -1220,7 +1309,7 @@ mod tests {
     use crate::ServerFrontend;
 
     use super::{
-        load_non_zero_usize_env, load_server_config_from_env_with_toml, parse_server_frontends_env,
+        ServerConfigError, load_server_config_from_env_with_toml, parse_server_frontends_env,
     };
 
     fn set_env_var(key: &str, value: &str) {
@@ -1229,6 +1318,208 @@ mod tests {
 
     fn remove_env_var(key: &str) {
         super::super::environment::remove_test_var(key);
+    }
+
+    fn clear_hub_recovery_env() {
+        for key in [
+            "SHARDLINE_HUB_RECOVERY_MODE",
+            "SHARDLINE_HUB_RECOVERY_DEPLOYMENT_ID",
+            "SHARDLINE_HUB_RECOVERY_KEY_ID",
+            "SHARDLINE_HUB_RECOVERY_SIGNING_KEY_FILE",
+            "SHARDLINE_HUB_RECOVERY_OBJECT_STORAGE_ADAPTER",
+            "SHARDLINE_HUB_RECOVERY_S3_BUCKET",
+            "SHARDLINE_HUB_RECOVERY_S3_REGION",
+            "SHARDLINE_HUB_RECOVERY_S3_ENDPOINT",
+            "SHARDLINE_HUB_RECOVERY_S3_KEY_PREFIX",
+            "SHARDLINE_HUB_RECOVERY_S3_ALLOW_HTTP",
+            "SHARDLINE_HUB_RECOVERY_S3_VIRTUAL_HOSTED_STYLE_REQUEST",
+            "SHARDLINE_HUB_RECOVERY_S3_ACCESS_KEY_ID",
+            "SHARDLINE_HUB_RECOVERY_S3_ACCESS_KEY_ID_FILE",
+            "SHARDLINE_HUB_RECOVERY_S3_SECRET_ACCESS_KEY",
+            "SHARDLINE_HUB_RECOVERY_S3_SECRET_ACCESS_KEY_FILE",
+            "SHARDLINE_HUB_RECOVERY_S3_SESSION_TOKEN",
+            "SHARDLINE_HUB_RECOVERY_S3_SESSION_TOKEN_FILE",
+            "SHARDLINE_S3_BUCKET",
+            "SHARDLINE_S3_ENDPOINT",
+            "SHARDLINE_S3_KEY_PREFIX",
+            "SHARDLINE_OBJECT_STORAGE_ADAPTER",
+        ] {
+            remove_env_var(key);
+        }
+    }
+
+    #[test]
+    fn hub_recovery_configuration_is_absent_by_default_and_off_is_explicit() {
+        clear_hub_recovery_env();
+        assert_eq!(
+            super::load_server_config_from_env()
+                .unwrap()
+                .hub_recovery_mode(),
+            None
+        );
+
+        set_env_var("SHARDLINE_HUB_RECOVERY_MODE", "off");
+        let config = super::load_server_config_from_env().unwrap();
+        assert_eq!(
+            config.hub_recovery_mode(),
+            Some(super::super::HubRecoveryMode::Off)
+        );
+        assert!(config.hub_recovery_runtime().is_none());
+
+        set_env_var("SHARDLINE_HUB_RECOVERY_MODE", "archive");
+        assert!(matches!(
+            super::load_server_config_from_env(),
+            Err(ServerConfigError::ConfigFileError(_))
+        ));
+        clear_hub_recovery_env();
+    }
+
+    #[test]
+    fn hub_recovery_shadow_loads_toml_with_external_key_and_separate_archive() {
+        use std::io::Write;
+
+        clear_hub_recovery_env();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        let mut key_bytes = [7; 32];
+        key_bytes[31] = b'\n';
+        key_file.write_all(&key_bytes).unwrap();
+        key_file.flush().unwrap();
+        let document = toml::from_str::<super::ShardlineTomlConfig>(&format!(
+            r#"
+[recovery.hub]
+mode = "shadow"
+deployment_id = "prod-eu1"
+key_id = "hub-archive-key-2026-01"
+signing_key_path = {:?}
+[recovery.hub.archive]
+adapter = "s3"
+[recovery.hub.archive.s3]
+bucket = "archive-bucket"
+region = "us-east-1"
+endpoint = "https://archive.example.test"
+prefix = "hub-recovery"
+"#,
+            key_file.path().to_str().unwrap(),
+        ))
+        .unwrap();
+
+        let config = super::load_server_config_from_env_with_toml(&document).unwrap();
+        assert_eq!(
+            config.hub_recovery_mode(),
+            Some(super::super::HubRecoveryMode::Shadow)
+        );
+        let runtime = config.hub_recovery_runtime().unwrap();
+        assert_eq!(runtime.deployment_id, "prod-eu1");
+        assert_eq!(runtime.key_id, "hub-archive-key-2026-01");
+        assert_eq!(runtime.signing_key.len(), 32);
+        assert_eq!(runtime.signing_key.expose_secret(), &key_bytes);
+        assert_eq!(runtime.archive_s3.bucket(), "archive-bucket");
+        assert_eq!(runtime.archive_s3.key_prefix(), Some("hub-recovery"));
+
+        clear_hub_recovery_env();
+    }
+
+    #[test]
+    fn hub_recovery_shadow_requires_key_material_and_rejects_overlapping_payload_namespace() {
+        clear_hub_recovery_env();
+        set_env_var("SHARDLINE_HUB_RECOVERY_MODE", "shadow");
+        set_env_var("SHARDLINE_HUB_RECOVERY_DEPLOYMENT_ID", "prod");
+        set_env_var("SHARDLINE_HUB_RECOVERY_KEY_ID", "");
+        assert!(matches!(
+            super::load_server_config_from_env(),
+            Err(ServerConfigError::ConfigFileError(_))
+        ));
+
+        set_env_var("SHARDLINE_HUB_RECOVERY_KEY_ID", "key-1");
+        assert!(matches!(
+            super::load_server_config_from_env(),
+            Err(ServerConfigError::ConfigFileError(_))
+        ));
+
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        key_file.write_all(&[9; 32]).unwrap();
+        key_file.flush().unwrap();
+        for (name, value) in [
+            ("SHARDLINE_HUB_RECOVERY_DEPLOYMENT_ID", "prod"),
+            ("SHARDLINE_HUB_RECOVERY_KEY_ID", "key-1"),
+            (
+                "SHARDLINE_HUB_RECOVERY_SIGNING_KEY_FILE",
+                key_file.path().to_str().unwrap(),
+            ),
+            ("SHARDLINE_HUB_RECOVERY_OBJECT_STORAGE_ADAPTER", "s3"),
+            ("SHARDLINE_HUB_RECOVERY_S3_BUCKET", "shared"),
+            (
+                "SHARDLINE_HUB_RECOVERY_S3_ENDPOINT",
+                "https://s3.example.test",
+            ),
+            ("SHARDLINE_HUB_RECOVERY_S3_KEY_PREFIX", "payload/archive"),
+            ("SHARDLINE_OBJECT_STORAGE_ADAPTER", "s3"),
+            ("SHARDLINE_S3_BUCKET", "shared"),
+            ("SHARDLINE_S3_ENDPOINT", "https://s3.example.test/"),
+            ("SHARDLINE_S3_KEY_PREFIX", "payload"),
+        ] {
+            set_env_var(name, value);
+        }
+        assert!(matches!(
+            super::load_server_config_from_env(),
+            Err(ServerConfigError::ConfigFileError(_))
+        ));
+        clear_hub_recovery_env();
+    }
+
+    #[test]
+    fn external_jwt_claim_settings_load_from_toml_and_allow_environment_overrides() {
+        let keys = [
+            "SHARDLINE_AUTH_PROVIDER",
+            "SHARDLINE_AUTH_JWKS_URL",
+            "SHARDLINE_AUTH_JWKS_ISSUER",
+            "SHARDLINE_AUTH_JWKS_AUDIENCE",
+            "SHARDLINE_AUTH_JWT_REPOSITORY_CLAIM",
+            "SHARDLINE_AUTH_JWT_SCOPE_CLAIM",
+            "SHARDLINE_ROOT_DIR",
+            "SHARDLINE_PUBLIC_BASE_URL",
+        ];
+        for key in keys {
+            remove_env_var(key);
+        }
+        let document = toml::from_str::<super::ShardlineTomlConfig>(
+            r#"
+[server]
+root_dir = "/tmp/shardline-jwt-claims"
+public_base_url = "http://localhost:8080"
+[auth]
+provider = "jwks"
+jwt_repository_claim = "assigned_repository"
+jwt_scope_claim = "assigned_permission"
+[auth.jwks]
+url = "https://identity.example/jwks"
+issuer = "https://identity.example"
+audience = "storage"
+"#,
+        )
+        .unwrap();
+        let config = load_server_config_from_env_with_toml(&document).unwrap();
+        assert_eq!(config.auth_jwks_issuer(), Some("https://identity.example"));
+        assert_eq!(config.auth_jwks_audience(), Some("storage"));
+        assert_eq!(
+            config.auth_jwt_repository_claim(),
+            Some("assigned_repository")
+        );
+        assert_eq!(config.auth_jwt_scope_claim(), Some("assigned_permission"));
+        set_env_var("SHARDLINE_AUTH_JWKS_AUDIENCE", "override-service");
+        set_env_var("SHARDLINE_AUTH_JWT_REPOSITORY_CLAIM", "override_repository");
+        set_env_var("SHARDLINE_AUTH_JWT_SCOPE_CLAIM", "override_permission");
+        let config = load_server_config_from_env_with_toml(&document).unwrap();
+        assert_eq!(config.auth_jwks_audience(), Some("override-service"));
+        assert_eq!(
+            config.auth_jwt_repository_claim(),
+            Some("override_repository")
+        );
+        assert_eq!(config.auth_jwt_scope_claim(), Some("override_permission"));
+        for key in keys {
+            remove_env_var(key);
+        }
     }
 
     #[test]
@@ -1336,6 +1627,22 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
         remove_env_var("SHARDLINE_DEPLOYMENT_MODE");
     }
 
+    #[test]
+    fn selective_serialized_xorb_ranges_requires_explicit_boolean() {
+        remove_env_var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES");
+        assert!(!super::selective_serialized_xorb_ranges_from_env().unwrap());
+        set_env_var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES", "true");
+        assert!(super::selective_serialized_xorb_ranges_from_env().unwrap());
+        set_env_var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES", "FALSE");
+        assert!(!super::selective_serialized_xorb_ranges_from_env().unwrap());
+        set_env_var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES", "yes");
+        assert!(matches!(
+            super::selective_serialized_xorb_ranges_from_env(),
+            Err(super::ServerConfigError::InvalidSelectiveXorbRangeMode { .. })
+        ));
+        remove_env_var("SHARDLINE_SELECTIVE_SERIALIZED_XORB_RANGES");
+    }
+
     // ── parse_server_frontends_env ─────────────────────────────────────────
 
     #[test]
@@ -1390,7 +1697,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
     #[test]
     fn parse_server_frontends_env_multiple_with_dedup() {
         let result = parse_server_frontends_env("xet,lfs,oci,lfs");
-        assert!(result.is_ok());
         let frontends = result.unwrap();
         assert_eq!(frontends.len(), 3);
         assert!(frontends.contains(&crate::ServerFrontend::Xet));
@@ -1401,7 +1707,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
     #[test]
     fn parse_server_frontends_env_all_known() {
         let result = parse_server_frontends_env("xet,lfs,bazel-http,oci,hub");
-        assert!(result.is_ok());
         let frontends = result.unwrap();
         assert_eq!(frontends.len(), 5);
     }
@@ -1635,22 +1940,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
-    #[test]
-    fn load_server_config_max_revisions_per_repo_rejects_unparsable() {
-        set_env_var("SHARDLINE_MAX_REVISIONS_PER_REPO", "not-a-number");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::MaxRevisionsPerRepo(_))
-        ));
-
-        remove_env_var("SHARDLINE_MAX_REVISIONS_PER_REPO");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
     // ── SHARDLINE_MAX_TREE_ENTRIES_PER_REPO ────────────────────────────────
 
     #[test]
@@ -1704,93 +1993,48 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
-    #[test]
-    fn load_server_config_max_tree_entries_per_repo_rejects_unparsable() {
-        set_env_var("SHARDLINE_MAX_TREE_ENTRIES_PER_REPO", "not-a-number");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::MaxTreeEntriesPerRepo(_))
-        ));
-
-        remove_env_var("SHARDLINE_MAX_TREE_ENTRIES_PER_REPO");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
     // ── env-provided secrets are never newline-trimmed ─────────────────────
 
     #[test]
-    fn hub_webhook_secret_from_env_is_not_newline_trimmed() {
-        // Trailing-newline stripping applies only to secret *files*. An
-        // env-provided value (32 key bytes + `\n` = 33 bytes) must exceed the
-        // 32-byte bound and be rejected, proving env values are left untouched.
-        // SAFETY: serialized env test
-        set_env_var(
-            "SHARDLINE_HUB_WEBHOOK_SECRET_KEY",
-            "0123456789abcdef0123456789abcdef\n",
-        );
-        remove_env_var("SHARDLINE_HUB_WEBHOOK_SECRET_KEY_FILE");
-        let result = super::load_secret_from_env_or_file_with_conflict_check(
+    fn fixed_length_secrets_from_env_are_not_newline_trimmed() {
+        for (env, file_env) in [
             (
                 "SHARDLINE_HUB_WEBHOOK_SECRET_KEY",
                 "SHARDLINE_HUB_WEBHOOK_SECRET_KEY_FILE",
             ),
-            super::HUB_WEBHOOK_SECRET_KEY_BYTES,
-            true,
-            super::ServerConfigError::EmptyHubWebhookSecretKey,
-            |env, file_env| super::ServerConfigError::SecretSourceConflict { env, file_env },
-            super::ServerConfigError::HubWebhookSecretKey,
-            |observed, maximum| super::ServerConfigError::HubWebhookSecretKeyTooLarge {
-                observed_bytes: observed,
-                maximum_bytes: maximum,
-            },
-            |expected, observed| super::ServerConfigError::HubWebhookSecretKeyLengthMismatch {
-                expected_bytes: expected,
-                observed_bytes: observed,
-            },
-        );
-        remove_env_var("SHARDLINE_HUB_WEBHOOK_SECRET_KEY");
-        assert!(result.is_err());
-    }
-
-    // ── provider-config secret key env handling ────────────────────────────
-
-    #[test]
-    fn config_secret_from_env_is_not_newline_trimmed() {
-        // Trailing-newline stripping applies only to secret *files*. An
-        // env-provided value (32 key bytes + `\n` = 33 bytes) must exceed the
-        // 32-byte bound and be rejected, proving env values are left untouched.
-        // SAFETY: serialized env test
-        set_env_var(
-            "SHARDLINE_CONFIG_SECRET_KEY",
-            "0123456789abcdef0123456789abcdef\n",
-        );
-        remove_env_var("SHARDLINE_CONFIG_SECRET_KEY_FILE");
-        let result = super::load_secret_from_env_or_file_with_conflict_check(
             (
                 "SHARDLINE_CONFIG_SECRET_KEY",
                 "SHARDLINE_CONFIG_SECRET_KEY_FILE",
             ),
-            super::CONFIG_SECRET_KEY_BYTES,
-            true,
-            super::ServerConfigError::EmptyConfigSecretKey,
-            |env, file_env| super::ServerConfigError::SecretSourceConflict { env, file_env },
-            super::ServerConfigError::ConfigSecretKey,
-            |observed, maximum| super::ServerConfigError::ConfigSecretKeyTooLarge {
-                observed_bytes: observed,
-                maximum_bytes: maximum,
-            },
-            |expected, observed| super::ServerConfigError::ConfigSecretKeyLengthMismatch {
-                expected_bytes: expected,
-                observed_bytes: observed,
-            },
-        );
-        remove_env_var("SHARDLINE_CONFIG_SECRET_KEY");
-        assert!(result.is_err());
+        ] {
+            // File newline stripping must never alter a direct environment value.
+            set_env_var(env, "0123456789abcdef0123456789abcdef\n");
+            remove_env_var(file_env);
+            let result = super::load_server_config_from_env();
+            remove_env_var(env);
+            assert!(
+                matches!(
+                    (env, &result),
+                    (
+                        "SHARDLINE_HUB_WEBHOOK_SECRET_KEY",
+                        Err(super::ServerConfigError::HubWebhookSecretKeyTooLarge {
+                            observed_bytes: 33,
+                            maximum_bytes: 32,
+                        }),
+                    ) | (
+                        "SHARDLINE_CONFIG_SECRET_KEY",
+                        Err(super::ServerConfigError::ConfigSecretKeyTooLarge {
+                            observed_bytes: 33,
+                            maximum_bytes: 32,
+                        }),
+                    )
+                ),
+                "unexpected result for {env}: {result:?}"
+            );
+        }
     }
+
+    // ── provider-config secret key env handling ────────────────────────────
 
     #[test]
     fn config_secret_key_from_env_is_applied_to_config() {
@@ -2201,70 +2445,65 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
         )
     }
 
-    // ── load_non_zero_usize_env ────────────────────────────────────────────
-
-    // ── load_non_zero_usize_env ────────────────────────────────────────────
-
     #[test]
-    fn load_non_zero_usize_env_uses_default_when_env_unset() {
-        let key = "SHARDLINE_TEST_NON_ZERO_UNSET";
-        remove_env_var(key);
-        let default = std::num::NonZeroUsize::new(42).unwrap();
-        let result = load_non_zero_usize_env(
-            key,
-            default,
-            super::ServerConfigError::MaxShardFiles,
-            || super::ServerConfigError::ZeroMaxShardFiles,
-        );
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().get(), 42);
-        remove_env_var(key);
-    }
-
-    #[test]
-    fn load_non_zero_usize_env_reads_env_value() {
-        let key = "SHARDLINE_TEST_NON_ZERO_VALID";
-        set_env_var(key, "99");
-        let default = std::num::NonZeroUsize::new(1).unwrap();
-        let result = load_non_zero_usize_env(
-            key,
-            default,
-            super::ServerConfigError::MaxShardFiles,
-            || super::ServerConfigError::ZeroMaxShardFiles,
-        );
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().get(), 99);
+    fn non_zero_usize_environment_values_preserve_defaults_and_errors() {
+        let key = "SHARDLINE_TEST_NON_ZERO_USIZE";
+        for value in [
+            None,
+            Some("99"),
+            Some("0"),
+            Some("not-a-number"),
+            Some("-1"),
+            Some("18446744073709551616"),
+        ] {
+            remove_env_var(key);
+            if let Some(value) = value {
+                set_env_var(key, value);
+            }
+            let result = super::load_non_zero_usize_env(
+                key,
+                std::num::NonZeroUsize::new(42).unwrap(),
+                ServerConfigError::MaxShardFiles,
+                ServerConfigError::ZeroMaxShardFiles,
+            );
+            match value {
+                None => assert_eq!(result.unwrap().get(), 42),
+                Some("99") => assert_eq!(result.unwrap().get(), 99),
+                Some("0") => assert!(matches!(result, Err(ServerConfigError::ZeroMaxShardFiles))),
+                Some(_) => assert!(matches!(result, Err(ServerConfigError::MaxShardFiles(_)))),
+            }
+        }
         remove_env_var(key);
     }
 
     #[test]
-    fn load_non_zero_usize_env_rejects_non_numeric() {
-        let key = "SHARDLINE_TEST_NON_ZERO_INVALID";
-        set_env_var(key, "not-a-number");
-        let default = std::num::NonZeroUsize::new(5).unwrap();
-        let result = load_non_zero_usize_env(
-            key,
-            default,
-            super::ServerConfigError::MaxShardFiles,
-            || super::ServerConfigError::ZeroMaxShardFiles,
-        );
-        assert!(result.is_err());
-        remove_env_var(key);
-    }
-
-    #[test]
-    fn load_non_zero_usize_env_rejects_zero_value() {
-        let key = "SHARDLINE_TEST_NON_ZERO_ZERO";
-        set_env_var(key, "0");
-        let default = std::num::NonZeroUsize::new(5).unwrap();
-        let result = load_non_zero_usize_env(
-            key,
-            default,
-            super::ServerConfigError::MaxShardFiles,
-            || super::ServerConfigError::ZeroMaxShardFiles,
-        );
-        assert!(result.is_err());
-        // Test-local environment cleanup.
+    fn non_zero_u64_environment_values_preserve_defaults_and_errors() {
+        let key = "SHARDLINE_TEST_NON_ZERO_U64";
+        for value in [
+            None,
+            Some("99"),
+            Some("0"),
+            Some("not-a-number"),
+            Some("-1"),
+            Some("18446744073709551616"),
+        ] {
+            remove_env_var(key);
+            if let Some(value) = value {
+                set_env_var(key, value);
+            }
+            let result = super::load_non_zero_u64_env(
+                key,
+                std::num::NonZeroU64::new(42).unwrap(),
+                ServerConfigError::S3MaxPartBytes,
+                ServerConfigError::ZeroS3MaxPartBytes,
+            );
+            match value {
+                None => assert_eq!(result.unwrap().get(), 42),
+                Some("99") => assert_eq!(result.unwrap().get(), 99),
+                Some("0") => assert!(matches!(result, Err(ServerConfigError::ZeroS3MaxPartBytes))),
+                Some(_) => assert!(matches!(result, Err(ServerConfigError::S3MaxPartBytes(_)))),
+            }
+        }
         remove_env_var(key);
     }
 
@@ -2272,283 +2511,160 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
 
     #[test]
     fn load_server_config_invalid_public_base_url() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "not-a-valid-url");
-        // Test-local environment override.
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
         let result = super::load_server_config_from_env();
         assert!(matches!(
             result,
             Err(super::ServerConfigError::InvalidPublicBaseUrl(_))
         ));
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_ROOT_DIR");
     }
 
     #[test]
-    fn load_server_config_zero_max_request_body_bytes() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxRequestBodyBytes)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
+    fn load_server_config_rejects_invalid_environment_values() {
+        use super::ServerConfigError::*;
 
-    #[test]
-    fn load_server_config_invalid_max_request_body_bytes() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES", "not-a-number");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(result.is_err());
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_chunk_size() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_CHUNK_SIZE_BYTES", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroChunkSize)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_CHUNK_SIZE_BYTES");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
+        let invalid_integer = "not-a-number".parse::<usize>().unwrap_err();
+        for (name, value, expected) in [
+            (
+                "SHARDLINE_MAX_REVISIONS_PER_REPO",
+                "not-a-number",
+                MaxRevisionsPerRepo(invalid_integer.clone()),
+            ),
+            (
+                "SHARDLINE_MAX_TREE_ENTRIES_PER_REPO",
+                "not-a-number",
+                MaxTreeEntriesPerRepo(invalid_integer.clone()),
+            ),
+            (
+                "SHARDLINE_MAX_REQUEST_BODY_BYTES",
+                "not-a-number",
+                MaxRequestBodyBytes(invalid_integer),
+            ),
+            (
+                "SHARDLINE_MAX_REQUEST_BODY_BYTES",
+                "0",
+                ZeroMaxRequestBodyBytes,
+            ),
+            ("SHARDLINE_CHUNK_SIZE_BYTES", "0", ZeroChunkSize),
+            ("SHARDLINE_SERVER_ROLE", "invalid-role", InvalidServerRole),
+            (
+                "SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS",
+                "0",
+                ZeroUploadMaxInFlightChunks,
+            ),
+            (
+                "SHARDLINE_TRANSFER_MAX_IN_FLIGHT_CHUNKS",
+                "0",
+                ZeroTransferMaxInFlightChunks,
+            ),
+            ("SHARDLINE_SERVER_FRONTENDS", "", MissingServerFrontends),
+            (
+                "SHARDLINE_SERVER_FRONTENDS",
+                "invalid-frontend",
+                InvalidServerFrontend,
+            ),
+            (
+                "SHARDLINE_RECONSTRUCTION_CACHE_TTL_SECONDS",
+                "0",
+                ZeroReconstructionCacheTtlSeconds,
+            ),
+            (
+                "SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS",
+                "0",
+                ZeroOciUploadSessionTtlSeconds,
+            ),
+            (
+                "SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS",
+                "0",
+                ZeroOciRegistryTokenTtlSeconds,
+            ),
+            (
+                "SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS",
+                "0",
+                ZeroOciUploadMaxActiveSessions,
+            ),
+            (
+                "SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS",
+                "0",
+                ZeroOciRegistryTokenMaxInFlightRequests,
+            ),
+            ("SHARDLINE_AUTH_PROVIDER", "oidc", MissingOidcIssuer),
+            ("SHARDLINE_AUTH_PROVIDER", "jwks", MissingJwksUrl),
+            ("SHARDLINE_MAX_SHARD_FILES", "0", ZeroMaxShardFiles),
+            ("SHARDLINE_MAX_SHARD_XORBS", "0", ZeroMaxShardXorbs),
+            (
+                "SHARDLINE_MAX_SHARD_RECONSTRUCTION_TERMS",
+                "0",
+                ZeroMaxShardReconstructionTerms,
+            ),
+            (
+                "SHARDLINE_MAX_SHARD_XORB_CHUNKS",
+                "0",
+                ZeroMaxShardXorbChunks,
+            ),
+            (
+                "SHARDLINE_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES",
+                "0",
+                ZeroReconstructionCacheMemoryMaxEntries,
+            ),
+            ("SHARDLINE_AUTH_PROVIDER", "invalid", InvalidAuthProvider),
+        ] {
+            set_env_var(name, value);
+            set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
+            set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
+            let result = super::load_server_config_from_env();
+            remove_env_var(name);
+            remove_env_var("SHARDLINE_ROOT_DIR");
+            remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
+            let error = result.expect_err(name);
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected),
+                "{name}={value:?}: {error:?}"
+            );
+        }
     }
 
     #[test]
     fn load_server_config_chunk_size_too_large() {
         // 2 GB exceeds MAX_CHUNK_SIZE (1 GB)
-        // Test-local environment override.
         set_env_var("SHARDLINE_CHUNK_SIZE_BYTES", "2147483648");
-        // Test-local environment override.
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
         let result = super::load_server_config_from_env();
         assert!(matches!(
             result,
             Err(super::ServerConfigError::ChunkSizeTooLarge)
         ));
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_CHUNK_SIZE_BYTES");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
     #[test]
     fn load_server_config_invalid_chunk_size() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_CHUNK_SIZE_BYTES", "not-a-size");
-        // Test-local environment override.
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
         let result = super::load_server_config_from_env();
         assert!(result.is_err());
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_CHUNK_SIZE_BYTES");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_invalid_server_role() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_SERVER_ROLE", "invalid-role");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::InvalidServerRole)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_SERVER_ROLE");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
     #[test]
     fn load_server_config_bind_addr_parse_error() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_BIND_ADDR", "not-a-valid-addr");
-        // Test-local environment override.
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
         let result = super::load_server_config_from_env();
         assert!(result.is_err());
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_BIND_ADDR");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_upload_max_in_flight_zero() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroUploadMaxInFlightChunks)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_UPLOAD_MAX_IN_FLIGHT_CHUNKS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_transfer_max_in_flight_zero() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_TRANSFER_MAX_IN_FLIGHT_CHUNKS", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroTransferMaxInFlightChunks)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_TRANSFER_MAX_IN_FLIGHT_CHUNKS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_missing_server_frontends() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_SERVER_FRONTENDS", "");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::MissingServerFrontends)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_SERVER_FRONTENDS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_invalid_server_frontends() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_SERVER_FRONTENDS", "invalid-frontend");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::InvalidServerFrontend)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_SERVER_FRONTENDS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_reconstruction_cache_ttl() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_TTL_SECONDS", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroReconstructionCacheTtlSeconds)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_TTL_SECONDS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_oci_upload_session_ttl() {
-        // Test-local environment override.
-        set_env_var("SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS", "0");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroOciUploadSessionTtlSeconds)
-        ));
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_OCI_UPLOAD_SESSION_TTL_SECONDS");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
@@ -2616,92 +2732,22 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
 
     #[test]
     fn load_server_config_missing_reconstruction_cache_redis_url() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_ADAPTER", "redis");
-        // Test-local environment override.
         set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL", "");
-        // Test-local environment override.
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        // Test-local environment override.
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
         let result = super::load_server_config_from_env();
         assert!(matches!(
             result,
             Err(super::ServerConfigError::MissingReconstructionCacheRedisUrl)
         ));
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_ADAPTER");
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        // Test-local environment cleanup.
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    // ── load_server_config_from_env: OCI zero-value edge cases ───────────
-
-    #[test]
-    fn load_server_config_zero_oci_registry_token_ttl() {
-        set_env_var("SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroOciRegistryTokenTtlSeconds)
-        ));
-        remove_env_var("SHARDLINE_OCI_REGISTRY_TOKEN_TTL_SECONDS");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_oci_upload_max_active_sessions() {
-        set_env_var("SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroOciUploadMaxActiveSessions)
-        ));
-        remove_env_var("SHARDLINE_OCI_UPLOAD_MAX_ACTIVE_SESSIONS");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_oci_registry_token_max_in_flight() {
-        set_env_var("SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroOciRegistryTokenMaxInFlightRequests)
-        ));
-        remove_env_var("SHARDLINE_OCI_REGISTRY_TOKEN_MAX_IN_FLIGHT_REQUESTS");
         remove_env_var("SHARDLINE_ROOT_DIR");
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
     // ── load_server_config_from_env: auth provider branches ─────────────
-
-    #[test]
-    fn load_server_config_oidc_requires_issuer() {
-        set_env_var("SHARDLINE_AUTH_PROVIDER", "oidc");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::MissingOidcIssuer)
-        ));
-        remove_env_var("SHARDLINE_AUTH_PROVIDER");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
 
     #[test]
     fn load_server_config_oidc_audience_from_env() {
@@ -2935,21 +2981,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
     }
 
     #[test]
-    fn load_server_config_jwks_requires_url() {
-        set_env_var("SHARDLINE_AUTH_PROVIDER", "jwks");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::MissingJwksUrl)
-        ));
-        remove_env_var("SHARDLINE_AUTH_PROVIDER");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
     fn load_server_config_jwks_rejects_http_url() {
         // Regression (F-95): JWKS key transport must be https (RFC 8414 §2).
         // A plain-http non-loopback SHARDLINE_AUTH_JWKS_URL is a startup error
@@ -3015,96 +3046,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
     }
 
     #[test]
-    fn load_server_config_lower_max_request_body_bytes_parse_error() {
-        set_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxRequestBodyBytes)
-        ));
-        remove_env_var("SHARDLINE_MAX_REQUEST_BODY_BYTES");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_shard_metadata_limits() {
-        set_env_var("SHARDLINE_MAX_SHARD_FILES", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxShardFiles)
-        ));
-        remove_env_var("SHARDLINE_MAX_SHARD_FILES");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_shard_xorbs() {
-        set_env_var("SHARDLINE_MAX_SHARD_XORBS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxShardXorbs)
-        ));
-        remove_env_var("SHARDLINE_MAX_SHARD_XORBS");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_shard_reconstruction_terms() {
-        set_env_var("SHARDLINE_MAX_SHARD_RECONSTRUCTION_TERMS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxShardReconstructionTerms)
-        ));
-        remove_env_var("SHARDLINE_MAX_SHARD_RECONSTRUCTION_TERMS");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_shard_xorb_chunks() {
-        set_env_var("SHARDLINE_MAX_SHARD_XORB_CHUNKS", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroMaxShardXorbChunks)
-        ));
-        remove_env_var("SHARDLINE_MAX_SHARD_XORB_CHUNKS");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
-    fn load_server_config_zero_reconstruction_cache_memory_max_entries() {
-        set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES", "0");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::ZeroReconstructionCacheMemoryMaxEntries)
-        ));
-        remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
-    #[test]
     fn load_server_config_hub_requires_auth() {
         set_env_var("SHARDLINE_SERVER_FRONTENDS", "hub");
         set_env_var("SHARDLINE_AUTH_PROVIDER", "local");
@@ -3122,26 +3063,10 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
     }
 
-    #[test]
-    fn load_server_config_invalid_auth_provider() {
-        set_env_var("SHARDLINE_AUTH_PROVIDER", "invalid");
-        set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
-        set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
-        let result = super::load_server_config_from_env();
-        assert!(matches!(
-            result,
-            Err(super::ServerConfigError::InvalidAuthProvider)
-        ));
-        remove_env_var("SHARDLINE_AUTH_PROVIDER");
-        remove_env_var("SHARDLINE_ROOT_DIR");
-        remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
-    }
-
     // ── load_server_config_from_env: empty index postgres url ─────────────
 
     #[test]
     fn load_server_config_empty_index_postgres_url() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_INDEX_POSTGRES_URL", "");
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "http://localhost:8080");
@@ -3150,7 +3075,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
             matches!(result, Err(super::ServerConfigError::EmptyIndexPostgresUrl)),
             "expected EmptyIndexPostgresUrl, got {result:?}"
         );
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_INDEX_POSTGRES_URL");
         remove_env_var("SHARDLINE_ROOT_DIR");
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
@@ -3160,7 +3084,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
 
     #[test]
     fn load_server_config_whitespace_reconstruction_cache_redis_url() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_ADAPTER", "redis");
         set_env_var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL", "   ");
         set_env_var("SHARDLINE_ROOT_DIR", "/tmp/shardline_test");
@@ -3173,7 +3096,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
             ),
             "expected MissingReconstructionCacheRedisUrl, got {result:?}"
         );
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_ADAPTER");
         remove_env_var("SHARDLINE_RECONSTRUCTION_CACHE_REDIS_URL");
         remove_env_var("SHARDLINE_ROOT_DIR");
@@ -3220,7 +3142,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
             ),
             "expected EmptyProviderTokenIssuer, got {result:?}"
         );
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_PROVIDER_TOKEN_ISSUER");
         remove_env_var("SHARDLINE_PROVIDER_CONFIG_FILE");
         remove_env_var("SHARDLINE_PROVIDER_API_KEY_FILE");
@@ -3344,7 +3265,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
 
     #[test]
     fn load_server_config_integration_end_to_end() {
-        // Test-local environment override.
         set_env_var("SHARDLINE_BIND_ADDR", "127.0.0.1:9090");
         set_env_var("SHARDLINE_PUBLIC_BASE_URL", "https://example.com:9090");
         set_env_var("SHARDLINE_SERVER_ROLE", "all");
@@ -3411,8 +3331,6 @@ root_dir = "runtime#dir\nSHARDLINE_INJECTED_VALUE=unexpected"
             Some("https://accounts.example.com")
         );
         assert!(config.token_signing_key().is_some());
-
-        // Test-local environment cleanup.
         remove_env_var("SHARDLINE_BIND_ADDR");
         remove_env_var("SHARDLINE_PUBLIC_BASE_URL");
         remove_env_var("SHARDLINE_SERVER_ROLE");

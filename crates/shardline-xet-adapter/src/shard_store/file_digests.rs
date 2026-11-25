@@ -100,13 +100,12 @@ impl FileDigestVerifier {
         file: &MDBFileInfo,
         expected: Option<&str>,
         derive: bool,
-        verified: &HashMap<String, XorbRangeInfo>,
+        verified: &HashMap<MerkleHash, ValidatedXorb>,
         checkpoint: &(dyn Fn() -> std::io::Result<()> + Sync),
     ) -> Result<Option<String>, XetAdapterError> {
         let mut digest = FileDigest::new(expected.map(str::to_owned), derive);
         for term in &file.segments {
-            let hash = term.xorb_hash.hex();
-            let info = verified.get(&hash).ok_or_else(rejected)?;
+            let info = verified.get(&term.xorb_hash).ok_or_else(rejected)?;
             digest.update(self, store, term, info, checkpoint)?;
         }
         digest.finish()
@@ -160,14 +159,13 @@ impl FileDigest {
     }
 
     pub(super) fn finish_terms(&mut self) {
-        if !self.reusing_prefix
-            && let Some(worker) = &mut self.worker
-        {
+        if self.reusing_prefix {
+            return;
+        }
+        if let Some(worker) = &mut self.worker {
             self.digest = worker.snapshot();
         }
-        if !self.reusing_prefix
-            && let (Some(prefixes), Some(digest)) = (&mut self.prefixes, &self.digest)
-        {
+        if let (Some(prefixes), Some(digest)) = (&mut self.prefixes, &self.digest) {
             prefixes.retain(digest);
         }
     }
@@ -222,7 +220,7 @@ impl FileDigest {
         verifier: &mut FileDigestVerifier,
         store: &ServerObjectStore,
         term: &FileDataSequenceEntry,
-        info: &XorbRangeInfo,
+        info: &ValidatedXorb,
         checkpoint: &(dyn Fn() -> std::io::Result<()> + Sync),
     ) -> Result<(), XetAdapterError> {
         let reusing_prefix = self.reusing_prefix;
@@ -234,7 +232,16 @@ impl FileDigest {
         let hash = term.xorb_hash.hex();
         let start = usize::try_from(term.chunk_index_start)?;
         let end = usize::try_from(term.chunk_index_end)?;
-        let members = info.verified_chunks.get(start..end).ok_or_else(rejected)?;
+        let members = info.chunks().get(start..end).ok_or_else(rejected)?;
+        let mut update_digest = |data: &[u8]| {
+            if !reusing_prefix {
+                if let Some(worker) = &mut worker {
+                    worker.update(data);
+                } else {
+                    digest.update(data);
+                }
+            }
+        };
         if let ServerObjectStore::S3(remote) = store {
             streaming_source::visit_range(
                 remote,
@@ -242,13 +249,7 @@ impl FileDigest {
                 members,
                 checkpoint,
                 &mut |_, data| {
-                    if !reusing_prefix {
-                        if let Some(worker) = &mut worker {
-                            worker.update(data);
-                        } else {
-                            digest.update(data);
-                        }
-                    }
+                    update_digest(data);
                     Ok(())
                 },
             )?;
@@ -298,13 +299,7 @@ impl FileDigest {
             {
                 return Err(rejected());
             }
-            if !reusing_prefix {
-                if let Some(worker) = &mut worker {
-                    worker.update(&data);
-                } else {
-                    digest.update(&data);
-                }
-            }
+            update_digest(&data);
         }
         Ok(())
     }

@@ -22,16 +22,13 @@ use rusqlite::{
 use serde_json::{Value, from_slice, from_str, from_value, to_string};
 use shardline_protocol::{RepositoryScope, unix_now_seconds_lossy};
 use shardline_reliability::{
-    EvidenceEventMetadata, HubRefEvidenceLog, HubRefLifecycleEvent, HubRefSnapshot,
-    OciTagEvidenceLog, OciTagLifecycleEvent, OciTagSnapshot, OperationKind, ProviderEvidenceLog,
-    ProviderLifecycleEvent, ProviderLifecycleSnapshot, QuarantineEvidenceLog,
-    QuarantineLifecycleEvent, QuarantineLifecycleState, QuarantineObjectIdentity,
-    QuarantineSnapshot, RetentionEvidenceLog, RetentionHoldLifecycleEvent,
+    EvidenceEventMetadata, HubRefEvidenceLog, HubRefSnapshot, OciTagEvidenceLog, OciTagSnapshot,
+    OperationKind, ProviderEvidenceLog, ProviderLifecycleSnapshot, QuarantineEvidenceLog,
+    QuarantineLifecycleState, QuarantineObjectIdentity, QuarantineSnapshot, RetentionEvidenceLog,
     RetentionHoldLifecycleState, RetentionHoldSnapshot, RetentionObjectIdentity,
-    S3ObjectEvidenceLog, S3ObjectLifecycleEvent, S3ObjectSnapshot, S3ObjectState, SnapshotEvidence,
-    WebhookDeliveryEvidenceLog, WebhookDeliveryIdentity, WebhookDeliveryLifecycleEvent,
-    WebhookDeliveryLifecycleState, WebhookDeliverySnapshot, verify_or_repair_snapshot_evidence,
-    verify_snapshot_evidence,
+    S3ObjectEvidenceLog, S3ObjectSnapshot, S3ObjectState, SnapshotEvidence, SnapshotEvidenceLog,
+    WebhookDeliveryEvidenceLog, WebhookDeliveryIdentity, WebhookDeliveryLifecycleState,
+    WebhookDeliverySnapshot, verify_or_repair_snapshot_evidence, verify_snapshot_evidence,
 };
 use shardline_storage::{
     DirectoryPathError, ObjectKey, ObjectKeyError,
@@ -66,6 +63,14 @@ use shardline_reliability::{
 
 use crate::{OciObjectKind, provider_evidence::snapshot_from_state};
 
+pub(crate) async fn run_blocking_store<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, LocalIndexStoreError> + Send + 'static,
+) -> Result<T, LocalIndexStoreError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
+}
+
 pub(crate) fn quarantine_evidence_operation_id(object_key: &str) -> String {
     object_key.to_owned()
 }
@@ -82,17 +87,14 @@ pub(crate) fn load_verified_event_json(
          FROM shardline_reliability_events
          WHERE operation_kind = ?1 AND operation_id = ?2 ORDER BY sequence",
     )?;
-    let rows = statement.query_map(params![operation_kind.as_str(), operation_id], |row| {
+    let mut rows = statement.query(params![operation_kind.as_str(), operation_id])?;
+    let mut row_sequences = Vec::new();
+    let mut events = Vec::new();
+    let mut merkle_commits = Vec::new();
+    while let Some(row) = rows.next()? {
         let sequence: i64 = row.get(0)?;
         let event_json: String = row.get(1)?;
         let merkle_commit_json: Option<String> = row.get(2)?;
-        Ok((sequence, event_json, merkle_commit_json))
-    })?;
-    let rows = rows.collect::<Result<Vec<_>, _>>()?;
-    let mut row_sequences = Vec::with_capacity(rows.len());
-    let mut events = Vec::with_capacity(rows.len());
-    let mut merkle_commits = Vec::with_capacity(rows.len());
-    for (sequence, event_json, merkle_commit_json) in rows {
         if sequence < 0 {
             return Err(LocalIndexStoreError::Reliability(
                 shardline_reliability::ReliabilityError::Merkle(
@@ -126,6 +128,46 @@ pub(crate) fn load_verified_event_json(
         &merkle_commits,
     )?;
     Ok(events)
+}
+
+fn verify_latest_event_json(
+    operation_kind: OperationKind,
+    operation_id: &str,
+    sequence: i64,
+    event_json: &str,
+    merkle_commit_json: Option<String>,
+    previous_merkle_json: Option<String>,
+) -> Result<Value, LocalIndexStoreError> {
+    let sequence = u64::try_from(sequence).map_err(|error| {
+        LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::Merkle(format!(
+            "persisted row sequence is out of range: {error}"
+        )))
+    })?;
+    let event_json = from_str::<Value>(event_json)?;
+    if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
+        return Err(LocalIndexStoreError::Reliability(
+            shardline_reliability::ReliabilityError::Merkle(
+                "persisted row sequence does not match its event".into(),
+            ),
+        ));
+    }
+    let identity = persisted_event_identity(operation_kind, event_json.clone())?;
+    if identity.operation_id != operation_id {
+        return Err(LocalIndexStoreError::Reliability(
+            shardline_reliability::ReliabilityError::OperationMismatch,
+        ));
+    }
+    verify_persisted_merkle_commit_with_previous(
+        operation_kind,
+        event_json.clone(),
+        merkle_commit_json
+            .map(|json| from_str::<Value>(&json))
+            .transpose()?,
+        previous_merkle_json
+            .map(|json| from_str::<Value>(&json))
+            .transpose()?,
+    )?;
+    Ok(event_json)
 }
 
 /// Loads and verifies only the latest event for one operation. Full-chain
@@ -176,36 +218,15 @@ pub(crate) fn load_latest_verified_event_json(
     let Some((sequence, event_json, merkle_commit_json, previous_merkle_json)) = row else {
         return Ok(None);
     };
-    let sequence = u64::try_from(sequence).map_err(|error| {
-        LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::Merkle(format!(
-            "persisted row sequence is out of range: {error}"
-        )))
-    })?;
-    let event_json = from_str::<Value>(&event_json)?;
-    if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
-        return Err(LocalIndexStoreError::Reliability(
-            shardline_reliability::ReliabilityError::Merkle(
-                "persisted row sequence does not match its event".into(),
-            ),
-        ));
-    }
-    let identity = persisted_event_identity(operation_kind, event_json.clone())?;
-    if identity.operation_id != operation_id {
-        return Err(LocalIndexStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ));
-    }
-    verify_persisted_merkle_commit_with_previous(
+    verify_latest_event_json(
         operation_kind,
-        event_json.clone(),
-        merkle_commit_json
-            .map(|json| from_str::<Value>(&json))
-            .transpose()?,
-        previous_merkle_json
-            .map(|json| from_str::<Value>(&json))
-            .transpose()?,
-    )?;
-    Ok(Some(event_json))
+        operation_id,
+        sequence,
+        &event_json,
+        merkle_commit_json,
+        previous_merkle_json,
+    )
+    .map(Some)
 }
 
 pub(crate) fn load_latest_verified_event_json_batch(
@@ -280,11 +301,10 @@ fn load_latest_verified_event_json_chunk(
     // and avoid repeated Merkle verification.
     let requested_ids = operation_ids.iter().collect::<BTreeSet<_>>();
     let sql = latest_verified_event_json_batch_sql(requested_ids.len());
-    let mut parameters = Vec::with_capacity(operation_ids.len().saturating_add(1));
-    parameters.push(operation_kind.as_str().to_owned());
-    parameters.extend(requested_ids.into_iter().cloned());
+    let parameters = std::iter::once(operation_kind.as_str())
+        .chain(requested_ids.into_iter().map(String::as_str));
     let mut statement = transaction.prepare(&sql)?;
-    let rows = statement.query_map(params_from_iter(parameters.iter()), |row| {
+    let rows = statement.query_map(params_from_iter(parameters), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
@@ -296,34 +316,13 @@ fn load_latest_verified_event_json_chunk(
     let mut heads = HashMap::with_capacity(operation_ids.len());
     for row in rows {
         let (operation_id, sequence, event_json, merkle_commit_json, previous_merkle_json) = row?;
-        let sequence = u64::try_from(sequence).map_err(|error| {
-            LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::Merkle(
-                format!("persisted row sequence is out of range: {error}"),
-            ))
-        })?;
-        let event_json = from_str::<Value>(&event_json)?;
-        if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
-            return Err(LocalIndexStoreError::Reliability(
-                shardline_reliability::ReliabilityError::Merkle(
-                    "persisted row sequence does not match its event".into(),
-                ),
-            ));
-        }
-        let identity = persisted_event_identity(operation_kind, event_json.clone())?;
-        if identity.operation_id != operation_id {
-            return Err(LocalIndexStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ));
-        }
-        verify_persisted_merkle_commit_with_previous(
+        let event_json = verify_latest_event_json(
             operation_kind,
-            event_json.clone(),
-            merkle_commit_json
-                .map(|json| from_str::<Value>(&json))
-                .transpose()?,
-            previous_merkle_json
-                .map(|json| from_str::<Value>(&json))
-                .transpose()?,
+            &operation_id,
+            sequence,
+            &event_json,
+            merkle_commit_json,
+            previous_merkle_json,
         )?;
         heads.insert(operation_id, event_json);
     }
@@ -339,6 +338,24 @@ pub(crate) fn persist_reliability_event<T: EvidenceEventMetadata>(
     event: &T,
 ) -> Result<(), LocalIndexStoreError> {
     persist_reliability_event_at(transaction, event, u64_to_i64(unix_now_seconds_lossy())?)
+}
+
+/// Persists a baseline plus transition for a new log, or only the appended head
+/// for an existing log. The caller retains ownership of the mutation transaction.
+pub(crate) fn persist_appended_reliability_events<T: EvidenceEventMetadata>(
+    transaction: &Transaction<'_>,
+    events: &[T],
+    was_empty: bool,
+) -> Result<(), LocalIndexStoreError> {
+    let pending = if was_empty {
+        events
+    } else {
+        events.last().map(std::slice::from_ref).unwrap_or_default()
+    };
+    for event in pending {
+        persist_reliability_event(transaction, event)?;
+    }
+    Ok(())
 }
 
 /// Persists one event with an explicitly selected timestamp source.
@@ -439,6 +456,27 @@ pub(crate) fn backfill_reliability_merkle_commits(
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
     drop(statement);
 
+    let mut previous_statement = transaction.prepare(
+        "SELECT CASE WHEN EXISTS (
+             SELECT 1 FROM shardline_reliability_events AS missing
+             WHERE missing.operation_kind = ?1 AND missing.operation_id = ?2
+               AND missing.sequence < ?3
+               AND missing.merkle_commit_json IS NULL
+         ) THEN '{\"missing_previous_merkle_commit\":true}' ELSE merkle_commit_json END
+         FROM shardline_reliability_events
+         WHERE operation_kind = ?1 AND operation_id = ?2 AND sequence < ?3
+         ORDER BY sequence DESC LIMIT 1",
+    )?;
+    let mut update_statement = transaction.prepare(
+        "UPDATE shardline_reliability_events
+         SET merkle_commit_json = ?1
+         WHERE operation_kind = ?2
+           AND operation_id = ?3
+           AND sequence = ?4
+           AND (merkle_commit_json IS NULL
+                OR (sequence > 0 AND json_extract(merkle_commit_json, '$.body.parent_commit_id') IS NULL))
+           AND event_json = ?5",
+    )?;
     for (operation_kind_text, operation_id, sequence, event_json_text) in &rows {
         let operation_kind = OperationKind::parse(operation_kind_text).ok_or_else(|| {
             LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::Merkle(
@@ -446,17 +484,8 @@ pub(crate) fn backfill_reliability_merkle_commits(
             ))
         })?;
         let event_json = from_str(event_json_text)?;
-        let previous_json: Option<String> = transaction
+        let previous_json: Option<String> = previous_statement
             .query_row(
-                "SELECT CASE WHEN EXISTS (
-                     SELECT 1 FROM shardline_reliability_events AS missing
-                     WHERE missing.operation_kind = ?1 AND missing.operation_id = ?2
-                       AND missing.sequence < ?3
-                       AND missing.merkle_commit_json IS NULL
-                 ) THEN '{\"missing_previous_merkle_commit\":true}' ELSE merkle_commit_json END
-                 FROM shardline_reliability_events
-                 WHERE operation_kind = ?1 AND operation_id = ?2 AND sequence < ?3
-                 ORDER BY sequence DESC LIMIT 1",
                 params![operation_kind.as_str(), operation_id, sequence],
                 |row| row.get(0),
             )
@@ -467,23 +496,13 @@ pub(crate) fn backfill_reliability_merkle_commits(
         let merkle_commit_json =
             build_persisted_merkle_commit_with_previous(operation_kind, event_json, previous_json)
                 .map_err(LocalIndexStoreError::Reliability)?;
-        transaction.execute(
-            "UPDATE shardline_reliability_events
-             SET merkle_commit_json = ?1
-             WHERE operation_kind = ?2
-               AND operation_id = ?3
-               AND sequence = ?4
-               AND (merkle_commit_json IS NULL
-                    OR (sequence > 0 AND json_extract(merkle_commit_json, '$.body.parent_commit_id') IS NULL))
-               AND event_json = ?5",
-            params![
-                merkle_commit_json.to_string(),
-                operation_kind.as_str(),
-                operation_id,
-                sequence,
-                event_json_text,
-            ],
-        )?;
+        update_statement.execute(params![
+            merkle_commit_json.to_string(),
+            operation_kind.as_str(),
+            operation_id,
+            sequence,
+            event_json_text,
+        ])?;
     }
     Ok(rows.len())
 }
@@ -513,6 +532,11 @@ pub(crate) fn repair_reliability_merkle_commits(
 
     let mut previous_operation: Option<(String, String, Value)> = None;
     let mut repaired = 0usize;
+    let mut update_statement = transaction.prepare(
+        "UPDATE shardline_reliability_events
+         SET merkle_commit_json = ?1
+         WHERE operation_kind = ?2 AND operation_id = ?3 AND sequence = ?4",
+    )?;
     for (operation_kind_text, operation_id, sequence, event_json_text) in rows {
         let operation_kind = OperationKind::parse(&operation_kind_text).ok_or_else(|| {
             LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::Merkle(
@@ -535,23 +559,18 @@ pub(crate) fn repair_reliability_merkle_commits(
             ));
         }
         let previous = previous_operation
-            .as_ref()
+            .take()
             .filter(|(kind, id, _)| kind == &operation_kind_text && id == &operation_id)
-            .map(|(_, _, commit)| commit.clone());
+            .map(|(_, _, commit)| commit);
         let merkle_commit_json =
             build_persisted_merkle_commit_with_previous(operation_kind, event_json, previous)
                 .map_err(LocalIndexStoreError::Reliability)?;
-        transaction.execute(
-            "UPDATE shardline_reliability_events
-             SET merkle_commit_json = ?1
-             WHERE operation_kind = ?2 AND operation_id = ?3 AND sequence = ?4",
-            params![
-                merkle_commit_json.to_string(),
-                operation_kind_text,
-                operation_id,
-                sequence,
-            ],
-        )?;
+        update_statement.execute(params![
+            merkle_commit_json.to_string(),
+            operation_kind_text,
+            operation_id,
+            sequence,
+        ])?;
         previous_operation = Some((operation_kind_text, operation_id, merkle_commit_json));
         repaired = repaired.saturating_add(1);
     }
@@ -608,9 +627,9 @@ pub(crate) fn verify_reliability_events(
         })?;
         let observed: Value = from_str(&merkle_json_text)?;
         let previous = previous_operation
-            .as_ref()
+            .take()
             .filter(|(kind, id, _)| kind == &operation_kind_text && id == &operation_id)
-            .map(|(_, _, commit)| commit.clone());
+            .map(|(_, _, commit)| commit);
         shardline_reliability::verify_persisted_merkle_commit_with_previous(
             operation_kind,
             event_json,
@@ -692,48 +711,67 @@ pub(crate) fn quarantine_snapshot(
     )?)
 }
 
+/// Loads an integrity-checked snapshot boundary, preserving absent-log semantics.
+pub(crate) fn load_snapshot_evidence<S>(
+    connection: &Connection,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<SnapshotEvidenceLog<S>, LocalIndexStoreError>
+where
+    S: SnapshotEvidence + serde::de::DeserializeOwned,
+{
+    match load_latest_verified_event_json(connection, operation_kind, operation_id)? {
+        Some(event) => Ok(SnapshotEvidenceLog::from_head(from_value(event)?)?),
+        None => Ok(SnapshotEvidenceLog::default()),
+    }
+}
+
+fn load_snapshot_evidence_for<S>(
+    connection: &Connection,
+    snapshot: &S,
+) -> Result<SnapshotEvidenceLog<S>, LocalIndexStoreError>
+where
+    S: SnapshotEvidence + serde::de::DeserializeOwned,
+{
+    let operation = snapshot.evidence_operation()?;
+    load_snapshot_evidence(connection, operation.kind, &operation.operation_id)
+}
+
 pub(crate) fn load_quarantine_evidence(
     transaction: &Connection,
     object_key: &str,
 ) -> Result<QuarantineEvidenceLog, LocalIndexStoreError> {
-    let rows = load_latest_verified_event_json(
+    load_snapshot_evidence(
         transaction,
         OperationKind::GarbageCollection,
         &quarantine_evidence_operation_id(object_key),
-    )?;
-    let Some(row) = rows else {
-        return Ok(QuarantineEvidenceLog::default());
-    };
-    Ok(QuarantineEvidenceLog::from_head(from_value::<
-        QuarantineLifecycleEvent,
-    >(row)?)?)
+    )
+}
+
+fn load_snapshot_evidence_batch<S>(
+    connection: &Connection,
+    operation_kind: OperationKind,
+    operation_ids: &[String],
+) -> Result<HashMap<String, SnapshotEvidenceLog<S>>, LocalIndexStoreError>
+where
+    S: SnapshotEvidence + serde::de::DeserializeOwned,
+{
+    load_latest_verified_event_json_batch(connection, operation_kind, operation_ids)?
+        .into_iter()
+        .map(|(operation_id, event)| {
+            Ok((
+                operation_id,
+                SnapshotEvidenceLog::from_head(from_value(event)?)?,
+            ))
+        })
+        .collect()
 }
 
 pub(crate) fn load_quarantine_evidence_batch(
     transaction: &Connection,
     object_keys: &[String],
 ) -> Result<HashMap<String, QuarantineEvidenceLog>, LocalIndexStoreError> {
-    let heads = load_latest_verified_event_json_batch(
-        transaction,
-        OperationKind::GarbageCollection,
-        object_keys,
-    )?;
-    heads
-        .into_iter()
-        .map(|(object_key, event)| {
-            Ok((
-                object_key,
-                QuarantineEvidenceLog::from_head(from_value::<QuarantineLifecycleEvent>(event)?)?,
-            ))
-        })
-        .collect()
-}
-
-pub(crate) fn persist_quarantine_evidence(
-    transaction: &Transaction<'_>,
-    event: &QuarantineLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
+    load_snapshot_evidence_batch(transaction, OperationKind::GarbageCollection, object_keys)
 }
 
 pub(crate) fn retention_evidence_operation_id(object_key: &str) -> String {
@@ -757,44 +795,18 @@ pub(crate) fn load_retention_evidence(
     transaction: &Connection,
     object_key: &str,
 ) -> Result<RetentionEvidenceLog, LocalIndexStoreError> {
-    let rows = load_latest_verified_event_json(
+    load_snapshot_evidence(
         transaction,
         OperationKind::RetentionHold,
         &retention_evidence_operation_id(object_key),
-    )?;
-    let Some(row) = rows else {
-        return Ok(RetentionEvidenceLog::default());
-    };
-    Ok(RetentionEvidenceLog::from_head(from_value::<
-        RetentionHoldLifecycleEvent,
-    >(row)?)?)
+    )
 }
 
 pub(crate) fn load_retention_evidence_batch(
     transaction: &Connection,
     object_keys: &[String],
 ) -> Result<HashMap<String, RetentionEvidenceLog>, LocalIndexStoreError> {
-    let heads = load_latest_verified_event_json_batch(
-        transaction,
-        OperationKind::RetentionHold,
-        object_keys,
-    )?;
-    heads
-        .into_iter()
-        .map(|(object_key, event)| {
-            Ok((
-                object_key,
-                RetentionEvidenceLog::from_head(from_value::<RetentionHoldLifecycleEvent>(event)?)?,
-            ))
-        })
-        .collect()
-}
-
-pub(crate) fn persist_retention_evidence(
-    transaction: &Transaction<'_>,
-    event: &RetentionHoldLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
+    load_snapshot_evidence_batch(transaction, OperationKind::RetentionHold, object_keys)
 }
 
 pub(crate) fn webhook_snapshot(
@@ -820,17 +832,11 @@ pub(crate) fn load_webhook_evidence(
     let operation = webhook_snapshot(delivery, WebhookDeliveryLifecycleState::Processed)?
         .evidence_operation()
         .map_err(LocalIndexStoreError::from)?;
-    let rows = load_latest_verified_event_json(
+    load_snapshot_evidence(
         transaction,
         OperationKind::WebhookDelivery,
         &operation.operation_id,
-    )?;
-    let Some(row) = rows else {
-        return Ok(WebhookDeliveryEvidenceLog::default());
-    };
-    Ok(WebhookDeliveryEvidenceLog::from_head(from_value::<
-        WebhookDeliveryLifecycleEvent,
-    >(row)?)?)
+    )
 }
 
 pub(crate) fn load_webhook_evidence_batch(
@@ -845,34 +851,14 @@ pub(crate) fn load_webhook_evidence_batch(
                 .map(|operation| operation.operation_id)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let heads = load_latest_verified_event_json_batch(
-        transaction,
-        OperationKind::WebhookDelivery,
-        &operation_ids,
-    )?;
-    operation_ids
-        .into_iter()
-        .map(|operation_id| {
-            let event = heads
-                .get(&operation_id)
-                .ok_or(LocalIndexStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                ))?;
-            Ok((
-                operation_id,
-                WebhookDeliveryEvidenceLog::from_head(
-                    from_value::<WebhookDeliveryLifecycleEvent>(event.clone())?,
-                )?,
-            ))
-        })
-        .collect()
-}
-
-pub(crate) fn persist_webhook_evidence(
-    transaction: &Transaction<'_>,
-    event: &WebhookDeliveryLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
+    let evidence =
+        load_snapshot_evidence_batch(transaction, OperationKind::WebhookDelivery, &operation_ids)?;
+    if operation_ids.iter().any(|id| !evidence.contains_key(id)) {
+        return Err(LocalIndexStoreError::Reliability(
+            shardline_reliability::ReliabilityError::OperationMismatch,
+        ));
+    }
+    Ok(evidence)
 }
 
 pub(crate) fn hub_ref_snapshot(
@@ -883,32 +869,6 @@ pub(crate) fn hub_ref_snapshot(
     Ok(HubRefSnapshot::new(repository, ref_name, head_sha)?)
 }
 
-pub(crate) fn load_hub_ref_evidence(
-    transaction: &Transaction<'_>,
-    repository: &str,
-    ref_name: &str,
-) -> Result<HubRefEvidenceLog, LocalIndexStoreError> {
-    let operation = hub_ref_snapshot(repository, ref_name, None)?.evidence_operation()?;
-    let rows = load_latest_verified_event_json(
-        transaction,
-        OperationKind::MetadataCommit,
-        &operation.operation_id,
-    )?;
-    let Some(row) = rows else {
-        return Ok(HubRefEvidenceLog::default());
-    };
-    Ok(HubRefEvidenceLog::from_head(from_value::<
-        HubRefLifecycleEvent,
-    >(row)?)?)
-}
-
-pub(crate) fn persist_hub_ref_evidence(
-    transaction: &Transaction<'_>,
-    event: &HubRefLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
-}
-
 pub(crate) fn current_hub_ref_evidence(
     transaction: &Transaction<'_>,
     repository: &str,
@@ -916,7 +876,7 @@ pub(crate) fn current_hub_ref_evidence(
     head_sha: Option<String>,
 ) -> Result<(HubRefEvidenceLog, bool), LocalIndexStoreError> {
     let snapshot = hub_ref_snapshot(repository, ref_name, head_sha)?;
-    let evidence = load_hub_ref_evidence(transaction, repository, ref_name)?;
+    let evidence = load_snapshot_evidence_for(transaction, &snapshot)?;
     Ok(verify_or_repair_snapshot_evidence(evidence, snapshot)?)
 }
 
@@ -927,7 +887,7 @@ pub(crate) fn verify_hub_ref_evidence(
     head_sha: Option<String>,
 ) -> Result<HubRefEvidenceLog, LocalIndexStoreError> {
     let snapshot = hub_ref_snapshot(repository, ref_name, head_sha)?;
-    let evidence = load_hub_ref_evidence(transaction, repository, ref_name)?;
+    let evidence = load_snapshot_evidence_for(transaction, &snapshot)?;
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(evidence)
 }
@@ -947,11 +907,8 @@ pub(crate) fn verify_hub_ref_evidence_batch(
                 .operation_id,
         );
     }
-    let heads = load_latest_verified_event_json_batch(
-        transaction,
-        OperationKind::MetadataCommit,
-        &operation_ids,
-    )?;
+    let heads =
+        load_snapshot_evidence_batch(transaction, OperationKind::MetadataCommit, &operation_ids)?;
     for ((repository, ref_name, head_sha), operation_id) in refs.iter().zip(operation_ids) {
         let snapshot = hub_ref_snapshot(repository, ref_name, head_sha.clone())?;
         let head = heads
@@ -959,9 +916,7 @@ pub(crate) fn verify_hub_ref_evidence_batch(
             .ok_or(LocalIndexStoreError::Reliability(
                 shardline_reliability::ReliabilityError::OperationMismatch,
             ))?;
-        let evidence =
-            HubRefEvidenceLog::from_head(from_value::<HubRefLifecycleEvent>(head.clone())?)?;
-        verify_snapshot_evidence(&evidence, &snapshot)?;
+        verify_snapshot_evidence(head, &snapshot)?;
     }
     Ok(())
 }
@@ -980,27 +935,6 @@ pub(crate) fn oci_tag_snapshot(
     )?)
 }
 
-pub(crate) fn load_oci_tag_evidence(
-    transaction: &Transaction<'_>,
-    scope_namespace: &str,
-    repository: &str,
-    tag: &str,
-) -> Result<OciTagEvidenceLog, LocalIndexStoreError> {
-    let operation =
-        oci_tag_snapshot(scope_namespace, repository, tag, None)?.evidence_operation()?;
-    let rows = load_latest_verified_event_json(
-        transaction,
-        OperationKind::OciTag,
-        &operation.operation_id,
-    )?;
-    let Some(row) = rows else {
-        return Ok(OciTagEvidenceLog::default());
-    };
-    Ok(OciTagEvidenceLog::from_head(from_value::<
-        OciTagLifecycleEvent,
-    >(row)?)?)
-}
-
 pub(crate) fn current_oci_tag_evidence(
     transaction: &Transaction<'_>,
     scope_namespace: &str,
@@ -1009,7 +943,7 @@ pub(crate) fn current_oci_tag_evidence(
     digest_hex: Option<String>,
 ) -> Result<(OciTagEvidenceLog, bool), LocalIndexStoreError> {
     let snapshot = oci_tag_snapshot(scope_namespace, repository, tag, digest_hex)?;
-    let loaded = load_oci_tag_evidence(transaction, scope_namespace, repository, tag)?;
+    let loaded = load_snapshot_evidence_for(transaction, &snapshot)?;
     Ok(verify_or_repair_snapshot_evidence(loaded, snapshot)?)
 }
 
@@ -1021,7 +955,7 @@ pub(crate) fn verify_oci_tag_evidence(
     digest_hex: Option<String>,
 ) -> Result<OciTagEvidenceLog, LocalIndexStoreError> {
     let snapshot = oci_tag_snapshot(scope_namespace, repository, tag, digest_hex)?;
-    let evidence = load_oci_tag_evidence(transaction, scope_namespace, repository, tag)?;
+    let evidence = load_snapshot_evidence_for(transaction, &snapshot)?;
     // An absent legacy tag has no materialized state and therefore may not
     // have a journal baseline yet.  This is the same read contract as the
     // Postgres adapter: verify an existing tag, but let a genuinely missing
@@ -1031,13 +965,6 @@ pub(crate) fn verify_oci_tag_evidence(
     }
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(evidence)
-}
-
-pub(crate) fn persist_oci_tag_evidence(
-    transaction: &Transaction<'_>,
-    event: &OciTagLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
 }
 
 pub(crate) fn s3_object_snapshot(
@@ -1056,25 +983,6 @@ pub(crate) fn s3_object_snapshot(
     Ok(S3ObjectSnapshot::new(scope_namespace, object_key, state)?)
 }
 
-pub(crate) fn load_s3_object_evidence(
-    transaction: &Transaction<'_>,
-    scope_namespace: &str,
-    object_key: &str,
-) -> Result<S3ObjectEvidenceLog, LocalIndexStoreError> {
-    let operation = s3_object_snapshot(scope_namespace, object_key, None)?.evidence_operation()?;
-    let event = load_latest_verified_event_json(
-        transaction,
-        OperationKind::S3Object,
-        &operation.operation_id,
-    )?;
-    let Some(event) = event else {
-        return Ok(S3ObjectEvidenceLog::default());
-    };
-    Ok(S3ObjectEvidenceLog::from_head(from_value::<
-        S3ObjectLifecycleEvent,
-    >(event)?)?)
-}
-
 pub(crate) fn current_s3_object_evidence(
     transaction: &Transaction<'_>,
     scope_namespace: &str,
@@ -1082,11 +990,11 @@ pub(crate) fn current_s3_object_evidence(
     entry: Option<&crate::S3ObjectEntry>,
 ) -> Result<S3ObjectEvidenceLog, LocalIndexStoreError> {
     let snapshot = s3_object_snapshot(scope_namespace, object_key, entry)?;
-    let loaded = load_s3_object_evidence(transaction, scope_namespace, object_key)?;
+    let loaded = load_snapshot_evidence_for(transaction, &snapshot)?;
     let (evidence, was_missing) = verify_or_repair_snapshot_evidence(loaded, snapshot)?;
     if was_missing {
         for event in evidence.events() {
-            persist_s3_object_evidence(transaction, event)?;
+            persist_reliability_event(transaction, event)?;
         }
     }
     Ok(evidence)
@@ -1099,16 +1007,9 @@ pub(crate) fn verify_s3_object_evidence(
     entry: Option<&crate::S3ObjectEntry>,
 ) -> Result<S3ObjectEvidenceLog, LocalIndexStoreError> {
     let snapshot = s3_object_snapshot(scope_namespace, object_key, entry)?;
-    let evidence = load_s3_object_evidence(transaction, scope_namespace, object_key)?;
+    let evidence = load_snapshot_evidence_for(transaction, &snapshot)?;
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(evidence)
-}
-
-pub(crate) fn persist_s3_object_evidence(
-    transaction: &Transaction<'_>,
-    event: &S3ObjectLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
 }
 
 pub(crate) trait SqliteExecutor {
@@ -1131,14 +1032,7 @@ pub(crate) fn load_provider_evidence(
     snapshot: &ProviderLifecycleSnapshot,
 ) -> Result<ProviderEvidenceLog, LocalIndexStoreError> {
     let operation_id = provider_evidence_operation_id(snapshot);
-    let Some(row) =
-        load_latest_verified_event_json(transaction, OperationKind::ProviderEvent, &operation_id)?
-    else {
-        return Ok(ProviderEvidenceLog::default());
-    };
-    Ok(ProviderEvidenceLog::from_head(from_value::<
-        ProviderLifecycleEvent,
-    >(row)?)?)
+    load_snapshot_evidence(transaction, OperationKind::ProviderEvent, &operation_id)
 }
 
 pub(crate) fn load_provider_evidence_batch(
@@ -1149,33 +1043,12 @@ pub(crate) fn load_provider_evidence_batch(
         .iter()
         .map(provider_evidence_operation_id)
         .collect::<Vec<_>>();
-    let heads = load_latest_verified_event_json_batch(
-        transaction,
-        OperationKind::ProviderEvent,
-        &operation_ids,
-    )?;
-    operation_ids
-        .into_iter()
-        .map(|operation_id| {
-            let evidence = heads
-                .get(&operation_id)
-                .map(|event| {
-                    ProviderEvidenceLog::from_head(from_value::<ProviderLifecycleEvent>(
-                        event.clone(),
-                    )?)
-                })
-                .transpose()?
-                .unwrap_or_default();
-            Ok((operation_id, evidence))
-        })
-        .collect()
-}
-
-pub(crate) fn persist_provider_evidence(
-    transaction: &Transaction<'_>,
-    event: &ProviderLifecycleEvent,
-) -> Result<(), LocalIndexStoreError> {
-    persist_reliability_event(transaction, event)
+    let mut evidence =
+        load_snapshot_evidence_batch(transaction, OperationKind::ProviderEvent, &operation_ids)?;
+    for operation_id in operation_ids {
+        evidence.entry(operation_id).or_default();
+    }
+    Ok(evidence)
 }
 
 impl SqliteExecutor for Connection {
@@ -3257,6 +3130,7 @@ mod tests {
 
     fn sample_record(scope: Option<RepositoryScope>) -> crate::FileRecord {
         crate::FileRecord {
+            deduplication_domain: None,
             file_id: "test.bin".into(),
             content_hash: "c".repeat(64),
             total_bytes: 4,

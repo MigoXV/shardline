@@ -3745,3 +3745,3030 @@ no recovery result is treated as a successful measurement.
 These measurements are baselines for a fixed host and deployment shape. Compare runs
 only with matching fixture, service, database, object-store, CPU, and toolchain
 metadata.
+
+## Maintenance cleanup source inventory
+
+The November 16, 2026 inventory compares baseline
+`e53a33e00a3c2feae4ee8e2417927763663421c7` with cleanup commit
+`3417c244c32cedecd1f1ded64292d8380c90d970`. It counts all tracked `.rs`
+lines, including tests, comments and blank lines. Uncommitted work and generated
+untracked files are excluded. These counts measure source size, not runtime cost
+or the amount of additional code that can safely be removed.
+
+Per-file counts from `git grep -I -c '^' <commit> -- '*.rs'` were independently
+checked against the line count of every Rust blob in each Git snapshot.
+
+| Scope | Baseline lines | Cleanup lines | Net reduction |
+| --- | ---: | ---: | ---: |
+| Entire repository | 603,649 | 568,434 | 35,215 (5.83%) |
+| Server | 220,570 | 209,561 | 11,009 (4.99%) |
+| Server core | 6,454 | 5,334 | 1,120 (17.35%) |
+| Hub API | 43,749 | 41,070 | 2,679 (6.12%) |
+| Storage | 20,373 | 18,427 | 1,946 (9.55%) |
+| S3 adapter | 10,954 | 9,928 | 1,026 (9.37%) |
+| Xet adapter | 17,801 | 15,730 | 2,071 (11.63%) |
+| Xet core | 14,456 | 11,220 | 3,236 (22.39%) |
+| OCI adapter | 7,700 | 6,575 | 1,125 (14.61%) |
+| Cache | 6,573 | 5,268 | 1,305 (19.85%) |
+| Index | 71,472 | 68,417 | 3,055 (4.27%) |
+| CAS | 3,447 | 2,622 | 825 (23.93%) |
+| GC | 10,954 | 9,949 | 1,005 (9.17%) |
+| Fsck | 8,989 | 8,493 | 496 (5.52%) |
+| Rebuild | 4,326 | 3,519 | 807 (18.65%) |
+| CLI | 37,677 | 36,861 | 816 (2.17%) |
+| SDK | 26,965 | 24,219 | 2,746 (10.18%) |
+| Protocol | 4,076 | 3,502 | 574 (14.08%) |
+| Protocol adapters | 1,670 | 1,414 | 256 (15.33%) |
+| Provider events | 5,283 | 4,905 | 378 (7.16%) |
+| VCS | 9,393 | 8,228 | 1,165 (12.40%) |
+| Validation | 977 | 628 | 349 (35.72%) |
+
+The SDK component decrease includes tests relocated to the E2E workspace. Those
+lines remain in the repository total and are not counted as repository deletions.
+
+The inventory at `46fe2321` included 1,123 fewer Rust lines since `c78b7e1e`. The client and
+server share one CDC boundary engine; SDK metadata decoding no longer copies
+identical response structs; Xorb packing reuses the core footer writer and
+already-computed chunk hashes. Shared shard field readers also fix legacy v2
+imports. Real-server SDK tests moved to the E2E workspace rather than being
+removed; standalone SDK tests no longer pull in the full server.
+
+At `1e4d3958`, the complete local CLI library suite passed all 597 tests
+with Rust 1.99 and strict CLI library/test Clippy passed with Rust 1.100. This
+covers the combined command-dispatch, report-writer, migration-root, atomic-output
+and retained-evidence scanner simplifications. The scanner retains each candidate
+in one bounded queue without separate filename strings. Existing cleanup tests
+also check first-page selection, continuation and wraparound. External PostgreSQL
+and native-client prerequisites were not required in this run; tests with optional
+fixture guards do not establish those integration guarantees. This is not a
+production or hosted-CI qualification.
+
+At `38f35a53`, the complete SDK test run passed all 353 tests, including
+12 public-API conformance tests against the independent mock frontend. Strict
+SDK library/test Clippy passed with Rust 1.100; tests used Rust 1.99. Recent
+simplifications remove duplicate retry markers, unused channel error wrappers,
+unreachable writer-state checks and temporary reconstruction buffers. The public
+429 retry policy now controls requests; a regression test failed against the
+previous implementation, which sent six requests when retries were disabled.
+Deduplication queries still fail fast. Tests also check token-refresh opt-in and
+loop bounds, missing chunk-location rejection before metadata publication,
+reader failures and panics, cancellation, memory limits and permit lifetimes.
+Repeated Xorb round-trip and retry fixtures were combined while retaining payload
+cases and jittered/plain retry coverage. These runs do not measure a throughput or build-time
+improvement. The mock frontend does not qualify the production server or its
+tree/revision routes.
+
+At `40665b6d`, all 314 selected non-PostgreSQL helper, LFS, Bazel and OCI
+tests passed, with strict server library/test Clippy. Bazel flat GET and HEAD
+share the same Action Cache lookup and fall back to CAS only on a missing object;
+storage failures propagate. The regression fixture checks both methods against
+healthy CAS content and a broken Action Cache object path. This run does not
+establish PostgreSQL or production qualification.
+
+At `ecbb5054`, all 86 selected LFS and batch tests passed after simplifying
+transfer actions and CAS credential negotiation; strict server library/test
+Clippy also passed. The run covers basic fallback on internal signing failure,
+Xet upload/download headers and existing-object responses. At `4a47b867`, all
+442 selected server-core, OCI and protocol-support tests passed, with strict
+core/server Clippy. Validator cases were consolidated without dropping prior
+literal inputs, and tag/session length-boundary cases were added.
+
+At `11e2a48a`, all 450 reliability/OCI/S3-adapter tests and 392 selected
+non-PostgreSQL server OCI/S3 tests passed. Strict library/test Clippy passed for
+the three affected crates. Both adapters share typed evidence suffix selection;
+OCI selects new events before serializing them instead of filtering and copying
+full JSON histories. Tests cover borrowed suffix boundaries, incremental
+snapshot appends, tampered Merkle records and uncommitted journal tails. At
+`4c57ff23`, all 206 OCI-adapter tests and strict adapter Clippy passed after
+consolidating journal write/sync/length accounting. These tests ran on Linux;
+the portable filesystem branch was not executed. Tests used Rust 1.99 and strict
+Clippy used Rust 1.100. These checks do not measure throughput or build-time gains.
+
+At `b80182540965b1be928a4607990f1423bc42d2e1`, all 105 reliability tests and all 279
+S3/OCI-adapter library tests passed with all features, followed by all 12 selected
+server LFS evidence tests (3,253 server tests filtered out). Reliability
+library/test Clippy passed with warnings denied. This checkpoint covers the
+shared Merkle builders after removing duplicate parent-head state and redundant
+JSON clones. The expanded builder test checks three-event chains, parity between
+typed and discriminator-based builders, and suffix appends linked to an existing
+head. Adapter and LFS tests also exercise tampering rejection, repair, journal
+tails and incremental publication. Tests used Rust 1.99 and Clippy used Rust
+1.100 on Linux. These are local functional checks; they do not qualify
+PostgreSQL/object-storage deployment, portable filesystem behavior, production
+throughput or the historical hosted SDK memory-test failure.
+
+At `c3dc54cd`, all 58 CAS tests passed with all features after simplifying
+upload lifecycle orchestration and raw-blob storage requirements. The raw-blob
+contract uses a unit index to prove that writing an object does not require an
+index implementation. Duplicate error tests were consolidated without dropping
+variant messages or conversion categories; derived-trait smoke tests were removed.
+
+At `724c732d`, all 150 cache tests passed, including 20 Redis integration tests
+with `SHARDLINE_REQUIRE_NATIVE_CLIENTS=1` and Docker infrastructure required.
+This covers loader cancellation, replacement accounting, stale reservation
+rejection, cross-replica loading, TTL expiry and mutual TLS. Ten key-format tests
+became one table retaining every input and asserting complete serialized keys.
+
+At `bed20c61`, all 12 selected transfer-limiter and related error tests passed.
+The closed-semaphore test now closes the semaphore, and timeout coverage uses
+paused time without a spawned task. At `248c9250`, all 47 download-stream tests
+passed after simplifying container routing and grouping, eliminating a full
+file-record clone, and consolidating four range tests across both local and
+dispatched reads. Integrity, truncation, file-growth and cancellation tests remain.
+Strict library/test Clippy passed for CAS, cache and server at their respective
+revisions. Tests used Rust 1.99 and strict Clippy used Rust 1.100. These checks
+provide no new production-throughput or build-time measurement.
+
+At `ef1d8e7a`, the dedicated native S3 listing pagination integration binary
+passed both SQLite and PostgreSQL lanes with Rust 1.99. PostgreSQL 16 ran in a
+disposable container with `DATABASE_URL` configured and
+`SHARDLINE_REQUIRE_POSTGRES_TESTS=1`; neither lane skipped. The test exercises
+v1/v2 HTTP listing walks, delimiter rollups, Unicode ordering, cursor boundaries,
+zero page sizes and invalid limits. PostgreSQL contained 21 S3 index rows after
+the run, independently confirming that the database lane executed. Object storage
+was local; this does not qualify PostgreSQL with a remote object store or measure
+listing read amplification.
+
+The same revision passed all 329 selected adapter-library and non-PostgreSQL S3
+server-route tests, and strict adapter library/test Clippy. Multipart completion
+now stores each part checksum once; public CRC-specific and generic accessors
+retain their behavior. Query and listing parsers no longer convert through
+intermediate name enums, and ordinary v2 XML listing responses borrow their
+result until URL encoding requires a copy.
+
+At `46fe2321`, raw-Xorb construction shares one implementation and server
+packing omits an unused boundary vector. Thirty-two duplicated compression/raw
+smoke tests were consolidated, moving their unique wire-value, scheme-name and
+passthrough assertions into retained tests. All 282 other top-level test bodies
+were unchanged. Core/adapter tests (633/295), ingestion tests (153), and five
+SDK/server byte-identity tests passed, as did strict core/server Clippy. One
+pre-existing adapter I/O diagnostic remained ignored. This pass removed 420 net
+Rust lines; no build-time speedup is inferred from that count.
+
+At `c78b7e1e`, all 23 selected server CDC and client chunker tests passed,
+including upstream golden boundaries and client/server equivalence across frame
+sizes and target sizes. Strict Rust 1.100 server library/test Clippy passed.
+At `5c840ed0`, both required PostgreSQL reuse tests passed: slow source
+verification releases discovery locks and the metadata connection, while
+publication rejects a source admitted for deletion. These focused checks do not
+replace a full release qualification.
+
+At `7b101b0b`, all 908 selected Hub API and index Hub library tests passed in
+98.296 seconds using a disposable PostgreSQL 16 database with
+`SHARDLINE_REQUIRE_POSTGRES_TESTS=1`; 699 unrelated tests were filtered out.
+This run exercises both SQLite and PostgreSQL storage paths. Strict Rust 1.100
+Clippy for index library and test targets also passed. Reproduce the selection
+against a migrated, disposable database with:
+
+```bash
+SHARDLINE_REQUIRE_POSTGRES_TESTS=1 cargo nextest run --locked \
+  -p shardline-index -p shardline-hub-api --lib --all-features --test-threads 1 \
+  -E 'package(shardline-hub-api) or (package(shardline-index) and test(hub))'
+```
+
+The inventory revision is not a release qualification stamp. The complete local
+distributed gate below passed again at `5b056cb6`, after the shared protocol
+cleanup and multipart buffering changes. A combined run at `0eaeaa81` passed
+all 565 selected S3, OCI, LFS, Bazel, admin and shared protocol-helper library tests
+in 68.494 seconds, with PostgreSQL 16 configured and `SHARDLINE_REQUIRE_POSTGRES_TESTS=1`. The run included ignored tests
+in those modules, including the PostgreSQL/MinIO disconnected-copy recovery test;
+2,828 unrelated tests were filtered out. Tests ran serially using all server
+features. Independent hosted CI and a multi-host PostgreSQL/S3 split-role topology
+remain separate qualification requirements.
+
+With a disposable PostgreSQL database available through `DATABASE_URL` and Docker
+available for the selected MinIO fixtures, reproduce the combined selection with:
+
+```bash
+SHARDLINE_REQUIRE_POSTGRES_TESTS=1 cargo nextest run -p shardline-server \
+  --lib --all-features --run-ignored all --test-threads 1 \
+  -E 'test(app::protocol_routes::lfs) | test(app::protocol_routes::s3::) | test(app::protocol_routes::oci::) | test(app::protocol_routes::bazel::) | test(app::admin_api::) | test(app::protocol_routes::helpers::)'
+```
+
+Component rows are selected examples; other components gained coverage, so their
+reductions must not be summed to obtain the repository total. Reproduce a row
+using the corresponding commit and path; use `'*.rs'` for the total:
+
+```bash
+set -o pipefail
+git grep -I -n '^' 248c9250dace1da32bb972b3f9c3df0daa7dfef3 -- 'crates/shardline-server/*.rs' | wc -l
+git grep -I -n '^' 248c9250dace1da32bb972b3f9c3df0daa7dfef3 -- '*.rs' | wc -l
+```
+
+The cleanup reuses Cargo build artifacts, narrows ordinary binary and
+integration-test targets, reuses the pinned Nextest installer, removes unused
+dependencies/features, shares root/E2E Cargo artifacts in the E2E CI job and
+avoids unnecessary CI tool installation. Local E2E commands also
+reuse the root `target/` directory through `.cargo/config.toml`; an explicit
+`CARGO_TARGET_DIR` or `--target-dir` still takes precedence. Cargo keeps distinct
+feature and profile artifacts separate within that directory. These are structural
+reductions in work.
+Controlled fresh-artifact, warm and edited-source Cargo observations appear below. Default-profile Cargo, Docker and hosted-CI
+critical-path comparisons remain outstanding; no general percentage build-time
+improvement is claimed. A source reduction also does not establish a throughput,
+latency, memory or I/O improvement.
+
+### Recorded Cargo build sample
+
+At commit `c21ac9cd8a5df982401e0cfcc708323b8b035c3a`, an x86_64 Linux
+shared-host sample used Rust
+1.99.0 (`b940084d7`) and Cargo 1.99.0 (`5f94df478`), four build jobs, no Rust
+compiler wrapper, and `CARGO_PROFILE_DEV_DEBUG=0`. This overrides the repository's
+default debug information setting. The target directory already contained
+compiled dependencies; no artifacts were cleaned between the three commands.
+
+| Sample | Wall time | Result |
+| --- | ---: | --- |
+| Populate current CLI artifacts using existing dependency cache | 29.139 s | Passed |
+| Unchanged-source build 1 | 0.244 s | Passed |
+| Unchanged-source build 2 | 0.234 s | Passed |
+
+The resulting executable passed `shardline --version`. The first sample is not
+a cold build, and the other two measure Cargo's unchanged-source path rather
+than recompilation after an edit. These observations do not compare the baseline
+or establish a build-time speedup. The separate comparison below adds controlled
+fresh-artifact and edited-source samples. Reproduce this historical command three times
+from the specified commit, keeping the same target directory:
+
+```bash
+/usr/bin/time -v env RUSTC_WRAPPER= CARGO_PROFILE_DEV_DEBUG=0 \
+  cargo build --locked -p shardline --bin shardline -j4 --timings
+```
+
+A later observation at `6869c27497334c0333846e30040260f30cba0ae8` used the same four-job,
+debug-disabled CLI command with an existing dependency cache. Rebuilding current
+artifacts took 25.662 s; the immediate unchanged-source repeat took 0.243 s.
+Both commands and the resulting executable's `--version` check passed. No artifacts
+were cleaned. This is a current-build observation, not a baseline comparison or
+evidence of a speedup; the earlier preparation sample used different cached inputs.
+
+### Controlled local Cargo comparison
+
+On November 14, 2026, baseline `e53a33e00a3c2feae4ee8e2417927763663421c7` and cleanup
+`2b96abf61e07c621a661196eb06c022339b941da` used the same direct CLI build command below,
+Rust 1.99.0, Cargo 1.99.0 and four jobs on an x86_64 Linux host with an
+AMD Ryzen 9 7950X (32 logical CPUs). Debug information was disabled explicitly;
+Rust incremental compilation remained disabled by the repository profile.
+Each revision had its own initially absent target directory on `/tmp` tmpfs.
+Registry/source caches and OS page caches were retained; these are fresh-artifact
+builds, not measurements with cold filesystem caches or dependency downloads.
+
+| Workload | Baseline | Cleanup |
+| --- | ---: | ---: |
+| Fresh artifacts, one sample | 72.130 s | 68.995 s |
+| Unchanged source, range of two samples | 0.219–0.233 s | 0.226–0.235 s |
+| CLI entrypoint comment edit, one sample | 1.179 s | 1.187 s |
+| Server library comment edit, median of three (range) | 14.717 s (14.649–14.786 s) | 14.510 s (14.284–14.780 s) |
+
+The entrypoint edit appended a comment to `crates/shardline/src/main.rs`.
+The server edits changed a numbered comment in `crates/shardline-server/src/lib.rs`;
+all six logs confirmed recompilation of both the server and CLI. Source files
+were restored afterward. Server-edit order was baseline, cleanup, cleanup,
+baseline, baseline, cleanup. Two preparation builds restored entrypoint artifacts
+before that series and are excluded from the table. All 16 builds and executable version checks passed.
+A one-second process sampler observed no competing Cargo or Rust compiler process;
+other shared-host activity and sample-order effects remain uncontrolled.
+
+Warm and server-edit ranges overlap, so these observations do not establish a
+repeatable build-time speedup. A direct CLI build excludes unit/integration test
+code, so the source inventory, which includes tests, cannot predict its timings.
+These samples do not measure the task runner, release profile, Docker build,
+test compilation or hosted CI. Reproduce each revision with a separate target
+directory; preserve it for unchanged-source and controlled comment-edit samples:
+
+```bash
+RUSTC_WRAPPER= CARGO_PROFILE_DEV_DEBUG=0 \
+  CARGO_TARGET_DIR=/tmp/shardline-build-REVISION \
+  cargo build --offline --locked -p shardline --bin shardline -j4 --timings
+```
+
+The focused [invariant ledger](../scripts/shardline/invariants.toml) maps retained
+storage, recovery and evidence checks. It is an index of the changed guarantees,
+not a substitute for the existing integration and release gates. Further source
+cuts require evidence of duplicated inputs, failure boundaries and assertions;
+the inventory does not justify removing an arbitrary percentage of tests.
+
+### Metrics recording without HTTP middleware
+
+On November 15, 2026, `0c57f12d5df4d39847488b3a8f5ea2035664012e`
+made the metrics crate's HTTP middleware optional and moved the Xet adapter's
+Axum fixture dependency to development dependencies. The metrics crate keeps
+`http` enabled by default for public API compatibility; engine dependencies opt
+out and server/Hub dependencies enable it explicitly. Recording, registration,
+and Prometheus text encoding use the same implementation in both configurations.
+
+Compared with parent `5f5351eb780a477b963a1b6ebc0623a64363ece4`, normal dependency
+trees exclude Axum, axum-core, matchit, mime, and serde_path_to_error from isolated
+SDK and index builds. The index additionally excludes httpdate; the SDK still
+uses it for client retry handling. These packages remain available to HTTP tests.
+
+A focused check of the metrics-only target used Rust 1.99.0, Cargo 1.99.0,
+x86_64 Linux, two build jobs, the repository's default dev profile, no compiler
+wrapper, and three initially absent target directories per revision on `/tmp`
+tmpfs. Registry and OS caches were retained. All six checks passed, in order
+baseline, candidate, candidate, baseline, baseline, candidate.
+
+| Metrics-only check | Baseline | With optional HTTP middleware |
+| --- | ---: | ---: |
+| Compiled packages, each sample | 60 | 23 |
+| Wall time, median (range) | 7.25 s (6.86–7.60 s) | 3.10 s (2.74–3.15 s) |
+
+Run from each revision with a new target directory for every sample:
+
+```bash
+/usr/bin/time -v env RUSTC_WRAPPER= \
+  CARGO_TARGET_DIR=/tmp/shardline-metrics-REVISION-SAMPLE \
+  cargo check --offline --locked -j2 -p shardline-metrics \
+    --no-default-features --lib --message-format=json-render-diagnostics
+```
+
+Package counts are distinct `package_id` values in Cargo's `compiler-artifact`
+JSON messages. These are shared-host, fresh-artifact checks, not cold-machine
+builds. They demonstrate less work for metrics-only consumers; they do not
+measure a full SDK or index build-time improvement. Server/CLI builds retain
+HTTP middleware, so no server/CLI, release or CI speedup is attributed to this
+change. Both metrics feature configurations, Xet HTTP fixtures, and the real
+server metrics semantics test pass; default-profile and CI gates remain intact.
+
+### Standalone SDK test compilation
+
+On November 15, 2026, two fresh-artifact pairs compared
+`23b9ad7af34a3bf524e3a915e666ab7937b5496d` with
+`f1b385b8142d3de65c3ff8a64abe9394990a6bb9`. Both used Linux x86_64,
+Rust/Cargo 1.99.0, four jobs, disabled dev/test debug information and incremental
+compilation, no compiler wrapper, and a new target directory for every build.
+Registry and filesystem caches remained warm. Run order was baseline, candidate,
+candidate, baseline; all four builds passed.
+
+| SDK-only test compilation | Baseline | Current branch |
+| --- | ---: | ---: |
+| Wall time, first sample | 83.53 s | 49.50 s |
+| Wall time, second sample | 80.15 s | 48.14 s |
+| Distinct packages in the host dependency tree | 447 | 362 |
+
+The SDK no longer has a server dev-dependency. Its real-server suite and five
+container interoperability tests now live in the existing E2E workspace, with
+CI selections updated. SDK unit and mock-protocol tests remain local. Thus this
+measures cheaper SDK-only iteration, not the complete qualification workload or
+a server/CLI build improvement. The 256 MiB and ignored 1 GiB memory gates also
+passed after moving, with their original limits.
+
+These are shared-host observations, not isolated cold-machine or hosted-CI
+measurements. Background host work was not excluded; a graph refresh could
+overlap the first baseline. The samples do not establish a universal build-time
+percentage. Reproduce from each revision with an initially absent target path:
+
+```bash
+/usr/bin/time -v env RUSTC_WRAPPER= CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=4 \
+  CARGO_TARGET_DIR=/path/to/new-sdk-target-REVISION-SAMPLE \
+  cargo +1.99.0 test --offline --locked --no-run -p sdx --tests
+```
+
+### SDK streaming RSS qualification remains open (2026-11-16)
+
+A three-iteration local run at `96da1316f02a41fce15b9a647011ba68995f00dc` passed both original
+workloads in every iteration (six transfers total, 699.044 seconds). The run
+used the same shared Linux development host and Rust 1.99.0 test profile with
+debug information disabled. Byte identity, length, the 64 MiB decoded-buffer
+cap and the strict 65,536 KiB additional-RSS threshold were unchanged.
+
+| Iteration | 256 MiB additional RSS, KiB | 1 GiB additional RSS, KiB |
+| --- | ---: | ---: |
+| 1 | 47,800 | 52,296 |
+| 2 | 55,208 | 60,960 |
+| 3 | 55,076 | 55,136 |
+
+Reproduce with the command below plus `--stress-count 3 --test-threads 1`.
+These repeated local passes do not establish the cause of the hosted failure.
+
+Further 256 MiB checks at `f28038e7` restricted the test process and its
+children to CPUs 0–1 using `taskset --cpu-list 0,1`. Each configuration ran
+three sequential iterations; all nine transfers passed byte identity, length
+and the unchanged additional-RSS gate. Other E2E tests were filtered out.
+
+| Compiler | Debug information | Additional RSS by iteration, KiB | Three-test elapsed time |
+| --- | --- | --- | --- |
+| Rust 1.99.0 | Disabled | 46,708 / 57,008 / 49,696 | 68.198 s |
+| Rust 1.100.0 | Disabled | 58,132 / 59,716 / 60,036 | 71.566 s |
+| Rust 1.100.0 | Full; incremental compilation disabled | 45,292 / 49,080 / 54,040 | 80.637 s |
+
+The original hosted job log identifies Rust 1.100.0
+(`0ef1bc386 2026-11-09`) and an unoptimized test build with debug information.
+The final row matches that compiler and those profile settings; earlier local
+Rust 1.99.0 passes did not control for this difference. Reproduce the final row
+with:
+
+```bash
+env RUSTC_WRAPPER= CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2 \
+  CARGO_PROFILE_DEV_INCREMENTAL=false CARGO_PROFILE_TEST_INCREMENTAL=false \
+  CARGO_BUILD_JOBS=4 taskset --cpu-list 0,1 \
+  cargo +1.100.0 nextest run --offline --locked --manifest-path e2e/Cargo.toml \
+  --all-features --test sdk_client_e2e --run-ignored all --no-fail-fast \
+  --success-output final --stress-count 3 --test-threads 1 \
+  -E 'test(stream_large_file_memory_bounded_cat)'
+```
+
+These checks used the current cleanup source and the shared local host, not
+the historical merge checkout or the hosted runner. CPU affinity also does not
+reproduce a hosted machine's memory limits or scheduling environment. The
+results do not establish a compiler or debug-profile cause, qualify the 1 GiB
+workload under these settings, or resolve the historical failure.
+
+A subsequent comparison used the exact historical merge checkout
+`74444f209ba0f56fd3db81cfc8d2036330bc8637`. Its Git tree is identical to candidate
+`a0c995f27545a5fdfd277433fc5d238fd7379bc7`. With the same Rust 1.100.0,
+full-debug, nonincremental and two-CPU settings, all three original 256 MiB
+transfers passed in 76.163 seconds, with additional RSS of 54,268, 53,684 and
+54,228 KiB. The historical command uses `-p sdx --test e2e` in place of
+`--manifest-path e2e/Cargo.toml --test sdk_client_e2e`. This source-matched
+comparison still did not reproduce the hosted failure. It also means the
+current local passes cannot be attributed to a cleanup fix.
+
+On November 17, both original workloads were also run together with
+`--test-threads 2`, using the same compiler, profile and CPU affinity. Each
+source checkout passed byte identity, length and the unchanged RSS gate for
+both transfers; 28 unrelated E2E cases were filtered out.
+
+| Source | 256 MiB additional RSS, KiB | 1 GiB additional RSS, KiB | Two-test elapsed time |
+| --- | ---: | ---: | ---: |
+| Historical merge `74444f20` | 52,404 | 51,232 | 237.793 s |
+| Cleanup `abf47371` | 49,016 | 49,476 | 241.215 s |
+
+For this concurrent comparison, replace `--stress-count 3 --test-threads 1`
+above with `--test-threads 2` and select both tests:
+`-E 'test(stream_large_file_memory_bounded_cat) or test(stream_gib_file_memory_bounded_cat)'`.
+The historical checkout still uses its original `-p sdx --test e2e` target.
+This closes the local concurrent-scheduling comparison, including the 1 GiB
+workload under the matched profile. It does not reproduce the hosted machine,
+explain its failure or demonstrate a performance improvement. Further identical
+local repetitions would not close that remaining environment gap.
+
+The earlier local passes above do not explain the failure in
+[hosted E2E run 43704721020](https://github.com/STEXS-Technologies/shardline/actions/runs/43704721020).
+Its checkout was PR merge `74444f2`, merging candidate `a0c995f27545a5fdfd277433fc5d238fd7379bc7`
+into baseline `e53a33e00a3c2feae4ee8e2417927763663421c7`.
+The 256 MiB transfer passed byte identity and length checks but failed its
+unchanged 65,536 KiB additional-RSS gate: baseline 27,168 KiB, peak VmHWM
+93,260 KiB, delta 66,092 KiB (556 KiB over the gate). The child transfer took
+2,971 ms; the parent test, including upload/setup, took 41.837 s. The 1 GiB
+test passed in 305.857 s, but its successful diagnostic output was suppressed.
+Later qualification steps were skipped after this failure.
+
+The workflow now retains successful memory-test output and runs both selected
+tests despite a failure. Neither memory threshold nor byte-identity checking
+has been relaxed. A decoded-payload semaphore is not a process-RSS limit:
+encoded responses, metadata, offsets, allocator retention and runtime overhead
+also contribute. These are possible contributors, not an established cause of
+the hosted failure. A small overshoot alone does not prove an environment issue
+or justify increasing the gate.
+
+Reproduction on the cleanup branch uses the existing E2E workspace and both
+original workload sizes:
+
+```bash
+cargo nextest run --locked --manifest-path e2e/Cargo.toml --all-features \
+  --test sdk_client_e2e --run-ignored all --no-fail-fast --success-output final \
+  -E 'test(stream_large_file_memory_bounded_cat) or test(stream_gib_file_memory_bounded_cat)'
+```
+
+A local run at `4e835206a8a79a2a068416a30a62c96848429182` passed both tests on
+November 16, 2026. It used Linux x86_64, Rust/Cargo 1.99.0, four build jobs,
+disabled dev/test debug information, no compiler wrapper, warm dependency
+artifacts and the normal shared development host. The two tests were selected
+together, with the original 64 MiB extra-RSS threshold and decoded buffer cap.
+
+| Workload | Baseline RSS | Peak VmHWM | Additional RSS | Client transfer | Parent test including setup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256 MiB | 25,044 KiB | 69,804 KiB | 44,760 KiB | 1,180 ms | 22.576 s |
+| 1 GiB | 25,040 KiB | 79,672 KiB | 54,632 KiB | 8,426 ms | 208.100 s |
+
+Both passed streamed byte identity and length verification. These are single
+local samples, not hosted reproductions or production throughput measurements.
+The local command additionally used `--offline`, explicit `+1.99.0`,
+`CARGO_BUILD_JOBS=4`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`, `RUSTC_WRAPPER=` and an existing
+`CARGO_TARGET_DIR`. No allocator setting or memory bound was changed.
+
+This gate remains unqualified on hosted CI until a current-branch run passes;
+local results do not establish a cause for the historical failure or qualify
+the remaining PostgreSQL/object-store and real-client matrix.
+
+### Integrated cleanup checkpoint (2026-11-16)
+
+An isolated checkout of `013fa01045196a0783e4fdc26a551d14a1d30d20`
+passed the following local checkpoint after the SDK, cache, protocol, S3,
+server-core, validation and rebuild cleanup. Uncommitted changes in the main
+worktree were excluded. Code edits were held during the checkpoint.
+
+| Check | Result |
+| --- | --- |
+| Combined tests for the seven crates below | 1,062 passed, none skipped |
+| SDK/server E2E and Xorb interoperability | 34 passed, one explicitly ignored 1 GiB test skipped |
+| Strict Clippy for the seven crates, library and tests | Passed with `-D warnings` |
+
+The E2E run included full/ranged, sequential/unordered and grouped downloads,
+metadata upload/reupload/deletion, server Xorb byte identity and the 256 MiB
+streamed byte-identity/RSS gate. That memory child reported baseline RSS
+25,348 KiB, peak VmHWM 80,864 KiB and additional RSS 55,516 KiB, below the
+unchanged 65,536 KiB threshold. This is one local sample; it does not explain
+the historical hosted failure above. The ignored 1 GiB test was not run here.
+
+The shared Linux development host used warm artifacts, four build jobs,
+disabled dev/test debug information, no compiler wrapper, Rust 1.99.0 for
+tests and Rust 1.100.0 for Clippy. Docker 29.2.1 was available, with Redis
+containers observed during the cache tests. The crate and E2E commands were
+started together; this was correctness verification, not a controlled timing
+or throughput comparison.
+
+Reproduce with an existing target directory of your choice:
+
+```bash
+export RUSTC_WRAPPER=
+export CARGO_BUILD_JOBS=4
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+cargo +1.99.0 nextest run --offline --locked \
+  -p sdx -p shardline-cache -p shardline-protocol -p shardline-s3-adapter \
+  -p shardline-server-core -p shardline-validation -p shardline-rebuild
+cargo +1.99.0 nextest run --offline --locked --manifest-path e2e/Cargo.toml \
+  --all-features --test sdk_client_e2e --test sdk_xorb_interop \
+  --no-fail-fast --success-output final --test-threads 2
+cargo +1.100.0 clippy --offline --locked \
+  -p sdx -p shardline-cache -p shardline-protocol -p shardline-s3-adapter \
+  -p shardline-server-core -p shardline-validation -p shardline-rebuild \
+  --lib --tests -- -D warnings
+```
+
+This checkpoint does not cover the entire workspace, hosted CI, or the
+PostgreSQL/object-store production topology. Those qualification gaps remain
+open; the local 256 MiB pass is not a replacement for the hosted RSS gate.
+
+A follow-up at `201699a1bf444b06eaa825d8a2c43024767772be` held SDK code
+fixed and repeated the same E2E command after the cache-write, upload-buffer,
+credential-resolution and session cleanup. All 34 tests passed in 119.477 s;
+the ignored 1 GiB case remained skipped. The 256 MiB child reported baseline
+RSS 25,608 KiB, peak VmHWM 79,164 KiB and additional RSS 53,556 KiB against
+the unchanged 65,536 KiB threshold (1,083 ms transfer; 21.945 s parent test).
+The same local build settings above were used. The SDK's 344 unit/mock tests
+and SDK-only strict Clippy also passed; the other six crate suites were not
+repeated for this follow-up. These single shared-host samples do not measure
+the individual changes' memory savings or resolve hosted qualification.
+
+A broader follow-up at `108e5669aeb21d20a8794b918f2c100a5ad438fd`
+held code fixed and repeated all three commands above, adding
+`--run-ignored all` to the E2E command to include the 1 GiB case. The seven
+crate suites passed all 1,055 tests with none skipped, and strict Clippy
+passed. All 35 SDK/server E2E and Xorb interoperability tests passed with
+none skipped in 278.806 s. The same local build settings were used.
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 24,620 | 68,432 | 43,812 | 1,126 |
+| 1 GiB | 24,464 | 75,208 | 50,744 | 8,227 |
+
+Both workloads checked every streamed byte and the total length, retaining
+the unchanged 65,536 KiB additional-RSS threshold. The parent tests took
+21.467 s and 206.160 s respectively, including fixture ingestion; these
+elapsed times are not download-throughput measurements. These shared-host
+samples do not isolate any individual optimization, explain the historical
+hosted failure, or qualify the production PostgreSQL/object-store topology.
+
+### Storage and cache checkpoint (2026-11-16)
+
+Source `f120dc00f8e2beeac8f6c30ff79101d9b8e4dcd7` was held fixed for a local
+follow-up after the storage and cache cleanup. The combined `shardline-storage`,
+`shardline-cache`, `sdx` and `shardline-server-core` suites passed 1,072 tests;
+three default-ignored storage tests were skipped. The server's 31 selected
+`reconstruction_cache::tests::` tests also passed; its other 3,197 library tests
+were filtered out. Strict Clippy passed for the four complete crate selections.
+
+The run used the same shared Linux development host, four build jobs, an empty
+`RUSTC_WRAPPER`, disabled dev/test debug information, existing target caches,
+Rust/Cargo 1.99.0 for tests and 1.100.0 for strict Clippy. Docker prerequisites
+were required for the storage and Redis integration fixtures. Reproduce the
+selected checks from the repository root:
+
+```bash
+export RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo +1.99.0 nextest run --offline --locked \
+  -p shardline-storage -p shardline-cache -p sdx -p shardline-server-core
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo +1.99.0 nextest run --offline --locked \
+  -p shardline-server --lib -E 'test(reconstruction_cache::tests::)'
+cargo +1.100.0 clippy --offline --locked \
+  -p shardline-storage -p shardline-cache -p sdx -p shardline-server-core \
+  --lib --tests -- -D warnings
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo +1.99.0 nextest run --offline --locked \
+  --manifest-path e2e/Cargo.toml --all-features \
+  --test sdk_client_e2e --test sdk_xorb_interop --run-ignored all \
+  --no-fail-fast --success-output final --test-threads 2
+```
+
+The SDK/server E2E and Xorb interoperability run passed all 35 tests with none
+skipped in 286.421 s, including the ignored 1 GiB workload. Both isolated client
+workloads checked byte identity and length, and met the unchanged 65,536 KiB
+additional-RSS limit:
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 24,900 | 68,408 | 43,508 | 1,238 |
+| 1 GiB | 24,580 | 76,052 | 51,472 | 8,239 |
+
+The parent tests took 22.166 s and 212.319 s, including fixture ingestion.
+These are local regression checks on a shared development host, not controlled
+measurements of an individual optimization or production throughput. The full
+server suite, production PostgreSQL/object-store topology and hosted memory
+qualification remain outside this checkpoint. The historical hosted RSS failure
+is still unexplained by these local passes.
+
+### SDK and cache follow-up checkpoint (2026-11-16)
+
+Source `c7f478d0ec12a01a4428dcc12ca0e84442d0c9b3` was held fixed while
+repeating the four-crate, server-cache and SDK/server E2E commands above after
+the async storage bridge, range-copy, frontend-test and SDK cleanup. The same
+shared Linux host, toolchains, build configuration and required Docker fixtures
+were used. The four-crate selection passed 1,047 tests with three default-ignored
+storage tests skipped. All 31 selected server cache tests passed (3,197 other
+library tests filtered out), and strict Clippy passed for the four crates.
+
+All 35 SDK/server E2E and Xorb interoperability tests passed with none skipped
+in 283.931 s, including the ignored 1 GiB workload. Both isolated clients checked
+byte identity and length and met the unchanged 65,536 KiB additional-RSS gate:
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 24,640 | 76,432 | 51,792 | 1,244 |
+| 1 GiB | 24,624 | 83,236 | 58,612 | 8,071 |
+
+The parent tests took 22.320 s and 209.425 s, including fixture ingestion.
+These shared-host samples establish a local regression checkpoint; they do not
+isolate individual changes or establish production throughput. The full server
+suite, production PostgreSQL/object-store qualification and historical hosted
+RSS failure remain outside these passing checks.
+
+### Xet core and SDK cleanup checkpoint (2026-11-16)
+
+Source `30b2f585eee90a4cdfa6ff165a251fcece3ffeec` was held fixed after the
+codec, metadata, cache and SDK upload cleanup, including bounded file hashing
+with fixed-size merge buffers, direct single-chunk hashes and removal of the
+extra BG4 slice-output copy. The combined `shardline-xet-core`, `sdx` and
+`shardline-xet-adapter` suites passed 1,086 tests; the adapter's explicitly
+ignored Linux normalization I/O diagnostic remained skipped. The lower test
+count reflects consolidation of duplicated wrappers into the owning modules,
+with complete-record, wire-size, truncation and error-payload assertions.
+Strict Clippy passed for these three crates. The same shared-host build settings
+and toolchains described above were used.
+
+The SDK/server E2E command above, with `--run-ignored all`, passed all 35 tests
+with none skipped in 282.131 s. Both isolated clients verified byte identity and
+length and met the unchanged 65,536 KiB additional-RSS limit:
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 25,396 | 76,656 | 51,260 | 1,163 |
+| 1 GiB | 25,444 | 83,296 | 57,852 | 8,215 |
+
+The parent tests took 22.897 s and 210.467 s, including fixture ingestion.
+These local results do not isolate individual changes, establish production
+throughput, or explain the historical hosted RSS failure. Full server and
+production PostgreSQL/object-store qualification remain outside this checkpoint.
+
+### SDK ownership and lifecycle recheck (2026-11-16)
+
+Source `5088960c` was held fixed while
+repeating the complete SDK/server E2E and Xorb interoperability command above,
+including `--run-ignored all --no-fail-fast --success-output final` with two
+test threads and required native fixtures. This rechecks cache ownership,
+buffer permits, chunk placement, reader-failure contracts and direct metadata
+response decoding together. Reconstruction normalization now consumes raw
+descriptors once per hash and borrows its lookup keys from response terms,
+avoiding duplicate raw metadata and repeated owned hash-key allocations. The all-features SDK suite also passed all 335
+tests, and strict SDK library/test Clippy passed with `-D warnings`.
+
+All 35 E2E tests passed with none skipped in 306.413 s. Both isolated clients
+verified exact byte identity and length and passed the unchanged 65,536 KiB
+additional-RSS limit:
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 24,732 | 68,272 | 43,540 | 1,201 |
+| 1 GiB | 24,448 | 71,912 | 47,464 | 8,842 |
+
+The parent memory tests took 23.929 s and 228.603 s, including fixture ingestion.
+The shared Linux host, Rust 1.99.0 test toolchain, Rust 1.100.0 Clippy toolchain
+and unoptimized build settings with debug information disabled match the earlier
+checkpoints. These samples do not isolate individual optimizations, establish
+production throughput, or explain the historical hosted RSS failure. PostgreSQL
+and remote-object-storage qualification are separate from this local SDK check.
+
+This source contains 571,099 tracked Rust lines, down 32,550 (5.39%) from the
+603,649-line baseline, counting comments, tests and blank lines. The remaining
+closeout work is to finish the focused review of complex modules, qualify one
+final source snapshot across the database and object-store gates, investigate
+the hosted RSS failure, and measure optimized production-topology performance
+and retained storage after retention expiry and GC. These remain open; the SDK
+checkpoint does not establish whole-branch or production qualification.
+
+### SDK wire dependency separation (2026-11-16)
+
+The SDK now consumes Xet wire contracts from `shardline-protocol-adapters` with
+its default `storage` feature disabled. The server Xet adapter re-exports the
+same types, constants and V1-to-V2 conversion, preserving existing server imports
+without maintaining duplicate wire definitions. Existing LFS/Bazel consumers
+retain their default storage feature. The SDK dependency retains its former
+Rust import name through a Cargo package alias.
+
+Compared with source `09f2721d`, the standalone SDK normal dependency graph
+(`cargo tree -p sdx --edges normal`) decreases from **338 to 218 unique packages**.
+SQLx, SQLite, object_store, Prometheus and the Shardline index/server-core chain
+are absent from that graph. This does not shrink server builds or remove any
+server feature.
+
+A sequential before/after sample used separate empty target directories,
+Rust 1.99.0, `RUSTC_WRAPPER=`, `CARGO_BUILD_JOBS=4` and
+`CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` on the same shared Linux
+host. Both ran `cargo test --offline --locked -p sdx --all-features --no-run`:
+**50.850 s before, 22.456 s after** (55.8% less elapsed time). This is one sample,
+with cached dependency sources and separate compilation artifacts; it is not a
+production runtime measurement or a general build-time guarantee.
+
+Validation passed 334 SDK tests, 310 adapter library tests (one default-ignored
+test skipped), 19 selected real-server metadata/range/Xorb interoperability tests
+(16 other E2E tests filtered out), the all-features CLI build, strict Clippy and
+wire-only doctests. The publish-order checker accepted the updated graph.
+
+### SDK/native-storage regression checkpoint (2026-11-16)
+
+Frozen source `812fc7844b987d0c7774b41ad3d037ae9e6d03ac` passed the complete
+SDK/server E2E and Xorb interoperability command above, including ignored tests,
+required native fixtures and two test threads: **35 passed, none skipped**, in
+297.014 s. This rerun covers the accumulated changes through this source,
+including native Xet metadata routes with the Hub frontend enabled. It does not
+run the entire E2E workspace or the separate PostgreSQL/MinIO gates.
+
+Both isolated clients verified exact byte identity and length and passed the
+unchanged 65,536 KiB additional-RSS gate:
+
+| Isolated client workload | Baseline RSS (KiB) | Peak VmHWM (KiB) | Additional RSS (KiB) | Client transfer (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 256 MiB | 24,216 | 74,656 | 50,440 | 1,184 |
+| 1 GiB | 24,236 | 82,656 | 58,420 | 7,959 |
+
+The parent memory tests took 22.236 s and 212.140 s, including fixture ingestion.
+The shared host, toolchains and unoptimized build settings match the preceding
+SDK checkpoint. These are regression samples, not production capacity
+measurements, and do not explain the historical hosted RSS failure. Database
+and remote-object-storage qualification remain separate.
+
+Earlier source `32bf52ae7adc55949afb81203e2f1868abd27cb9` also passed all 35 E2E
+tests, 322 SDK library tests, 12 mock conformance tests and strict SDK
+library/test Clippy. Its upload changes retain ingestion hashes for immutable
+pending chunks and share one Xorb serializer between prehashed and public
+inputs; repeated reconstruction terms avoid cloning fetch descriptors before
+comparison. The current checkpoint reruns the E2E selection only.
+
+### PostgreSQL cleanup checkpoint (2026-11-16)
+
+Source `bf121d8cfaffa3e8fb0ed3d558d27faeb8cb58e6` passed `scripts/test-postgres.sh`
+against a disposable PostgreSQL 16 Alpine container with local object storage.
+Current migrations were applied using the CLI built from this source before
+starting the gate. `DATABASE_URL`, `SHARDLINE_REQUIRE_NATIVE_CLIENTS=1` and both
+pinned recovery executables were configured; the script sets
+`SHARDLINE_REQUIRE_POSTGRES_TESTS=1` so missing PostgreSQL fixtures fail rather
+than return early. The 1.12.1 and 1.11.3 release archives matched the checksums
+in `scripts/shardline/fetch_compatibility_baseline.sh`.
+
+Use the migration setup in `CONTRIBUTING.md`, then run:
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 RUSTUP_TOOLCHAIN=1.99.0 RUSTC_WRAPPER= \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=4 \
+  NEXTEST_TEST_THREADS=4 bash scripts/test-postgres.sh
+```
+
+| Gate stage | Passed | Test execution time |
+| --- | ---: | ---: |
+| All-features index library | 813 | 142.432 s |
+| PostgreSQL provider-event integration | 2 | 0.123 s |
+| All-features server library | 3,281 | 589.459 s |
+| Explicitly ignored PostgreSQL copy-integrity and cache-revocation checks | 6 | 4.031 s |
+| CLI PostgreSQL migration E2E | 1 | 0.347 s |
+
+All 4,103 selected tests passed. Strict all-features server library/test Clippy
+also passed with Rust 1.100.0 and `-D warnings`. These are shared-host,
+unoptimized builds with debug information disabled, not throughput measurements.
+
+The first database-backed server run at `b548f594` had 3,280 passes and one
+failure: the corrected LFS PATCH returned HTTP 500 after a digest rejection.
+That case passed alone against a fresh database. Its test name omitted
+`postgres`, excluding it from nextest's existing shared-database coordination
+group. Renaming it places it in `postgres-coordination` (confirmed with
+`nextest show-config test-groups`); the full gate then passed. The assertion now
+includes the error response body if the corrected PATCH fails again. This
+supports fixture interference as the explanation without changing production
+behavior or weakening the repair assertion.
+
+The default stages still exclude ignored tests (six index and 45 server tests);
+only the six explicitly selected server checks above were subsequently enabled.
+The provider stage intentionally selects its two PostgreSQL tests. The server
+stage also exercises MinIO copy-integrity cases; the standalone integration
+targets were run separately below. Full-capacity drills, production throughput
+and the historical hosted SDK RSS failure remain outside these checks.
+
+### PostgreSQL cleanup recheck (2026-11-16)
+
+Source `c20dd457` passed the complete
+`scripts/test-postgres.sh` gate against a fresh, migrated PostgreSQL 16 Alpine
+container. This rechecks the accumulated ingestion, deduplication, download,
+cache and CAS cleanup together. It used the same required-fixture settings, cached
+checksum-verified recovery executables and Rust 1.99.0 build settings as the
+checkpoint above, with nextest's default test concurrency rather than an explicit
+`NEXTEST_TEST_THREADS` override. The existing PostgreSQL coordination group still
+serializes tests that share database-wide maintenance locks.
+
+| Gate stage | Passed | Test execution time |
+| --- | ---: | ---: |
+| All-features index library | 813 | 112.070 s |
+| PostgreSQL provider-event integration | 2 | 0.106 s |
+| All-features server library | 3,223 | 537.775 s |
+| Explicitly ignored PostgreSQL copy-integrity and cache-revocation checks | 6 | 3.450 s |
+| CLI PostgreSQL migration E2E | 1 | 0.276 s |
+
+All 4,045 selected tests passed. Strict all-features server and CLI library/test Clippy
+also passed with Rust 1.100.0 and `-D warnings`. The default index and server
+stages excluded six and 45 ignored tests respectively; the subsequent stage
+enabled only the six specified server checks. The provider stage selected its
+two PostgreSQL tests. These runs do not cover every ignored test or replace the
+separate integration targets.
+
+The snapshot contains 571,099 tracked Rust lines, down 32,550 (5.39%) from
+the 603,649-line baseline. `git grep` counts were independently checked against
+each tracked Rust blob. Counts include tests, comments and blank lines, and
+exclude uncommitted files. Fewer tests after consolidation do not by themselves
+establish equivalent coverage; the focused contracts and integration checks
+remain necessary.
+
+An explicit `cargo +1.99.0 build --offline --locked -p shardline --all-features`
+also passed. Before this checkpoint, the same command at `b9c6cdd5` failed with
+a compiler query-depth overflow in the concurrent-upload benchmark. Restoring
+the boxed protocol-reuse future fixed that build without increasing compiler
+limits or changing lookup behavior. The prior server tests and Clippy run had
+not detected the downstream code-generation failure.
+
+These are local functional checks on a shared development host. The timings
+are not a controlled performance comparison. Production throughput, unit costs,
+full-capacity drills and the historical hosted SDK RSS failure remain open.
+
+### MinIO integration cleanup checkpoint (2026-11-16)
+
+At source `439144a3`, the storage and server integration targets passed all
+157 tests with zero skipped in 200.304 s:
+
+| Integration target | Passed |
+| --- | ---: |
+| Server `postgres_s3_e2e_http` | 52 |
+| Server `s3_integration` | 69 |
+| Storage `s3_integration` | 36 |
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 RUSTC_WRAPPER= \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_BUILD_JOBS=4 \
+  cargo +1.99.0 nextest run --offline --locked \
+  -p shardline-storage -p shardline-server --all-features \
+  --test s3_integration --test postgres_s3_e2e_http \
+  --no-fail-fast --success-output final --test-threads 4
+```
+
+The required-fixture setting prevents unavailable Docker services from silently
+skipping tests. Fixtures created disposable PostgreSQL and pinned MinIO
+containers, then removed them. These targets cover storage operations and
+protocol HTTP behavior, including overlapping LFS ranges streamed from S3 and
+OCI upload and retrieval.
+
+A focused library run of
+`test(copy_integrity::minio_) | test(copy_integrity::postgres_minio_)` also
+passed all three selected tests in 13.624 s with one test thread. These check
+source replacement during an in-flight copy and reconciliation of a disconnected
+copy-part request through list-parts, including PostgreSQL plus MinIO. They are
+regular tests, already included in the preceding all-features server checkpoint;
+`--run-ignored only` does not select them.
+
+These are local functional regression results on the same shared development
+host, not production-scale latency, throughput, retention-expiry or cost
+measurements. They do not resolve the historical hosted SDK RSS failure.
+
+## Shared protocol chunk reuse qualification
+
+The shared ingestion path now consults the existing scoped native chunk index,
+verifies the source Xorb through the existing descriptor recovery code, and
+records references to its members. It packs new chunks instead of repacking
+verified existing members. Native dedup discovery and raw-protocol ingestion
+share one source-selection implementation, including repository visibility and
+pending-delete checks. Publication continues through the existing durable
+content and transactional reference checks.
+
+Reproduce the local storage qualification with `hf_xet==1.7.0` installed:
+
+```bash
+python scripts/shardline/benchmark_protocol_dedup.py \
+  target/debug/shardline /tmp/shardline-dedup-new-output
+```
+
+Measured on 2026-11-14: 32 independently edited versions of one deterministic
+4 MiB file, each with a distinct 4 KiB replacement, 64 KiB CDC target, fresh
+metadata and storage per protocol. Total retained logical content: 134,217,728
+bytes. Native uploads use one warm stock Xet session; basic LFS explicitly
+negotiates the basic adapter. S3 uses its HTTP frontend with bearer auth.
+
+| Frontend | Xorb bytes after GC | All object bytes after GC | Verified reads after GC |
+| --- | ---: | ---: | ---: |
+| Native Xet | 6,984,571 | 7,025,522 | 32 |
+| S3 | 6,984,691 | 6,984,810 | 32 |
+| Basic Git LFS | 6,984,691 | 6,984,810 | 32 |
+
+Revalidated on 2026-11-15 at `df18558f` after enforcing explicit repository
+reuse domains. The same repository-scoped HTTP benchmark reproduced every byte
+count in the table and all 96 post-GC downloads. S3 and basic LFS also retained
+a readable final version after deleting its source versions and running GC.
+
+All object bytes include a 119-byte GC control object; native Xet additionally
+retains 40,832 bytes of shard metadata. They exclude the metadata database,
+filesystem allocation overhead and client caches. Native verification uses a
+separate process and an empty download cache. For S3 and LFS, deleting the first
+31 objects and running GC again also preserved a verified download of the last
+version, which still references shared source containers. Whole-container
+retention explains why this second GC did not reduce their physical footprint.
+
+This qualifies physical reuse on this workload, not throughput, multi-replica
+behavior, arbitrary workload savings or a paired historical performance gain.
+Existing containers without native chunk-index entries need the existing index
+rebuild/backfill machinery before lookup can discover them. Storage tests also
+exercise the S3-compatible object-store fixture; these measurements use local
+physical storage. Benchmark output includes inventories and per-lane logs.
+
+### Complete local distributed-integrity gate (2026-11-15)
+
+The existing `scripts/shardline/run_distributed_integrity_gate.sh` completed
+successfully from clean commit `28c0f227e6d62b176b53f71c5aaf6dcf65091855`.
+Every deployment and multi-node test, including ignored qualification cases,
+executed. The script also verified the expected test counts and rejected runtime
+prerequisite skips and panic markers.
+
+| Stage | Result | Test elapsed time |
+| --- | --- | ---: |
+| Deployment faults and compatibility | 50 passed, 0 skipped | 482.716 s |
+| Split-role traffic and probe contracts | 8 passed, 0 skipped | 22.583 s |
+
+The complete command, including build and prerequisite preparation, took
+531.290 seconds. These are local qualification elapsed times, not throughput
+or service latency measurements.
+
+The gate froze an all-features dev executable built with Rust
+`1.99.0 (b940084d7 2026-09-28)`, four build jobs, no compiler wrapper, and dev
+and test debug information disabled. Its SHA-256 was
+`2ba732267f5766de8d196975d885de875281ccaaa5a8a847cf2759aa81062372`, unchanged
+after the run. This is separate from the optimized release executable qualified
+below. The adjacent release was checksum-pinned v1.12.1. Recorded clients were
+Git 2.52.0, `huggingface_hub==2.2.0`, and `hf_xet==1.7.0`.
+
+Deployment coverage includes PostgreSQL/MinIO/Redis outages, actual network
+partitions and packet duplication/reordering, clock skew, mixed-version
+rollout/rollback, durable resumable uploads, lost remote-delete acknowledgements,
+GC takeover fencing, restricted grants, native source reclamation, Git atomic
+publication, and recovery of maintenance evidence. Some compatibility cases
+exercise local storage; the gate is not uniformly a remote-storage workload.
+
+The eight split-role cases comprise five API/transfer traffic drills and three
+probe contracts. Their servers run as in-process tasks sharing local SQLite and
+filesystem storage, with proxy-level partition injection. A multi-host
+PostgreSQL/S3 split-role topology still needs separate qualification. This run
+also does not establish independent CI, production capacity, or customer unit
+costs. The measured PostgreSQL/MinIO throughput and physical-reuse workloads
+remain separate results below.
+
+With Docker, Nextest, the pinned Python clients on `PATH`, and the clock library
+available as described in [the distributed gate prerequisites](../CONTRIBUTING.md#distributed-integrity-qualification),
+reproduce from that commit with:
+
+```bash
+env RUSTC_WRAPPER= CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  CARGO_BUILD_JOBS=4 SHARDLINE_FAKETIME_LIBRARY=/path/to/libfaketime.so.1 \
+  bash scripts/shardline/run_distributed_integrity_gate.sh /private/evidence/distributed
+```
+
+The output retains frozen binaries, checksums, build records, client versions,
+and complete stage logs. This gate remains pinned to its recorded source revision;
+the source inventory above is refreshed independently.
+
+### Distributed-integrity gate after shared parsing and cache refactors (2026-11-15)
+
+Repeated the same gate at clean source commit
+`7e3c77a5d85616e47b8017eecb51a9b804a0f415`, including the later shared Xorb
+metadata, reconstruction-cache decoding, allocation-free JWT partitioning, and
+consolidated test contracts. The script completed successfully and rejected no
+runtime skips or panic markers:
+
+| Stage | Result | Test elapsed time |
+| --- | --- | ---: |
+| Deployment faults and compatibility | 50 passed, 0 skipped | 470.710 s |
+| Split-role traffic and probe contracts | 8 passed, 0 skipped | 22.549 s |
+
+Total driver time, including build and released-baseline preparation, was
+533.167 seconds. The frozen all-features dev executable had SHA-256
+`e8540beea20f26bcf8a25021a4620f37a287f48e2feb4a573247d4281e433c5f`,
+verified unchanged after the tests. The script checksum, compiler/profile settings,
+Git version, Python clients, and v1.12.1 release baseline matched the earlier gate.
+The retained evidence includes source revision, script and executable checksums,
+client versions, compiler artifacts, and complete deployment and split-role logs.
+Reproduce with the preceding command at this pinned revision.
+
+This rerun qualifies the later refactors against the existing local fault gate.
+It retains the earlier scope limits: the split-role servers share local SQLite
+and filesystem storage, some compatibility cases use local storage, and the
+result does not establish a multi-host PostgreSQL/S3 topology, optimized-release
+performance, independent hosted CI, or production capacity.
+
+### Distributed-integrity gate after protocol cleanup (2026-11-15)
+
+Repeated the complete gate at clean commit `6823c999a2c09270e33d8cb254557cc1632ad8ae`,
+including the shared protocol/PostgreSQL fixtures, bounded LFS stream handling,
+S3 bucket dispatch, and OCI read/upload-response consolidation.
+
+| Stage | Result | Test elapsed time |
+| --- | --- | ---: |
+| Deployment faults and compatibility | 50 passed, 0 skipped | 491.222 s |
+| Split-role traffic and probe contracts | 8 passed, 0 skipped | 22.555 s |
+
+Total driver time was 552.597 seconds. The all-features dev executable was
+frozen before testing and its SHA-256 remained
+`4695b202a047e49164aa5911ad60b757e6c46cdf294f41967bc59a8f1a0ec7c3`.
+The gate script checksum remained
+`3e417512287358e0a0db9614418de1e265206341aa18b3cbfb758e89fee9d312`.
+The run used Rust 1.99.0, four build jobs, disabled dev/test debug information,
+and no compiler wrapper. Source revision, build artifacts, executable checksums,
+client versions, and complete logs were retained. Reproduce using the earlier
+gate command at this pinned revision.
+
+The gate rejected runtime skip and panic markers. Its scope remains the same:
+local deployment faults include PostgreSQL/MinIO cases, while the multinode
+suite uses in-process roles with local SQLite/filesystem storage. This does not
+establish a multi-host PostgreSQL/S3 deployment, independent hosted CI,
+optimized-release performance, or production capacity.
+
+### Distributed-integrity gate after shared protocol fixtures (2026-11-15)
+
+Repeated the complete local gate at clean commit
+`c64bc0f847cc2081c2ca96bc058af5a068835bab`, after the LFS range-parser fix,
+shared OID validation, shared Bazel/LFS HEAD responses, protocol fixture
+consolidation and test layout changes.
+
+| Stage | Result | Test elapsed time |
+| --- | --- | ---: |
+| Deployment faults and compatibility | 50 passed, 0 skipped | 472.911 s |
+| Split-role traffic and probe contracts | 8 passed, 0 skipped | 22.560 s |
+
+Total driver time was 537.467 seconds. The all-features dev executable was
+frozen before testing; its SHA-256 remained
+`27b7b29690946ba57f78185b0e5d55cd634d1a9cfb6055e386ba3994043221a7`.
+The gate script checksum remained
+`3e417512287358e0a0db9614418de1e265206341aa18b3cbfb758e89fee9d312`.
+The run used Rust 1.99.0, four build jobs, disabled dev/test debug information,
+and no compiler wrapper. Revision metadata, build artifacts, client versions,
+checksums and complete logs were retained. Reproduce with the earlier gate
+command at this pinned revision.
+
+The gate checked exact test counts and rejected runtime skip and panic markers.
+It covers local deployment faults, including PostgreSQL/MinIO recovery and
+released-version rollback. The multinode suite uses in-process roles and local
+SQLite/filesystem storage. This result does not establish a multi-host
+PostgreSQL/S3 topology, independent hosted CI, optimized-release performance or
+production capacity.
+
+### Distributed-integrity gate after multipart buffering changes (2026-11-15)
+
+The complete local gate passed at clean commit
+`5b056cb60319bcf3941a2bf203665c6431c39450`, including the OCI multipart
+prefix-removal change, S3 AWS-chunked split buffers, shared query parsing and
+LFS error responses.
+
+| Stage | Result | Test elapsed time |
+| --- | --- | ---: |
+| Deployment faults and compatibility | 50 passed, 0 skipped | 470.500 s |
+| Split-role traffic and probe contracts | 8 passed, 0 skipped | 22.602 s |
+
+Total driver time was 532.198 seconds. The frozen all-features dev executable
+retained SHA-256
+`93874312aa9e911c866073585863e8c5aec4684cdb4326a8855211f0e99dad4a`.
+The gate script checksum and build settings match the preceding qualification:
+Rust/Cargo 1.99.0, four build jobs, disabled dev/test debug information and no
+compiler wrapper. Exact test counts were checked and runtime skip/panic markers
+were rejected. Revision metadata, build/client versions and complete logs were
+retained. Reproduce with the earlier gate command at this pinned revision.
+
+This includes real local PostgreSQL/MinIO fault drills and released-version
+upgrade/rollback checks. The multinode suite still uses in-process roles with
+local SQLite/filesystem storage. It does not establish multi-host PostgreSQL/S3
+qualification, independent hosted CI, optimized-release throughput or capacity.
+
+### PostgreSQL/MinIO GC recovery qualification (2026-11-15)
+
+Four existing deployment fault drills passed against a frozen binary built from
+clean commit `45fd33b484df17ec439bb3d5606a9bee97d7b646`, using real local
+PostgreSQL and MinIO containers. The acknowledgement drills also provision Redis.
+The binary used Rust `1.99.0 (b940084d7 2026-09-28)`, the dev profile with debug
+information disabled, and all CLI features. Its SHA-256 was
+`efa91c53f87ceec68820bcfafb2b629a94e2d360120968e288da6cc23ba975a5`.
+
+| Existing drill | Result | Test elapsed time |
+| --- | --- | ---: |
+| `native_source_gc_sigkill_preserves_live_bytes_and_expired_orphan_recovery` | Passed | 16.955 s |
+| `drill_gc_applied_remote_delete_with_lost_acknowledgement_is_not_replayed` | Passed | 12.016 s |
+| `drill_gc_delayed_delete_rejects_hold_after_takeover` | Passed | 16.511 s |
+| `drill_gc_saved_reply_recovers_after_database_outage` | Passed | 42.889 s |
+
+These cover process death during a source read, preservation of referenced
+native content, reclamation of an expired orphan after restart, lost remote
+delete acknowledgements, deletion takeover fencing, and recovery of a saved
+reply after a database outage. Timings include fixture setup and deliberate
+fault waits; they are not upload latency or throughput measurements.
+
+To repeat from that clean commit, with Docker and cargo-nextest available:
+
+```bash
+export RUSTC_WRAPPER=
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_BUILD_JOBS=4
+cargo build --locked --all-features -p shardline
+# Freeze the executable before compiling the server test harness.
+qualification_output=$(mktemp -d)
+cp target/debug/shardline "$qualification_output/shardline"
+export CARGO_BIN_EXE_shardline="$qualification_output/shardline"
+export SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 SHARDLINE_CHAOS_DEPLOYMENT=1
+cargo nextest run --locked -p shardline-server --all-features \
+  --test deployment_chaos \
+  -E 'test(native_source_gc_sigkill_preserves_live_bytes_and_expired_orphan_recovery) | test(drill_gc_applied_remote_delete_with_lost_acknowledgement_is_not_replayed) | test(drill_gc_delayed_delete_rejects_hold_after_takeover) | test(drill_gc_saved_reply_recovers_after_database_outage)' \
+  --test-threads 1 --success-output immediate --failure-output immediate
+```
+
+If `CARGO_TARGET_DIR` is configured, copy the binary from that target directory
+instead. The recorded run used a shared target directory and ran the source-GC
+drill separately from the three acknowledgement drills. All four selected tests
+executed; other deployment tests were excluded by the filter. No selected test
+reported a missing-prerequisite skip.
+
+This is targeted local fault qualification, not the complete
+[distributed integrity gate](../CONTRIBUTING.md), independent CI evidence, or
+production-scale qualification. Concurrent cross-protocol uploads, multi-tenant
+isolation under load, and PostgreSQL/object-store throughput and read
+amplification still require a separate measured run. The local physical-reuse
+benchmark above remains a separate result.
+
+### PostgreSQL/MinIO upload recovery qualification (2026-11-15)
+
+Four more existing deployment drills passed against the same frozen `45fd33b4`
+binary and real PostgreSQL/MinIO topology described above:
+
+| Existing drill | Result | Test elapsed time |
+| --- | --- | ---: |
+| `drill_deploy_a_postgres_kill_mid_upload_no_lost_commits` | Passed | 36.478 s |
+| `drill_deploy_b_minio_kill_mid_upload_durability` | Passed | 12.019 s |
+| `drill_deploy_postgres_kill_mid_lfs_patch` | Passed | 14.425 s |
+| `drill_deploy_postgres_kill_mid_s3_multipart` | Passed | 15.204 s |
+
+The S3 upload drills verify that acknowledged content survives dependency
+outages, in-flight failures are handled, and service recovers. The LFS PATCH
+and S3 multipart drills verify durable resumable state and byte-exact content
+after PostgreSQL recovery. These are fault-drill elapsed times, not performance
+measurements.
+
+After the build and environment setup in the previous subsection, reproduce
+this selection with:
+
+```bash
+cargo nextest run --locked -p shardline-server --all-features \
+  --test deployment_chaos \
+  -E 'test(drill_deploy_a_postgres_kill_mid_upload_no_lost_commits) | test(drill_deploy_b_minio_kill_mid_upload_durability) | test(drill_deploy_postgres_kill_mid_lfs_patch) | test(drill_deploy_postgres_kill_mid_s3_multipart)' \
+  --test-threads 1 --success-output immediate --failure-output immediate
+```
+
+All four selected tests executed and passed in 78.128 seconds overall; 46 other
+deployment tests were excluded by the filter. No selected test reported a
+missing-prerequisite skip. This extends the local recovery evidence; it does
+not qualify the complete distributed integrity gate or concurrent throughput.
+
+### Additional resumable-upload recovery checks (2026-11-15)
+
+The frozen `128f7c5eea9d2807b97ef3299d333c9ddae05f72` ingestion candidate
+(SHA-256 `f037e781827085069d6887a98849d7f413d9d0110b6b67f704ef30ba7c2079b4`)
+was exercised against real local PostgreSQL and MinIO containers using the
+existing deployment harness:
+
+| Existing drill | Result | Test elapsed time |
+| --- | --- | ---: |
+| `drill_deploy_minio_kill_mid_lfs_patch_staging` | Passed | 15.393 s |
+| `drill_deploy_postgres_kill_mid_oci_blob_upload` | Passed | 48.234 s |
+| `drill_deploy_server_kill_during_s3_upload_part_copy` | Passed after fixing the test proxy | 16.160 s |
+
+The first two checks verify resumable staging and byte-exact completion after
+object-store or database recovery. The part-copy check kills the real server
+while a source read is deliberately paused, verifies that no partial part was
+published, then retries and checks the complete destination bytes.
+
+The initial part-copy run timed out during multipart completion with both the
+candidate and the earlier `45fd33b4` executable. The fault proxy serialized all
+connections: a large response could block its only worker while the streaming
+consumer needed another object through that same proxy. The shared proxy now
+serves connections concurrently and joins its connection workers on shutdown.
+The existing crash drill then passed with its original request timeout and
+assertions. No server or ingestion code changed for this fixture correction.
+
+Reproduce these checks after the build/environment setup above, pointing
+`CARGO_BIN_EXE_shardline` at the frozen candidate:
+
+```bash
+cargo nextest run --locked -p shardline-server --all-features \
+  --test deployment_chaos \
+  -E 'test(drill_deploy_minio_kill_mid_lfs_patch_staging) | test(drill_deploy_postgres_kill_mid_oci_blob_upload) | test(drill_deploy_server_kill_during_s3_upload_part_copy)' \
+  --test-threads 1 --success-output immediate --failure-output immediate
+```
+
+All three selected tests passed together in 79.788 seconds with the final proxy
+implementation; 47 other deployment tests were excluded by the filter. No
+selected test reported a runtime prerequisite skip. These elapsed times include
+fixture setup and fault waits on a shared host running another qualification;
+they are not latency or throughput measurements.
+
+A fourth attempted check, `drill_deploy_partition_during_lfs_patch_repair`,
+failed before fault injection because the required `nicolaka/netshoot:v0.13`
+image was unavailable locally and Docker could not resolve its registry. The
+subsequent release-mode qualification below resolved that prerequisite and
+executed the partition drill successfully.
+
+### Cleanup candidate deployment qualification (2026-11-16)
+
+The follow-up PostgreSQL gate at
+`96da1316f02a41fce15b9a647011ba68995f00dc` used a fresh disposable PostgreSQL 16 database,
+the candidate migrations, required PostgreSQL/native-client test modes, and the
+released v1.12.1 and v1.11.3 recovery fixtures. `scripts/test-postgres.sh` exited
+successfully: 813 index library tests, two selected provider-event tests, 3,220
+default server library tests, six explicitly selected ignored PostgreSQL
+contracts, and one migration E2E test passed (4,042 executed tests total).
+Default ignored tests and name-filter exclusions remain outside these counts;
+this was not an all-ignored workspace run. The owned database was removed.
+
+The OCI follow-up source `864d11621d5d97981c25dd3be60e973cc0ce7a6c` also
+passed an all-features release build. Its frozen executable SHA-256 was
+`93bd48c1575904f1d87c2afa149bf6d7651a544db975a54ff5c18ac1451454a0`.
+All 13 selected storage-copy maintenance cases passed in 85.150 seconds, and
+both selected OCI deployment cases passed in 18.139 seconds (PostgreSQL failure
+during upload and lost GC deletion acknowledgement). No selected case reported
+a runtime prerequisite skip; other tests were excluded by the filters.
+
+
+Clean source commit `683916e8c4330363f711eaad236af917db0d46ca` passed an
+all-features CLI release build using Rust `1.99.0 (b940084d7 2026-09-28)`,
+four build jobs and the workspace's default release profile (optimization level
+3, thin LTO, one codegen unit, panic abort). The build took 7m 17s on a shared
+host; this is not a controlled build-time comparison. The frozen executable's
+SHA-256 was
+`b8f1126d02d32063e14c94a6030b51a638518d3d3c493c0ff98fbab1da9704e7`.
+
+All 51 `deployment_chaos` cases passed, including nine ignored qualification
+cases, in 544.928 seconds with zero skipped tests. The harness ran disposable
+PostgreSQL/MinIO/Redis stacks and used the frozen release CLI, the checksum-pinned
+v1.12.1 baseline, `libfaketime`, `huggingface_hub==2.2.0` and `hf_xet==1.7.0`.
+Coverage includes upload interruption, network faults, GC acknowledgement and
+takeover, mixed-version upgrade/rollback, native protocol history, atomic Git
+publication, read-only maintenance and tracker replacement.
+
+Separately, all eight `multinode_chaos` cases passed in 24.729 seconds with zero
+skipped tests. That suite runs server roles in-process in the test profile; its
+result does not establish optimized CLI throughput. Both logs passed explicit
+checks for runtime prerequisite skips and task panics. The frozen CLI checksum
+was unchanged after the run, and the disposable deployment stacks were removed.
+
+Reproduction uses the prerequisites in
+[the distributed-integrity gate](../CONTRIBUTING.md#distributed-integrity-qualification).
+Set `CARGO_BIN_EXE_shardline` to the frozen all-features release executable,
+`SHARDLINE_N_MINUS_ONE_BINARY` to the verified v1.12.1 executable,
+`SHARDLINE_FAKETIME_LIBRARY` to the clock-skew library, and place the pinned
+Python clients on `PATH`. Then run:
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 SHARDLINE_CHAOS_DEPLOYMENT=1 \
+  cargo nextest run --locked -p shardline-server --all-features \
+  --test deployment_chaos --run-ignored all --test-threads 1 --no-fail-fast \
+  --success-output immediate --failure-output immediate
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 \
+  cargo nextest run --locked -p shardline-server --all-features \
+  --test multinode_chaos --run-ignored all --test-threads 1 --no-fail-fast \
+  --success-output immediate --failure-output immediate
+```
+
+This is local deployment fault qualification, not a full workspace test run,
+hosted CI qualification, a resolution of the historical hosted SDK RSS failure,
+or a production-scale throughput or cost measurement.
+
+### Release-mode maintenance and LFS partition qualification (2026-11-15)
+
+An all-features CLI built from clean commit
+`98ff78d4e7bcdb523da95fc06590c6468ab1b671` passed the workspace's default
+release build (optimization level 3, thin LTO, one codegen unit, panic abort),
+using Rust `1.99.0 (b940084d7 2026-09-28)` and four build jobs. The frozen
+executable's SHA-256 was
+`59f71f524235b758f5ef5cfa2e16fcc048d580cc574775ece3d09236a452b5e8`.
+
+The maintenance-copy cases used that executable, the checksum-verified released
+v1.12.1 executable, and the historical archive producer specified in
+[the integration prerequisites](../CONTRIBUTING.md#full-docker-integration-prerequisites).
+The archive producer was built from
+`a2f343963f0105e6c89fad8c6c76d150211c648a` with dev debug information disabled;
+its frozen executable's SHA-256 was
+`146cf17c8eadbe3af8444ee4fb56ea34f9b450ab32685a2d31156dc08dfa75d2`.
+
+| Existing selection | Result | Test elapsed time |
+| --- | --- | ---: |
+| All 13 `maintenance_profiles::storage_copy::` cases | Passed | 82.229 s total |
+| `drill_deploy_partition_during_lfs_patch_repair` | Passed | 13.078 s |
+
+The maintenance cases cover local-to-S3 and S3-to-S3 interruption, accepted PUT
+and saved-report recovery, termination during source inventory, unsafe history
+paths, unrelated PostgreSQL configuration, and inspection of historical and
+released copy evidence without replay. They use disposable MinIO fixtures.
+The partition drill uses PostgreSQL/MinIO and real packet loss: the overlapping
+LFS PATCH fails while metadata is unreachable, then completion after healing
+returns byte-exact content. Timings include setup and deliberate fault waits.
+
+The initial broader consumer run had omitted its required CLI environment and
+therefore failed all 13 maintenance-copy cases before exercising them. The
+corrected selection above passed every case with no runtime prerequisite skips;
+60 unrelated HTTP tests were excluded. The other selection excluded 49
+deployment tests. These are targeted local results, not a passing full
+integration suite, distributed-integrity gate, or independent CI result.
+
+With the three executable variables from the linked prerequisites configured,
+reproduce with:
+
+```bash
+cargo nextest run --locked -p shardline-server --all-features \
+  --test s3_e2e_http -E 'test(maintenance_profiles::storage_copy::)' \
+  --run-ignored all --test-threads 1 --success-output immediate --failure-output immediate
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 SHARDLINE_CHAOS_DEPLOYMENT=1 \
+  cargo nextest run --locked -p shardline-server --all-features \
+  --test deployment_chaos -E 'test(drill_deploy_partition_during_lfs_patch_repair)' \
+  --test-threads 1 --success-output immediate --failure-output immediate
+```
+
+The missing `nicolaka/netshoot:v0.13` prerequisite was loaded using anonymous
+Skopeo access to Docker Hub, with source digest
+`sha256:a20c2531bf35436ed3766cd6cfe89d352b050ccc4d7005ce6400adf97503da1b`.
+The existing drill then ran unchanged against the preloaded image.
+
+### Concurrent S3 and GC measurements (2026-11-15)
+
+The existing `validate_performance.py` harness completed 12 lanes against the
+same frozen `45fd33b4` all-features dev binary used above. Each lane used fresh
+PostgreSQL metadata and a MinIO bucket, 32 objects of 1 MiB, eight concurrent
+clients, and one or two resource-limited API replicas (one CPU and 1 GiB each).
+There were three repetitions per dataset/replica combination. Replica order and
+mixed-workload/GC order alternate across repetitions. The unique dataset is
+deterministic incompressible content; repeated content has four identical
+copies of each of eight distinct objects.
+
+All lanes passed cross-replica mixed-workload reads and final byte comparisons:
+1,728 post-GC reads in total. Fourteen GC processes completed across the twelve
+maintenance workloads; each workload had an overlapping completed collector.
+MinIO trace counts were checked against independent server API counters.
+
+Median throughput across three repetitions, in MiB/s:
+
+| Data | Replicas | Initial PUT-only ingest | Mixed PUT/GET | Mixed PUT/GET with GC |
+| --- | ---: | ---: | ---: | ---: |
+| Unique | 1 | 16.24 | 41.86 | 37.68 |
+| Unique | 2 | 28.79 | 77.81 | 64.66 |
+| Repeated | 1 | 17.49 | 41.16 | 37.55 |
+| Repeated | 2 | 31.24 | 66.41 | 64.87 |
+
+Backend and PostgreSQL observations:
+
+| Data | Replicas | Median initial S3 requests/decimal GB | Median initial SQL calls | Peak connections | Maximum sampled GC lock waiters | Initial stored/logical ratio range |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Unique | 1 | 4,768 | 2,950 | 15 | 1 | 1.001–1.001 |
+| Unique | 2 | 4,768 | 2,950 | 26 | 8 | 1.001–1.001 |
+| Repeated | 1 | 4,411 | 2,318 | 15 | 1 | 0.252–0.314 |
+| Repeated | 2 | 5,543 | 2,385 | 25 | 6 | 0.381–0.442 |
+
+Each unique initial-ingest lane issued 64 successful backend GETs for 32
+uploaded objects. Median MinIO trace response bytes were 2.002 times the logical
+upload bytes, including protocol overhead. This establishes a read-amplification
+cost to investigate; it does not identify which integrity checks can safely be
+removed. SQL calls include nested trigger/function statements and are not client
+round trips. Connection and lock peaks are sampled every 0.5 seconds and can
+miss shorter spikes.
+
+Reproduce the matrix after freezing the binary as above:
+
+```bash
+python3 -B scripts/shardline/validate_performance.py \
+  "$CARGO_BIN_EXE_shardline" /tmp/shardline-performance-new-output \
+  --binary-source-revision 45fd33b484df17ec439bb3d5606a9bee97d7b646 \
+  --replicas 1 2 --datasets unique repeated --objects 32 \
+  --object-bytes 1048576 --clients 8 --repeats 3
+```
+
+Docker, boto3 and the MinIO `mc` client are required. The output directory must
+be new and outside the checkout. The harness records binary provenance, host
+metadata, direct-S3 comparisons, per-lane results, query samples, inventories,
+and `summary.md`; retain those artifacts with access restricted because service
+configuration contains disposable fixture credentials.
+
+These short same-host bursts use a debug build and only 32 observations per
+operation, so p99 is the slowest sample. They are not sustained-load, production
+capacity, cloud-cost, multi-tenant isolation, or native Xet/LFS measurements.
+PostgreSQL, MinIO and clients share the host. Stored/logical ratios include
+reliability evidence and quarantined objects: the CLI enforces at least one hour
+of retention, which did not expire during this run. Their variation does not
+establish a final retained-footprint regression or a fixed customer savings
+ratio. GC overlap measures process lifetime, including startup and ownership
+waits; it does not prove every request overlapped an active scan. No historical
+before/after speedup is claimed.
+
+To measure the later retained footprint, add `--retention-expiry` to the same
+matrix command. This optional phase leaves all lane databases and buckets intact
+with API writers stopped, waits for the latest database-recorded quarantine
+expiry and at least one hour even when quarantine is empty, then resumes each
+lane with fresh credentials. It runs two more normal
+GC passes, records before/after inventory and remaining quarantine, then checks
+every object through every replica again. It neither backdates rows nor changes
+the minimum retention policy. Lanes age together, so this adds approximately one
+hour after the short matrix rather than one hour per lane.
+
+`retention-expiry.json` records the pending deadline and completed results;
+per-lane `result.json` and `summary.md` include the optional measurements after
+completion. Initial request traces are preserved separately from expiry-phase
+traces. All three upload phases remain live, so the final logical denominator
+is three times the initial-ingest denominator. Compare retained physical bytes
+across replica counts before attributing the initial ratio difference to either
+transient quarantine or persistent packing/reference behavior. This phase does
+not establish sustained throughput, cloud cost or a production margin.
+
+Per-lane results also record referenced Xorb member accounting after initial GC
+and after the mixed phases, outside measured upload intervals. Repeated latest
+and version references count each physical member once. Distinct chunk hashes
+count once across containers; the difference between used and distinct unpacked
+bytes identifies live duplicate copies. Unused unpacked bytes instead identify
+members retained alongside live members in the same immutable container. These
+are descriptor-derived unpacked counts, exclude standalone fallback chunks, and
+must not be substituted for the object-store inventory's physical byte count.
+Ordinary object-level GC cannot remove a container while any member is live.
+
+### Footprint after real retention expiry (2026-11-15)
+
+The twelve-lane matrix was repeated with a frozen dev binary from
+`ab4099636753259631e32f5c33cd1c9316376465`, built with Rust 1.99.0 and debug
+information disabled. Its SHA-256 was
+`08f30a6626a9997cd46a511b2952e5d23ed780d9f5ded0facb86b5ec6c9e5739`.
+This is a fixed qualification candidate, not a binary of the latest cleanup
+commit. The harness at that revision used PostgreSQL 16, MinIO, eight clients,
+one or two API replicas capped at one CPU and 1 GiB each, 32 one-MiB objects,
+and three repetitions per dataset/replica combination.
+
+After the mixed upload/read phases and ordinary GC, API writers stopped for
+3,600 real seconds. All twelve databases and buckets then resumed with fresh
+credentials, ran two further normal GC passes, and passed all 1,728 full-body
+download comparisons through every replica. No quarantine rows remained.
+Physical payload bytes were unchanged in every lane:
+
+| Data | Replicas | Retained payload bytes, range across three runs | Change after expiry GC |
+| --- | ---: | ---: | ---: |
+| Unique | 1 | 33,588,965 | 0 |
+| Unique | 2 | 33,588,965 | 0 |
+| Repeated | 1 | 10,642,606–15,983,814 | 0 |
+| Repeated | 2 | 12,311,197–15,845,177 | 0 |
+
+Initial logical data is 32 MiB; all three upload namespaces remain live at the
+end, totaling 96 MiB per lane. Later phases deliberately upload the same content
+under additional names. Thus a smaller final stored/logical ratio does not mean
+GC reclaimed data. These inventory bytes include Xorbs and reliability evidence,
+excluding database size, MinIO filesystem overhead, replication and versions.
+
+The repeated-data lanes already had zero quarantined objects before the wait.
+Their descriptor accounting found 135 distinct used chunk hashes (8 MiB of
+unique unpacked data), but 177–251 live physical members across containers. Every
+member was referenced; unused unpacked bytes were zero. This explains why normal
+object GC cannot reclaim the surplus: it cannot delete containers required by
+live file references. Retention expiry did not eliminate this footprint.
+
+A separate three-run control changed ingestion to one client and one API replica
+with the same binary, repeated dataset, object count and three upload phases.
+Each run had exactly 135 used members for 135 distinct hashes, eight referenced
+containers, and 8,397,245 final payload bytes. All 288 final downloads passed.
+This control used normal short-run GC, not another hour-long observation. Its
+harness source at `ee7f7d0f` is unchanged from `ab409963`.
+
+The control supports concurrent ingestion affecting reuse/packing choices rather
+than a chunk-boundary mismatch. The one- and two-replica ranges overlap, so this
+does not isolate a replica-count effect or establish a historical regression.
+Ingestion must avoid repacking members that become reusable during an upload;
+existing surplus would need verified reference rewriting/compaction. Deleting
+referenced containers is not a safe GC shortcut. The buffered-member fix below
+addresses the demonstrated ingestion race.
+These measurements do not compare concurrent native Xet/basic LFS workloads or
+establish production throughput, cloud unit costs or a margin.
+
+To repeat, first freeze a binary built from the recorded source revision, then
+use a new output directory outside the checkout:
+
+```bash
+python3 -B scripts/shardline/validate_performance.py \
+  "$FROZEN_SHARDLINE_BINARY" /path/to/new-expiry-run \
+  --binary-source-revision ab4099636753259631e32f5c33cd1c9316376465 \
+  --replicas 1 2 --datasets unique repeated --objects 32 \
+  --object-bytes 1048576 --clients 8 --repeats 3 --retention-expiry
+```
+
+For the serial control, use another new directory with `--replicas 1`,
+`--datasets repeated`, `--clients 1`, and omit `--retention-expiry`. Retain the
+provenance, per-lane JSON, inventories and traces as described above; fixture
+service files contain disposable credentials.
+
+### Buffered-member reuse during concurrent ingestion (2026-11-15)
+
+Candidate `b00a06e8708bb3f24a9c6f8358190839382c6abd` fixes a late-discovery race
+in the shared S3/basic LFS packer. Chunks can miss discovery before another
+upload publishes, then remain buffered when a later chunk discovers and fully
+verifies that source. Before packing, the upload now reuses buffered members
+already covered by its verified, domain-filtered cache. Only this bounded batch
+is reordered for file offsets. This adds no metadata/object-store probes or
+locks for buffered members; final publication retains its deletion fences.
+
+The deterministic regression failed on the previous code: an identical upload
+repacked 17 buffered chunks. It now writes none. Its mixed-content case also
+checks that only the new prefix is packed, downloads match, response offsets
+stay ordered, and buffer admission is released. All 153 ingestion tests passed.
+Both PostgreSQL-required tests for source deletion/publication and slow
+verification releasing discovery locks passed separately; strict Clippy passed.
+
+A frozen Rust 1.99.0 dev binary, SHA-256
+`e585fb82334738ad568f4cdee1bc23ce48b114e74c42f55984005e1336737760`, passed
+the same twelve-lane PostgreSQL/MinIO matrix: 32 one-MiB objects, eight clients,
+one/two one-CPU, 1-GiB API replicas, three repetitions. All 1,728 final downloads
+matched, and traces reconciled with MinIO counters.
+
+| Data | Replicas | Final payload bytes in every run | Used physical members / distinct used chunk hashes |
+| --- | ---: | ---: | ---: |
+| Unique | 1 or 2 | 33,588,965 | 546 / 546 |
+| Repeated | 1 or 2 | 8,397,245 | 135 / 135 |
+
+The repeated lanes now match the earlier serial control: eight referenced
+containers, 8 MiB of distinct unpacked content, and no duplicate used members.
+Initial and final payload bytes were identical in every lane. All final GC logs
+reported zero active/new/retained quarantine candidates. This run used ordinary
+GC without another hour-long wait; it measures prevention of the earlier live
+surplus, not reclamation of existing duplicates. Unique ingestion still used
+128 backend requests and 1,956 top-level SQL calls per lane, matching the frozen
+baseline. Shared-host timings do not establish a production speedup or capacity.
+
+Reproduce with the matrix command above, the recorded candidate binary/revision,
+a new output directory, and omit `--retention-expiry`. Arbitrary overlapping
+files, concurrent native Xet/LFS clients, and production throughput still need
+qualification.
+
+### Reusing validated upload descriptors (2026-11-15)
+
+Candidate `128f7c5eea9d2807b97ef3299d333c9ddae05f72` removes the second full
+object-store read during fresh packed-protocol registration. The existing Xorb
+validator derives member metadata from the bounded packed input. Registration
+uses it only after the existing storage integrity/read-back check succeeds.
+Native source discovery still fully verifies retained containers; an encoding
+conflict still recovers the installed encoding's descriptor and offsets.
+Descriptor conversion is shared with native recovery rather than reimplemented.
+
+Repeated the twelve-lane concurrent S3/GC matrix above with the same arguments
+and toolchain, using a frozen all-features dev binary with SHA-256
+`f037e781827085069d6887a98849d7f413d9d0110b6b67f704ef30ba7c2079b4`.
+All twelve lanes passed, including 1,728 post-GC byte comparisons and independent
+MinIO trace/counter validation. Every unique-data lane (both replica counts,
+all three repetitions) showed:
+
+| Initial ingestion of 32 unique 1 MiB objects | Baseline `45fd33b4` | Candidate `128f7c5e` |
+| --- | ---: | ---: |
+| Successful backend GETs | 64 | 32 |
+| Total backend requests | 160 | 128 |
+| Median traced response bytes / logical bytes | 2.002 | 1.001 |
+
+This halves backend GETs and traced response bytes on this workload and reduces
+initial backend request count by 20%. Read-back and complete decoded-content
+validation remain mandatory. The existing PostgreSQL concurrency regression
+now asserts one fresh-container GET before checking discovery lock release and
+publication fencing against a competing deletion; it passed with PostgreSQL
+required.
+
+Candidate median MiB/s across three repetitions:
+
+| Data | Replicas | Initial ingest | Mixed PUT/GET | Mixed PUT/GET with GC |
+| --- | ---: | ---: | ---: | ---: |
+| Unique | 1 | 16.49 | 41.36 | 37.50 |
+| Unique | 2 | 29.61 | 79.11 | 57.56 |
+| Repeated | 1 | 17.38 | 39.74 | 36.53 |
+| Repeated | 2 | 30.96 | 73.02 | 62.83 |
+
+Throughput varies in both directions relative to the earlier run; no general
+speedup or production-capacity improvement is established. The same short-burst,
+shared-host, debug-build and retention limitations described above apply.
+Reproduce with the previous matrix command, supplying the frozen candidate
+binary, a new output directory, and `--binary-source-revision 128f7c5e`.
+
+The separate 32-version, 4 MiB physical-reuse benchmark was also rerun with
+`hf_xet==1.7.0`. It reproduced the original table exactly: 6,984,571 native Xet
+Xorb bytes and 6,984,691 bytes each for S3/basic LFS. All 96 post-GC downloads
+passed, as did final S3/LFS reads after deleting source versions and running GC.
+These local-storage results establish preserved partial-file physical reuse on
+that workload; they are separate from the PostgreSQL/MinIO throughput matrix.
+
+### Standalone index checks without inherited S3 dependencies (2026-11-15)
+
+Compared `b38e851f` with `e83bdc5a`. Workspace storage dependencies no longer
+inherit S3 by default; consumers of S3 types request `s3` explicitly. Direct
+users of `shardline-storage` still receive its unchanged default `s3` feature.
+The standalone index and CAS normal dependency graphs each lose 35 package
+versions, including `object_store`, its HTTP client stack, and AWS-LC bindings.
+Server and other S3 consumers retain their explicit S3 dependency.
+
+Fresh standalone index checks used Linux x86_64, rustc/Cargo 1.99.0, two jobs,
+and repository dev defaults (`debug = 2`, incremental compilation disabled).
+Every sample used a new target directory on `/tmp` tmpfs, an empty
+`RUSTC_WRAPPER`, and no profile or Rust-flag overrides. Registry and OS caches
+were shared. Runs were sequential in baseline, candidate, candidate, baseline,
+baseline, candidate order, with three samples per revision:
+
+```sh
+RUSTC_WRAPPER= CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/path/to/fresh-target \
+  cargo check --offline --locked -j2 -p shardline-index --lib \
+  --message-format=json-render-diagnostics
+```
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Wall time, median (range) | 50.3 s (49.9–58.8 s) | 23.0 s (22.3–23.0 s) |
+| Compiled package IDs, including build dependencies | 248 | 209 |
+| Compiler artifacts | 275 | 232 |
+
+Wall-time samples were 58.840/50.315/49.924 seconds before and
+23.010/22.951/22.299 seconds after. Every compiler artifact was fresh in all
+six checks. Median check time decreased approximately 54%; this is a focused
+standalone index result, not a server, SDK, release-build, or container timing.
+Local-only index/CAS/storage tests, default S3 storage tests, a real MinIO
+round trip, and server/storage Clippy checks also passed.
+
+### Native Hugging Face split roles with PostgreSQL/MinIO (2026-11-15)
+
+The existing
+`native_huggingface_frontends::native_huggingface_cli_flows_with_split_roles_postgres_minio`
+E2E test passed at source snapshot `d6f873cd`, with the accompanying one-line
+E2E lockfile correction. Cargo initially rejected `--locked` because the separate
+E2E lockfile still listed Axum under the Xet adapter. Removing that obsolete edge
+preserved every package version and checksum; the locked offline rerun passed
+one test in 34.90 seconds (45 other tests filtered out).
+
+Used the existing CI client pins: `huggingface_hub==2.2.0`, `hf_xet==1.7.0`,
+`httpx==0.28.1`, `duckdb==1.5.5`, and `pyarrow==25.0.0`, in a separate environment
+on `PATH`. The first runtime attempt with an incomplete environment stopped at
+its missing `httpx` import; it did not qualify the deployment. The complete-client
+rerun exercised the stock CLI flow, including a 9 MiB Xet upload, and asserted
+that a native download traversed the transfer role with HTTP 206.
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo test --offline --locked \
+  --manifest-path e2e/Cargo.toml --test native_huggingface_cli_e2e \
+  native_huggingface_frontends::native_huggingface_cli_flows_with_split_roles_postgres_minio \
+  -- --ignored --exact
+```
+
+This adds remote-storage split-role client evidence to the local fault gate.
+Both role servers are Tokio tasks in one test process; Docker supplies the real
+PostgreSQL and MinIO services. It does not establish independent server-process
+failure recovery, multi-host isolation, or production capacity.
+
+
+### FSCK MinIO regression qualification (2026-11-16)
+
+At cleanup commit `74337505`, all 114 FSCK library tests passed in 4.396 s
+with none skipped, including the three normally ignored Docker MinIO tests.
+The run used Rust 1.99.0 on the shared Linux development host.
+Reproduce from the repository root:
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 RUSTC_WRAPPER= \
+  cargo +1.99.0 nextest run --offline --locked -p shardline-fsck --lib \
+  --all-features --run-ignored all --no-fail-fast --test-threads 4
+```
+
+The tests check bounded ordinary-chunk reads, native-container corruption and
+missing-member diagnostics, and multi-member snapshot turnover with asserted
+GET/HEAD counts. The turnover case checks 17, 16, 17 and 1 GETs across initial,
+repeated, changed-source and corrupted-source scans, with zero HEADs throughout.
+The complete library target was selected. Fixtures were removed after the run. This qualifies
+these local MinIO regression scenarios, not production throughput or scale.
+
+### Complete CLI library cleanup checkpoint (2026-11-16)
+
+Source `d6b390ea` passed all 558 CLI library tests with none skipped in
+30.717 s. The run used a fresh, migrated PostgreSQL 16 Alpine database,
+`SHARDLINE_REQUIRE_POSTGRES_TESTS=1`, `SHARDLINE_REQUIRE_NATIVE_CLIENTS=1`,
+Rust 1.99.0 and the same unoptimized, debug-information-disabled build settings
+as the checkpoints above. The disposable database was removed afterward.
+
+```bash
+# DATABASE_URL identifies a disposable database with current migrations applied.
+SHARDLINE_REQUIRE_POSTGRES_TESTS=1 SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 \
+  cargo +1.99.0 nextest run --offline --locked -p shardline --all-features \
+  --lib --no-fail-fast --success-output final --test-threads 4
+```
+
+The all-features CLI executable build also passed. This checks the accumulated
+maintenance, inspection, backup, retention-hold and migration cleanup together.
+The snapshot contains 570,633 tracked Rust lines, down 33,016 (5.47%) from the
+603,649-line baseline, including comments, tests and blank lines. These are local
+functional results; the historical hosted SDK RSS failure and production
+performance qualification remain open.
+
+### Incremental development recompilation
+
+On November 16, 2026, source `b9820832049726a53818dd6bcf07f40709e6e478`
+was measured with Rust/Cargo 1.99.0 on the shared x86_64 Linux development host.
+Removing the workspace's `profile.dev.incremental = false` restores Cargo's
+incremental development/test default. Release settings are unchanged.
+
+The controlled workload appended a distinct comment to the S3 adapter's
+`src/multipart.rs`, then ran `cargo +1.99.0 test --no-run --lib --offline --locked
+-p shardline-s3-adapter`. Each mode had a preparation build and three edited-source
+samples, with source restored afterward. Both modes used the same existing target
+directory and dependency caches, four jobs, no compiler wrapper, and disabled
+dev/test debug information. `CARGO_INCREMENTAL=0` and `1` selected the modes.
+
+| Edited-source compilation | Disabled | Enabled |
+| --- | ---: | ---: |
+| Median of three samples | 1.816 s | 0.817 s |
+| Range | 1.814–1.834 s | 0.809–0.822 s |
+
+This is about 55% less elapsed time for this small, comment-only adapter rebuild.
+It does not measure fresh builds, semantic edits, the full server/CLI build, or
+production throughput. Incremental compilation uses additional cache space and
+its preparation cost is excluded from the table. The repository's normal debug
+information setting was not measured here.
+
+### Hub cleanup package checkpoint (2026-11-16)
+
+Frozen source `0474dc34e375bc900541f0852fd5585b610438c9` passed the
+all-features Hub package suite on the shared development host with Rust 1.99.0,
+four build jobs, four test threads, cached dependencies, no compiler wrapper,
+and disabled dev/test debug information. The current all-features CLI built in
+18.72 seconds and applied migrations to a fresh PostgreSQL 16 Alpine database.
+Both native-client and PostgreSQL fixture requirements were enabled; all seven
+PostgreSQL fixture variables pointed at that disposable database.
+
+```bash
+# Set DATABASE_URL and each SHARDLINE_*_TEST_DATABASE_URL used by the Hub tests
+# to the migrated disposable database before running this command.
+SHARDLINE_REQUIRE_POSTGRES_TESTS=1 SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 \
+  cargo +1.99.0 nextest run --offline --locked -p shardline-hub-api \
+  --all-features --no-fail-fast --test-threads 4
+```
+
+All 742 selected unit and integration tests passed in 45.657 seconds. The four
+normally ignored tests were explicitly selected in a separate run against the
+same frozen source and current CLI. The two runs ran sequentially on the shared host;
+the durations are observations, not isolated performance comparisons.
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 SHARDLINE_BIN="$CARGO_TARGET_DIR/debug/shardline" \
+  cargo +1.99.0 nextest run --offline --locked -p shardline-hub-api \
+  --all-features --run-ignored only --no-fail-fast --success-output final \
+  --test-threads 1
+```
+
+All four passed in 35.291 seconds. The clone/fetch and protocol-v2 matrices used
+stock Git with disposable PostgreSQL/MinIO; the snapshot-token fixture checked
+confinement on PostgreSQL/MinIO; and the publication fixture checked PostgreSQL
+conflicts, deleted branches, concurrent reads, and corrupt journal rejection.
+The fixture containers were cleaned up; the running-container inventory matched
+the pre-run inventory.
+
+Across the two runs, all 746 Hub tests passed, including the four normally
+ignored tests. This updates the earlier `73d23cc4`/`740eb15e` checkpoint with
+coverage of shared path-history revisions, recursive tree construction,
+Parquet predicate preparation and aggregation, range-buffer ownership,
+authorized default dataset loading, and webhook payload/response ownership.
+The lower test count reflects consolidated cases, including explicit dataset
+layout/format precedence and repository response timestamps. Strict
+all-features Hub library/test Clippy passed during the changes. This is local functional
+qualification; it does not qualify production throughput, establish
+a measured speedup from these changes, or resolve the historical hosted SDK
+memory failure.
+
+### Release-build cross-protocol reuse checkpoint (2026-11-16)
+
+Frozen all-features release source
+`864d11621d5d97981c25dd3be60e973cc0ce7a6c` repeated the 32-version
+benchmark using `scripts/shardline/benchmark_protocol_dedup.py`, Rust 1.99.0
+and `hf_xet` 1.7.0. The executable SHA-256 was
+`93bd48c1575904f1d87c2afa149bf6d7651a544db975a54ff5c18ac1451454a0`.
+Each version is 4 MiB with a distinct 4 KiB edit; the CDC target is 64 KiB,
+the seed is 20261114, and the logical versioned total is 134,217,728 bytes.
+
+| Frontend | Retained Xorb bytes after GC | Total physical object bytes after GC | Verified downloads |
+| --- | ---: | ---: | ---: |
+| Native Xet | 6,984,571 | 7,025,522 | 32/32 |
+| S3 | 6,984,691 | 6,984,810 | 32/32 |
+| Basic Git LFS | 6,984,691 | 6,984,810 | 32/32 |
+
+Native Xet's total additionally includes 40,832 shard bytes; each lane includes
+119 GC metadata bytes. Database and filesystem overhead are excluded. These
+Xorb counts reproduce the earlier scoped-reuse result. S3 and basic LFS also
+passed the surviving-version read after deleting their first 31 versions and
+running GC. This checks reference safety, not reclamation after retention expiry
+or container repacking. The benchmark uses local storage and does not establish
+PostgreSQL/S3 throughput, concurrent-GC performance, or general customer savings.
+
+### Release PostgreSQL/MinIO retention observation (2026-11-16)
+
+Frozen all-features release source
+`683916e8c4330363f711eaad236af917db0d46ca` completed the performance
+matrix with executable SHA-256
+`b8f1126d02d32063e14c94a6030b51a638518d3d3c493c0ff98fbab1da9704e7`.
+The harness source was `d5d699b08cc104b7c9a8cc04c901a346a121295f`.
+It used disposable PostgreSQL/MinIO, one or two S3 API replicas limited to
+one CPU and 1 GiB each, eight clients, 32 objects of 1 MiB per phase, unique
+and repeated datasets, and three repetitions: 12 lanes in total.
+
+```bash
+python3 -B scripts/shardline/validate_performance.py /path/to/release/shardline \
+  /path/to/results --binary-source-revision 683916e8c4330363f711eaad236af917db0d46ca \
+  --replicas 1 2 --datasets unique repeated --objects 32 \
+  --object-bytes 1048576 --clients 8 --repeats 3 --retention-expiry
+```
+
+Median observed throughput across the three repetitions:
+
+| Data | Replicas | Initial PUT MiB/s | Mixed PUT/GET MiB/s | Mixed PUT/GET with GC MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| Unique | 1 | 103.67 | 326.57 | 327.05 |
+| Unique | 2 | 112.54 | 452.73 | 436.16 |
+| Repeated | 1 | 126.75 | 348.66 | 330.44 |
+| Repeated | 2 | 133.09 | 445.71 | 456.78 |
+
+Each maintenance phase completed one GC process during the workload; process
+overlap does not prove active collection during every request. All 1,728
+post-workload read checks passed. API writers then stopped for a real one-hour
+retention observation, followed by two GC passes per lane and another 1,728
+successful reads through the resumed replicas. Backend trace validation passed.
+
+After initial GC, stored object bytes were 33,588,967 for every unique-data lane
+and 8,397,247 for every repeated-data lane, independent of replica count. These
+counts include 119 metadata bytes per lane. At that checkpoint, used physical
+member counts equaled distinct used chunk hashes in every lane. After the
+retention observation and final GC, all lanes retained those same byte counts.
+Quarantine was empty both before and after the wait: this demonstrates stable
+footprint and readable references, not reclamation of expired quarantine entries.
+All three upload phases remained logically live. Fixture containers were removed.
+
+These are short bursts on a shared development host, not production-scale
+throughput or cost measurements. The modest initial-ingest increase with two
+replicas does not establish efficient scale-out. Release-profile results cannot
+be compared with the earlier development-profile samples as a cleanup speedup.
+The output retains per-phase latency, backend requests/bytes, database query
+counts, and connection/lock observations for follow-up analysis.
+
+
+### Frozen cleanup qualification checkpoint (2026-11-16)
+
+Source `3417c244c32cedecd1f1ded64292d8380c90d970` was held fixed for a
+fresh all-features release build and integrated correctness checks. The optimized
+CLI used Rust 1.99.0 and the repository's release profile (optimization level 3,
+thin LTO, one codegen unit, abort on panic). Its frozen executable SHA-256 was
+`3ca4255174564e4cbf845a3869d32fa3a741d599dd89ba5700a888737cce8d84`,
+unchanged after both gates. Uncommitted main-worktree changes were excluded.
+
+The PostgreSQL gate used `scripts/test-postgres.sh`, a fresh PostgreSQL 16 Alpine
+database migrated by the frozen CLI, required PostgreSQL/native-client fixture
+settings, and the pinned 1.12.1 and 1.11.3 recovery executables. The distributed
+checks used the same frozen CLI, the pinned 1.12.1 executable, `libfaketime`,
+`huggingface_hub==2.2.0` and `hf_xet==1.7.0`. Every deployment and multi-node
+case was enabled with `--run-ignored all --test-threads 1`; their logs contained
+no runtime skips or task panics.
+
+| Gate stage | Passed | Test execution time |
+| --- | ---: | ---: |
+| All-features index library | 813 | 125.084 s |
+| PostgreSQL provider-event integration | 2 | 0.114 s |
+| All-features server library | 3,220 | 468.121 s |
+| Explicit PostgreSQL copy-integrity and cache-revocation contracts | 6 | 3.264 s |
+| CLI PostgreSQL migration E2E | 1 | 0.115 s |
+| Deployment faults and released-binary compatibility | 51 | 448.087 s |
+| Multi-node role faults | 8 | 22.738 s |
+
+All 4,101 selected tests passed. The PostgreSQL gate's default stages still
+exclude six normally ignored index cases and 45 normally ignored server cases;
+only its six explicitly selected PostgreSQL contracts were subsequently enabled.
+This checkpoint does not claim every ignored workspace test was qualified.
+
+The first disposable PostgreSQL setup attempt returned a connection reset during
+migration, before any tests ran. A fresh fixture using TCP readiness completed
+the gate; no production code was changed for that setup retry. Owned test
+fixtures were cleaned up. Tests used unoptimized builds with debug information
+disabled and four build jobs; the two gates ran concurrently on the shared Linux
+host. Their execution times are not throughput or before/after performance
+measurements.
+
+The source inventory above was refreshed for this snapshot. Every tracked Rust
+blob was counted independently and checked against `git grep -I -c '^'` for both
+snapshots: 603,649 baseline lines and 568,434 candidate lines, a net decrease of
+35,215 (5.83%), including comments, tests and blank lines.
+
+The historical hosted SDK RSS failure remains unexplained. This checkpoint does
+not establish hosted-CI success, production-scale capacity, cloud costs or unit
+economics. Existing versioned performance and cross-protocol deduplication
+measurements retain their original source and workload limitations.
+
+### Contributor CI qualification checkpoint (2026-11-17)
+
+Source `75b73dcf73bca0a7d981de252ed4ddf562247c99` completed the documented
+`cargo make ci` pipeline locally with Rust 1.99.0, four build jobs, cached
+dependencies, no compiler wrapper, and dev/test debug information disabled.
+Release tests retained the repository's optimized release profile. The isolated
+checkout excluded uncommitted main-worktree changes.
+
+The first attempt stopped at a Hub webhook formatting discrepancy. The next
+attempt found two forbidden `expect()` calls in the lifecycle classification
+fuzz target. Formatting was corrected; the fuzz oracle now checks both calls
+against the expected action without discarding errors or weakening assertions.
+The complete pipeline then passed, including workspace formatting and strict
+Clippy, dependency exceptions, both workspace dependency policies, release CLI
+help/manpage/completion smoke checks, and parity across 44 database migrations.
+Formatting was also checked independently with Rust 1.100.0.
+
+| Test stage | Passed | Normally ignored tests excluded |
+| --- | ---: | ---: |
+| Workspace library tests | 8,153 | 45 |
+| Reliability contracts | 39 | 0 |
+| Release-mode CLI API and maintenance contracts | 41 | 5 |
+| Separate Python script contracts | 55 | 0 |
+
+The release executable was frozen with SHA-256
+`ddf875ff19e01148bd2742d9493dfe3d887887df51295baf5976028c9b091443`.
+This contributor gate does not qualify excluded tests or external-fixture tests
+that return early without their infrastructure. Infrastructure qualification retains its separately recorded source revisions;
+the PostgreSQL follow-up below uses this same candidate. This is local evidence, not hosted-CI success, a controlled build-speed
+comparison, or resolution of the historical hosted SDK RSS failure.
+
+#### PostgreSQL follow-up
+
+The same frozen candidate completed `scripts/test-postgres.sh` against a fresh
+PostgreSQL 16 Alpine database migrated by that executable, with PostgreSQL and
+native-client prerequisites required and the pinned 1.12.1/1.11.3 recovery
+executables available. All **4,040 selected tests passed**: 813 index library,
+two provider-event integration, 3,218 server library, six explicitly enabled
+PostgreSQL copy-integrity/cache-revocation contracts, and one live migration E2E.
+The default library stages excluded six normally ignored index tests and 45
+normally ignored server tests; the six explicit contracts were enabled separately.
+
+The frozen executable's checksum was unchanged afterward, and the owned database
+container was removed. This used Rust 1.99.0, four test/build workers, cached
+dependencies and disabled test debug information on the shared development host.
+It is correctness evidence for this gate, not a production-topology or throughput
+qualification. Distributed and remote-object-store results remain tied to their
+previously recorded revisions.
+
+### Contributor CI refresh after maintenance simplification (2026-11-17)
+
+Source `6c8f0d58d4fe68c82c1e5f326cf97096eff824b6` completed `cargo make ci`
+locally after the subsequent index, SDK, upload, rebuild and fsck cleanup.
+The isolated checkout excluded unrelated uncommitted main-worktree changes.
+The run used Rust 1.99.0, four build jobs, cached dependencies, no compiler
+wrapper and disabled dev/test debug information; release checks retained the
+optimized repository profile.
+
+| Test stage | Passed | Normally ignored tests excluded |
+| --- | ---: | ---: |
+| Workspace library tests | 8,138 | 45 |
+| Reliability contracts | 39 | 0 |
+| Release CLI API and maintenance contracts | 41 | 5 |
+
+Workspace formatting, strict Clippy, dependency exceptions, both workspace
+cargo-deny policies, release help/manpage/completion checks and parity across
+44 database migrations passed. The full command exited successfully in 550.82
+seconds on the shared development host. This is a correctness checkpoint,
+not a controlled build-speed measurement.
+
+External fixtures were not required by this contributor run: tests that return
+early without their infrastructure do not constitute infrastructure
+qualification. PostgreSQL and distributed qualifications retain their separately
+recorded source revisions. This run does not resolve the historical hosted SDK
+RSS failure or establish hosted-CI success or production capacity.
+
+#### PostgreSQL refresh and deadline regression
+
+Revision `d2d48dff` completed `scripts/test-postgres.sh` against a fresh
+PostgreSQL 16 Alpine database with required PostgreSQL and native-client
+prerequisites, pinned 1.12.1/1.11.3 compatibility binaries and local object
+storage. The schema bootstrap used the frozen release executable from
+`6c8f0d58`, SHA-256
+`45645d17d63d353ebd8b0a0c29a386347b3fa0b467ce7b4e6d77864c58168cf0`.
+Only documentation and the deadline regression tests changed between those
+revisions; production code was identical.
+
+| Test stage | Passed |
+| --- | ---: |
+| Index library | 813 |
+| PostgreSQL provider events | 2 |
+| Server library | 3,215 |
+| Explicit PostgreSQL copy/reference integrity contracts | 6 |
+| CLI migration application/status/reversal | 1 |
+
+All 4,037 selected tests passed. The default library stages excluded six
+normally ignored index tests and 45 normally ignored server tests; the six
+explicit integrity contracts were selected separately.
+
+The preceding database run failed one publication-timeout assertion: it
+required the client deadline to beat the equally bounded database statement
+deadline. The corrected tests preserve either specific timeout cause, reject
+unrelated errors, and exercise a forced 100 ms statement timeout. Original
+evidence and retirement-marker preservation, successful retry, and connection
+acquisition diagnostics remain checked. All four deadline tests passed both
+in a focused fresh-database run and in this complete rerun.
+
+The frozen executable's checksum was unchanged after qualification and the
+owned database container was removed. The restored isolated checkout and
+verification fixtures were kept outside the host's cache-cleanup directory.
+This remains local PostgreSQL/local-object-storage correctness evidence;
+it does not qualify MinIO, hosted CI, production capacity or the historical
+hosted SDK RSS failure.
+
+### Contributor CI checkpoint after GC and CLI test cleanup (2026-11-17)
+
+Source `8f648825d65454bd0b30d6bfd9b9582edbbf63a7` completed `cargo make ci`
+in the isolated cleanup checkout. The run used Rust 1.99.0, four build jobs,
+four Nextest workers, disabled dev/test debug information and no compiler
+wrapper. Release checks retained the repository's optimized profile, including thin LTO and one
+code-generation unit. The target cache had no release artifacts at the start.
+
+| Test stage | Passed | Normally ignored tests excluded |
+| --- | ---: | ---: |
+| Workspace library tests | 8,126 | 45 |
+| Reliability contracts | 39 | 0 |
+| Release CLI API and maintenance contracts | 41 | 5 |
+
+All 8,206 selected tests passed. Workspace formatting, strict Clippy,
+dependency-exception checks, root and E2E cargo-deny policies, release
+help/manpage/completion checks and parity across 44 migrations passed.
+The command exited successfully in 757.43 seconds on the shared development
+host; this is correctness evidence, not a controlled build-speed comparison.
+
+The preceding run at `1ab1f26f` stopped on the webhook TLS test's assertion
+that a negative result must be certificate validation. Its underlying cause
+was not included in the original diagnostic. The follow-up adds that cause
+to assertion failures without changing delivery code or relaxing the test.
+The test passed in 22 focused executions (including 20 bounded repetitions)
+and in this complete rerun. The original intermittent failure remains
+unexplained; these passes do not establish that it is fixed.
+
+The verified release executable was frozen for subsequent qualifications.
+Its SHA-256 is
+`65f56834cd9b5fddad6961ec46a0f56f406d46830206b476ffaed9bc6ce26ba9`.
+At this source revision the tracked Rust inventory is 567,686 lines, down
+35,963 lines (5.96%) from the 603,649-line baseline. This includes tests,
+comments and blank lines and excludes unrelated uncommitted changes.
+
+External fixture requirements were not enabled for this contributor gate.
+Infrastructure-dependent tests that return early do not qualify their
+backends. Required PostgreSQL/object-storage topology, hosted CI, production
+capacity and the historical hosted SDK RSS failure remain separate gates.
+
+### Contributor CI refresh after ingestion and rebuild cleanup (2026-11-17)
+
+Frozen source `4c95fa7215e793c4067f275f60ee7779928a078f` completed
+`cargo make ci` successfully in 504.71 seconds in the isolated cleanup checkout.
+Rust 1.99.0 used four build jobs, four Nextest workers, disabled dev/test debug
+information, offline dependencies and an explicitly disabled compiler wrapper.
+Release checks retained thin LTO and one code-generation unit. Existing build
+artifacts were available; this is not a cold-build timing or a controlled speed
+comparison with earlier checkpoints.
+
+| Test stage | Passed | Normally ignored tests excluded |
+| --- | ---: | ---: |
+| Workspace library tests | 8,121 | 45 |
+| Reliability contracts | 39 | 0 |
+| Release CLI API and maintenance contracts | 41 | 5 |
+
+All 8,201 selected tests passed. Workspace formatting, strict Clippy, dependency
+exceptions, root and E2E cargo-deny policies, release help/manpage/completion
+checks and parity across 44 migrations passed. This covers the combined GC,
+maintenance-error, rebuild and ingestion changes since `8f648825`, including
+the consolidated test cases and shared durable-chunk identity comparison.
+
+The frozen release executable has SHA-256
+`1ae5353ad0f6291e9731b2e7aefb4c130d70ac9cd9848f917e62305c1fc94818`.
+Tracked Rust inventory at this source is 567,534 lines, down 36,115 (5.98%)
+from the 603,649-line baseline, including comments, tests and blank lines.
+Unrelated uncommitted changes were excluded.
+
+Required external-fixture flags were not enabled. Tests returning early do not
+qualify PostgreSQL or object-storage topology. The earlier intermittent webhook
+TLS failure and historical hosted SDK RSS failure remain unexplained; this
+successful local gate does not establish either issue is fixed, production
+capacity, or hosted qualification.
+
+#### Required PostgreSQL refresh after ingestion and rebuild cleanup
+
+The same frozen `4c95fa72` release executable bootstrapped a fresh PostgreSQL
+16 Alpine container. The test harness source was
+`1bd714228d60a45cb654c16785e0c60de2d8aa27`, whose only changes from the executable
+source were documentation. `scripts/test-postgres.sh` exited successfully in
+644.91 seconds with PostgreSQL and native-client requirements enabled, four
+build jobs and four Nextest workers. Compatibility executables remained pinned
+to 1.12.1 and 1.11.3.
+
+| Required selection | Passed |
+| --- | ---: |
+| Complete index library, all features | 813 |
+| PostgreSQL provider-event integration | 2 |
+| Complete server library, all features | 3,211 |
+| Explicitly enabled PostgreSQL integrity contracts | 6 |
+| Live migration apply/status/revert E2E | 1 |
+
+All 4,033 selected tests passed. This includes the history-publication deadline
+regression, source-deletion and reference-lock contracts, recovery queries and
+router readiness during held file verification. Normally ignored or filtered
+checks outside these selections remain excluded. The explicit integrity
+selection covers local object storage, not PostgreSQL/MinIO publication.
+
+The frozen executable checksum remained unchanged, and the owned database
+container was removed after the terminal result. This refresh qualifies the
+selected PostgreSQL contracts; it does not establish production throughput,
+the complete remote-storage deployment matrix, hosted CI qualification or a
+resolution of the earlier webhook TLS and hosted SDK RSS failures.
+
+#### PostgreSQL/MinIO integration refresh after ingestion cleanup
+
+At `ba1b9ad1256e70dd3bbdad4c669111a60d77f9ae` (documentation-only changes
+since the qualified `4c95fa72` executable source), the existing required-fixture
+integration selection exercised these targets against disposable services:
+
+| Target | Cases with passing evidence |
+| --- | ---: |
+| Server `postgres_s3_e2e_http` | 52 |
+| Server `s3_integration` | 69 |
+| Storage `s3_integration` | 36 |
+
+The first complete invocation exited 100 in 187.19 seconds: 156 tests passed,
+one failed, none skipped. The failure was the DuckDB client's prerequisite
+check: the selected Python environment lacked DuckDB and PyArrow. After installing
+the repository E2E workflow pins (`duckdb==1.5.5`, `pyarrow==25.0.0`), that single
+failed test passed in a focused rerun (22.34 seconds including Cargo preparation).
+No source or assertions changed. Thus all 157 cases have passing evidence
+across the two invocations; this was not one uninterrupted green full run.
+
+A separate required-fixture library selection also passed all three
+`copy_integrity::minio_` / `copy_integrity::postgres_minio_` cases in 11.80 seconds
+with one test worker. These exercise source replacement during an in-flight copy
+and reconciliation of disconnected copy-part acknowledgement through list-parts,
+including PostgreSQL plus MinIO.
+
+Runs used Rust 1.99.0, disabled compiler wrapping and dev/test debug information,
+four build jobs, and `SHARDLINE_REQUIRE_NATIVE_CLIENTS=1`; integration execution
+used four test workers. These are local remote-storage correctness checks,
+not production throughput, capacity, cost, or hosted SDK memory qualification.
+
+#### Metadata-backlog phase timing (2026-11-17)
+
+At `1ae584d7`, the existing 1,026-run metadata fixture was measured with its
+phase diagnostics exposed (`--success-output final`). The single selected
+`larger_metadata_backlog_preserves_pagination_and_safe_retention` test passed,
+with all retention, deleted-cursor, unfinished/corrupt-history and payload
+preservation assertions intact.
+
+| Existing timer | Observed wall time |
+| --- | ---: |
+| Entire test | 102.54 s |
+| Full paginated inspection | 13.27 s |
+| 17 retention calls combined | 57.20 s |
+| Slowest retention call | 4.51 s |
+
+The untimed remainder includes fixture construction and additional assertions;
+it cannot be attributed to setup alone. This is one shared-host debug-profile
+sample (Rust 1.99.0, debug information disabled, one selected test worker), not a
+production latency estimate or before/after speedup. No source changes, test
+removals or relaxed limits were used. Retention is the largest explicitly timed
+phase; further optimization must preserve verification before retirement,
+oldest-first selection, resumable markers and the existing artifact budgets.
+
+#### Optimized development signature arithmetic
+
+A sampled rerun of the same backlog fixture at `a67bc3c3` passed and showed CPU
+cost in SQLite parsing and unoptimized Curve25519/vector arithmetic. The sampled
+run retained similar phase timings (inspection 13.42 s, retention 57.30 s).
+An initial override supplied to the outer Cargo invocation was not forwarded to
+Nextest's build and did not rebuild dependencies; it is not optimized evidence.
+
+Passing the override through Nextest's `--config` rebuilt both locked
+`curve25519-dalek` versions with `opt-level=3`. With the source, inputs and
+assertions unchanged, the selected test passed with these existing timers:
+
+| Timer | Original sample | Optimized-curve sample |
+| --- | ---: | ---: |
+| Entire test | 102.54 s | 61.61 s |
+| Paginated inspection | 13.27 s | 6.39 s |
+| 17 retention calls | 57.20 s | 32.67 s |
+| Slowest retention call | 4.51 s | 2.35 s |
+
+The dependency override is retained in the development profile, which tests
+inherit. Overflow checks and all verification remain enabled; the optimized
+release profile is unchanged. The first affected rebuild took 52.59 s, so its
+compilation cost must be considered separately from the approximately 40% lower
+test execution time in this sample. These sequential shared-host observations
+are a targeted development-feedback result, not a cold-build speedup,
+production throughput estimate or general CI timing guarantee.
+
+The retained profile candidate atop `a67bc3c3` subsequently passed full
+`cargo make ci`: 8,121 library tests, 39 reliability contracts and 41 release
+CLI/maintenance tests, with formatting, strict workspace Clippy, dependency
+policies, release smoke checks and 44-version migration parity passing.
+Normally ignored tests remained excluded (45 library and five release tests).
+The command exited zero in 363.80 s with existing artifacts and rebuilds;
+that elapsed time is not a controlled whole-CI comparison. The exact candidate
+patch was held unchanged throughout this gate. No test cases were removed.
+
+### SDK qualification after cache and CLI report cleanup (2026-11-17)
+
+At `91dbd4a5`, the full SDK library suite passed with all features enabled:
+
+```sh
+cargo +1.99.0 nextest run --offline --locked -p sdx --all-features --lib --no-fail-fast
+```
+
+All 321 selected tests passed, with zero skipped, in 1.336 s of test execution.
+The run used four Cargo build jobs, existing build artifacts, disabled debug
+information and no compiler wrapper on the shared development host. This checks
+SDK unit and mock-protocol behavior; it does not run the separate real-server E2E
+workspace or resolve the outstanding hosted memory qualification.
+
+The preceding focused runs passed all 69 cache/stream tests and all 18 CLI
+report-output tests. Strict Clippy passed for each affected package's library
+and tests. Cache removal accounting is now shared by corrupt reads and both
+eviction paths. Cache serialization hashes the already serialized offset table
+in one call instead of hashing each offset separately; a fixed-byte fixture
+checks compatibility with the existing cache format. No end-to-end throughput
+improvement is claimed from that change.
+
+Tracked Rust inventory is 567,575 lines, including tests, comments and blank
+lines: 36,074 fewer (5.98%) than the 603,649-line baseline. This is 41 more lines
+than the preceding 567,534-line checkpoint: stronger output and byte-format
+assertions outweigh the small production reductions in this batch. These changes
+improve shared ownership and verification; they are not a net source reduction.
+
+### Integrated SDK and CLI cleanup checkpoint (2026-11-17)
+
+At `e1096951654cbea0756d3e56b23fd36598a27e16`, `cargo +1.99.0 make ci`
+completed successfully with the tracked source held unchanged throughout the run.
+The isolated checkout used four Cargo jobs and Nextest workers, disabled dev/test
+debug information, no compiler wrapper, offline dependencies and existing build
+artifacts.
+
+- All 8,117 selected workspace library tests passed in 251.699 s; 45 normally
+  ignored tests remained excluded.
+- All 39 reliability contracts and 41 release CLI/maintenance tests passed;
+  five normally ignored release tests remained excluded.
+- Formatting, strict workspace Clippy, dependency exceptions, root and E2E
+  dependency policies, release help/manpage/completion checks and 44-version
+  migration parity passed.
+
+The 8,197 selected tests cover the recent CLI report, SDK cache, reconstruction,
+transfer and shard-constant cleanup together with the existing workspace
+contracts. The SDK's separate all-feature library run also passed all 319 tests
+at this source. Consolidating three planner functions into one retained their
+three scenarios and all original descriptors and terms; the new assertions check
+complete fetch ranges and term indexes.
+
+Total gate elapsed time was 421.73 s, including a 2m 18s release rebuild. This is
+not a controlled cold-build or before/after performance measurement. External
+PostgreSQL/MinIO qualification and the hosted SDK memory gap are separate from
+this contributor gate; another passing local run does not resolve the historical
+intermittent TLS failure's cause.
+
+Tracked Rust inventory is 567,554 lines, including tests, comments and blanks:
+36,095 fewer (5.98%) than the 603,649-line baseline and 21 fewer than the preceding
+SDK checkpoint.
+
+### Configuration cleanup checkpoint (2026-11-17)
+
+At `8ef6fa354fbac73b8f4da7cb13131cfb43a3417f`, the complete non-ignored
+server library selection passed: 3,107 tests in 174.317 s, with 28 normally
+ignored tests excluded. Command:
+
+```sh
+RUSTC_WRAPPER='' CARGO_BUILD_JOBS=4 CARGO_PROFILE_DEV_DEBUG=0 \
+CARGO_PROFILE_TEST_DEBUG=0 NEXTEST_TEST_THREADS=4 \
+cargo +1.99.0 nextest run --offline --locked -p shardline-server --lib
+```
+
+The isolated checkout used the existing external target directory. Each source
+change also passed the selected configuration tests, formatting and strict
+`cargo +1.99.0 clippy --offline --locked -p shardline-server --lib --tests -- -D warnings`.
+This is server-library qualification, not a fresh required PostgreSQL/MinIO,
+hosted memory, complete workspace or production-scale run.
+
+Relative to `cba8ddc5`, this batch removes 267 tracked Rust lines: 15 from
+production code and 252 from tests and their comments. In-flight limits share
+existing numeric parsing and clamping, the secret loader owns its uniform source
+conflict error, and secret-read preparation has fewer redundant branches.
+Consolidated tests preserve all distinct input/error cases; one exact duplicate
+was removed. Direct secret newline rejection now checks precise errors through
+the full configuration loader. No memory bounds or verification checks were
+relaxed.
+
+Tracked Rust inventory is 567,287 lines, 36,362 fewer (6.02%) than the
+603,649-line baseline. These counts include tests, comments and blank lines;
+they are not a measured build-time or throughput improvement.
+
+### Hub ownership and fixture cleanup checkpoint (2026-11-17)
+
+Source `a8c81020754f89e498d9616c689776356aec2bac` passed all 711 selected Hub
+library and integration tests in 41.518 s; four normally ignored integration
+tests remained excluded. The isolated checkout used Rust 1.99.0, four Cargo jobs
+and Nextest workers, disabled dev/test debug information, no compiler wrapper,
+offline dependencies and the existing external target directory:
+
+```sh
+cargo +1.99.0 nextest run --offline --locked -p shardline-hub-api --lib --tests
+cargo +1.99.0 clippy --offline --locked -p shardline-hub-api --lib --tests -- -D warnings
+```
+
+Formatting and strict Clippy passed. The final test selection includes the
+cross-tenant authorization contracts, repository search/creation, Git clients,
+webhook security and README metadata parsing. It is not a fresh required
+PostgreSQL/MinIO deployment qualification: tests that conditionally require
+external services do not establish those guarantees without the required gate.
+
+Compared with `94063b33`, Hub cleanup removes 193 Rust lines: three production
+lines and 190 test lines. Both authorization entrypoints now share optional
+provider dispatch. Response conversion consumes owned repository IDs, and
+webhook delivery moves owned URLs rather than cloning them. No end-to-end
+performance gain is claimed from those ownership changes.
+
+Fixture and table consolidation retains distinct address-classification,
+URL-redaction, repository-type and front-matter cases. Deletion coverage keeps
+empty, revision-only and webhook-only states and adds a combined state; all four
+check cleanup after repeated deletion. Exact front-matter objects replace weaker partial assertions.
+
+Reqwest JSON helpers are now a Hub dev-dependency feature. A production-only
+`cargo tree -p shardline-hub-api -e features,no-dev -i reqwest@0.12.28` no longer
+shows Hub enabling JSON. The production library check without that feature and
+all 13 dataset/webhook integration tests passed. This narrows the package feature
+request; feature unification in the complete server may still enable JSON through
+other consumers. It is not a measured cold/warm build improvement.
+
+Tracked Rust inventory is 567,094 lines: 36,555 fewer (6.06%) than the
+603,649-line baseline. Hosted SDK memory and production-scale qualification
+remain open.
+
+## Configuration, Hub and S3 integrated checkpoint (2026-11-17)
+
+Frozen source: `a3b20bd32a56d274a38e95ae466c09e5b520f808`.
+`cargo +1.99.0 make ci` passed in 501.440 seconds with four build jobs,
+four Nextest threads, dev/test debug info disabled, `RUSTC_WRAPPER` empty,
+offline dependency resolution and the existing shared target directory.
+This is a warm developer-gate sample, not a controlled build-speed comparison.
+
+- Workspace library suite: 8,064 passed in 249.718 seconds; 45 normally
+  ignored tests excluded.
+- Reliability contract suites: 39 passed.
+- Release CLI and maintenance suites: 41 passed; five ignored tests excluded.
+- Total selected tests: 8,144 passed. Formatting, strict workspace Clippy
+  (the gate's existing Xet-core exclusion), dependency exception checks, root
+  and E2E dependency policy checks, release help/manpage/completion smoke checks
+  and all 44 migration-version parity checks passed.
+
+Local artifacts: `.shardline-cleanup-state/ci-a3b20bd3/gate.log` and
+`result.json` in the parent projects directory.
+
+The lower library test count reflects the recent table-driven consolidation;
+case coverage is documented in the individual changes. Persisted S3 checksum
+coverage now explicitly checks absence, composite omission, valid full-object
+metadata, duplicate keys, malformed JSON, invalid Base64, incorrect digest length
+and noncanonical encoding.
+
+Tracked Rust inventory is 567,084 lines, including tests, comments and blank
+lines: 36,565 fewer (6.06%) than the 603,649-line baseline. This gate does not
+include a fresh required PostgreSQL/MinIO deployment qualification or resolve
+the historical hosted SDK memory failure. Those remain open.
+
+## Index adapter and checksum cleanup checkpoint (2026-11-17)
+
+Frozen source: `4a0377182731bd892030eb8e420c29beca77e356`. Compared with
+`13b12372`, the batch removes 79 production Rust lines and adds three test
+lines, for 76 fewer Rust lines overall. SQLite upload-intent row decoding and
+batch evidence verification now each have one implementation. PostgreSQL tuple
+decoding is shared by listing and lookup. S3 manifest readers share parsing,
+and multipart composite checksums consume decoded parts directly rather than
+allocating an aggregate checksum buffer. The existing multipart regression test
+now uses two parts and an independently computed fixed CRC32 result.
+
+All 813 selected index library tests passed against a disposable PostgreSQL 16
+Alpine database with `SHARDLINE_REQUIRE_POSTGRES_TESTS=1`, four build jobs and
+four Nextest threads. Six normally ignored tests were excluded. Nextest reported
+125.126 seconds; the Cargo invocation took 126.023 seconds. The container was
+removed after the run. Base migrations were applied with the previously qualified
+`4c95fa72` binary; both migration directories are unchanged since that source.
+The tested index code was built from the frozen source above.
+
+Command: `cargo +1.99.0 nextest run --locked -p shardline-index --lib --no-fail-fast`.
+Local artifacts are in the parent projects directory at
+`.shardline-cleanup-state/postgres-index-4a037718/{migration.log,tests.log,result.json}`.
+The earlier isolated 39-test PostgreSQL adapter run also passed after correcting
+a missing base-schema setup; its initial fixture failure is retained separately.
+All 179 selected S3 library tests, strict index/server Clippy and formatting
+passed for the corresponding source changes.
+
+The shared CI action also drops unused LLVM/libclang development package
+requests and path discovery (20 fewer YAML lines). Clang remains for fuzzing;
+coverage still requests Rust's `llvm-tools-preview`. YAML parsing, Bash syntax
+and both lockfiles were checked; no hosted timing improvement is established.
+
+Tracked Rust inventory is 567,008 lines, including tests, comments and blank
+lines: 36,641 fewer (6.07%) than the 603,649-line baseline. This checkpoint
+qualifies index behavior with PostgreSQL; fresh server/MinIO deployment
+qualification and the historical hosted SDK memory issue remain open.
+
+## Full server release-build comparison (2026-11-17)
+
+Compared cleanup baseline `401dcac4f95c61a41104df3ee6e222d93c0b18fb` with
+`b367232d0ed6cc02f9c12c9ab52f0014d88595e5`. Both used Rust 1.99.0, four
+build jobs, CPU affinity restricted to cores 0–3, incremental compilation
+disabled, an empty `RUSTC_WRAPPER`, offline dependency resolution and separate
+initially nonexistent Cargo target directories on the same host. Command:
+
+```text
+cargo +1.99.0 build --offline --locked --release -p shardline --bin shardline
+```
+
+| Sample | Baseline | Current |
+| --- | ---: | ---: |
+| Empty Cargo target directory | 243.923 s | 234.337 s |
+| Immediate unchanged warm rebuild | 0.414 s | 0.319 s |
+
+Both release builds and both warm rebuilds passed. Both generated binaries
+also passed `--version` and `--help` smoke checks. The current empty-target
+sample took 9.587 seconds less (3.93%). This single sequential pair is not a
+statistically established speedup: dependency sources and OS caches were warm,
+the baseline ran first, and shared-host contention was not eliminated. Warm
+samples measure unchanged-build overhead, not compilation after a source edit.
+This does not establish the aspirational 30% full-build reduction, container
+build performance or a cold-machine result. Earlier SDK iteration measurements
+remain a separate, narrower benefit.
+
+Commands, CPU affinity, source hashes, exit codes and elapsed times are saved
+in the parent projects directory at
+`.shardline-cleanup-state/build-comparison-b367232d/result.json`; individual
+build/smoke logs and binary hashes/sizes are alongside it. The orchestrator is
+`.shardline-cleanup-state/build-comparison-b367232d.py`.
+
+## Current PostgreSQL/MinIO qualification (2026-11-17)
+
+Frozen source: `711de39c468099f8c77e08b50baa2bbc00e4a967`. The complete
+157-case integration selection passed in one uninterrupted invocation, with
+zero skipped tests: server `postgres_s3_e2e_http` (52), server `s3_integration`
+(69), storage `s3_integration` (36). Nextest execution took 159.407 seconds;
+including Cargo preparation the command took 186.228 seconds.
+
+```text
+cargo +1.99.0 nextest run --locked -p shardline-server -p shardline-storage \
+  --features docker --test postgres_s3_e2e_http --test s3_integration --no-fail-fast
+```
+
+The three additional server-library copy-integrity cases also passed in a
+separate run (11.415 seconds test execution, 52.603 seconds including Cargo).
+Selection: `test(copy_integrity::minio_) or test(copy_integrity::postgres_minio_)`,
+with `--features docker --lib --run-ignored all --no-fail-fast` and one test worker.
+These cover source replacement and uncertain copy-part acknowledgements that
+can be reconciled through list-parts, including PostgreSQL-backed metadata.
+
+Both runs required native clients (`SHARDLINE_REQUIRE_NATIVE_CLIENTS=1`) and
+used the suites' disposable Docker service fixtures. DuckDB 1.5.5 and PyArrow
+25.0.0 were checked before execution. Integration execution used four workers.
+Builds used Rust 1.99.0, four build jobs, dev/test debug info disabled, an empty
+compiler wrapper and the existing shared target directory. No source changes
+or assertion relaxations were needed. No Docker containers remained afterward.
+Logs, exact commands, source hash and exit codes are in the parent projects
+directory at `.shardline-cleanup-state/minio-711de39c/`.
+
+This refresh replaces the older split-run evidence for the same integration
+selection. It qualifies these local remote-storage correctness paths after the
+configuration, Hub, checksum and index changes; it does not establish production
+throughput/cost or close the historical hosted SDK memory issue.
+
+## Maintenance and S3 shared-boundary checkpoint (2026-11-17)
+
+Frozen source: `d4d6b2d6b218356b9f447185380b273487cd2179`.
+`cargo +1.99.0 make ci` passed in 517.849 seconds with four build jobs,
+four Nextest threads, dev/test debug info disabled, an empty compiler wrapper,
+offline dependency resolution and the existing shared target directory.
+
+- Workspace library suite: 8,062 passed in 249.526 seconds; 45 normally
+  ignored tests excluded.
+- Reliability contract suites: 39 passed.
+- Release CLI and maintenance suites: 41 passed; five ignored tests excluded.
+- Total selected tests: 8,142 passed. Formatting, strict workspace Clippy
+  (with the gate's existing Xet-core exclusion), dependency exception checks,
+  root and E2E dependency policy checks, release help/manpage/completion smoke
+  checks and all 44 migration-version parity checks passed.
+
+This checkpoint includes the recent SQLite/PostgreSQL upload-intent decoding,
+shared maintenance file hashing, CLI test consolidation and S3 metadata/attributes
+validation cleanup. The S3 regressions explicitly exercise reserved form metadata
+and unsupported encryption options on attributes requests. Source inventory is
+566,953 tracked Rust lines: 36,696 fewer (6.08%) than the 603,649-line baseline,
+including tests, comments and blank lines.
+
+Artifacts in the parent projects directory:
+`.shardline-cleanup-state/ci-d4d6b2d6/{gate.log,result.json,inventory.json}`.
+This is a local contributor-gate result, not a build-speed comparison, required
+PostgreSQL/MinIO qualification or resolution of the historical hosted SDK memory
+failure. The separately recorded database/object-storage checkpoints retain their
+own frozen sources and coverage limits.
+
+## Release-mode CLI edit comparison (2026-11-17)
+
+Compared baseline `401dcac4f95c61a41104df3ee6e222d93c0b18fb` with
+`d49752c358ff6f7cf9a75f68c5092d31b078246b`. This measures a small CLI
+source edit, not an unchanged rebuild or a clean build. Both revisions used
+Rust 1.99.0, cores 0–3, four build jobs, incremental compilation disabled,
+an empty `RUSTC_WRAPPER`, offline resolution and separate warmed Cargo targets:
+
+```text
+cargo +1.99.0 build --offline --locked --release -p shardline --bin shardline
+```
+
+First build each unmodified revision to prepare its target; exclude that time.
+For samples 1–3, replace the top-level `about` string in
+`crates/shardline/src/command/definition.rs` with the original text followed by
+` Build iteration N.`. Change N for each sample so each build processes a new
+source edit. Run baseline/current, current/baseline, baseline/current in order.
+After every timed build, run the executable with `-h` and assert that the
+changed text appears. Restore the original source files after the sequence.
+
+| Edited-source sample | Baseline | Current |
+| --- | ---: | ---: |
+| 1 | 126.614 s | 122.763 s |
+| 2 | 130.910 s | 128.704 s |
+| 3 | 129.033 s | 127.761 s |
+| Median | 129.033 s | 127.761 s |
+
+All six builds and changed-help assertions passed; both source files were
+restored. The current median was 1.272 s (0.99%) shorter. With three samples
+per revision on a shared host, this does not establish a statistically reliable
+speedup. It does show that this release-mode edit still costs roughly two
+minutes. Do not generalize this result to development-profile incremental
+builds, server-core edits, container builds or the 30% contributor critical-path
+target. Preparation builds took 221.627 s and 182.516 s respectively; their
+cache invalidation differed and they are not clean-build comparison samples.
+
+Raw source hashes, settings, per-sample times, build logs and changed-help
+outputs are in `.shardline-cleanup-state/build-edit-d49752c3/` in the parent
+projects directory. The restoring orchestrator is
+`.shardline-cleanup-state/build-edit-d49752c3.py`.
+
+## Container input-cache qualification (2026-11-17)
+
+On source `ff414cd114fab382872cfdbf526466419f34cf99`, replaced the Docker
+builder's whole-context copy with explicit copies of `Cargo.toml`, `Cargo.lock`,
+`README.md`, `.cargo/`, `crates/` and `migrations/`. Changes to root developer
+files such as `Makefile.toml` therefore no longer invalidate the Cargo RUN
+layer. Source changes still rebuild through the existing Cargo cache mounts.
+
+Validation used the pinned Rust and Debian images in the Dockerfile. The first
+full build used a temporary Dockerfile with `CARGO_BUILD_JOBS=4` to limit shared-host
+resource use. A subsequent full build used the checked-in Dockerfile with its
+normal defaults and the warmed Cargo cache. Both produced a runnable image.
+`docker buildx build --check .` passed without warnings. The resulting image,
+configured as UID/GID `10001:10001`, passed `--version` and `--help`.
+
+After the checked-in build, appended a temporary comment to `Makefile.toml`
+and rebuilt with the same Dockerfile. BuildKit reported the Cargo RUN layer
+`CACHED`. The image configuration digest stayed
+`sha256:ad5233ea6be7bcf8cebc775c7fa67271aba197731b45e08e4a7b0c0308129595`;
+provenance manifest digests can differ between builds. Restored the Makefile
+byte-for-byte afterward. This demonstrates avoided layer invalidation for an
+unrelated input, not a measured cold-container or edited-Rust speedup.
+
+Logs are in the parent projects directory at
+`.shardline-cleanup-state/container-inputs-{build,default-build,cache,version,help,final-check}.log`.
+
+## Full contributor checkpoint at `89d8801f` (2026-11-17)
+
+Frozen source: `89d8801f5a9a778ca9b558ab670cced2346686c3`.
+`cargo +1.99.0 make ci` passed in 550.958 s with an empty `RUSTC_WRAPPER`,
+four build jobs, four Nextest workers, dev/test debug information disabled,
+offline dependency resolution and the existing warmed cleanup target directory.
+This is a qualification run, not a build-speed comparison.
+
+- All 8,022 selected workspace library tests passed in 249.642 s; 45 tests
+  configured as ignored were excluded.
+- All 39 reliability contracts passed across the six selected integration targets.
+- All 41 selected release CLI/maintenance contracts passed; five configured
+  ignored maintenance tests were excluded.
+- Formatting, strict workspace Clippy (with its existing Xet-core exclusion),
+  dependency exceptions, root/E2E dependency policy, release help/manpage/completion
+  checks and parity across all 44 migrations passed.
+
+The total is 8,102 passing selected tests. This run does not freshly qualify
+required PostgreSQL/MinIO fixtures, production capacity or the historical hosted
+SDK memory failure. Existing infrastructure-specific checkpoints remain separate.
+Tracked Rust inventory is 566,513 lines including comments, blank lines and tests:
+37,136 fewer (6.15%) than the 603,649-line baseline.
+
+Raw gate output, exit status, elapsed time and per-area inventory are in the
+parent projects directory at `.shardline-cleanup-state/ci-89d8801f/`.
+
+## PostgreSQL/MinIO refresh at `b080738d` (2026-11-17)
+
+Frozen source: `b080738dbf49e918cc589c68d108c91952f43fae`. Repeated the
+complete integration and copy-integrity selections from the earlier
+PostgreSQL/MinIO checkpoint, with the same commands and required native clients
+(`SHARDLINE_REQUIRE_NATIVE_CLIENTS=1`). DuckDB 1.5.5 and PyArrow 25.0.0 were
+available. Disposable Docker fixtures supplied the actual backing services.
+
+All 157 integration cases passed in one uninterrupted invocation, zero skipped:
+52 server PostgreSQL/S3 HTTP cases, 69 server S3 cases and 36 storage S3 cases.
+Nextest execution took 172.039 s; total invocation time was 197.169 s.
+All three explicitly selected copy-integrity cases also passed in a separate
+single-worker run (51.190 s including compilation). These exercise source
+replacement and uncertain copy-part acknowledgement reconciliation, including
+PostgreSQL-backed metadata. The library selection excludes unrelated tests.
+
+Both runs used Rust 1.99.0, four build jobs, dev/test debug information disabled,
+an empty compiler wrapper, offline dependency resolution and the existing target
+directory; integration used four test workers. No source or assertion changes
+were required. No Docker containers were running before or after the runs.
+This refresh qualifies the selected remote-storage correctness paths at the
+frozen source; it does not prove production capacity, replace the standalone
+required PostgreSQL index suite or resolve the hosted SDK memory failure.
+
+Commands, versions, source hashes, exit codes, durations and raw logs are in the
+parent projects directory at `.shardline-cleanup-state/minio-b080738d/`.
+
+## Required PostgreSQL index refresh at `e5d4f3af` (2026-11-17)
+
+Frozen source: `e5d4f3afe96255a5cc474c2d1503f95c6acc85d4`.
+All 813 selected `shardline-index` library tests passed with
+`SHARDLINE_REQUIRE_POSTGRES_TESTS=1` and a real disposable PostgreSQL 16 Alpine
+database. Six configured ignored tests were excluded. Command:
+
+```text
+cargo +1.99.0 nextest run --locked -p shardline-index --lib --no-fail-fast
+```
+
+Total invocation time was 125.338 s. Builds used Rust 1.99.0, four build jobs,
+four test workers, dev/test debug information disabled, an empty compiler wrapper,
+offline resolution and the existing target directory. PostgreSQL tests used the
+suite's isolated-schema fixtures and configured coordination rules.
+
+The first fixture attempt failed during migration startup with a connection
+reset, before any tests ran. Its local-socket readiness probe could observe the
+initialization server before external TCP service was ready. Removed that
+container, started a fresh fixture and waited using `pg_isready -h 127.0.0.1`;
+migration and the complete subsequent test invocation passed. No product code,
+test assertions or retry settings changed. The final fixture was removed.
+
+The migration executable's SHA-256 was verified as
+`1ae5353ad0f6291e9731b2e7aefb4c130d70ac9cd9848f917e62305c1fc94818`;
+both migration trees were checked unchanged from its source. Tests compiled and
+ran the frozen current index code. This qualifies the selected PostgreSQL index
+contracts, not production throughput or the historical hosted SDK memory issue.
+Logs, command, source hash, duration, result and fixture runner are in the parent
+projects directory at `.shardline-cleanup-state/postgres-index-e5d4f3af/`.
+
+### Development CLI source-edit checkpoint (2026-11-17)
+
+Compared baseline `401dcac4f95c61a41104df3ee6e222d93c0b18fb` with
+`5433f0325cdd18a9e6c896a186f311805752b7a8` on the shared Linux host using
+Rust/Cargo 1.99.0, four jobs pinned to CPU cores 0–3, no compiler wrapper,
+offline locked dependencies, and separate initially empty target directories.
+Both revisions used their checked-in development profiles, including full debug
+information and runtime checks. No `CARGO_PROFILE_*` or `CARGO_INCREMENTAL`
+override was set. This measures the accumulated branch changes, including the
+restored default incremental compilation, rather than isolating one optimization.
+
+After a preparation build for each revision, three samples changed the CLI's
+actual help description in `crates/shardline/src/command/definition.rs` to a
+unique string and ran:
+
+```bash
+cargo +1.99.0 build --offline --locked -p shardline --bin shardline
+```
+
+Each rebuilt executable's `-h` output was checked for its new string. Execution
+order alternated baseline/current, current/baseline, baseline/current. Original
+source bytes were restored afterward. All eight builds and six changed-help
+checks passed.
+
+| Development CLI edit | Baseline | Cleanup branch |
+| --- | ---: | ---: |
+| Sample 1 | 8.498 s | 5.480 s |
+| Sample 2 | 7.811 s | 3.735 s |
+| Sample 3 | 7.380 s | 3.656 s |
+| Median | 7.811 s | 3.735 s |
+
+The median was approximately 52.2% shorter for this narrow source-edit workload.
+Preparation builds took 98.267 s and 100.614 s respectively and are excluded
+from those medians; they do not establish a fresh-build improvement. Dependencies
+and host filesystem caches were warm. This result does not establish an overall
+30% contributor critical-path improvement, a server-library edit speedup, a
+container build improvement, or production throughput. The release-mode CLI edit
+comparison above remains approximately unchanged.
+
+Local raw results, build logs and changed-help output are retained outside the
+repository in `.shardline-cleanup-state/build-dev-edit-5433f032/`, under the parent
+projects directory; the reproducible orchestration script is
+`.shardline-cleanup-state/build-dev-edit-5433f032.py`.
+
+### Full contributor checkpoint at 99bde68e (2026-11-17)
+
+Frozen source `99bde68ea3eadf0f37c37b3ff9b1029da109f25d` passed
+`cargo +1.99.0 make ci` in 548.852 seconds on the shared development host.
+The run used four build jobs and four Nextest workers, cached dependencies,
+no compiler wrapper, offline dependencies, and disabled dev/test debug
+information. This is a functional checkpoint, not a build-speed comparison.
+
+The uninterrupted gate passed formatting, strict workspace Clippy with its
+existing Xet-core exclusion, dependency exception checks, root and standalone-E2E
+Cargo deny checks, 8,018 selected workspace library tests, 39 reliability contract
+tests, and 41 release CLI maintenance contract tests: 8,098 selected tests total.
+The library stage took 249.783 seconds. Its 45 configured ignored tests and the
+maintenance suite's five ignored tests were excluded. Release help, manual-page
+and completion generation passed, as did SQLite/PostgreSQL migration parity
+across all 44 versions.
+
+This checkpoint includes the shared SQLite appended-evidence persistence and
+quarantine/OCI tag callers. It does not repeat required PostgreSQL/MinIO fixtures,
+standalone E2E suites, or hosted SDK memory qualification. Conditional PostgreSQL
+unit tests in the contributor suite are not new database qualification.
+The historical hosted SDK memory failure remains unresolved.
+
+The source contains 566,249 tracked Rust lines, including tests, comments and
+blank lines: 37,400 fewer (6.20%) than the 603,649-line baseline. Local gate logs,
+exit status, timings and source inventory are retained in
+`.shardline-cleanup-state/ci-99bde68e/`, under the parent projects directory.
+
+### PostgreSQL and MinIO checkpoint at df0d63fd (2026-11-17)
+
+Frozen source `df0d63fdc7137258ef921881ee88957327d4a856` passed the
+required PostgreSQL index gate and PostgreSQL/MinIO integration gates. Its Rust
+sources and manifests are identical to the full contributor checkpoint at
+`99bde68e`; the intervening commit only documents that checkpoint.
+
+A fresh PostgreSQL 16 Alpine database received all current migrations using the
+release executable built by that contributor gate. Readiness was checked over
+TCP before migration. With `SHARDLINE_REQUIRE_POSTGRES_TESTS=1`, the full index
+library suite passed all 813 selected tests in 136.647 seconds (137.179 seconds
+including compilation and runner setup); six configured ignored tests were
+excluded. The owned database container was removed afterward.
+
+```bash
+# DATABASE_URL points to that disposable, migrated database.
+SHARDLINE_REQUIRE_POSTGRES_TESTS=1 cargo +1.99.0 nextest run --locked \
+  -p shardline-index --lib --no-fail-fast
+```
+
+In one uninterrupted run, all 157 PostgreSQL/S3 integration cases passed with
+zero skipped: 52 server PostgreSQL HTTP cases, 69 server S3 cases and 36 storage
+S3 cases. Test execution took 183.937 seconds, or 212.021 seconds including
+compilation and runner setup. All three copy-integrity fault cases then passed
+with one worker in 12.048 seconds, or 61.086 seconds including compilation and
+runner setup. These preserve source-replacement snapshot bytes and reconcile
+disconnected copy-part responses through ListParts, including PostgreSQL.
+
+```bash
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo +1.99.0 nextest run --locked \
+  -p shardline-server -p shardline-storage --features docker \
+  --test postgres_s3_e2e_http --test s3_integration --no-fail-fast
+SHARDLINE_REQUIRE_NATIVE_CLIENTS=1 cargo +1.99.0 nextest run --locked \
+  -p shardline-server --features docker --lib --run-ignored all --no-fail-fast \
+  -E 'test(copy_integrity::minio_) or test(copy_integrity::postgres_minio_)' \
+  --test-threads 1
+```
+
+The shared-host runs used Rust 1.99.0, four build jobs, four Nextest workers
+except the fault gate, cached dependencies, offline mode, no compiler wrapper,
+and disabled dev/test debug information. Native clients were required; DuckDB
+1.5.5 and PyArrow 25.0.0 were available. No test containers remained afterward.
+These are functional qualification results, not throughput or production-scale
+measurements. Hosted SDK memory qualification remains unresolved.
+
+Local logs, exact commands, exit statuses and timings are retained under the
+parent projects directory in `.shardline-cleanup-state/postgres-index-df0d63fd/`
+and `.shardline-cleanup-state/minio-df0d63fd/`. Their orchestration scripts are
+`.shardline-cleanup-state/postgres-index-df0d63fd.py` and
+`.shardline-cleanup-state/minio-df0d63fd.py`.
+
+### Standalone data-integrity checkpoint at d2d9df5f (2026-11-17)
+
+Frozen source `d2d9df5ff78a0d0a6cc4b24da4724b6e4ebcaa40` passed all
+284 standalone data-integrity tests, with zero skipped, in 26.917 seconds:
+
+```bash
+cargo +1.99.0 nextest run --manifest-path e2e/Cargo.toml --locked \
+  --test data_integrity --no-fail-fast --test-threads 4
+```
+
+The shared-host run used four build jobs, cached dependencies, offline mode,
+no compiler wrapper and disabled dev/test debug information. It covers the
+fixture storage-lifetime regression, consolidated range cases and actual CDC
+boundary upload/download cases together with the suite's other protocol cases.
+Strict Clippy for this E2E target also passed after the final test change.
+This is not a required PostgreSQL qualification or a production performance
+measurement. The separate required backend checkpoints above remain applicable
+to unchanged production code. Hosted SDK memory qualification remains open.
+The local log is `.shardline-cleanup-state/data-integrity-d2d9df5f.log` under
+the parent projects directory.
+
+### Development server-library edit checkpoint (2026-11-17)
+
+Compared baseline `401dcac4f95c61a41104df3ee6e222d93c0b18fb` with
+`1b02136b7eedfa3f99629b70ca7f725cf2ac4a3b` using Rust/Cargo 1.99.0,
+four jobs pinned to CPU cores 0–3, no compiler wrapper, offline locked
+dependencies and each revision's checked-in development profile. Full debug
+information, runtime checks and repository-default incremental settings remained
+enabled as configured; no profile or incremental environment overrides were set.
+
+The benchmark reused the separate targets from the development CLI experiment,
+primed both revisions, then changed the `InvalidContentHash` display message in
+`crates/shardline-server/src/error/server.rs` for each sample. It rebuilt the
+complete CLI with `cargo +1.99.0 build --offline --locked -p shardline --bin
+shardline`, alternating baseline/current, current/baseline, baseline/current.
+Every edited executable contained the distinct message and passed `--version`.
+All eight builds and six marker/version checks passed; source bytes were restored.
+
+| Server-library edit | Baseline | Cleanup branch |
+| --- | ---: | ---: |
+| Sample 1 | 22.933 s | 7.442 s |
+| Sample 2 | 21.733 s | 6.547 s |
+| Sample 3 | 21.636 s | 7.914 s |
+| Median | 21.733 s | 7.442 s |
+
+The median was approximately 65.8% shorter for this narrow error-message edit,
+which recompiles the server library and CLI. This measures accumulated branch
+changes, including restored incremental compilation, rather than attributing
+all savings to code removal. Preparation builds took 8.475 s and 16.041 s and
+are excluded from the medians; warm targets and unequal invalidation make them
+unsuitable for a fresh-build comparison. This does not establish an overall
+contributor critical-path improvement, a large structural-edit speedup, or a
+container build improvement. The rebuilt diagnostic was checked in the binary,
+not triggered through an HTTP request.
+
+Local logs and raw results are in
+`.shardline-cleanup-state/build-server-edit-1b02136b/`, under the parent projects
+directory. The orchestration script is
+`.shardline-cleanup-state/build-server-edit-1b02136b.py`.
+
+### Container Rust-edit checkpoint (2026-11-17)
+
+Compared baseline `401dcac4f95c61a41104df3ee6e222d93c0b18fb` with
+`b67809217cce2c05af856bf256e76d35d8af86a6` using Docker BuildKit on the
+shared development host. Both used their checked-in Dockerfile build inputs,
+identical pinned Rust 1.99.0 and Debian image digests, and release profiles.
+Temporary benchmark Dockerfiles added `CARGO_BUILD_JOBS=4` and distinct initially
+empty target-cache identifiers. Registry/git caches and base images were warm;
+repository Dockerfiles were unchanged. The two revisions have different locked
+dependencies, so this measures the accumulated branch rather than one change.
+
+Each revision received a preparation image build. A subsequent real Rust edit
+appended a distinct sentence to the CLI help description in
+`crates/shardline/src/command/definition.rs`, then rebuilt and loaded the image.
+All four images ran `-h`; both edited images were required to display the changed
+sentence. All builds and runtime help checks passed. Source bytes were restored.
+
+| Container build, one sample per revision | Baseline | Cleanup branch |
+| --- | ---: | ---: |
+| Preparation, excluded from edit comparison | 266.364 s | 273.602 s |
+| Rust source edit, retained compiler cache | 146.197 s | 135.355 s |
+
+The edited build was approximately 7.4% shorter in this pair. One sequential
+baseline/current pair on a shared host does not establish a repeatable speedup.
+Preparation timings do not show an improvement and are not cold-machine results.
+The Rust compilation step executed for both edits; this is distinct from the
+previous tooling-only edit that reused the entire compiled image layer. This
+measurement does not establish the overall 30% contributor critical-path target.
+
+The exact benchmark Dockerfiles, logs, source hashes and elapsed times are in
+`.shardline-cleanup-state/container-edit-b6780921/`, under the parent projects
+directory. Its orchestration script is
+`.shardline-cleanup-state/container-edit-b6780921.py`. Local benchmark image tags
+`shardline-cleanup-container-{baseline,current}:b6780921` contain the temporary
+help text and are measurement artifacts, not release candidates.
+
+
+### Hosted cleanup qualification in progress (2026-11-17)
+
+Manual workflow dispatches test frozen source
+`39c86a9e5134b54f43a3f6410d9160f652a632f5`, without a pull request:
+[CI run 44065549505](https://github.com/STEXS-Technologies/shardline/actions/runs/44065549505)
+and [E2E run 44065552584](https://github.com/STEXS-Technologies/shardline/actions/runs/44065552584).
+At this checkpoint, the owned PostgreSQL process-cut job passed. The distributed
+integrity job passed 51 deployment-fault/mixed-version tests and eight multi-node
+role tests: 59 passed, zero skipped. Its downloaded current and released 1.12.1
+binaries match the artifact's recorded SHA-256 checksums.
+
+The contributor job failed at `cargo deny check`: `RUSTSEC-2026-0542`
+(`humantime` 2.3.0) and `RUSTSEC-2026-0543` (`chrono` 0.4.44) mark all versions
+unmaintained and list no patched version. Both direct and transitive usage are
+present; removing direct Shardline usage alone would not clear this gate. No
+advisory exception or dependency-policy relaxation was applied. This result does
+not replace the earlier passing local contributor checkpoint.
+
+Configured PostgreSQL contracts and the E2E job were still running when this
+checkpoint was recorded. Their outcome, including the dedicated SDK memory step,
+is unresolved here. Passing individual steps does not qualify the complete branch.
+The later workflow-only commit `3d23a446` removes the duplicate 256 MiB SDK memory
+test from the broad E2E step; both memory sizes remain in the dedicated step.
+Nextest listing confirmed that exactly one of 30 SDK cases changes selection.
+The running workflows continue to test their original source, not that later
+workflow change.
+
+Logs, upstream advisory snapshots, dependency trees, downloaded distributed
+artifacts and binary-checksum verification are retained in
+`.shardline-cleanup-state/hosted-39c86a9e/`, under the parent projects directory.
+
+### Hosted cleanup qualification completed with failures (2026-11-17)
+
+The dispatches above finished on frozen source `39c86a9e`. All three CI
+PostgreSQL jobs passed: owned process cuts, configured PostgreSQL, and
+distributed integrity. The configured gate required PostgreSQL and passed
+813 index library cases, two provider-event cases, 3,161 server library cases,
+six explicitly ignored PostgreSQL integrity cases, and one CLI migration case.
+These are separate selections, not a deduplicated coverage total. The earlier
+59-test distributed result and process-cut result remain valid. CI nevertheless
+failed because of the dependency-policy findings described above.
+
+The E2E workflow failed in its dedicated SDK memory qualification. The 256 MiB
+case passed byte identity and the unchanged 65,536 KiB streaming-memory bound:
+baseline RSS 25,392 KiB, peak high-water RSS 86,976 KiB, delta 61,584 KiB;
+client transfer took 3,488 ms and the complete case took 41.976 seconds. This
+sample did not reproduce the earlier 256 MiB memory-bound failure.
+
+The 1 GiB case reached Nextest's 300-second timeout. Its captured output contains
+only the parent test's startup, with no isolated-child startup or memory report.
+The evidence therefore does not establish either its streaming RSS or successful
+byte identity. Fixture preparation occurs before the isolated client starts;
+further investigation must distinguish preparation cost from download behavior.
+Neither the timeout nor the memory bound was relaxed.
+
+Earlier E2E steps passed, including actual object-store disk exhaustion for
+SQLite and PostgreSQL with stock Xet, restart and byte-identity checks. Later
+steps, including large native transfers/process recovery, official JavaScript
+delta edits and native Bazel flows, were skipped after the memory-step failure.
+The workflow is not a passing release qualification, and does not qualify later
+Hub source changes. Final job status and the complete E2E log are retained as
+`e2e-final-status.json` and `e2e-job.log` in the evidence directory above.
+
+### SQLite record-membership parsing checkpoint (2026-11-17)
+
+Investigated the hosted 1 GiB SDK timeout above on source `16a1da06`.
+An unchanged local reproduction passed in 210.20 seconds: isolated client
+transfer 8,232 ms, baseline RSS 24,572 KiB, peak high-water RSS 77,096 KiB,
+streaming delta 52,524 KiB. An eight-second CPU sample during fixture preparation
+attributed 75.22% of samples to SQLite `jsonTranslateTextToBlob`. The domain
+membership trigger extracted the same record-level domain inside the per-chunk
+projection, repeatedly parsing the complete file record.
+
+The additive `20261117000000_record_membership_domain_once` migration moves
+that expression into an uncorrelated scalar subquery. Insert/update triggers
+retain the same domain fallback, member validation, distinct membership rows,
+replay guard and transaction boundaries. Historical migrations are unchanged;
+the down migration restores the prior triggers. PostgreSQL already passes the
+domain as one expansion parameter, so its paired migration is a no-op.
+
+With this patch, both SDK sizes passed together under the same local Rust 1.99.0,
+four-build-job, debug-information-disabled test configuration:
+
+| File size | Complete case | Client transfer | Added client RSS |
+| --- | ---: | ---: | ---: |
+| 256 MiB | 13.106 s | 1,068 ms | 49,804 KiB |
+| 1 GiB | 56.812 s | 8,468 ms | 46,964 KiB |
+
+Both cases verify every byte and total length, and retain the 65,536 KiB bound
+and 300-second Nextest timeout. The before/after 1 GiB samples suggest reduced
+fixture-publication cost, not faster downloads. They are single samples on a
+shared host with different competing work; they do not establish production
+throughput or resolve the hosted timeout without a new hosted run.
+
+The patch passed 350 selected SQLite library tests, 44 server migration tests,
+strict all-target/all-feature index/server Clippy, formatting and migration
+parity (45 versions). Conditional PostgreSQL cases in the migration selection
+are not a new required-PostgreSQL qualification. The new regression exercises
+upgrade/downgrade, malformed records, legacy fallback, explicit domains, key and
+scope updates, exact replay, authoritative payload retention and rollback.
+Logs, the CPU profile and preliminary SQL experiments are retained in the
+`hosted-39c86a9e` evidence directory above under `domain-once-*`,
+`gib-timeout-local-reproduction.log`, and `gib-setup*`.

@@ -6,8 +6,7 @@ use shardline_protocol::RepositoryScope;
 use crate::{
     ServerError,
     error::IndexError,
-    record_store::parse_stored_file_record_bytes,
-    validation::{validate_content_hash, validate_identifier},
+    record_store::{file_record_locator, parse_stored_file_record_bytes},
 };
 
 pub(super) async fn read_record(
@@ -16,33 +15,8 @@ pub(super) async fn read_record(
     content_hash: Option<&str>,
     repository_scope: Option<&RepositoryScope>,
 ) -> Result<FileRecord, ServerError> {
-    validate_identifier(file_id)?;
-    let bytes = if let Some(hash) = content_hash {
-        validate_content_hash(hash)?;
-        let record = FileRecord {
-            file_id: file_id.to_owned(),
-            content_hash: hash.to_owned(),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: repository_scope.cloned(),
-            chunks: Vec::new(),
-        };
-        let locator = RecordTraversal::version_record_locator(record_store, &record);
-        read_record_bytes(record_store, &locator).await?
-    } else {
-        let record = FileRecord {
-            file_id: file_id.to_owned(),
-            content_hash: String::new(),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: repository_scope.cloned(),
-            chunks: Vec::new(),
-        };
-        let locator = RecordTraversal::latest_record_locator(record_store, &record);
-        read_record_bytes(record_store, &locator).await?
-    };
+    let locator = file_record_locator(record_store, file_id, content_hash, repository_scope)?;
+    let bytes = read_record_bytes(record_store, &locator).await?;
     parse_stored_file_record_bytes(&bytes)
 }
 
@@ -64,45 +38,18 @@ pub(super) async fn repository_references_xorb(
     hash_hex: &str,
     repository_scope: &RepositoryScope,
 ) -> Result<bool, ServerError> {
-    let mut found = false;
-    crate::record_store::any_repository_hash_record(
+    crate::record_store::repository_references_hash_in_scope(
         record_store,
-        repository_scope,
         hash_hex,
-        |bytes| {
-            inspect_repository_record_for_xorb(&mut found, bytes, hash_hex, repository_scope)?;
-            Ok(found)
-        },
+        repository_scope,
     )
     .await
 }
 
-fn inspect_repository_record_for_xorb(
-    found: &mut bool,
-    bytes: &[u8],
-    hash_hex: &str,
-    repository_scope: &RepositoryScope,
-) -> Result<(), ServerError> {
-    if *found {
-        return Ok(());
-    }
-    let record = parse_stored_file_record_bytes(bytes)?;
-    if record.repository_scope.as_ref() == Some(repository_scope)
-        && record.chunks.iter().any(|chunk| chunk.hash == hash_hex)
-    {
-        *found = true;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::to_vec;
     use shardline_index::{FileChunkRecord, FileRecord};
     use shardline_protocol::{RepositoryProvider, RepositoryScope};
-
-    use super::inspect_repository_record_for_xorb;
 
     fn make_scope() -> RepositoryScope {
         RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", None).unwrap()
@@ -114,6 +61,7 @@ mod tests {
 
     fn make_record(scope: &RepositoryScope, chunk_hash: &str) -> FileRecord {
         FileRecord {
+            deduplication_domain: None,
             file_id: "test.txt".to_owned(),
             content_hash: "deadbeef".to_owned(),
             total_bytes: 100,
@@ -130,62 +78,6 @@ mod tests {
                 packed_end: 0,
             }],
         }
-    }
-
-    #[test]
-    fn matching_hash_and_scope() {
-        let scope = make_scope();
-        let record = make_record(&scope, "abc123");
-        let bytes = to_vec(&record).unwrap();
-
-        let mut found = false;
-        inspect_repository_record_for_xorb(&mut found, &bytes, "abc123", &scope).unwrap();
-        assert!(found);
-    }
-
-    #[test]
-    fn matching_hash_wrong_scope() {
-        let scope = make_scope();
-        let record = make_record(&scope, "abc123");
-        let bytes = to_vec(&record).unwrap();
-
-        let mut found = false;
-        let other = make_other_scope();
-        inspect_repository_record_for_xorb(&mut found, &bytes, "abc123", &other).unwrap();
-        assert!(!found);
-    }
-
-    #[test]
-    fn different_hash() {
-        let scope = make_scope();
-        let record = make_record(&scope, "abc123");
-        let bytes = to_vec(&record).unwrap();
-
-        let mut found = false;
-        inspect_repository_record_for_xorb(&mut found, &bytes, "xyz789", &scope).unwrap();
-        assert!(!found);
-    }
-
-    #[test]
-    fn already_found() {
-        let scope = make_scope();
-        let mut found = true;
-
-        // When found is already true, the function returns early without parsing,
-        // so even garbage bytes are fine.
-        inspect_repository_record_for_xorb(&mut found, b"not valid json", "anything", &scope)
-            .unwrap();
-        assert!(found);
-    }
-
-    #[test]
-    fn invalid_bytes() {
-        let scope = make_scope();
-        let mut found = false;
-
-        let result =
-            inspect_repository_record_for_xorb(&mut found, b"not valid json", "anything", &scope);
-        assert!(result.is_err());
     }
 
     // ── read_record tests ───────────────────────────────────────────────────

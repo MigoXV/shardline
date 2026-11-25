@@ -11,209 +11,20 @@
 //! SECURITY VALIDATION PASS 3 — Concrete tests that confirm or refute specific
 //! vulnerabilities found in passes 1 and 2.
 //!
-//! Each test reads actual source code or exercises real code paths to
-//! definitively prove (or disprove) the claimed vulnerability.
+//! These tests exercise request handling, parsing, and storage behavior.
 
 // ============================================================================
 // FINDING 1: JWT Signature Verification — FIXED
 // ============================================================================
 
-/// Verifies OIDC provider now performs proper JWT signature verification.
-///
-/// **[FIXED]**: The provider now uses `self.get_cached_keys()` (not `_keys`),
-/// calls `decode()` with a `DecodingKey` and `Validation`, and rejects
-/// `alg: "none"`. The `exp` claim is required (not defaulted to u64::MAX).
-#[test]
-fn validate_jwt_signature_checked_oidc() {
-    let oidc_source = include_str!("../../shardline-server/src/oidc_provider.rs");
-
-    assert!(
-        oidc_source.contains("let keys = self.get_cached_keys()"),
-        "OIDC provider fetches keys into `keys` (used variable)"
-    );
-    assert!(
-        oidc_source.contains("decode::<serde_json::Value>("),
-        "OIDC provider calls decode() for signature verification"
-    );
-    assert!(
-        oidc_source.contains("build_decoding_key("),
-        "OIDC provider builds a decoding key from JWK"
-    );
-    assert!(
-        oidc_source.contains("Validation::new("),
-        "OIDC provider creates Validation with algorithm"
-    );
-    assert!(
-        oidc_source.contains("set_issuer("),
-        "OIDC provider validates issuer claim"
-    );
-    assert!(
-        oidc_source.contains("JwtAlgorithm::from_str"),
-        "OIDC provider parses alg via typed JwtAlgorithm"
-    );
-    assert!(
-        oidc_source.contains("alg.is_none()"),
-        "OIDC provider rejects alg:none attack via typed guard"
-    );
-}
-
-/// Verifies JWKS provider now performs proper JWT signature verification.
-///
-/// **[FIXED]**: The provider now reads from a background-refreshed cache
-/// (via `try_read()` retry loop) instead of calling `block_on`-based
-/// `get_or_refresh_keys()`. It calls `decode()` with proper key material,
-/// validates the issuer, and requires the `exp` claim.
-#[test]
-fn validate_jwt_signature_checked_jwks() {
-    let jwks_source = include_str!("../../shardline-server/src/jwks_provider.rs");
-
-    assert!(
-        jwks_source.contains("cached_keys.try_read()"),
-        "JWKS provider reads from background-refreshed cache via try_read()"
-    );
-    assert!(
-        jwks_source.contains("decode::<serde_json::Value>("),
-        "JWKS provider calls decode() for signature verification"
-    );
-    assert!(
-        jwks_source.contains("build_decoding_key("),
-        "JWKS provider builds a decoding key from JWK"
-    );
-    assert!(
-        jwks_source.contains("set_issuer("),
-        "JWKS provider validates issuer claim"
-    );
-    assert!(
-        jwks_source.contains("JwtAlgorithm::from_str"),
-        "JWKS provider parses alg via typed JwtAlgorithm"
-    );
-    assert!(
-        jwks_source.contains("alg.is_none()"),
-        "JWKS provider rejects alg:none attack via typed guard"
-    );
-}
-
-/// Verifies alg:none attack is now blocked.
-///
-/// **[HARDENED]**: Both providers now parse `alg` via a typed `JwtAlgorithm`
-/// and reject `none` (`alg.is_none()`) and any symmetric algorithm
-/// (`alg.is_symmetric()`, alg-confusion guard) with `AuthError::InvalidToken`
-/// / `ProviderError` before key matching.
-#[test]
-fn validate_jwt_alg_none_attack_blocked() {
-    let oidc_source = include_str!("../../shardline-server/src/oidc_provider.rs");
-    let jwks_source = include_str!("../../shardline-server/src/jwks_provider.rs");
-
-    let oidc_verify_start = oidc_source.find("fn verify_jwt_claims").unwrap();
-    let oidc_verify_end = oidc_source
-        .find("impl AuthProvider for OidcProvider")
-        .unwrap();
-    let oidc_fn = &oidc_source[oidc_verify_start..oidc_verify_end];
-    assert!(
-        oidc_fn.contains("JwtAlgorithm::from_str"),
-        "OIDC verify_jwt_claims parses alg via typed JwtAlgorithm"
-    );
-    assert!(
-        oidc_fn.contains("alg.is_none()"),
-        "OIDC verify_jwt_claims now rejects alg:none via typed guard"
-    );
-    assert!(
-        oidc_fn.contains("alg.is_symmetric()"),
-        "OIDC verify_jwt_claims blocks symmetric alg-confusion"
-    );
-
-    let jwks_verify_start = jwks_source.find("fn verify_jwt_claims").unwrap();
-    let jwks_verify_end = jwks_source
-        .find("impl AuthProvider for JwksProvider")
-        .unwrap();
-    let jwks_fn = &jwks_source[jwks_verify_start..jwks_verify_end];
-    assert!(
-        jwks_fn.contains("JwtAlgorithm::from_str"),
-        "JWKS verify_jwt_claims parses alg via typed JwtAlgorithm"
-    );
-    assert!(
-        jwks_fn.contains("alg.is_none()"),
-        "JWKS verify_jwt_claims now rejects alg:none via typed guard"
-    );
-    assert!(
-        jwks_fn.contains("alg.is_asymmetric()"),
-        "JWKS verify_jwt_claims blocks symmetric alg-confusion via the asymmetric guard"
-    );
-}
-
-/// Verifies missing exp is now rejected instead of defaulting to u64::MAX.
-///
-/// **[FIXED]**: Both providers now use `ok_or_else` to require the `exp` claim
-/// instead of `unwrap_or(u64::MAX)`.
-#[test]
-fn validate_missing_exp_now_rejected() {
-    let oidc_source = include_str!("../../shardline-server/src/oidc_provider.rs");
-    let jwks_source = include_str!("../../shardline-server/src/jwks_provider.rs");
-
-    assert!(
-        !oidc_source.contains("unwrap_or(u64::MAX)"),
-        "OIDC: no longer defaults missing exp to u64::MAX"
-    );
-    assert!(
-        !jwks_source.contains("unwrap_or(u64::MAX)"),
-        "JWKS: no longer defaults missing exp to u64::MAX"
-    );
-    assert!(
-        oidc_source.contains("missing exp claim"),
-        "OIDC: returns error when exp is missing"
-    );
-    assert!(
-        jwks_source.contains("missing exp claim"),
-        "JWKS: returns error when exp is missing"
-    );
-}
+// JWT signature, issuer and algorithm rejection are exercised through both
+// real providers in shardline-server's oidc_provider/jwks_provider tests,
+// including signed tokens with a missing expiry claim.
+// Shared algorithm guards live in jwt_keys::tests; source layout is not a contract.
 
 // ============================================================================
 // FINDING 2: Webhook SSRF — PARTIALLY FIXED (URL validation at creation)
 // ============================================================================
-
-/// Validates that delivery-time URL validation exists in `deliver_one_webhook`.
-///
-/// **[FIXED]**: `deliver_one_webhook` now calls `validate_webhook_url` and
-/// performs DNS resolution to block private/internal IPs at delivery time.
-#[test]
-fn validate_deliver_one_webhook_has_url_validation() {
-    let routes_source = include_str!("../src/routes/webhooks.rs");
-
-    let start = routes_source.find("async fn deliver_one_webhook").unwrap();
-    let fn_body = &routes_source[start..start + 2000];
-
-    assert!(
-        fn_body.contains("validate_webhook_url"),
-        "deliver_one_webhook calls validate_webhook_url"
-    );
-    assert!(
-        fn_body.contains("is_private_ip"),
-        "deliver_one_webhook checks resolved addresses for private IPs"
-    );
-}
-
-/// Validates that webhook URL validation exists at creation time.
-///
-/// **[FIXED]**: `validate_webhook_url` now checks scheme (http/https only),
-/// host presence, URL length, and rejects private/internal IPs.
-#[test]
-fn validate_webhook_url_validation_exists() {
-    let routes_source = include_str!("../src/routes/webhooks.rs");
-
-    assert!(
-        routes_source.contains("fn validate_webhook_url("),
-        "validate_webhook_url function exists"
-    );
-    assert!(
-        routes_source.contains("WebhookScheme::from_str(scheme).is_err()"),
-        "validate_webhook_url checks scheme is http or https"
-    );
-    assert!(
-        routes_source.contains("MAX_WEBHOOK_URL_LEN"),
-        "validate_webhook_url enforces URL length limit"
-    );
-}
 
 /// Validates that webhook URLs accept arbitrary schemes at the store level.
 ///
@@ -227,48 +38,7 @@ fn validate_webhook_accepts_dangerous_urls_at_store_level() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
-    let db_path = root.join("metadata.sqlite3");
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS shardline_hub_repos (
-            repo_id TEXT PRIMARY KEY,
-            repo_type TEXT NOT NULL CHECK (repo_type IN ('model', 'dataset', 'space')),
-            private INTEGER NOT NULL DEFAULT 0 CHECK (private IN (0, 1)),
-            default_branch TEXT NOT NULL,
-            created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-            updated_at_unix_seconds INTEGER NOT NULL CHECK (updated_at_unix_seconds >= 0)
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_revisions (
-            repo_id TEXT NOT NULL,
-            ref_name TEXT NOT NULL,
-            sha TEXT NOT NULL,
-            parent_sha TEXT,
-            message TEXT,
-            created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-            PRIMARY KEY (repo_id, sha),
-            FOREIGN KEY (repo_id) REFERENCES shardline_hub_repos(repo_id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_refs (
-            repo_id TEXT NOT NULL,
-            ref_name TEXT NOT NULL,
-            sha TEXT NOT NULL,
-            PRIMARY KEY (repo_id, ref_name)
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_webhooks (
-            id TEXT PRIMARY KEY,
-            repo_id TEXT NOT NULL,
-            url TEXT NOT NULL,
-            events TEXT NOT NULL DEFAULT 'push',
-            secret TEXT,
-            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-            created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-            FOREIGN KEY (repo_id) REFERENCES shardline_hub_repos(repo_id) ON DELETE CASCADE
-        );",
-    )
-    .unwrap();
-    shardline_index::hub::ensure_hub_tables(&root).unwrap();
-
-    let store = LocalIndexStore::open(root);
+    let store = LocalIndexStore::new(root).unwrap();
     let boxed = BoxedHubStore::from_store(store);
     boxed
         .create_repo(HubRepoType::Model, "team/ssrf-test", false)
@@ -283,53 +53,6 @@ fn validate_webhook_accepts_dangerous_urls_at_store_level() {
     assert!(
         wh.is_ok(),
         "Store-level accepts file:// URL (validation is at route layer)"
-    );
-}
-
-// ============================================================================
-// FINDING 3: Body Size Limits — FIXED
-// ============================================================================
-
-/// Confirms that hub_routes() now applies a DefaultBodyLimit layer.
-///
-/// **[FIXED]**: The hub API router now applies `DefaultBodyLimit::max(64MB)`.
-#[test]
-fn validate_hub_router_has_body_limit() {
-    let router_source = include_str!("../src/router.rs");
-
-    assert!(
-        router_source.contains("DefaultBodyLimit::max"),
-        "Hub API router now applies DefaultBodyLimit::max"
-    );
-}
-
-/// Confirms the commit handler accepts the entire body as a String (bounded by
-/// the router-level body limit).
-///
-/// **[MITIGATED]**: The router's `DefaultBodyLimit::max(64MB)` bounds the body
-/// size. The handler still takes `body: String` but the outer layer rejects
-/// oversized requests before they reach the handler.
-#[test]
-fn validate_commit_handler_body_bounded_by_router() {
-    let router_source = include_str!("../src/router.rs");
-
-    assert!(
-        router_source.contains("DefaultBodyLimit::max"),
-        "Hub API router enforces body size limit at the layer level"
-    );
-}
-
-/// Confirms the LFS upload handler consumes the request body as a stream.
-///
-/// **[FIXED]**: The handler accepts `axum::body::Body` and applies the explicit
-/// LFS upload cap while consuming frames incrementally.
-#[test]
-fn validate_lfs_upload_unbounded_body() {
-    let routes_source = include_str!("../src/routes/lfs.rs");
-
-    assert!(
-        routes_source.contains("body: Body") && routes_source.contains("async fn lfs_upload("),
-        "lfs_upload consumes an axum Body stream"
     );
 }
 
@@ -369,25 +92,6 @@ fn validate_commit_rejects_absolute_paths() {
     assert!(
         result.is_err(),
         "parse_ndjson_commit now rejects /etc/shadow"
-    );
-}
-
-/// Validates that commit.rs has path validation.
-///
-/// **[FIXED]**: `validate_commit_path` function now exists and checks for
-/// `..` components, absolute paths, null bytes, control characters, and
-/// max length.
-#[test]
-fn validate_commit_has_path_validation() {
-    let commit_source = include_str!("../src/commit.rs");
-
-    assert!(
-        commit_source.contains("fn validate_commit_path("),
-        "commit.rs contains validate_commit_path function"
-    );
-    assert!(
-        commit_source.contains("MAX_COMMIT_PATH_LEN"),
-        "commit.rs enforces max path length"
     );
 }
 
@@ -444,44 +148,6 @@ fn validate_pack_parser_shift_overflow_protected() {
 }
 
 // ============================================================================
-// FINDING 6: whoami endpoint hardcodes is_admin: true
-// ============================================================================
-
-/// Validates the whoami endpoint no longer hardcodes is_admin: true.
-///
-/// **[FIXED]**: The whoami handler now returns `is_admin: false` (not hardcoded true).
-#[test]
-fn validate_whoami_hardcoded_admin() {
-    let handlers_source = include_str!("../src/routes/handlers.rs");
-
-    let whoami_start = handlers_source.find("async fn whoami(").unwrap();
-    let whoami_fn = &handlers_source[whoami_start..whoami_start + 800];
-
-    assert!(
-        whoami_fn.contains("is_admin: false"),
-        "whoami endpoint should not hardcode is_admin: true"
-    );
-}
-
-// ============================================================================
-// FINDING 7: Error messages leak internal details — FIXED
-// ============================================================================
-
-/// Validates that CasError no longer leaks internal error strings to clients.
-///
-/// **[FIXED]**: The `IntoResponse` impl for `CasError` now returns a generic
-/// "internal error" string instead of `self.to_string()`.
-#[test]
-fn validate_cas_error_no_longer_leaks_internals() {
-    let error_source = include_str!("../src/error.rs");
-
-    assert!(
-        error_source.contains("CasError(_)") && error_source.contains("\"internal error\""),
-        "CasError now returns generic 'internal error' — no internal details leaked"
-    );
-}
-
-// ============================================================================
 // FINDING 8: NDJSON commit instruction count limit — FIXED
 // ============================================================================
 
@@ -509,13 +175,10 @@ fn validate_ndjson_has_instruction_count_limit() {
 // FINDING 9: Commit handler body size — MITIGATED
 // ============================================================================
 
-/// Validates the full commit request path is bounded by router body limit.
-///
-/// **[MITIGATED]**: The hub API router's `DefaultBodyLimit::max(64MB)` bounds
-/// all request bodies. A body exceeding 64MB is rejected before reaching the
-/// commit handler.
+/// JSON extractors enforce the router cap; streamed commits enforce a separate
+/// per-line cap without advancing the branch when parsing fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn validate_commit_body_bounded_by_router() {
+async fn hub_request_limits_reject_oversized_json_and_commit_lines() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use shardline_hub_api::routes::HubState;
@@ -526,64 +189,14 @@ async fn validate_commit_body_bounded_by_router() {
 
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_path_buf();
-    let db_path = root.join("metadata.sqlite3");
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS shardline_hub_repos (
-                repo_id TEXT PRIMARY KEY,
-                repo_type TEXT NOT NULL CHECK (repo_type IN ('model', 'dataset', 'space')),
-                private INTEGER NOT NULL DEFAULT 0 CHECK (private IN (0, 1)),
-                default_branch TEXT NOT NULL,
-                created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-                updated_at_unix_seconds INTEGER NOT NULL CHECK (updated_at_unix_seconds >= 0)
-            );
-            CREATE TABLE IF NOT EXISTS shardline_hub_revisions (
-                repo_id TEXT NOT NULL,
-                ref_name TEXT NOT NULL,
-                sha TEXT NOT NULL,
-                parent_sha TEXT,
-                message TEXT,
-                created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-                PRIMARY KEY (repo_id, sha),
-                FOREIGN KEY (repo_id) REFERENCES shardline_hub_repos(repo_id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS shardline_hub_refs (
-                repo_id TEXT NOT NULL,
-                ref_name TEXT NOT NULL,
-                sha TEXT NOT NULL,
-                PRIMARY KEY (repo_id, ref_name)
-            );
-            CREATE TABLE IF NOT EXISTS shardline_hub_file_entries (
-                commit_sha TEXT NOT NULL,
-                path TEXT NOT NULL,
-                size INTEGER NOT NULL CHECK (size >= 0),
-                sha TEXT NOT NULL,
-                is_lfs INTEGER NOT NULL DEFAULT 0 CHECK (is_lfs IN (0, 1)),
-                PRIMARY KEY (commit_sha, path)
-            );
-            CREATE TABLE IF NOT EXISTS shardline_hub_webhooks (
-                id TEXT PRIMARY KEY,
-                repo_id TEXT NOT NULL,
-                url TEXT NOT NULL,
-                events TEXT NOT NULL DEFAULT 'push',
-                secret TEXT,
-                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-                created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
-                FOREIGN KEY (repo_id) REFERENCES shardline_hub_repos(repo_id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS shardline_hub_webhooks_repo_idx ON shardline_hub_webhooks (repo_id);",
-    )
-    .unwrap();
-    drop(conn);
-    shardline_index::hub::ensure_hub_tables(&root).unwrap();
-
-    let store = LocalIndexStore::open(root.clone());
+    let store = LocalIndexStore::new(root.clone()).unwrap();
     let boxed = BoxedHubStore::from_store(store);
     let object_store = shardline_server_core::ServerObjectStore::local(root.join("lfs"))
         .expect("local object store");
     let state = HubState {
         store: boxed,
         object_store,
+        recovery_archive: None,
         auth: None,
         http_client: None,
         webhook_secret_cipher: None,
@@ -598,22 +211,14 @@ async fn validate_commit_body_bounded_by_router() {
         .create_revision("team/body-limit-test", None, "sha1", "main", "init")
         .unwrap();
 
-    let mut ndjson_body =
-        String::from(r#"{"header":{"message":"large commit","parentCommit":"sha1"}}"#);
-    ndjson_body.push('\n');
-    for i in 0..100 {
-        let content = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            format!("file content {i}").as_bytes(),
-        );
-        ndjson_body.push_str(&format!(
-            r#"{{"file":{{"path":"dir/file{i}.txt","content":"{content}"}}}}"#
-        ));
-        ndjson_body.push('\n');
-    }
+    let ndjson_body = concat!(
+        "{\"header\":{\"message\":\"small commit\",\"parentCommit\":\"sha1\"}}\n",
+        "{\"file\":{\"path\":\"file.txt\",\"content\":\"aGVsbG8=\"}}\n",
+    );
 
     let app = shardline_hub_api::hub_routes(state, true);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -632,7 +237,51 @@ async fn validate_commit_body_bounded_by_router() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "Small commit body accepted within64MB limit: {}",
+        "small streamed commit should succeed: {}",
         String::from_utf8_lossy(&response_body)
     );
+    let head = store
+        .resolve_revision("team/body-limit-test", "main")
+        .unwrap();
+    for (endpoint, size, expected_status, expected_message) in [
+        (
+            "commit/main",
+            16 * 1024 * 1024 + 1,
+            StatusCode::BAD_REQUEST,
+            "commit line exceeds 16 MiB limit; use LFS for large files",
+        ),
+        (
+            "preupload/main",
+            64 * 1024 * 1024 + 1,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "length limit exceeded",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/models/team/body-limit-test/{endpoint}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b' '; size]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status, "{endpoint}");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(expected_message),
+            "{endpoint}: {body:?}"
+        );
+        assert_eq!(
+            store
+                .resolve_revision("team/body-limit-test", "main")
+                .unwrap(),
+            head
+        );
+    }
 }

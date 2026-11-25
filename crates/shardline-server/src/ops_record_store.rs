@@ -13,12 +13,10 @@ mod tests {
     fn local_locator_helpers_extract_scoped_file_id_and_hash() {
         let scope =
             RepositoryScope::new(RepositoryProvider::GitHub, "octo", "assets", Some("main"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+        let scope = scope.expect("expected valid scope");
         let store = LocalRecordStore::open("/var/lib/shardline".into());
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "a".repeat(64),
             total_bytes: 0,

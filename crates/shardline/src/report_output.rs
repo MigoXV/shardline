@@ -108,36 +108,45 @@ pub(crate) fn write_fsck_summary(
     writer: &mut (impl Write + ?Sized),
     report: &LocalFsckReport,
 ) -> io::Result<()> {
-    writeln!(writer, "latest_records: {}", report.latest_records)?;
-    writeln!(writer, "version_records: {}", report.version_records)?;
-    writeln!(
-        writer,
-        "inspected_chunk_references: {}",
-        report.inspected_chunk_references
-    )?;
-    writeln!(
-        writer,
-        "inspected_dedupe_shard_mappings: {}",
-        report.inspected_dedupe_shard_mappings
-    )?;
-    writeln!(
-        writer,
-        "inspected_reconstructions: {}",
-        report.inspected_reconstructions
-    )?;
-    writeln!(
-        writer,
-        "inspected_webhook_deliveries: {}",
-        report.inspected_webhook_deliveries
-    )?;
-    writeln!(
-        writer,
-        "inspected_provider_repository_states: {}",
-        report.inspected_provider_repository_states
-    )?;
-    writeln!(writer, "issue_count: {}", report.issue_count())?;
-
+    write_fsck_summary_prefixed(writer, report, "")?;
     writer.flush()
+}
+
+pub(crate) fn write_fsck_summary_prefixed(
+    writer: &mut (impl Write + ?Sized),
+    report: &LocalFsckReport,
+    prefix: &str,
+) -> io::Result<()> {
+    let sep = if prefix.is_empty() { "" } else { "." };
+    for (name, value) in [
+        ("latest_records", report.latest_records),
+        ("version_records", report.version_records),
+        (
+            "inspected_chunk_references",
+            report.inspected_chunk_references,
+        ),
+        (
+            "inspected_dedupe_shard_mappings",
+            report.inspected_dedupe_shard_mappings,
+        ),
+        (
+            "inspected_reconstructions",
+            report.inspected_reconstructions,
+        ),
+        (
+            "inspected_webhook_deliveries",
+            report.inspected_webhook_deliveries,
+        ),
+        (
+            "inspected_provider_repository_states",
+            report.inspected_provider_repository_states,
+        ),
+    ] {
+        writeln!(writer, "{prefix}{sep}{name}: {value}")?;
+    }
+
+    writeln!(writer, "{prefix}{sep}issue_count: {}", report.issue_count())?;
+    Ok(())
 }
 
 pub(crate) fn write_fsck_cli_summary(
@@ -170,71 +179,63 @@ pub(crate) fn write_index_rebuild_summary(
     writer: &mut (impl Write + ?Sized),
     report: &LocalIndexRebuildReport,
 ) -> io::Result<()> {
-    writeln!(
-        writer,
-        "scanned_version_records: {}",
-        report.scanned_version_records
-    )?;
-    writeln!(
-        writer,
-        "scanned_retained_shards: {}",
-        report.scanned_retained_shards
-    )?;
-    writeln!(
-        writer,
-        "rebuilt_latest_records: {}",
-        report.rebuilt_latest_records
-    )?;
-    writeln!(
-        writer,
-        "unchanged_latest_records: {}",
-        report.unchanged_latest_records
-    )?;
-    writeln!(
-        writer,
-        "removed_stale_latest_records: {}",
-        report.removed_stale_latest_records
-    )?;
+    write_index_rebuild_summary_prefixed(writer, report, "")?;
+    writer.flush()
+}
+
+pub(crate) fn write_index_rebuild_summary_prefixed(
+    writer: &mut (impl Write + ?Sized),
+    report: &LocalIndexRebuildReport,
+    prefix: &str,
+) -> io::Result<()> {
+    let sep = if prefix.is_empty() { "" } else { "." };
+    for (name, value) in [
+        ("scanned_version_records", report.scanned_version_records),
+        ("scanned_retained_shards", report.scanned_retained_shards),
+        ("rebuilt_latest_records", report.rebuilt_latest_records),
+        ("unchanged_latest_records", report.unchanged_latest_records),
+        (
+            "removed_stale_latest_records",
+            report.removed_stale_latest_records,
+        ),
+    ] {
+        writeln!(writer, "{prefix}{sep}{name}: {value}")?;
+    }
     for location in &report.preserved_latest_records_unreadable_version {
         writeln!(
             writer,
-            "kept_latest_record_unreadable_version: {}",
+            "{prefix}{sep}kept_latest_record_unreadable_version: {}",
             location
         )?;
     }
-    writeln!(
-        writer,
-        "scanned_reconstructions: {}",
-        report.scanned_reconstructions
-    )?;
-    writeln!(
-        writer,
-        "unchanged_reconstructions: {}",
-        report.unchanged_reconstructions
-    )?;
-    writeln!(
-        writer,
-        "removed_stale_reconstructions: {}",
-        report.removed_stale_reconstructions
-    )?;
-    writeln!(
-        writer,
-        "rebuilt_dedupe_shard_mappings: {}",
-        report.rebuilt_dedupe_shard_mappings
-    )?;
-    writeln!(
-        writer,
-        "unchanged_dedupe_shard_mappings: {}",
-        report.unchanged_dedupe_shard_mappings
-    )?;
-    writeln!(
-        writer,
-        "removed_stale_dedupe_shard_mappings: {}",
-        report.removed_stale_dedupe_shard_mappings
-    )?;
-    writeln!(writer, "issue_count: {}", report.issue_count())?;
+    for (name, value) in [
+        ("scanned_reconstructions", report.scanned_reconstructions),
+        (
+            "unchanged_reconstructions",
+            report.unchanged_reconstructions,
+        ),
+        (
+            "removed_stale_reconstructions",
+            report.removed_stale_reconstructions,
+        ),
+        (
+            "rebuilt_dedupe_shard_mappings",
+            report.rebuilt_dedupe_shard_mappings,
+        ),
+        (
+            "unchanged_dedupe_shard_mappings",
+            report.unchanged_dedupe_shard_mappings,
+        ),
+        (
+            "removed_stale_dedupe_shard_mappings",
+            report.removed_stale_dedupe_shard_mappings,
+        ),
+    ] {
+        writeln!(writer, "{prefix}{sep}{name}: {value}")?;
+    }
+    writeln!(writer, "{prefix}{sep}issue_count: {}", report.issue_count())?;
 
-    writer.flush()
+    Ok(())
 }
 
 pub(crate) fn write_index_rebuild_cli_summary(
@@ -270,32 +271,23 @@ pub(crate) fn write_backup_manifest_summary(
     writeln!(writer, "manifest_version: {}", report.manifest_version)?;
     writeln!(writer, "metadata_backend: {}", report.metadata_backend)?;
     writeln!(writer, "object_backend: {}", report.object_backend)?;
-    writeln!(writer, "object_count: {}", report.object_count)?;
-    writeln!(writer, "object_bytes: {}", report.object_bytes)?;
-    writeln!(writer, "latest_records: {}", report.latest_records)?;
-    writeln!(writer, "version_records: {}", report.version_records)?;
-    writeln!(
-        writer,
-        "reconstruction_rows: {}",
-        report.reconstruction_rows
-    )?;
-    writeln!(
-        writer,
-        "dedupe_shard_mappings: {}",
-        report.dedupe_shard_mappings
-    )?;
-    writeln!(
-        writer,
-        "quarantine_candidates: {}",
-        report.quarantine_candidates
-    )?;
-    writeln!(writer, "retention_holds: {}", report.retention_holds)?;
-    writeln!(writer, "webhook_deliveries: {}", report.webhook_deliveries)?;
-    writeln!(
-        writer,
-        "provider_repository_states: {}",
-        report.provider_repository_states
-    )?;
+    for (name, value) in [
+        ("object_count", report.object_count),
+        ("object_bytes", report.object_bytes),
+        ("latest_records", report.latest_records),
+        ("version_records", report.version_records),
+        ("reconstruction_rows", report.reconstruction_rows),
+        ("dedupe_shard_mappings", report.dedupe_shard_mappings),
+        ("quarantine_candidates", report.quarantine_candidates),
+        ("retention_holds", report.retention_holds),
+        ("webhook_deliveries", report.webhook_deliveries),
+        (
+            "provider_repository_states",
+            report.provider_repository_states,
+        ),
+    ] {
+        writeln!(writer, "{name}: {value}")?;
+    }
 
     writer.flush()
 }
@@ -375,66 +367,49 @@ pub(crate) fn write_lifecycle_repair_summary_prefixed(
     prefix: &str,
 ) -> io::Result<()> {
     let sep = if prefix.is_empty() { "" } else { "." };
-    writeln!(
-        writer,
-        "{prefix}{sep}scanned_records: {}",
-        report.scanned_records
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}referenced_objects: {}",
-        report.referenced_objects
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}scanned_quarantine_candidates: {}",
-        report.scanned_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_missing_quarantine_candidates: {}",
-        report.removed_missing_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_reachable_quarantine_candidates: {}",
-        report.removed_reachable_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_held_quarantine_candidates: {}",
-        report.removed_held_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}scanned_retention_holds: {}",
-        report.scanned_retention_holds
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_expired_retention_holds: {}",
-        report.removed_expired_retention_holds
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_missing_retention_holds: {}",
-        report.removed_missing_retention_holds
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}scanned_webhook_deliveries: {}",
-        report.scanned_webhook_deliveries
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_stale_webhook_deliveries: {}",
-        report.removed_stale_webhook_deliveries
-    )?;
-    writeln!(
-        writer,
-        "{prefix}{sep}removed_future_webhook_deliveries: {}",
-        report.removed_future_webhook_deliveries
-    )?;
+    for (name, value) in [
+        ("scanned_records", report.scanned_records),
+        ("referenced_objects", report.referenced_objects),
+        (
+            "scanned_quarantine_candidates",
+            report.scanned_quarantine_candidates,
+        ),
+        (
+            "removed_missing_quarantine_candidates",
+            report.removed_missing_quarantine_candidates,
+        ),
+        (
+            "removed_reachable_quarantine_candidates",
+            report.removed_reachable_quarantine_candidates,
+        ),
+        (
+            "removed_held_quarantine_candidates",
+            report.removed_held_quarantine_candidates,
+        ),
+        ("scanned_retention_holds", report.scanned_retention_holds),
+        (
+            "removed_expired_retention_holds",
+            report.removed_expired_retention_holds,
+        ),
+        (
+            "removed_missing_retention_holds",
+            report.removed_missing_retention_holds,
+        ),
+        (
+            "scanned_webhook_deliveries",
+            report.scanned_webhook_deliveries,
+        ),
+        (
+            "removed_stale_webhook_deliveries",
+            report.removed_stale_webhook_deliveries,
+        ),
+        (
+            "removed_future_webhook_deliveries",
+            report.removed_future_webhook_deliveries,
+        ),
+    ] {
+        writeln!(writer, "{prefix}{sep}{name}: {value}")?;
+    }
 
     writer.flush()
 }
@@ -487,77 +462,59 @@ pub(crate) fn write_local_gc_summary(
         "retention_deferred_clock: {}",
         report.retention_deferred_clock
     )?;
-    writeln!(writer, "scanned_records: {}", report.scanned_records)?;
-    writeln!(writer, "referenced_chunks: {}", report.referenced_chunks)?;
-    writeln!(writer, "orphan_chunks: {}", report.orphan_chunks)?;
-    writeln!(writer, "orphan_chunk_bytes: {}", report.orphan_chunk_bytes)?;
-    writeln!(
-        writer,
-        "active_quarantine_candidates: {}",
-        report.active_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "new_quarantine_candidates: {}",
-        report.new_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "retained_quarantine_candidates: {}",
-        report.retained_quarantine_candidates
-    )?;
-    writeln!(
-        writer,
-        "released_quarantine_candidates: {}",
-        report.released_quarantine_candidates
-    )?;
-    writeln!(writer, "deleted_chunks: {}", report.deleted_chunks)?;
-    writeln!(writer, "deleted_bytes: {}", report.deleted_bytes)?;
-    writeln!(
-        writer,
-        "pruned_revisions_over_cap: {}",
-        report.pruned_revisions_over_cap
-    )?;
-    writeln!(
-        writer,
-        "scanned_oci_tombstones: {}",
-        report.scanned_oci_tombstones
-    )?;
-    writeln!(
-        writer,
-        "eligible_oci_tombstones: {}",
-        report.eligible_oci_tombstones
-    )?;
-    writeln!(
-        writer,
-        "reclaimed_oci_tombstones: {}",
-        report.reclaimed_oci_tombstones
-    )?;
-    writeln!(
-        writer,
-        "scanned_resumable_staging_objects: {}",
-        report.scanned_resumable_staging_objects
-    )?;
-    writeln!(
-        writer,
-        "protected_resumable_staging_objects: {}",
-        report.protected_resumable_staging_objects
-    )?;
-    writeln!(
-        writer,
-        "reclaimed_resumable_staging_objects: {}",
-        report.reclaimed_resumable_staging_objects
-    )?;
-    writeln!(
-        writer,
-        "reclaimed_resumable_staging_bytes: {}",
-        report.reclaimed_resumable_staging_bytes
-    )?;
-    writeln!(
-        writer,
-        "reclaimed_resumable_sessions: {}",
-        report.reclaimed_resumable_sessions
-    )?;
+    for (name, value) in [
+        ("scanned_records", report.scanned_records),
+        ("referenced_chunks", report.referenced_chunks),
+        ("orphan_chunks", report.orphan_chunks),
+        ("orphan_chunk_bytes", report.orphan_chunk_bytes),
+        (
+            "active_quarantine_candidates",
+            report.active_quarantine_candidates,
+        ),
+        (
+            "new_quarantine_candidates",
+            report.new_quarantine_candidates,
+        ),
+        (
+            "retained_quarantine_candidates",
+            report.retained_quarantine_candidates,
+        ),
+        (
+            "released_quarantine_candidates",
+            report.released_quarantine_candidates,
+        ),
+        ("deleted_chunks", report.deleted_chunks),
+        ("deleted_bytes", report.deleted_bytes),
+        (
+            "pruned_revisions_over_cap",
+            report.pruned_revisions_over_cap,
+        ),
+        ("scanned_oci_tombstones", report.scanned_oci_tombstones),
+        ("eligible_oci_tombstones", report.eligible_oci_tombstones),
+        ("reclaimed_oci_tombstones", report.reclaimed_oci_tombstones),
+        (
+            "scanned_resumable_staging_objects",
+            report.scanned_resumable_staging_objects,
+        ),
+        (
+            "protected_resumable_staging_objects",
+            report.protected_resumable_staging_objects,
+        ),
+        (
+            "reclaimed_resumable_staging_objects",
+            report.reclaimed_resumable_staging_objects,
+        ),
+        (
+            "reclaimed_resumable_staging_bytes",
+            report.reclaimed_resumable_staging_bytes,
+        ),
+        (
+            "reclaimed_resumable_sessions",
+            report.reclaimed_resumable_sessions,
+        ),
+    ] {
+        writeln!(writer, "{name}: {value}")?;
+    }
 
     writer.flush()
 }
@@ -590,7 +547,6 @@ pub(crate) fn write_local_gc_cli_summary(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
     use std::path::Path;
 
     use shardline_server::{
@@ -602,13 +558,14 @@ mod tests {
     };
 
     use super::*;
+    use crate::hold::output_test_support::assert_writer_errors;
 
     // -----------------------------------------------------------------------
-    // print_config_check_summary — smoke test (no panic)
+    // Config check summary output and errors
     // -----------------------------------------------------------------------
 
     #[test]
-    fn config_check_summary_runs() {
+    fn config_check_summary_preserves_output_and_propagates_errors() {
         let report = ConfigCheckReport {
             status: "ok".to_owned(),
             server_role: "all".to_owned(),
@@ -619,15 +576,31 @@ mod tests {
             auth_enabled: true,
             provider_tokens_enabled: false,
         };
-        print_config_check_summary(&report);
+        let mut bytes = Vec::new();
+        write_config_check_summary(&mut bytes, &report).unwrap();
+        assert_eq!(
+            bytes,
+            concat!(
+                "status: ok\n",
+                "server_role: all\n",
+                "server_frontends: xet\n",
+                "metadata_backend: local\n",
+                "object_backend: local\n",
+                "cache_backend: memory\n",
+                "auth_enabled: true\n",
+                "provider_tokens_enabled: false\n",
+            )
+            .as_bytes()
+        );
+        assert_writer_errors(|writer| write_config_check_summary(writer, &report));
     }
 
     // -----------------------------------------------------------------------
-    // print_database_migration_summary — smoke test (no panic)
+    // Database migration summary output and errors
     // -----------------------------------------------------------------------
 
     #[test]
-    fn database_migration_summary_runs() {
+    fn database_migration_summary_preserves_output_and_propagates_errors() {
         let report = DatabaseMigrationReport {
             backend: "postgres".to_owned(),
             command: DatabaseMigrationCommand::Status,
@@ -650,7 +623,22 @@ mod tests {
                 },
             ],
         };
-        print_database_migration_summary(&report);
+        let mut bytes = Vec::new();
+        write_database_migration_summary(&mut bytes, &report).unwrap();
+        assert_eq!(
+            bytes,
+            concat!(
+                "backend: postgres\n",
+                "applied_count: 3\n",
+                "reverted_count: 1\n",
+                "applied_total_count: 7\n",
+                "pending_count: 2\n",
+                "migration: version=v1 name=m1 applied=true applied_at_utc=2026-01-01T00:00:00Z\n",
+                "migration: version=v2 name=m2 applied=false applied_at_utc=-\n",
+            )
+            .as_bytes()
+        );
+        assert_writer_errors(|writer| write_database_migration_summary(writer, &report));
     }
 
     #[test]
@@ -672,23 +660,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fsck_summary_runs() {
-        let report = LocalFsckReport {
-            latest_records: 100,
-            version_records: 200,
-            inspected_chunk_references: 1500,
-            inspected_dedupe_shard_mappings: 50,
-            inspected_reconstructions: 25,
-            inspected_webhook_deliveries: 10,
-            inspected_provider_repository_states: 5,
-            issues: vec![],
-        };
-        print_fsck_summary(&report);
-    }
-
-    #[test]
-    fn fsck_cli_summary_runs() {
-        let report = LocalFsckReport {
+    fn fsck_summaries_preserve_fields_order_and_issue_counts() {
+        let mut report = LocalFsckReport {
             latest_records: 1,
             version_records: 2,
             inspected_chunk_references: 3,
@@ -696,52 +669,52 @@ mod tests {
             inspected_reconstructions: 5,
             inspected_webhook_deliveries: 6,
             inspected_provider_repository_states: 7,
-            issues: vec![],
+            ..LocalFsckReport::default()
         };
-        print_fsck_cli_summary(&report, Path::new("/root"));
-    }
-
-    #[test]
-    fn fsck_summary_reports_issue_count() {
-        let report = LocalFsckReport {
-            latest_records: 0,
-            version_records: 0,
-            inspected_chunk_references: 0,
-            inspected_dedupe_shard_mappings: 0,
-            inspected_reconstructions: 0,
-            inspected_webhook_deliveries: 0,
-            inspected_provider_repository_states: 0,
-            issues: vec![
-                LocalFsckIssue {
-                    kind: FsckIssueKind::MissingChunk,
-                    location: "chunks/a".to_owned(),
-                    detail: FsckIssueDetail::MissingVersionRecord {
-                        version_locator: "r/a".to_owned(),
+        for (issue_count, issues) in [
+            (0, vec![]),
+            (
+                2,
+                vec![
+                    LocalFsckIssue {
+                        kind: FsckIssueKind::MissingChunk,
+                        location: "chunks/a".to_owned(),
+                        detail: FsckIssueDetail::MissingVersionRecord {
+                            version_locator: "r/a".to_owned(),
+                        },
                     },
-                },
-                LocalFsckIssue {
-                    kind: FsckIssueKind::ChunkHashMismatch,
-                    location: "chunks/b".to_owned(),
-                    detail: FsckIssueDetail::RecordJsonInvalid,
-                },
-            ],
-        };
-        assert_eq!(report.issue_count(), 2);
-        print_fsck_summary(&report);
-        // issue_count() is internally derived from issues.len()
-        assert!(!report.is_clean());
+                    LocalFsckIssue {
+                        kind: FsckIssueKind::ChunkHashMismatch,
+                        location: "chunks/b".to_owned(),
+                        detail: FsckIssueDetail::RecordJsonInvalid,
+                    },
+                ],
+            ),
+        ] {
+            report.issues = issues;
+            let expected = format!(
+                concat!(
+                    "latest_records: 1\nversion_records: 2\n",
+                    "inspected_chunk_references: 3\ninspected_dedupe_shard_mappings: 4\n",
+                    "inspected_reconstructions: 5\ninspected_webhook_deliveries: 6\n",
+                    "inspected_provider_repository_states: 7\nissue_count: {}\n",
+                ),
+                issue_count
+            );
+            let mut bytes = Vec::new();
+            write_fsck_summary(&mut bytes, &report).unwrap();
+            assert_eq!(bytes, expected.as_bytes());
+            bytes.clear();
+            write_fsck_cli_summary(&mut bytes, &report, Path::new("/root")).unwrap();
+            assert_eq!(bytes, format!("root: /root\n{expected}").as_bytes());
+            assert_eq!(report.issue_count(), issue_count);
+            assert_eq!(report.is_clean(), issue_count == 0);
+        }
     }
 
     #[test]
     fn fsck_issues_runs() {
         let report = LocalFsckReport {
-            latest_records: 0,
-            version_records: 0,
-            inspected_chunk_references: 0,
-            inspected_dedupe_shard_mappings: 0,
-            inspected_reconstructions: 0,
-            inspected_webhook_deliveries: 0,
-            inspected_provider_repository_states: 0,
             issues: vec![LocalFsckIssue {
                 kind: FsckIssueKind::MissingChunk,
                 location: "chunks/abc".to_owned(),
@@ -749,50 +722,54 @@ mod tests {
                     version_locator: "records/abc".to_owned(),
                 },
             }],
+            ..LocalFsckReport::default()
         };
         print_fsck_issues(&report);
-    }
-
-    #[test]
-    fn fsck_empty_issues_is_clean() {
-        let report = LocalFsckReport {
-            issues: vec![],
-            ..empty_fsck_report()
-        };
-        assert!(report.is_clean());
-        assert_eq!(report.issue_count(), 0);
     }
 
     // -----------------------------------------------------------------------
     // print_index_rebuild_summary / cli / issues
     // -----------------------------------------------------------------------
 
-    fn empty_index_rebuild_report() -> LocalIndexRebuildReport {
-        LocalIndexRebuildReport {
-            scanned_version_records: 0,
-            scanned_retained_shards: 0,
-            rebuilt_latest_records: 0,
-            unchanged_latest_records: 0,
-            removed_stale_latest_records: 0,
-            scanned_reconstructions: 0,
-            unchanged_reconstructions: 0,
-            removed_stale_reconstructions: 0,
-            rebuilt_dedupe_shard_mappings: 0,
-            unchanged_dedupe_shard_mappings: 0,
-            removed_stale_dedupe_shard_mappings: 0,
-            preserved_latest_records_unreadable_version: vec![],
-            issues: vec![],
-        }
-    }
-
     #[test]
-    fn index_rebuild_summary_runs() {
-        print_index_rebuild_summary(&empty_index_rebuild_report());
-    }
-
-    #[test]
-    fn index_rebuild_cli_summary_runs() {
-        print_index_rebuild_cli_summary(&empty_index_rebuild_report(), Path::new("/root"));
+    fn index_rebuild_summary_preserves_fields_and_order() {
+        let report = LocalIndexRebuildReport {
+            scanned_version_records: 1,
+            scanned_retained_shards: 2,
+            rebuilt_latest_records: 3,
+            unchanged_latest_records: 4,
+            removed_stale_latest_records: 5,
+            preserved_latest_records_unreadable_version: vec!["records/kept".to_owned()],
+            scanned_reconstructions: 6,
+            unchanged_reconstructions: 7,
+            removed_stale_reconstructions: 8,
+            rebuilt_dedupe_shard_mappings: 9,
+            unchanged_dedupe_shard_mappings: 10,
+            removed_stale_dedupe_shard_mappings: 11,
+            ..LocalIndexRebuildReport::default()
+        };
+        let mut bytes = Vec::new();
+        write_index_rebuild_cli_summary(&mut bytes, &report, Path::new("/root")).unwrap();
+        assert_eq!(
+            bytes,
+            concat!(
+                "root: /root\n",
+                "scanned_version_records: 1\n",
+                "scanned_retained_shards: 2\n",
+                "rebuilt_latest_records: 3\n",
+                "unchanged_latest_records: 4\n",
+                "removed_stale_latest_records: 5\n",
+                "kept_latest_record_unreadable_version: records/kept\n",
+                "scanned_reconstructions: 6\n",
+                "unchanged_reconstructions: 7\n",
+                "removed_stale_reconstructions: 8\n",
+                "rebuilt_dedupe_shard_mappings: 9\n",
+                "unchanged_dedupe_shard_mappings: 10\n",
+                "removed_stale_dedupe_shard_mappings: 11\n",
+                "issue_count: 0\n",
+            )
+            .as_bytes()
+        );
     }
 
     #[test]
@@ -803,7 +780,7 @@ mod tests {
                 location: "records/abc".to_owned(),
                 detail: IndexRebuildIssueDetail::RecordJsonInvalid,
             }],
-            ..empty_index_rebuild_report()
+            ..LocalIndexRebuildReport::default()
         };
         print_index_rebuild_issues(&report);
     }
@@ -816,57 +793,14 @@ mod tests {
                 location: "r".to_owned(),
                 detail: IndexRebuildIssueDetail::RecordJsonInvalid,
             }],
-            ..empty_index_rebuild_report()
+            ..LocalIndexRebuildReport::default()
         };
         assert_eq!(report.issue_count(), 1);
         assert!(!report.is_clean());
 
-        let clean = empty_index_rebuild_report();
+        let clean = LocalIndexRebuildReport::default();
         assert_eq!(clean.issue_count(), 0);
         assert!(clean.is_clean());
-    }
-
-    // -----------------------------------------------------------------------
-    // print_lifecycle_repair_summary / prefixed / cli
-    // -----------------------------------------------------------------------
-
-    fn empty_lifecycle_repair_report() -> LifecycleRepairReport {
-        LifecycleRepairReport {
-            scanned_records: 0,
-            referenced_objects: 0,
-            scanned_quarantine_candidates: 0,
-            removed_missing_quarantine_candidates: 0,
-            removed_reachable_quarantine_candidates: 0,
-            removed_held_quarantine_candidates: 0,
-            scanned_retention_holds: 0,
-            removed_expired_retention_holds: 0,
-            removed_missing_retention_holds: 0,
-            scanned_webhook_deliveries: 0,
-            removed_stale_webhook_deliveries: 0,
-            removed_future_webhook_deliveries: 0,
-        }
-    }
-
-    #[test]
-    fn lifecycle_repair_summary_runs() {
-        print_lifecycle_repair_summary(&empty_lifecycle_repair_report());
-    }
-
-    #[test]
-    fn lifecycle_repair_summary_prefixed_runs() {
-        let report = empty_lifecycle_repair_report();
-        print_lifecycle_repair_summary_prefixed(&report, "repair");
-        // empty prefix — no dot separator
-        print_lifecycle_repair_summary_prefixed(&report, "");
-    }
-
-    #[test]
-    fn lifecycle_repair_cli_summary_runs() {
-        print_lifecycle_repair_cli_summary(
-            &empty_lifecycle_repair_report(),
-            Path::new("/root"),
-            2592000,
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -891,26 +825,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backup_manifest_summary_runs() {
-        print_backup_manifest_summary(&empty_backup_report());
-    }
-
-    #[test]
-    fn backup_manifest_cli_summary_runs() {
-        print_backup_manifest_cli_summary(
-            &empty_backup_report(),
-            Path::new("/root"),
-            Path::new("/out.json"),
-        );
-    }
-
     // -----------------------------------------------------------------------
     // print_storage_migration_summary
     // -----------------------------------------------------------------------
 
     #[test]
-    fn storage_migration_summary_runs() {
+    fn storage_migration_summary_preserves_output_and_propagates_errors() {
         let report = StorageMigrationReport {
             source_backend: "local".to_owned(),
             destination_backend: "s3".to_owned(),
@@ -922,142 +842,164 @@ mod tests {
             already_present_objects: 200,
             copied_bytes: 400_000_000,
         };
-        print_storage_migration_summary(&report);
+        let mut bytes = Vec::new();
+        write_storage_migration_summary(&mut bytes, &report).unwrap();
+        assert_eq!(
+            bytes,
+            concat!(
+                "source_backend: local\n",
+                "destination_backend: s3\n",
+                "prefix: chunks/\n",
+                "dry_run: true\n",
+                "scanned_objects: 1000\n",
+                "scanned_bytes: 500000000\n",
+                "inserted_objects: 800\n",
+                "already_present_objects: 200\n",
+                "copied_bytes: 400000000\n",
+            )
+            .as_bytes()
+        );
+        assert_writer_errors(|writer| write_storage_migration_summary(writer, &report));
     }
 
     // -----------------------------------------------------------------------
     // print_local_gc_summary / cli
     // -----------------------------------------------------------------------
 
-    fn empty_gc_report() -> LocalGcReport {
-        LocalGcReport {
-            scanned_records: 0,
-            referenced_chunks: 0,
-            orphan_chunks: 0,
-            orphan_chunk_bytes: 0,
-            active_quarantine_candidates: 0,
-            new_quarantine_candidates: 0,
-            retained_quarantine_candidates: 0,
-            released_quarantine_candidates: 0,
-            deleted_chunks: 0,
-            deleted_bytes: 0,
-            reaped_stale_temporary_chunks: 0,
-            reaped_stale_temporary_bytes: 0,
-            pruned_revisions_over_cap: 0,
+    #[test]
+    fn local_gc_summary_preserves_fields_and_order() {
+        let report = LocalGcReport {
+            retention_deferred_clock: true,
+            scanned_records: 1,
+            referenced_chunks: 2,
+            orphan_chunks: 3,
+            orphan_chunk_bytes: 4,
+            active_quarantine_candidates: 5,
+            new_quarantine_candidates: 6,
+            retained_quarantine_candidates: 7,
+            released_quarantine_candidates: 8,
+            deleted_chunks: 9,
+            deleted_bytes: 10,
+            pruned_revisions_over_cap: 11,
+            scanned_oci_tombstones: 12,
+            eligible_oci_tombstones: 13,
+            reclaimed_oci_tombstones: 14,
+            scanned_resumable_staging_objects: 15,
+            protected_resumable_staging_objects: 16,
+            reclaimed_resumable_staging_objects: 17,
+            reclaimed_resumable_staging_bytes: 18,
+            reclaimed_resumable_sessions: 19,
             ..LocalGcReport::default()
-        }
+        };
+        let mut bytes = Vec::new();
+        write_local_gc_summary(&mut bytes, &report).unwrap();
+        assert_eq!(
+            bytes,
+            concat!(
+                "retention_deferred_clock: true\n",
+                "scanned_records: 1\n",
+                "referenced_chunks: 2\n",
+                "orphan_chunks: 3\n",
+                "orphan_chunk_bytes: 4\n",
+                "active_quarantine_candidates: 5\n",
+                "new_quarantine_candidates: 6\n",
+                "retained_quarantine_candidates: 7\n",
+                "released_quarantine_candidates: 8\n",
+                "deleted_chunks: 9\n",
+                "deleted_bytes: 10\n",
+                "pruned_revisions_over_cap: 11\n",
+                "scanned_oci_tombstones: 12\n",
+                "eligible_oci_tombstones: 13\n",
+                "reclaimed_oci_tombstones: 14\n",
+                "scanned_resumable_staging_objects: 15\n",
+                "protected_resumable_staging_objects: 16\n",
+                "reclaimed_resumable_staging_objects: 17\n",
+                "reclaimed_resumable_staging_bytes: 18\n",
+                "reclaimed_resumable_sessions: 19\n",
+            )
+            .as_bytes()
+        );
+        assert_writer_errors(|writer| write_local_gc_summary(writer, &report));
     }
 
     #[test]
-    fn local_gc_summary_runs() {
-        print_local_gc_summary(&empty_gc_report());
-    }
-
-    #[test]
-    fn local_gc_cli_summary_runs() {
-        // mark=true — retention_seconds printed
-        print_local_gc_cli_summary(
-            &empty_gc_report(),
-            "mark",
-            Path::new("/root"),
-            7200,
-            true,
-            Some(Path::new("/ret.json")),
-            None,
-        );
-        // mark=false — retention_seconds not printed, orphan_inventory printed
-        print_local_gc_cli_summary(
-            &empty_gc_report(),
-            "sweep",
-            Path::new("/root"),
-            3600,
-            false,
-            None,
-            Some(Path::new("/orphans.json")),
-        );
-        // Both optional paths present
-        print_local_gc_cli_summary(
-            &empty_gc_report(),
-            "mark-and-sweep",
-            Path::new("/root"),
-            3600,
-            true,
-            Some(Path::new("/ret.json")),
-            Some(Path::new("/orphans.json")),
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Helper: empty default report for fsck
-    // -----------------------------------------------------------------------
-
-    fn empty_fsck_report() -> LocalFsckReport {
-        LocalFsckReport {
-            latest_records: 0,
-            version_records: 0,
-            inspected_chunk_references: 0,
-            inspected_dedupe_shard_mappings: 0,
-            inspected_reconstructions: 0,
-            inspected_webhook_deliveries: 0,
-            inspected_provider_repository_states: 0,
-            issues: vec![],
-        }
-    }
-    struct FailingReportWriter {
-        fail_write: bool,
-        written: Vec<u8>,
-    }
-
-    impl Write for FailingReportWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if self.fail_write {
-                return Err(io::Error::from_raw_os_error(28));
-            }
-            self.written.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::Error::from_raw_os_error(28))
+    fn local_gc_cli_summary_preserves_mode_headers_and_errors() {
+        let report = LocalGcReport::default();
+        let mut summary = Vec::new();
+        write_local_gc_summary(&mut summary, &report).unwrap();
+        for (mode, retention, mark, retention_report, orphan_inventory, header) in [
+            (
+                "mark",
+                7200,
+                true,
+                Some("/ret.json"),
+                None,
+                "mode: mark\nroot: /root\nretention_seconds: 7200\nretention_report: /ret.json\n",
+            ),
+            (
+                "sweep",
+                3600,
+                false,
+                None,
+                Some("/orphans.json"),
+                "mode: sweep\nroot: /root\norphan_inventory: /orphans.json\n",
+            ),
+            (
+                "mark-and-sweep",
+                3600,
+                true,
+                Some("/ret.json"),
+                Some("/orphans.json"),
+                "mode: mark-and-sweep\nroot: /root\nretention_seconds: 3600\nretention_report: /ret.json\norphan_inventory: /orphans.json\n",
+            ),
+            (
+                "dry-run",
+                3600,
+                false,
+                None,
+                None,
+                "mode: dry-run\nroot: /root\n",
+            ),
+        ] {
+            let write = |writer: &mut dyn Write| {
+                write_local_gc_cli_summary(
+                    writer,
+                    &report,
+                    mode,
+                    Path::new("/root"),
+                    retention,
+                    mark,
+                    retention_report.map(Path::new),
+                    orphan_inventory.map(Path::new),
+                )
+            };
+            let mut bytes = Vec::new();
+            write(&mut bytes).unwrap();
+            assert_eq!(bytes, [header.as_bytes(), &summary].concat(), "{mode}");
+            assert_writer_errors(write);
         }
     }
 
     #[test]
     fn fallible_cli_summaries_propagate_write_and_flush_errors() {
-        for fail_write in [true, false] {
-            let mut writer = FailingReportWriter {
-                fail_write,
-                written: Vec::new(),
-            };
-            assert_eq!(
-                write_fsck_cli_summary(&mut writer, &empty_fsck_report(), Path::new("/root"))
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_index_rebuild_cli_summary(
-                    &mut writer,
-                    &empty_index_rebuild_report(),
-                    Path::new("/root")
-                )
-                .unwrap_err()
-                .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_backup_manifest_cli_summary(
-                    &mut writer,
-                    &empty_backup_report(),
-                    Path::new("/root"),
-                    Path::new("/manifest.json")
-                )
-                .unwrap_err()
-                .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(writer.written.is_empty(), fail_write);
-        }
+        assert_writer_errors(|writer| {
+            write_fsck_cli_summary(writer, &LocalFsckReport::default(), Path::new("/root"))
+        });
+        assert_writer_errors(|writer| {
+            write_index_rebuild_cli_summary(
+                writer,
+                &LocalIndexRebuildReport::default(),
+                Path::new("/root"),
+            )
+        });
+        assert_writer_errors(|writer| {
+            write_backup_manifest_cli_summary(
+                writer,
+                &empty_backup_report(),
+                Path::new("/root"),
+                Path::new("/manifest.json"),
+            )
+        });
     }
 
     #[test]
@@ -1068,7 +1010,7 @@ mod tests {
                 location: "chunks/abc".to_owned(),
                 detail: FsckIssueDetail::RecordJsonInvalid,
             }],
-            ..empty_fsck_report()
+            ..LocalFsckReport::default()
         };
         let rebuild = LocalIndexRebuildReport {
             issues: vec![LocalIndexRebuildIssue {
@@ -1076,131 +1018,108 @@ mod tests {
                 location: "records/abc".to_owned(),
                 detail: IndexRebuildIssueDetail::RecordJsonInvalid,
             }],
-            ..empty_index_rebuild_report()
+            ..LocalIndexRebuildReport::default()
         };
-        for fail_write in [true, false] {
-            let mut writer = FailingReportWriter {
-                fail_write,
-                written: Vec::new(),
-            };
-            assert_eq!(
-                write_fsck_issues(&mut writer, &fsck)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_index_rebuild_issues(&mut writer, &rebuild)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(writer.written.is_empty(), fail_write);
-        }
+        assert_writer_errors(|writer| write_fsck_issues(writer, &fsck));
+        assert_writer_errors(|writer| write_index_rebuild_issues(writer, &rebuild));
     }
 
     #[test]
-    fn fallible_cli_summaries_preserve_report_format() {
+    fn backup_manifest_writer_preserves_fields_and_order() {
+        let report = BackupManifestReport {
+            object_count: 1,
+            object_bytes: 2,
+            latest_records: 3,
+            version_records: 4,
+            reconstruction_rows: 5,
+            dedupe_shard_mappings: 6,
+            quarantine_candidates: 7,
+            retention_holds: 8,
+            webhook_deliveries: 9,
+            provider_repository_states: 10,
+            ..empty_backup_report()
+        };
         let mut writer = Vec::new();
         write_backup_manifest_cli_summary(
             &mut writer,
-            &empty_backup_report(),
+            &report,
             Path::new("/root"),
             Path::new("/manifest.json"),
         )
         .unwrap();
-        let text = String::from_utf8(writer).unwrap();
-        assert!(text.starts_with("root: /root\noutput: /manifest.json\nmanifest_version: 1\n"));
-        assert!(text.contains("object_count: 0\n"));
-        assert!(text.ends_with("provider_repository_states: 0\n"));
+        assert_eq!(
+            writer,
+            concat!(
+                "root: /root\noutput: /manifest.json\nmanifest_version: 1\n",
+                "metadata_backend: local\nobject_backend: fs\n",
+                "object_count: 1\n",
+                "object_bytes: 2\n",
+                "latest_records: 3\n",
+                "version_records: 4\n",
+                "reconstruction_rows: 5\n",
+                "dedupe_shard_mappings: 6\n",
+                "quarantine_candidates: 7\n",
+                "retention_holds: 8\n",
+                "webhook_deliveries: 9\n",
+                "provider_repository_states: 10\n",
+            )
+            .as_bytes()
+        );
     }
+
     #[test]
-    fn remaining_summary_writers_propagate_write_and_flush_errors() {
-        let config = ConfigCheckReport {
-            status: "ok".to_owned(),
-            server_role: "all".to_owned(),
-            server_frontends: vec!["xet".to_owned()],
-            metadata_backend: "local".to_owned(),
-            object_backend: "local".to_owned(),
-            cache_backend: "memory".to_owned(),
-            auth_enabled: true,
-            provider_tokens_enabled: false,
+    fn lifecycle_summary_preserves_output_and_propagates_errors() {
+        let report = LifecycleRepairReport {
+            scanned_records: 1,
+            referenced_objects: 2,
+            scanned_quarantine_candidates: 3,
+            removed_missing_quarantine_candidates: 4,
+            removed_reachable_quarantine_candidates: 5,
+            removed_held_quarantine_candidates: 6,
+            scanned_retention_holds: 7,
+            removed_expired_retention_holds: 8,
+            removed_missing_retention_holds: 9,
+            scanned_webhook_deliveries: 10,
+            removed_stale_webhook_deliveries: 11,
+            removed_future_webhook_deliveries: 12,
         };
-        let database = DatabaseMigrationReport {
-            backend: "postgres".to_owned(),
-            command: DatabaseMigrationCommand::Status,
-            applied_count: 0,
-            reverted_count: 0,
-            applied_total_count: 1,
-            pending_count: 0,
-            migrations: vec![DatabaseMigrationStatusEntry {
-                version: "v1".to_owned(),
-                name: "migration".to_owned(),
-                applied: true,
-                applied_at_utc: None,
-            }],
-        };
-        let storage = StorageMigrationReport {
-            source_backend: "local".to_owned(),
-            destination_backend: "local".to_owned(),
-            prefix: String::new(),
-            dry_run: true,
-            scanned_objects: 0,
-            scanned_bytes: 0,
-            inserted_objects: 0,
-            already_present_objects: 0,
-            copied_bytes: 0,
-        };
-        for fail_write in [true, false] {
-            let mut writer = FailingReportWriter {
-                fail_write,
-                written: Vec::new(),
+        let expected = concat!(
+            "scanned_records: 1\nreferenced_objects: 2\n",
+            "scanned_quarantine_candidates: 3\n",
+            "removed_missing_quarantine_candidates: 4\n",
+            "removed_reachable_quarantine_candidates: 5\n",
+            "removed_held_quarantine_candidates: 6\n",
+            "scanned_retention_holds: 7\n",
+            "removed_expired_retention_holds: 8\n",
+            "removed_missing_retention_holds: 9\n",
+            "scanned_webhook_deliveries: 10\n",
+            "removed_stale_webhook_deliveries: 11\n",
+            "removed_future_webhook_deliveries: 12\n",
+        );
+        for prefix in ["", "repair"] {
+            let mut output = Vec::new();
+            write_lifecycle_repair_summary_prefixed(&mut output, &report, prefix).unwrap();
+            let expected = if prefix.is_empty() {
+                expected.to_owned()
+            } else {
+                expected
+                    .lines()
+                    .map(|line| format!("repair.{line}\n"))
+                    .collect()
             };
-            assert_eq!(
-                write_config_check_summary(&mut writer, &config)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_database_migration_summary(&mut writer, &database)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_storage_migration_summary(&mut writer, &storage)
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_lifecycle_repair_cli_summary(
-                    &mut writer,
-                    &empty_lifecycle_repair_report(),
-                    Path::new("/root"),
-                    3600
-                )
-                .unwrap_err()
-                .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(
-                write_local_gc_cli_summary(
-                    &mut writer,
-                    &empty_gc_report(),
-                    "dry-run",
-                    Path::new("/root"),
-                    3600,
-                    false,
-                    None,
-                    None
-                )
-                .unwrap_err()
-                .raw_os_error(),
-                Some(28)
-            );
-            assert_eq!(writer.written.is_empty(), fail_write);
+            assert_eq!(output, expected.as_bytes());
+            assert_writer_errors(|writer| {
+                write_lifecycle_repair_summary_prefixed(writer, &report, prefix)
+            });
         }
+        let mut output = Vec::new();
+        write_lifecycle_repair_cli_summary(&mut output, &report, Path::new("/root"), 3600).unwrap();
+        assert_eq!(
+            output,
+            format!("root: /root\nwebhook_retention_seconds: 3600\n{expected}").as_bytes()
+        );
+        assert_writer_errors(|writer| {
+            write_lifecycle_repair_cli_summary(writer, &report, Path::new("/root"), 3600)
+        });
     }
 }

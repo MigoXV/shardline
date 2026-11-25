@@ -1,4 +1,3 @@
-use super::RebuildError;
 use super::types::{IndexRebuildIssue, IndexRebuildIssueDetail, IndexRebuildIssueKind};
 
 /// Index-rebuild report.
@@ -30,7 +29,7 @@ use super::types::{IndexRebuildIssue, IndexRebuildIssueDetail, IndexRebuildIssue
 ///     assert!(report.is_clean());
 ///     assert!(report.preserved_latest_records_unreadable_version.is_empty());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexRebuildReport {
     /// Number of version records scanned through the configured record store.
     pub scanned_version_records: u64,
@@ -83,12 +82,10 @@ pub(crate) fn push_issue(
     kind: IndexRebuildIssueKind,
     location: String,
     detail: IndexRebuildIssueDetail,
-) -> Result<(), RebuildError> {
-    let _count = u64::try_from(report.issues.len())?;
+) {
     report.issues.push(IndexRebuildIssue {
         kind,
         location,
         detail,
     });
-    Ok(())
 }

@@ -62,10 +62,7 @@ fn cancelled_digest_stops_between_verified_members_and_can_retry() {
         metadata_ext: None,
     };
     let mut verified = HashMap::new();
-    verified.insert(
-        hash.hex(),
-        load_xorb_range_info(&objects, &hash.hex(), None).unwrap(),
-    );
+    verified.insert(hash, load_verified_xorb(&objects, &hash.hex()).unwrap());
     let digest = format!("{:x}", Sha256::digest(members.concat()));
     let checks = AtomicUsize::new(0);
     let mut verifier = file_digests::FileDigestVerifier::default();
@@ -110,10 +107,7 @@ fn cancelled_digest_reload_stops_s3_streaming_and_can_retry() {
         parse_xet_hash_hex(&hash.hex()).unwrap(),
     )
     .unwrap();
-    let info = XorbRangeInfo {
-        total_length: validated.total_length(),
-        verified_chunks: validated.chunks().to_vec(),
-    };
+    let info = validated;
     let file = MDBFileInfo {
         metadata: FileDataSequenceHeader::new(
             file_hash(&[(leaf, data.len() as u64)]),
@@ -167,7 +161,7 @@ fn cancelled_digest_reload_stops_s3_streaming_and_can_retry() {
             .unwrap();
             tokio::task::spawn_blocking(move || {
                 let mut verified = HashMap::new();
-                verified.insert(hash.hex(), info);
+                verified.insert(hash, info);
                 let checks = AtomicUsize::new(0);
                 let mut verifier = file_digests::FileDigestVerifier::default();
                 // Model an evicted source whose authenticated metadata remains cached.
@@ -293,7 +287,7 @@ fn cancelled_source_validation_stops_inside_container_and_can_retry() {
     let objects = ServerObjectStore::local(root.path().join("objects")).unwrap();
     let (hash, _) = store_members(&objects, &[b"first", b"second"]);
     let checks = AtomicUsize::new(0);
-    let result = load_xorb_range_info_with_checkpoint(&objects, &hash.hex(), None, &|| {
+    let result = load_verified_xorb_with_checkpoint(&objects, &hash.hex(), None, &|| {
         let count = checks.fetch_add(1, Ordering::SeqCst);
         if count >= 5 {
             Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
@@ -308,8 +302,8 @@ fn cancelled_source_validation_stops_inside_container_and_can_retry() {
         "validation must observe cancellation inside I/O"
     );
     let (verified, _) =
-        load_xorb_range_info_with_checkpoint(&objects, &hash.hex(), None, &|| Ok(())).unwrap();
-    assert_eq!(verified.verified_chunks.len(), 2);
+        load_verified_xorb_with_checkpoint(&objects, &hash.hex(), None, &|| Ok(())).unwrap();
+    assert_eq!(verified.chunks().len(), 2);
 }
 
 #[test]
@@ -467,7 +461,7 @@ fn source_validation_and_file_digest_share_materializations() {
         };
         let mut verifier = file_digests::FileDigestVerifier::default();
         let (records, identities) = build_file_records_with_cache(
-            vec![file],
+            &[file],
             &objects,
             Some(&repository),
             None,
@@ -567,8 +561,9 @@ fn cached_source_change_is_rejected(
     let root = tempfile::tempdir().unwrap();
     let objects = ServerObjectStore::local(root.path().join("objects")).unwrap();
     let (hash, leaves) = store_members(&objects, &[b"first", b"second"]);
-    let (info, source) = load_xorb_range_info_with_source(&objects, &hash.hex(), None).unwrap();
-    let mut cache = HashMap::from([(hash.hex(), info)]);
+    let (info, source) =
+        load_verified_xorb_with_checkpoint(&objects, &hash.hex(), None, &|| Ok(())).unwrap();
+    let mut cache = HashMap::from([(hash, info)]);
     let mut verifier = file_digests::FileDigestVerifier::default();
     verifier.retain_verified_source(&hash.hex(), source);
     let key = xorb_object_key(&hash.hex()).unwrap();
@@ -584,7 +579,7 @@ fn cached_source_change_is_rejected(
         )),
     };
     build_file_records_with_cache(
-        vec![file],
+        &[file],
         &objects,
         None,
         None,

@@ -1,9 +1,14 @@
 [tasks.build]
-description = "Build all shardline workspace crates"
+description = "Build the shardline server and CLI"
 workspace = false
 command = "cargo"
-args = ["build", "--workspace", "--all-features", "${@}"]
-dependencies = ["clean"]
+args = ["build", "--locked", "-p", "shardline", "--bin", "shardline", "${@}"]
+
+[tasks.build-workspace]
+description = "Build all workspace tools and optional features, including fuzz targets"
+workspace = false
+command = "cargo"
+args = ["build", "--locked", "--workspace", "--all-features", "${@}"]
 
 [tasks.format-rust]
 description = "Format Rust code using rustfmt"
@@ -30,6 +35,17 @@ workspace = false
 command = "cargo"
 args = ["fmt", "--check", "--all"]
 
+# Ordinary builds preserve Cargo's artifact cache. Clean builds are explicit.
+[tasks.build-clean]
+description = "Clean artifacts, then build the shardline server and CLI"
+workspace = false
+dependencies = ["clean", "build"]
+
+[tasks.build-prod-clean]
+description = "Clean artifacts, then build the optimized shardline server and CLI"
+workspace = false
+dependencies = ["clean", "build-prod"]
+
 [tasks.clean]
 description = "Remove build artifacts"
 workspace = false
@@ -50,11 +66,10 @@ command = "cargo"
 args = ["audit", "${@}"]
 
 [tasks.build-prod]
-description = "Build optimized release binaries"
+description = "Build the optimized shardline server and CLI"
 workspace = false
 command = "cargo"
-args = ["build", "--workspace", "--release", "--all-features", "${@}"]
-dependencies = ["clean"]
+args = ["build", "--locked", "--release", "-p", "shardline", "--bin", "shardline", "${@}"]
 
 [tasks.check]
 description = "Quick compilation check without building"
@@ -62,24 +77,30 @@ workspace = false
 command = "cargo"
 args = ["check", "--workspace", "--all-targets", "--all-features", "${@}"]
 
+# Check the executable and exact version before considering an installation.
+# Explicit metadata also works for tasks whose command is a Bash script.
+[tasks.setup-nextest]
+description = "Reuse or install the pinned Nextest test runner"
+workspace = false
+install_crate = { crate_name = "cargo-nextest", binary = "cargo-nextest", test_arg = "--version", version = "0.9.123" }
+command = "cargo"
+args = ["nextest", "--version"]
+
 [tasks.test]
 description = "Run workspace lib tests (fast, no external infrastructure needed)"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "cargo"
 args = ["nextest", "run", "--workspace", "--lib", "${@}"]
 
 [tasks.test-integration]
 description = "Run integration tests (requires Docker: Postgres, MinIO, Redis)"
 workspace = false
-dependencies = ["build-reliability-runtime-fixture"]
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest", "build-reliability-runtime-fixture"]
 command = "cargo"
-# Nextest unions multiple -E expressions. Select all integration binaries once,
-# including Xet format contracts, without rerunning library tests in this gate.
-args = ["nextest", "run", "--locked", "--workspace", "--exclude", "shardline-fuzz", "--all-features", "-E", "kind(test)", "${@}"]
+# Select integration targets before compilation so this gate also avoids building
+# library test harnesses. The literal glob includes newly added integration tests.
+args = ["nextest", "run", "--locked", "--workspace", "--exclude", "shardline-fuzz", "--all-features", "--test", "*", "-E", "kind(test)", "${@}"]
 
 [tasks.test-reliability-contracts]
 description = "Verify historical evidence, native profiles and durable task recovery without external services"
@@ -100,8 +121,7 @@ args = ["rustc", "-p", "shardline-reliability", "--features", "process-runtime",
 [tasks.test-postgres]
 description = "Run Postgres-gated tests (requires DATABASE_URL env var)"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "bash"
 args = ["scripts/test-postgres.sh"]
 
@@ -126,8 +146,7 @@ args = ["scripts/shardline/verify_disk_pressure.py", "${@}"]
 [tasks.test-e2e]
 description = "Run e2e integration tests from the e2e/ folder"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "cargo"
 args = ["nextest", "run", "--locked", "--all-features", "${@}"]
 cwd = "e2e"
@@ -135,8 +154,7 @@ cwd = "e2e"
 [tasks.test-docker]
 description = "Run Docker-backed server integration and end-to-end tests"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "bash"
 args = ["-c", "docker version >/dev/null && cargo nextest run --locked -p shardline-server --features docker && (cd e2e && cargo nextest run --locked --all-features)"]
 
@@ -201,13 +219,13 @@ args = ["expand", "${@}"]
 description = "Run shardline protocol microbenchmarks"
 workspace = false
 command = "cargo"
-args = ["bench", "-p", "shardline-protocol", "--bench", "protocol_core", "--", "--noplot", "${@}"]
+args = ["bench", "-p", "shardline-bench", "--bench", "protocol_core", "--", "--noplot", "${@}"]
 
 [tasks.shardline-bench-local-backend]
 description = "Run shardline local-backend microbenchmarks"
 workspace = false
 command = "cargo"
-args = ["bench", "-p", "shardline-server", "--bench", "local_backend", "--", "--noplot", "${@}"]
+args = ["bench", "-p", "shardline-bench", "--bench", "local_backend", "--", "--noplot", "${@}"]
 
 [tasks.shardline-bench-e2e]
 description = "Run the shardline deterministic end-to-end benchmark suite"
@@ -397,6 +415,7 @@ dependencies = ["ci-full", "test-overflow", "test-miri", "test-asan", "test-loom
 [tasks.test-loom]
 description = "Run Loom concurrency model-checking tests"
 workspace = false
+dependencies = ["setup-nextest"]
 command = "bash"
 args = ["-c", "RUSTFLAGS='--cfg loom' cargo nextest run -p shardline-loom-tests"]
 
@@ -436,16 +455,14 @@ args = ["${@}"]
 [tasks.chaos-test]
 description = "Run the deterministic chaos-testing orchestrator (fault injection + invariant checks)"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "cargo"
 args = ["nextest", "run", "-p", "shardline-server", "--test", "chaos_runner", "${@}"]
 
 [tasks.chaos-deployment]
 description = "Boot the shardline-chaos stack, migrate, and run real-deployment chaos drills"
 workspace = false
-install_crate = "cargo-nextest@0.9.123"
-install_crate_args = ["--locked", "--force"]
+dependencies = ["setup-nextest"]
 command = "bash"
 args = [
   "-c",

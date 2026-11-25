@@ -20,11 +20,6 @@ use crate::{
 use super::super::{AppState, parse_query_map};
 use super::helpers::{OciRepository, oci_manifest_index_key, oci_tag_key, oci_tag_prefix};
 
-struct OciTagListPage {
-    tags: Vec<String>,
-    has_more: bool,
-}
-
 pub(crate) async fn oci_tags_list(
     state: &Arc<AppState>,
     uri: &axum::http::Uri,
@@ -40,22 +35,25 @@ pub(crate) async fn oci_tags_list(
 
     // Per the OCI Distribution spec, when n is zero the endpoint MUST return
     // an empty list and MUST NOT include a Link header.
-    if page_size == 0 {
-        let body = serde_json::to_vec(&serde_json::json!({
-            "name": repository,
-            "tags": [],
-        }))?;
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .header(CONTENT_LENGTH, body.len().to_string())
-            .body(Body::from(body))
-            .map_err(|_error| ServerError::Overflow);
-    }
-
-    let tag_page = list_oci_tags(state, repository, repo.capability(), page_size, last).await?;
-    let tags = tag_page.tags;
-    let has_more = tag_page.has_more;
+    let mut tags = if page_size == 0 {
+        Vec::new()
+    } else {
+        backfill_legacy_oci_tags(state, repository, repo.capability()).await?;
+        state
+            .backend
+            .list_oci_tags(
+                &scope_namespace(repo.capability().namespace()),
+                repository,
+                last,
+                page_size.saturating_add(1),
+            )
+            .await?
+            .into_iter()
+            .map(|entry| entry.tag)
+            .collect::<Vec<_>>()
+    };
+    let has_more = tags.len() > page_size;
+    tags.truncate(page_size);
     let body = serde_json::to_vec(&serde_json::json!({
         "name": repository,
         "tags": tags,
@@ -73,31 +71,6 @@ pub(crate) async fn oci_tags_list(
     builder
         .body(Body::from(body))
         .map_err(|_error| ServerError::Overflow)
-}
-
-async fn list_oci_tags(
-    state: &Arc<AppState>,
-    repository: &str,
-    auth: &AuthorizedRepository,
-    page_size: usize,
-    last: Option<&str>,
-) -> Result<OciTagListPage, ServerError> {
-    backfill_legacy_oci_tags(state, repository, auth).await?;
-    let entries = state
-        .backend
-        .list_oci_tags(
-            &scope_namespace(auth.namespace()),
-            repository,
-            last,
-            page_size.saturating_add(1),
-        )
-        .await?;
-    let mut tags: Vec<String> = entries.into_iter().map(|entry| entry.tag).collect();
-    let has_more = tags.len() > page_size;
-    if has_more {
-        let _removed = tags.pop();
-    }
-    Ok(OciTagListPage { tags, has_more })
 }
 
 pub(crate) async fn update_oci_tags(
@@ -206,9 +179,6 @@ fn parse_oci_tag_list_page_size(value: Option<&str>) -> Result<usize, ServerErro
     let page_size = value
         .parse::<usize>()
         .map_err(|_error| ServerError::InvalidManifestReference)?;
-    if page_size == 0 {
-        return Ok(0);
-    }
     if page_size > super::super::MAX_OCI_TAG_LIST_PAGE_SIZE {
         return Err(ServerError::InvalidManifestReference);
     }
@@ -252,47 +222,35 @@ mod tests {
     // ── parse_oci_tag_list_page_size ────────────────────────────────────
 
     #[test]
-    fn default_page_size_when_none() {
-        assert_eq!(
-            parse_oci_tag_list_page_size(None).unwrap(),
-            super::super::super::MAX_OCI_TAG_LIST_PAGE_SIZE
-        );
-    }
-
-    #[test]
-    fn zero_page_size_returns_zero() {
-        assert_eq!(parse_oci_tag_list_page_size(Some("0")).unwrap(), 0);
-    }
-
-    #[test]
-    fn valid_page_size_returned() {
-        assert_eq!(parse_oci_tag_list_page_size(Some("10")).unwrap(), 10);
-    }
-
-    #[test]
-    fn max_page_size_accepted() {
+    fn page_size_accepts_default_and_protocol_bounds() {
         let max = super::super::super::MAX_OCI_TAG_LIST_PAGE_SIZE;
-        assert_eq!(
-            parse_oci_tag_list_page_size(Some(&max.to_string())).unwrap(),
-            max
-        );
+        let max_value = max.to_string();
+        for (value, expected) in [
+            (None, max),
+            (Some("0"), 0),
+            (Some("10"), 10),
+            (Some(max_value.as_str()), max),
+        ] {
+            assert_eq!(
+                parse_oci_tag_list_page_size(value).unwrap(),
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
-    fn oversized_page_size_rejected() {
-        let oversized = super::super::super::MAX_OCI_TAG_LIST_PAGE_SIZE + 1;
-        assert!(matches!(
-            parse_oci_tag_list_page_size(Some(&oversized.to_string())),
-            Err(ServerError::InvalidManifestReference)
-        ));
-    }
-
-    #[test]
-    fn non_numeric_page_size_rejected() {
-        assert!(matches!(
-            parse_oci_tag_list_page_size(Some("abc")),
-            Err(ServerError::InvalidManifestReference)
-        ));
+    fn page_size_rejects_invalid_values() {
+        let oversized = (super::super::super::MAX_OCI_TAG_LIST_PAGE_SIZE + 1).to_string();
+        for value in [oversized.as_str(), "abc", "", "-1", " 10", "10 "] {
+            assert!(
+                matches!(
+                    parse_oci_tag_list_page_size(Some(value)),
+                    Err(ServerError::InvalidManifestReference)
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     // ── oci_tags_list_next_link ─────────────────────────────────────────
@@ -310,62 +268,22 @@ mod tests {
     // ── oci_created_response ────────────────────────────────────────────
 
     #[test]
-    fn created_response_with_digest() {
-        let digest_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let response =
-            oci_created_response("/v2/team/assets/blobs/uploads/abc", Some(digest_hex)).unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert!(response.headers().get("Docker-Content-Digest").is_some());
-        assert_eq!(
-            response
+    fn created_response_preserves_location_and_optional_digest() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for (location, digest) in [
+            ("/v2/team/assets/blobs/uploads/abc", Some(digest)),
+            ("/v2/team/assets/blobs/uploads/abc", None),
+            ("/v2/test/blob/uploads/123", None),
+        ] {
+            let response = oci_created_response(location, digest).unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.headers()[axum::http::header::LOCATION], location);
+            let expected = digest.map(|digest| format!("sha256:{digest}"));
+            let actual = response
                 .headers()
                 .get("Docker-Content-Digest")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            format!("sha256:{digest_hex}")
-        );
-    }
-
-    #[test]
-    fn created_response_without_digest() {
-        let response = oci_created_response("/v2/team/assets/blobs/uploads/abc", None).unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert!(response.headers().get("Docker-Content-Digest").is_none());
-    }
-
-    // ── validate_oci_tag in tags list (line 37) ──────────────────────────
-
-    #[test]
-    fn validate_oci_tag_accepts_valid_rejects_invalid() {
-        assert!(validate_oci_tag("valid-tag").is_ok());
-        assert!(validate_oci_tag("v1.0.0").is_ok());
-        assert!(validate_oci_tag("").is_err());
-        assert!(validate_oci_tag("tag with spaces").is_err());
-        assert!(validate_oci_tag("tag\nnewline").is_err());
-    }
-
-    // ── oci_tags_list_next_link ─────────────────────────────────────────
-
-    #[test]
-    fn next_link_encodes_last_parameter() {
-        let header = oci_tags_list_next_link("team/assets", 10, "v1.0").unwrap();
-        let value = header.to_str().unwrap();
-        assert!(value.contains("last=v1.0"));
-    }
-
-    // ── oci_created_response edge cases ──────────────────────────────────
-
-    #[test]
-    fn created_response_includes_location_header() {
-        let response = oci_created_response("/v2/test/blob/uploads/123", None).unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::LOCATION)
-                .unwrap(),
-            "/v2/test/blob/uploads/123"
-        );
+                .map(|value| value.to_str().unwrap());
+            assert_eq!(actual, expected.as_deref());
+        }
     }
 }

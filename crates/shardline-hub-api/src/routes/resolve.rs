@@ -132,13 +132,9 @@ async fn resolve_file_for_repository(
                         stream_object(&state.object_store, key, size).into_response()
                     }
                     super::lfs::LfsRangeSelection::Partial(range) => {
-                        let range_length = range
-                            .end_inclusive()
-                            .checked_sub(range.start())
-                            .and_then(|distance| distance.checked_add(1))
-                            .ok_or_else(|| {
-                                HubApiError::CasError("invalid file range".to_owned())
-                            })?;
+                        let range_length = range.len().ok_or_else(|| {
+                            HubApiError::CasError("invalid file range".to_owned())
+                        })?;
                         super::object_io::stream_object_range(
                             &state.object_store,
                             key,
@@ -228,8 +224,7 @@ async fn resolve_file_for_repository(
             if let Some(hash) = xet_hash {
                 let stored_repo = state
                     .store
-                    .get_repo(&name)
-                    .map_err(|error| HubApiError::CasError(error.to_string()))?
+                    .get_repo(&name)?
                     .ok_or(HubApiError::RepoNotFound)?;
                 let mut refresh = url::Url::parse(&state.public_base_url)
                     .map_err(|error| HubApiError::CasError(error.to_string()))?;

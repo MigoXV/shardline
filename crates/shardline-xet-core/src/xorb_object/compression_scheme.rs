@@ -126,31 +126,25 @@ impl CompressionScheme {
     ///
     /// Returns [`CoreError`] when the underlying compression library fails.
     pub fn compress_from_slice<'a>(&self, data: &'a [u8]) -> Result<Cow<'a, [u8]>, CoreError> {
-        Ok(match self {
-            CompressionScheme::Auto => {
-                return self.resolve_for_data(data).compress_from_slice(data);
-            }
-            CompressionScheme::None => data.into(),
-            CompressionScheme::LZ4 => lz4_compress_from_slice(data).map(Cow::from)?,
-            CompressionScheme::ByteGrouping4LZ4 => {
-                bg4_lz4_compress_from_slice(data).map(Cow::from)?
-            }
-        })
+        match self {
+            CompressionScheme::Auto => self.resolve_for_data(data).compress_from_slice(data),
+            CompressionScheme::None => Ok(data.into()),
+            CompressionScheme::LZ4 => lz4_compress_from_slice(data).map(Cow::from),
+            CompressionScheme::ByteGrouping4LZ4 => bg4_lz4_compress_from_slice(data).map(Cow::from),
+        }
     }
 
     pub fn decompress_from_slice<'a>(&self, data: &'a [u8]) -> Result<Cow<'a, [u8]>, CoreError> {
-        Ok(match self {
-            CompressionScheme::Auto => {
-                return Err(CoreError::MalformedData(
-                    "Cannot decompress with Auto scheme".to_string(),
-                ));
-            }
-            CompressionScheme::None => data.into(),
-            CompressionScheme::LZ4 => lz4_decompress_from_slice(data).map(Cow::from)?,
+        match self {
+            CompressionScheme::Auto => Err(CoreError::MalformedData(
+                "Cannot decompress with Auto scheme".to_string(),
+            )),
+            CompressionScheme::None => Ok(data.into()),
+            CompressionScheme::LZ4 => lz4_decompress_from_slice(data).map(Cow::from),
             CompressionScheme::ByteGrouping4LZ4 => {
-                bg4_lz4_decompress_from_slice(data).map(Cow::from)?
+                bg4_lz4_decompress_from_slice(data).map(Cow::from)
             }
-        })
+        }
     }
 
     pub fn decompress_from_reader<R: Read, W: Write>(
@@ -158,16 +152,14 @@ impl CompressionScheme {
         reader: &mut R,
         writer: &mut W,
     ) -> Result<u64, CoreError> {
-        Ok(match self {
-            CompressionScheme::Auto => {
-                return Err(CoreError::MalformedData(
-                    "Cannot decompress with Auto scheme".to_string(),
-                ));
-            }
-            CompressionScheme::None => copy(reader, writer)?,
-            CompressionScheme::LZ4 => lz4_decompress_from_reader(reader, writer)?,
-            CompressionScheme::ByteGrouping4LZ4 => bg4_lz4_decompress_from_reader(reader, writer)?,
-        })
+        match self {
+            CompressionScheme::Auto => Err(CoreError::MalformedData(
+                "Cannot decompress with Auto scheme".to_string(),
+            )),
+            CompressionScheme::None => copy(reader, writer).map_err(CoreError::from),
+            CompressionScheme::LZ4 => lz4_decompress_from_reader(reader, writer),
+            CompressionScheme::ByteGrouping4LZ4 => bg4_lz4_decompress_from_reader(reader, writer),
+        }
     }
 
     /// Decompresses `reader` into `writer` while enforcing a `declared_len`
@@ -190,7 +182,7 @@ impl CompressionScheme {
             )),
             CompressionScheme::None => copy_limited(reader, writer, declared_len),
             CompressionScheme::LZ4 => {
-                lz4_decompress_from_reader_limited(reader, writer, declared_len)
+                copy_limited(&mut FrameDecoder::new(reader), writer, declared_len)
             }
             CompressionScheme::ByteGrouping4LZ4 => {
                 bg4_lz4_decompress_from_reader_limited(reader, writer, declared_len)
@@ -283,27 +275,12 @@ fn lz4_decompress_from_reader<R: Read, W: Write>(
     Ok(copy(&mut dec, writer)?)
 }
 
-fn lz4_decompress_from_reader_limited<R: Read, W: Write>(
-    reader: &mut R,
-    writer: &mut W,
-    declared_len: u64,
-) -> Result<u64, CoreError> {
-    let mut dec = FrameDecoder::new(reader);
-    let mut limited = LimitedWriter::new(writer, declared_len);
-    copy(&mut dec, &mut limited).map_err(map_limit_io_error)
-}
-
 fn bg4_lz4_compress_from_slice(data: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let grouped = bg4_split(data);
-    let mut enc = FrameEncoder::new(Vec::with_capacity(grouped.len()));
-    enc.write_all(&grouped)?;
-    Ok(enc.finish()?)
+    lz4_compress_from_slice(&bg4_split(data))
 }
 
 fn bg4_lz4_decompress_from_slice(data: &[u8]) -> Result<Vec<u8>, CoreError> {
-    let mut dest = vec![];
-    bg4_lz4_decompress_from_reader(&mut Cursor::new(data), &mut dest)?;
-    Ok(dest)
+    Ok(bg4_regroup(&lz4_decompress_from_slice(data)?))
 }
 
 fn bg4_lz4_decompress_from_reader<R: Read, W: Write>(
@@ -352,14 +329,14 @@ mod tests {
 
     #[test]
     fn from_and_into_static_str_covers_all_variants() {
-        for scheme in [
-            CompressionScheme::None,
-            CompressionScheme::LZ4,
-            CompressionScheme::ByteGrouping4LZ4,
-            CompressionScheme::Auto,
+        for (scheme, expected) in [
+            (CompressionScheme::None, "none"),
+            (CompressionScheme::LZ4, "lz4"),
+            (CompressionScheme::ByteGrouping4LZ4, "bg4-lz4"),
+            (CompressionScheme::Auto, "auto"),
         ] {
             let s: &'static str = scheme.into();
-            assert!(!s.is_empty());
+            assert_eq!(s, expected);
             let s_ref: &'static str = (&scheme).into();
             assert_eq!(s, s_ref);
         }
@@ -374,6 +351,7 @@ mod tests {
             (99, CompressionScheme::Auto),
         ] {
             assert_eq!(CompressionScheme::try_from(val).unwrap(), expected);
+            assert_eq!(expected as u8, val);
         }
     }
 
@@ -408,7 +386,7 @@ mod tests {
 
     #[test]
     fn from_str_invalid_values() {
-        for s in ["gzip", "zstd", "lz5", "lz4-hc", "bg4", "unknown"] {
+        for s in ["gzip", "zstd", "lz5", "lz4-hc", "bg4", "unknown", "garbage"] {
             assert!(
                 s.parse::<CompressionScheme>().is_err(),
                 "should fail for: {s}"
@@ -450,16 +428,48 @@ mod tests {
     }
 
     #[test]
-    fn compress_and_decompress_all_non_auto() {
-        let data = b"Hello, this is a comprehensive test of all compression schemes!";
-        for scheme in &[
-            CompressionScheme::None,
-            CompressionScheme::LZ4,
-            CompressionScheme::ByteGrouping4LZ4,
+    fn codec_roundtrips_and_bounded_reader_limits() {
+        for data in [
+            b"Hello, this is a comprehensive test of all compression schemes!".as_slice(),
+            b"Reader-based decompression across all schemes".as_slice(),
         ] {
-            let compressed = scheme.compress_from_slice(data).unwrap();
-            let decompressed = scheme.decompress_from_slice(&compressed).unwrap();
-            assert_eq!(&*decompressed, data, "roundtrip failed for {scheme:?}");
+            for scheme in [
+                CompressionScheme::None,
+                CompressionScheme::LZ4,
+                CompressionScheme::ByteGrouping4LZ4,
+            ] {
+                let compressed = scheme.compress_from_slice(data).unwrap();
+                assert_eq!(&*scheme.decompress_from_slice(&compressed).unwrap(), data);
+                let mut output = Vec::new();
+                let n = scheme
+                    .decompress_from_reader(&mut Cursor::new(&*compressed), &mut output)
+                    .unwrap();
+                assert_eq!(n, data.len() as u64);
+                assert_eq!(output, data);
+                for limit in [data.len() as u64, data.len() as u64 + 1] {
+                    output.clear();
+                    let n = scheme
+                        .decompress_from_reader_bounded(
+                            &mut Cursor::new(&*compressed),
+                            &mut output,
+                            limit,
+                        )
+                        .unwrap();
+                    assert_eq!(n, data.len() as u64);
+                    assert_eq!(output, data);
+                }
+                output.clear();
+                let limit = data.len() as u64 - 1;
+                let error = scheme
+                    .decompress_from_reader_bounded(
+                        &mut Cursor::new(&*compressed),
+                        &mut output,
+                        limit,
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, CoreError::MalformedData(_)));
+                assert!(output.len() as u64 <= limit);
+            }
         }
     }
 
@@ -478,28 +488,6 @@ mod tests {
         let result = CompressionScheme::Auto.decompress_from_slice(b"garbage");
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), CoreError::MalformedData(_)));
-    }
-
-    #[test]
-    fn decompress_from_reader_all_non_auto() {
-        let data = b"Reader-based decompression across all schemes";
-        for scheme in &[
-            CompressionScheme::None,
-            CompressionScheme::LZ4,
-            CompressionScheme::ByteGrouping4LZ4,
-        ] {
-            let compressed = scheme.compress_from_slice(data).unwrap();
-            let mut reader = Cursor::new(&*compressed);
-            let mut writer = Vec::new();
-            let n = scheme
-                .decompress_from_reader(&mut reader, &mut writer)
-                .unwrap();
-            assert_eq!(n, data.len() as u64);
-            assert_eq!(
-                &writer, data,
-                "decompress_from_reader failed for {scheme:?}"
-            );
-        }
     }
 
     #[test]
@@ -532,8 +520,9 @@ mod tests {
     fn compress_none_uses_cow_borrowed() {
         let data = b"no compression test data";
         let compressed = CompressionScheme::None.compress_from_slice(data).unwrap();
-        // None scheme returns borrowed Cow
+        // None scheme returns the original bytes without copying.
         assert!(matches!(compressed, Cow::Borrowed(_)));
+        assert_eq!(compressed.as_ref(), data);
     }
 
     #[test]
@@ -567,67 +556,28 @@ mod tests {
     // --- BG4-specific regression tests ---
 
     #[test]
-    fn bg4_roundtrip_small_payload() {
-        let data = b"Hello, this tests BG4 byte-interleaving compression!";
-        let compressed = CompressionScheme::ByteGrouping4LZ4
-            .compress_from_slice(data)
-            .unwrap();
-        let decompressed = CompressionScheme::ByteGrouping4LZ4
-            .decompress_from_slice(&compressed)
-            .unwrap();
-        assert_eq!(&*decompressed, data);
-    }
-
-    #[test]
-    fn bg4_roundtrip_empty() {
-        let data: &[u8] = b"";
-        let compressed = CompressionScheme::ByteGrouping4LZ4
-            .compress_from_slice(data)
-            .unwrap();
-        let decompressed = CompressionScheme::ByteGrouping4LZ4
-            .decompress_from_slice(&compressed)
-            .unwrap();
-        assert!(decompressed.is_empty());
-    }
-
-    #[test]
-    fn bg4_roundtrip_single_byte() {
-        let data = &[42u8];
-        let compressed = CompressionScheme::ByteGrouping4LZ4
-            .compress_from_slice(data)
-            .unwrap();
-        let decompressed = CompressionScheme::ByteGrouping4LZ4
-            .decompress_from_slice(&compressed)
-            .unwrap();
-        assert_eq!(&*decompressed, data);
-    }
-
-    #[test]
-    fn bg4_roundtrip_not_multiple_of_4() {
-        // Test various sizes that don't divide evenly by 4
-        for n in [1, 2, 3, 5, 7, 13, 65535, 65537, 131073] {
-            let data: Vec<u8> = (0..n).map(|i| (i % 256) as u8).collect();
-            let compressed = CompressionScheme::ByteGrouping4LZ4
-                .compress_from_slice(&data)
+    fn bg4_roundtrips_slice_and_reader_across_payload_sizes() {
+        let cases = [
+            b"Hello, this tests BG4 byte-interleaving compression!".to_vec(),
+            vec![42],
+        ]
+        .into_iter()
+        .chain(
+            [0, 1, 2, 3, 5, 7, 13, 10000, 65535, 65536, 65537, 131073]
+                .into_iter()
+                .map(|len| (0..len).map(|i| (i % 256) as u8).collect()),
+        );
+        let scheme = CompressionScheme::ByteGrouping4LZ4;
+        for data in cases {
+            let compressed = scheme.compress_from_slice(&data).unwrap();
+            assert_eq!(&*scheme.decompress_from_slice(&compressed).unwrap(), data);
+            let mut output = Vec::new();
+            let written = scheme
+                .decompress_from_reader(&mut Cursor::new(&*compressed), &mut output)
                 .unwrap();
-            let decompressed = CompressionScheme::ByteGrouping4LZ4
-                .decompress_from_slice(&compressed)
-                .unwrap();
-            assert_eq!(*decompressed, data, "BG4 roundtrip failed for size {n}");
+            assert_eq!(written, data.len() as u64);
+            assert_eq!(output, data);
         }
-    }
-
-    #[test]
-    fn bg4_roundtrip_chunk_sized_payload() {
-        // Typical chunk size used in shardline (64 KiB)
-        let data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
-        let compressed = CompressionScheme::ByteGrouping4LZ4
-            .compress_from_slice(&data)
-            .unwrap();
-        let decompressed = CompressionScheme::ByteGrouping4LZ4
-            .decompress_from_slice(&compressed)
-            .unwrap();
-        assert_eq!(*decompressed, data);
     }
 
     #[test]
@@ -661,21 +611,6 @@ mod tests {
             .decompress_from_slice(&compressed)
             .unwrap();
         assert_eq!(*decompressed, data);
-    }
-
-    #[test]
-    fn bg4_roundtrip_reader_based() {
-        let data: Vec<u8> = (0..10000).map(|i| (i % 256) as u8).collect();
-        let compressed = CompressionScheme::ByteGrouping4LZ4
-            .compress_from_slice(&data)
-            .unwrap();
-        let mut reader = Cursor::new(&*compressed);
-        let mut writer = Vec::new();
-        let n = CompressionScheme::ByteGrouping4LZ4
-            .decompress_from_reader(&mut reader, &mut writer)
-            .unwrap();
-        assert_eq!(n, data.len() as u64);
-        assert_eq!(writer, data);
     }
 
     #[test]

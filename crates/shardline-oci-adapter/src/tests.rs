@@ -7,7 +7,6 @@
     clippy::ignored_unit_patterns
 )]
 
-use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -112,7 +111,9 @@ use shardline_protocol::{RepositoryProvider, RepositoryScope};
 use shardline_storage::{DeleteOutcome, ObjectKey, PutOutcome};
 
 /// No-op backend used in tests that never creates S3 multipart uploads.
-struct TestBackend;
+#[path = "../tests/support/backend.rs"]
+mod backend;
+use backend::{NO_BACKEND, TestBackend};
 
 // ── MockS3Backend ──────────────────────────────────────────────────────────
 
@@ -263,68 +264,6 @@ impl OciBackend for MockS3Backend {
     }
 }
 
-impl OciBackend for TestBackend {
-    async fn create_resumable_object_upload(
-        &self,
-        _object_key: &ObjectKey,
-    ) -> Result<Option<String>, OciAdapterError> {
-        Ok(None)
-    }
-
-    async fn upload_resumable_object_part(
-        &self,
-        _object_key: &ObjectKey,
-        _upload_id: &str,
-        _part_idx: usize,
-        _bytes: Bytes,
-    ) -> Result<String, OciAdapterError> {
-        Err(OciAdapterError::NotFound)
-    }
-
-    async fn complete_resumable_object_upload(
-        &self,
-        _object_key: &ObjectKey,
-        _upload_id: &str,
-        _parts: Vec<(usize, String)>,
-    ) -> Result<(), OciAdapterError> {
-        Err(OciAdapterError::NotFound)
-    }
-
-    async fn abort_resumable_object_upload(
-        &self,
-        _object_key: &ObjectKey,
-        _upload_id: &str,
-    ) -> Result<(), OciAdapterError> {
-        Ok(())
-    }
-
-    fn put_sha256_addressed_object_bytes_if_absent(
-        &self,
-        _object_key: &ObjectKey,
-        _digest_hex: &str,
-        _bytes: Vec<u8>,
-    ) -> Result<PutOutcome, OciAdapterError> {
-        Ok(PutOutcome::Inserted)
-    }
-
-    fn copy_object_if_absent(
-        &self,
-        _source: &ObjectKey,
-        _destination: &ObjectKey,
-    ) -> Result<PutOutcome, OciAdapterError> {
-        Ok(PutOutcome::Inserted)
-    }
-
-    async fn delete_object_if_present(
-        &self,
-        _object_key: &ObjectKey,
-    ) -> Result<DeleteOutcome, OciAdapterError> {
-        Ok(DeleteOutcome::Deleted)
-    }
-}
-
-const NO_BACKEND: Option<&TestBackend> = None;
-
 fn temp_root() -> TempDir {
     tempfile::tempdir().expect("failed to create temp dir")
 }
@@ -337,23 +276,28 @@ fn max_sessions() -> NonZeroUsize {
     NonZeroUsize::new(100).unwrap()
 }
 
-fn create_test_session(
-    root: &Path,
-    use_s3: bool,
-) -> impl Future<Output = Result<String, OciAdapterError>> {
-    let root = root.to_path_buf();
-    async move {
-        create_upload_session(
-            &root,
-            NO_BACKEND,
-            "repo",
-            None,
-            ttl(),
-            max_sessions(),
-            use_s3,
-        )
-        .await
+fn upload_session_fixture() -> OciUploadSession {
+    OciUploadSession {
+        repository: "repo".to_owned(),
+        scope_namespace: "global".to_owned(),
+        created_at_unix_seconds: 0,
+        last_touched_unix_seconds: 0,
+        use_s3_multipart: false,
+        s3_multipart: None,
     }
+}
+
+async fn create_test_session(root: &Path, use_s3: bool) -> Result<String, OciAdapterError> {
+    create_upload_session(
+        root,
+        NO_BACKEND,
+        "repo",
+        None,
+        ttl(),
+        max_sessions(),
+        use_s3,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -440,52 +384,93 @@ async fn read_upload_session_does_not_write_missing_canonical_evidence() {
 
 #[tokio::test]
 async fn malformed_reliability_envelope_is_not_downgraded_to_legacy() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
-    metadata["evidence"] = serde_json::json!("corrupt");
-    tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
-        .await
-        .unwrap();
+    for field in [
+        "evidence",
+        "snapshot_evidence",
+        "journal_head",
+        "journal_bytes",
+        "journal_evidence_sequence",
+        "journal_snapshot_sequence",
+        "merkle_evidence_sequence",
+        "merkle_snapshot_sequence",
+        "journal_evidence_head",
+        "journal_snapshot_head",
+        "reliability_head_metadata",
+    ] {
+        let root = temp_root();
+        let session_id = create_test_session(root.path(), false).await.unwrap();
+        let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
+        metadata.as_object_mut().unwrap().remove("evidence");
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("snapshot_evidence");
+        metadata[field] = serde_json::json!("corrupt");
+        tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .await
+            .unwrap();
 
-    let error = read_upload_session(root.path(), &session_id, ttl())
-        .await
-        .unwrap_err();
-    assert!(matches!(error, OciAdapterError::Json(_)));
+        let error = read_upload_session(root.path(), &session_id, ttl())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OciAdapterError::Json(_)), "{field}");
+    }
 }
 
 #[tokio::test]
 async fn tampered_merkle_journal_is_rejected() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let path = crate::fs::upload_evidence_journal_path(root.path(), &session_id);
-    let mut value: serde_json::Value = serde_json::from_slice(
-        tokio::fs::read(&path)
+    for (field, missing) in [
+        ("merkle_commits", false),
+        ("snapshot_merkle_commits", false),
+        ("merkle_commits", true),
+        ("snapshot_merkle_commits", true),
+    ] {
+        let root = temp_root();
+        let session_id = create_test_session(root.path(), false).await.unwrap();
+        // Exercise the historical full-journal reader, not a file-length check.
+        let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
+        metadata["reliability_head_metadata"] = serde_json::json!(false);
+        tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
             .await
-            .unwrap()
-            .split(|byte| *byte == b'\n')
-            .find(|line| !line.is_empty())
-            .unwrap(),
-    )
-    .unwrap();
-    value["snapshot_merkle_commits"][0]["body"]["sequence"] = serde_json::json!(9);
-    tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
-        .await
+            .unwrap();
+        read_upload_session(root.path(), &session_id, ttl())
+            .await
+            .unwrap();
+        let path = crate::fs::upload_evidence_journal_path(root.path(), &session_id);
+        let mut value: serde_json::Value = serde_json::from_slice(
+            tokio::fs::read(&path)
+                .await
+                .unwrap()
+                .split(|byte| *byte == b'\n')
+                .find(|line| !line.is_empty())
+                .unwrap(),
+        )
         .unwrap();
+        if missing {
+            value[field] = serde_json::json!([]);
+        } else {
+            value[field][0]["body"]["sequence"] = serde_json::json!(9);
+        }
+        tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+            .await
+            .unwrap();
 
-    let error = read_upload_session(root.path(), &session_id, ttl())
-        .await
-        .unwrap_err();
-    assert!(matches!(error, OciAdapterError::Reliability(_)));
+        let error = read_upload_session(root.path(), &session_id, ttl())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OciAdapterError::Reliability(_)));
 
-    crate::repair_upload_session_evidence(root.path(), &session_id)
-        .await
-        .unwrap();
-    read_upload_session(root.path(), &session_id, ttl())
-        .await
-        .unwrap();
+        crate::repair_upload_session_evidence(root.path(), &session_id)
+            .await
+            .unwrap();
+        read_upload_session(root.path(), &session_id, ttl())
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -530,19 +515,32 @@ async fn create_s3_multipart_session_persists_metadata() {
 
 #[tokio::test]
 async fn create_upload_session_with_repository_scope_works() {
-    let root = temp_root();
-    let session_id = create_upload_session(
-        root.path(),
-        NO_BACKEND,
-        "my-repo",
-        None,
-        ttl(),
-        max_sessions(),
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(!session_id.is_empty());
+    let bound_scope = test_scope();
+    for (repository, scope) in [
+        ("my-repo", None),
+        ("team/assets", Some(&bound_scope)),
+        ("team/assets/cache", Some(&bound_scope)),
+    ] {
+        let root = temp_root();
+        let session_id = create_upload_session(
+            root.path(),
+            NO_BACKEND,
+            repository,
+            scope,
+            ttl(),
+            max_sessions(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!session_id.is_empty());
+        let session = read_session(root.path(), &session_id).await;
+        assert_eq!(session.repository, repository);
+        assert_eq!(
+            session.scope_namespace,
+            crate::protocol_support::scope_namespace(scope)
+        );
+    }
 }
 
 #[tokio::test]
@@ -566,25 +564,39 @@ async fn create_upload_session_rejects_invalid_repository() {
 
 #[tokio::test]
 async fn create_upload_session_rejects_invalid_repository_scope() {
-    let root = temp_root();
-    let result = create_upload_session(
-        root.path(),
-        NO_BACKEND,
-        "my-repo",
-        None,
-        ttl(),
-        max_sessions(),
-        false,
-    )
-    .await;
-    assert!(result.is_ok());
+    let scope = test_scope();
+    for repository in ["team/other", "other/assets", "team/assets-suffix"] {
+        let root = temp_root();
+        let result = create_upload_session(
+            root.path(),
+            NO_BACKEND,
+            repository,
+            Some(&scope),
+            ttl(),
+            max_sessions(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(OciAdapterError::NotFound)),
+            "{repository}: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn read_upload_session_returns_not_found_for_nonexistent() {
-    let root = temp_root();
-    let result = read_upload_session(root.path(), "10000000000000000000000000000000", ttl()).await;
-    assert!(matches!(result, Err(OciAdapterError::NotFound)));
+async fn read_upload_session_returns_not_found_for_missing() {
+    for session_id in [
+        "10000000000000000000000000000000",
+        "00000000000000000000000000000000",
+    ] {
+        let root = temp_root();
+        let result = read_upload_session(root.path(), session_id, ttl()).await;
+        assert!(
+            matches!(result, Err(OciAdapterError::NotFound)),
+            "{session_id}: {result:?}"
+        );
+    }
 }
 
 #[allow(clippy::shadow_unrelated)]
@@ -612,14 +624,42 @@ async fn append_upload_bytes_returns_not_found_for_missing_session() {
 }
 
 #[tokio::test]
-async fn upload_length_returns_correct_value() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    append_upload_bytes(root.path(), &session_id, b"abcdef")
-        .await
-        .unwrap();
-    let len = upload_length(root.path(), &session_id).await.unwrap();
-    assert_eq!(len, 6);
+async fn upload_length_and_integrity_match_empty_text_binary_and_multibuffer_content() {
+    for data in [
+        Vec::new(),
+        b"abcdef".to_vec(),
+        b"hello world".to_vec(),
+        b"integrity check".to_vec(),
+        (0_u8..=255).collect(),
+        vec![0xa5; 2 * 256 * 1024 + 1],
+    ] {
+        let root = temp_root();
+        let session_id = create_test_session(root.path(), false).await.unwrap();
+        let expected_length = data.len() as u64;
+        if !data.is_empty() {
+            assert_eq!(
+                append_upload_bytes(root.path(), &session_id, &data)
+                    .await
+                    .unwrap(),
+                expected_length,
+            );
+        }
+        assert_eq!(
+            upload_length(root.path(), &session_id).await.unwrap(),
+            expected_length
+        );
+        let (sha256_hex, integrity) = upload_body_integrity(root.path(), &session_id)
+            .await
+            .unwrap();
+        assert_eq!(sha256_hex, hex::encode(Sha256::digest(&data)));
+        assert_eq!(
+            integrity,
+            shardline_storage::ObjectIntegrity::new(
+                shardline_server_core::chunk_hash(&data),
+                expected_length
+            )
+        );
+    }
 }
 
 #[tokio::test]
@@ -653,122 +693,77 @@ async fn delete_upload_session_is_idempotent() {
 }
 
 #[tokio::test]
-async fn delete_upload_session_rejects_tampered_evidence() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
-    metadata["repository"] = serde_json::Value::String("tampered".to_owned());
-    tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
-        .await
-        .unwrap();
-
-    let result = delete_upload_session(root.path(), &session_id).await;
-    assert!(
-        matches!(result, Err(OciAdapterError::Reliability(_))),
-        "unexpected delete result: {result:?}"
-    );
-    assert!(tokio::fs::try_exists(&metadata_path).await.unwrap());
-    assert!(
-        tokio::fs::try_exists(crate::upload_body_path(root.path(), &session_id))
+async fn tampered_upload_session_cannot_be_read_or_deleted() {
+    for (field, value) in [
+        ("repository", serde_json::json!("tampered")),
+        ("last_touched_unix_seconds", serde_json::json!(0_u64)),
+    ] {
+        let root = temp_root();
+        let session_id = create_test_session(root.path(), false).await.unwrap();
+        let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
+        metadata[field] = value;
+        tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
             .await
-            .unwrap()
-    );
-}
+            .unwrap();
 
-#[tokio::test]
-async fn delete_upload_session_rejects_tampered_session_snapshot() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
-    metadata["last_touched_unix_seconds"] = serde_json::Value::from(0_u64);
-    tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        delete_upload_session(root.path(), &session_id).await,
-        Err(OciAdapterError::Reliability(_))
-    ));
-    assert!(tokio::fs::try_exists(&metadata_path).await.unwrap());
-}
-
-#[tokio::test]
-async fn read_upload_session_rejects_expired_tampering_without_deleting_state() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&metadata_path).await.unwrap()).unwrap();
-    metadata["last_touched_unix_seconds"] = serde_json::Value::from(0_u64);
-    tokio::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap())
-        .await
-        .unwrap();
-
-    let result = read_upload_session(root.path(), &session_id, NonZeroU64::new(1).unwrap()).await;
-    assert!(matches!(result, Err(OciAdapterError::Reliability(_))));
-    assert!(tokio::fs::try_exists(&metadata_path).await.unwrap());
-    assert!(
-        tokio::fs::try_exists(crate::upload_body_path(root.path(), &session_id))
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn read_upload_session_returns_not_found_for_missing() {
-    let root = temp_root();
-    let result = read_upload_session(root.path(), "00000000000000000000000000000000", ttl()).await;
-    assert!(matches!(result, Err(OciAdapterError::NotFound)));
+        let read = read_upload_session(root.path(), &session_id, NonZeroU64::new(1).unwrap()).await;
+        assert!(
+            matches!(read, Err(OciAdapterError::Reliability(_))),
+            "{field}: {read:?}"
+        );
+        let deletion = delete_upload_session(root.path(), &session_id).await;
+        assert!(
+            matches!(deletion, Err(OciAdapterError::Reliability(_))),
+            "{field}: {deletion:?}"
+        );
+        assert!(tokio::fs::try_exists(&metadata_path).await.unwrap());
+        assert!(
+            tokio::fs::try_exists(crate::upload_body_path(root.path(), &session_id))
+                .await
+                .unwrap()
+        );
+    }
 }
 
 #[tokio::test]
 async fn read_upload_session_returns_not_found_when_expired() {
     let root = temp_root();
     let session_id = create_test_session(root.path(), false).await.unwrap();
-    let zero_ttl = NonZeroU64::new(1).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    let result = read_upload_session(root.path(), &session_id, zero_ttl).await;
-    assert!(matches!(result, Err(OciAdapterError::NotFound)));
-}
-
-#[tokio::test]
-async fn purge_expired_upload_sessions_removes_old_sessions() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 10_000;
-    purge_expired_upload_sessions::<TestBackend>(
-        root.path(),
-        NO_BACKEND,
-        NonZeroU64::new(1).unwrap(),
-        now,
-    )
-    .await
-    .unwrap();
-    let result = read_upload_session(root.path(), &session_id, ttl()).await;
-    assert!(matches!(result, Err(OciAdapterError::NotFound)));
-}
-
-#[tokio::test]
-async fn purge_expired_upload_sessions_keeps_fresh_sessions() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+    let mut session = read_session(root.path(), &session_id).await;
+    session.last_touched_unix_seconds = 1;
+    super::persist_upload_session(root.path(), &session_id, &session)
         .await
         .unwrap();
     let result = read_upload_session(root.path(), &session_id, ttl()).await;
-    assert!(result.is_ok());
+    assert!(matches!(result, Err(OciAdapterError::NotFound)));
+}
+
+#[tokio::test]
+async fn purge_expires_sessions_at_the_ttl_boundary() {
+    let root = temp_root();
+    let session_id = create_test_session(root.path(), false).await.unwrap();
+    let session = read_session(root.path(), &session_id).await;
+    let expires_at = session.last_touched_unix_seconds + ttl().get();
+    for (now, retained) in [(expires_at - 1, true), (expires_at, false)] {
+        purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+            .await
+            .unwrap();
+        for path in [
+            crate::upload_body_path(root.path(), &session_id),
+            crate::upload_metadata_path(root.path(), &session_id),
+            crate::fs::upload_evidence_journal_path(root.path(), &session_id),
+        ] {
+            assert_eq!(path.is_file(), retained, "{path:?} at {now}");
+        }
+        let result = read_upload_session(root.path(), &session_id, ttl()).await;
+        if retained {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(OciAdapterError::NotFound)));
+        }
+    }
 }
 
 #[tokio::test]
@@ -783,106 +778,58 @@ async fn purge_expired_upload_sessions_handles_missing_upload_dir() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
-async fn upload_body_integrity_matches_expected_sha256() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let data = b"hello world";
-    append_upload_bytes(root.path(), &session_id, data)
-        .await
-        .unwrap();
-    let (sha256_hex, integrity) = upload_body_integrity(root.path(), &session_id)
-        .await
-        .unwrap();
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let expected = hex::encode(hasher.finalize());
-    assert_eq!(sha256_hex, expected);
-    assert_eq!(integrity.length(), data.len() as u64);
-}
-
-#[tokio::test]
-async fn new_upload_session_id_is_unique() {
+#[test]
+fn upload_session_ids_are_unique_hex_values() {
     let mut ids = std::collections::HashSet::new();
     for _ in 0..100 {
         let id = new_upload_session_id();
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
         assert!(ids.insert(id.clone()), "duplicate session id: {id}");
     }
 }
 
 #[test]
-fn upload_session_expired_returns_true_when_past_ttl() {
+fn upload_session_expiry_obeys_the_ttl_boundary() {
     let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
         created_at_unix_seconds: 1000,
         last_touched_unix_seconds: 1000,
-        use_s3_multipart: false,
-        s3_multipart: None,
+        ..upload_session_fixture()
     };
     let ttl = NonZeroU64::new(60).unwrap();
-    assert!(upload_session_expired(&session, ttl, 1061));
+    for (now, expired) in [(1050, false), (1059, false), (1060, true), (1061, true)] {
+        assert_eq!(upload_session_expired(&session, ttl, now), expired, "{now}");
+    }
 }
 
 #[test]
-fn upload_session_expired_returns_false_when_within_ttl() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 1000,
-        last_touched_unix_seconds: 1000,
-        use_s3_multipart: false,
-        s3_multipart: None,
-    };
-    let ttl = NonZeroU64::new(60).unwrap();
-    assert!(!upload_session_expired(&session, ttl, 1050));
-}
-
-#[test]
-fn upload_session_expired_returns_false_at_exact_boundary() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 1000,
-        last_touched_unix_seconds: 1000,
-        use_s3_multipart: false,
-        s3_multipart: None,
-    };
-    let ttl = NonZeroU64::new(60).unwrap();
-    assert!(upload_session_expired(&session, ttl, 1060));
-    assert!(!upload_session_expired(&session, ttl, 1059));
-}
-
-#[test]
-fn upload_session_ids_are_hex_and_not_reused_back_to_back() {
-    let first = new_upload_session_id();
-    let second = new_upload_session_id();
-
-    assert_eq!(first.len(), 32);
-    assert_eq!(second.len(), 32);
-    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert!(second.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(first, second);
-}
-
-#[test]
-fn serializable_sha256_state_matches_reference_digest() {
-    let mut state = SerializableSha256State::default();
-    assert!(state.update(b"chunk-1").is_ok());
-    assert!(state.update(&vec![b'x'; 1_000_000]).is_ok());
-    assert!(state.update(b"chunk-3").is_ok());
-
-    let mut reference = Sha256::new();
-    reference.update(b"chunk-1");
-    reference.update(vec![b'x'; 1_000_000]);
-    reference.update(b"chunk-3");
-    let expected = hex::encode(reference.finalize());
-
-    assert!(matches!(
-        state.finalize_hex().as_deref(),
-        Ok(actual) if actual == expected
-    ));
+fn serializable_sha256_matches_reference_and_resumes_after_each_fragment() {
+    let large = vec![b'x'; 1_000_000];
+    let cases: [(&str, &[&[u8]]); 6] = [
+        ("empty", &[]),
+        ("single", &[b"hello"]),
+        ("fragmented", &[b"hel", b"lo", b" world"]),
+        ("partial block", &[b"partial"]),
+        ("full blocks and tail", &[&[0u8; 128], b"tail"]),
+        ("large", &[b"chunk-1", &large, b"chunk-3"]),
+    ];
+    for (case, chunks) in cases {
+        let mut state = SerializableSha256State::default();
+        let mut reference = Sha256::new();
+        for chunk in chunks {
+            state.update(chunk).unwrap();
+            reference.update(chunk);
+            let before = state.finalize_hex().unwrap();
+            assert_eq!(before, hex::encode(reference.clone().finalize()), "{case}");
+            state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(state.finalize_hex().unwrap(), before, "{case}");
+        }
+        assert_eq!(
+            state.finalize_hex().unwrap(),
+            hex::encode(reference.finalize()),
+            "{case}"
+        );
+    }
 }
 
 // ── Key construction tests ──────────────────────────────────────────────────
@@ -895,156 +842,84 @@ fn test_scope() -> RepositoryScope {
     RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", None).unwrap()
 }
 
-#[test]
-fn oci_blob_key_global_namespace() {
-    let key = oci_blob_key("team/assets", VALID_DIGEST_FULL, None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("protocols/oci/global/repos/"),
-        "expected global namespace, got: {s}"
-    );
-    assert!(s.contains("/blobs/"), "expected blobs path, got: {s}");
-    assert!(
-        s.contains(VALID_DIGEST_FULL),
-        "expected digest in key, got: {s}"
-    );
+fn assert_oci_path(path: &str, scoped: bool, suffix: &str) {
+    let (namespace, _) = path
+        .strip_prefix("protocols/oci/")
+        .unwrap()
+        .split_once("/repos/")
+        .unwrap();
+    assert_eq!(namespace == "global", !scoped, "{path}");
+    if scoped {
+        assert_eq!(namespace.len(), 64, "{path}");
+        assert!(
+            namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{path}"
+        );
+    }
+    assert!(path.ends_with(suffix), "{path} must end with {suffix}");
 }
 
 #[test]
-fn oci_blob_key_with_scope() {
-    let scope = test_scope();
-    let key = oci_blob_key("team/assets", VALID_DIGEST_FULL, Some(&scope)).unwrap();
-    let s = key.as_str();
-    assert!(
-        !s.contains("/global/"),
-        "should not contain global namespace with scope, got: {s}"
-    );
-    assert!(s.contains("/blobs/"), "expected blobs path, got: {s}");
-}
-
-#[test]
-fn oci_blob_key_empty_repo_errors() {
-    assert!(matches!(
-        oci_blob_key("", VALID_DIGEST_FULL, None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_manifest_key_global_namespace() {
-    let key = oci_manifest_key("team/assets", VALID_DIGEST_FULL, None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("protocols/oci/global/repos/"),
-        "expected global namespace, got: {s}"
-    );
-    assert!(
-        s.contains("/manifests/"),
-        "expected manifests path, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_key_with_scope() {
-    let scope = test_scope();
-    let key = oci_manifest_key("team/assets", VALID_DIGEST_FULL, Some(&scope)).unwrap();
-    let s = key.as_str();
-    assert!(
-        !s.contains("/global/"),
-        "should not contain global namespace with scope, got: {s}"
-    );
-    assert!(
-        s.contains("/manifests/"),
-        "expected manifests path, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_media_type_key_contains_expected_path() {
-    let key = oci_manifest_media_type_key("team/assets", VALID_DIGEST_FULL, None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("/manifest-media-types/"),
-        "expected manifest-media-types path, got: {s}"
-    );
-}
-
-#[test]
-fn oci_tag_key_global_namespace() {
-    let key = oci_tag_key("team/assets", "latest", None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("protocols/oci/global/repos/"),
-        "expected global namespace, got: {s}"
-    );
-    assert!(s.contains("/tags/latest"), "expected tags/latest, got: {s}");
-}
-
-#[test]
-fn oci_tag_key_with_scope() {
-    let scope = test_scope();
-    let key = oci_tag_key("team/assets", "v1.0", Some(&scope)).unwrap();
-    let s = key.as_str();
-    assert!(
-        !s.contains("/global/"),
-        "should not contain global namespace with scope, got: {s}"
-    );
-    assert!(s.contains("/tags/v1.0"), "expected tags/v1.0, got: {s}");
-}
-
-#[test]
-fn oci_tag_key_empty_tag_errors() {
-    assert!(matches!(
-        oci_tag_key("team/assets", "", None),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
-}
-
-#[test]
-fn oci_manifest_prefix_returns_manifest_path() {
-    let prefix = oci_manifest_prefix("team/assets", None).unwrap();
-    let s = prefix.as_str();
-    assert!(
-        s.contains("/manifests/"),
-        "expected manifests path in prefix, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_prefix_with_scope() {
-    let scope = test_scope();
-    let prefix = oci_manifest_prefix("team/assets", Some(&scope)).unwrap();
-    let s = prefix.as_str();
-    assert!(
-        !s.contains("/global/"),
-        "should not contain global namespace with scope, got: {s}"
-    );
-    assert!(
-        s.contains("/manifests/"),
-        "expected manifests path, got: {s}"
-    );
-}
-
-#[test]
-fn oci_tag_prefix_returns_tag_path() {
-    let prefix = oci_tag_prefix("team/assets", None).unwrap();
-    let s = prefix.as_str();
-    assert!(
-        s.contains("/tags/"),
-        "expected tags path in prefix, got: {s}"
-    );
-}
-
-#[test]
-fn oci_tag_prefix_with_scope() {
-    let scope = test_scope();
-    let prefix = oci_tag_prefix("team/assets", Some(&scope)).unwrap();
-    let s = prefix.as_str();
-    assert!(
-        !s.contains("/global/"),
-        "should not contain global namespace with scope, got: {s}"
-    );
-    assert!(s.contains("/tags/"), "expected tags path, got: {s}");
+fn oci_key_and_prefix_layouts_preserve_namespaces_and_references() {
+    let repository_scope = test_scope();
+    for scope in [None, Some(&repository_scope)] {
+        // Object keys preserve historical opaque digest strings; tag-target
+        // tombstones separately require canonical SHA-256 digests.
+        for digest in [
+            VALID_DIGEST_FULL,
+            "short-digest",
+            "any-digest-string",
+            "test-digest",
+            "sha256:nothex",
+        ] {
+            for (key, kind) in [
+                (oci_blob_key("team/assets", digest, scope), "blobs"),
+                (oci_manifest_key("team/assets", digest, scope), "manifests"),
+                (
+                    oci_manifest_media_type_key("team/assets", digest, scope),
+                    "manifest-media-types",
+                ),
+            ] {
+                assert_oci_path(
+                    key.unwrap_or_else(|error| {
+                        panic!("{kind}/{digest}, scoped={}: {error}", scope.is_some())
+                    })
+                    .as_str(),
+                    scope.is_some(),
+                    &format!("/{kind}/{digest}"),
+                );
+            }
+        }
+        for tag in ["latest", "v1.0", "v1", "stable"] {
+            assert_oci_path(
+                oci_tag_key("team/assets", tag, scope).unwrap().as_str(),
+                scope.is_some(),
+                &format!("/tags/{tag}"),
+            );
+            assert_oci_path(
+                super::oci_tag_target_key("team/assets", VALID_DIGEST, tag, scope)
+                    .unwrap()
+                    .as_str(),
+                scope.is_some(),
+                &format!("/tag-targets/{VALID_DIGEST}/{tag}"),
+            );
+        }
+        for (prefix, suffix) in [
+            (
+                oci_manifest_prefix("team/assets", scope),
+                "/manifests/".to_owned(),
+            ),
+            (oci_tag_prefix("team/assets", scope), "/tags/".to_owned()),
+            (
+                super::oci_tag_target_prefix("team/assets", VALID_DIGEST, scope),
+                format!("/tag-targets/{VALID_DIGEST}/"),
+            ),
+        ] {
+            assert_oci_path(prefix.unwrap().as_str(), scope.is_some(), &suffix);
+        }
+    }
 }
 
 // ── parse_reference tests ───────────────────────────────────────────────────
@@ -1063,71 +938,17 @@ fn parse_reference_tag() {
 }
 
 #[test]
-fn parse_reference_empty_tag_errors() {
-    assert!(matches!(
-        parse_reference(""),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
-}
-
-// ── SerializableSha256State additional tests ────────────────────────────────
-
-#[test]
-fn serializable_sha256_empty_state_matches_reference() {
-    let state = SerializableSha256State::default();
-    let hex = state.finalize_hex().unwrap();
-    let reference = hex::encode(Sha256::new().finalize());
-    assert_eq!(hex, reference);
-}
-
-#[test]
-fn serializable_sha256_single_update_matches_reference() {
-    let mut state = SerializableSha256State::default();
-    state.update(b"hello").unwrap();
-    let hex = state.finalize_hex().unwrap();
-
-    let mut reference = Sha256::new();
-    reference.update(b"hello");
-    let expected = hex::encode(reference.finalize());
-    assert_eq!(hex, expected);
-}
-
-#[test]
-fn serializable_sha256_multiple_updates_match_concatenated() {
-    let mut state = SerializableSha256State::default();
-    state.update(b"hel").unwrap();
-    state.update(b"lo").unwrap();
-    state.update(b" world").unwrap();
-    let hex = state.finalize_hex().unwrap();
-
-    let mut reference = Sha256::new();
-    reference.update(b"hello world");
-    let expected = hex::encode(reference.finalize());
-    assert_eq!(hex, expected);
-}
-
-#[test]
-fn serializable_sha256_serialization_round_trip() {
-    let mut state = SerializableSha256State::default();
-    state.update(b"partial").unwrap();
-    let mid_hex = state.finalize_hex().unwrap();
-
-    let serialized = serde_json::to_vec(&state).unwrap();
-    let deserialized: SerializableSha256State = serde_json::from_slice(&serialized).unwrap();
-    let rt_hex = deserialized.finalize_hex().unwrap();
-    assert_eq!(mid_hex, rt_hex);
-}
-
-#[test]
-fn serializable_sha256_serialization_round_trip_after_multiple_updates() {
-    let mut state = SerializableSha256State::default();
-    state.update(&[0u8; 128]).unwrap(); // triggers block compression
-    state.update(b"tail").unwrap();
-    let expected_hex = state.finalize_hex().unwrap();
-
-    let serialized = serde_json::to_vec(&state).unwrap();
-    let deserialized: SerializableSha256State = serde_json::from_slice(&serialized).unwrap();
-    assert_eq!(expected_hex, deserialized.finalize_hex().unwrap());
+fn parse_reference_rejects_invalid_tags() {
+    // Other digest prefixes follow tag validation, which rejects colons.
+    for reference in ["", "md5:00112233445566778899aabbccddeeff"] {
+        assert!(
+            matches!(
+                parse_reference(reference),
+                Err(OciAdapterError::InvalidManifestReference)
+            ),
+            "{reference:?}"
+        );
+    }
 }
 
 // ── Key content-addressed uniqueness ────────────────────────────────────────
@@ -1238,23 +1059,44 @@ async fn s3_multipart_append_and_finalize() {
 
 #[tokio::test]
 async fn s3_multipart_append_triggers_part_at_chunk_boundary() {
-    let root = temp_root();
-    let backend = MockS3Backend::new();
-    let session_id = create_s3_session(root.path(), &backend).await;
-
-    // Write enough bytes to trigger a part upload (chunk size is 8 MiB).
-    let chunk = vec![b'x'; 8 * 1024 * 1024 + 100];
-    let session = read_session(root.path(), &session_id).await;
-    let (_session, length) =
-        append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, &chunk)
+    let part_size = crate::types::OCI_S3_MULTIPART_CHUNK_BYTES;
+    for length in [
+        part_size - 1,
+        part_size,
+        part_size + 100,
+        3 * part_size + 100,
+    ] {
+        let root = temp_root();
+        let backend = MockS3Backend::new();
+        let session_id = create_s3_session(root.path(), &backend).await;
+        let chunk: Vec<u8> = (0..length).map(|i| ((i / 997) % 251) as u8).collect();
+        let session = read_session(root.path(), &session_id).await;
+        let (session, observed_length) =
+            append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, &chunk)
+                .await
+                .unwrap();
+        assert_eq!(usize::try_from(observed_length).unwrap(), length);
+        let multipart = session.s3_multipart.as_ref().unwrap();
+        assert_eq!(multipart.uploaded_part_ids.len(), length / part_size);
+        let upload_id = multipart.upload_id.clone();
+        let digest = sha256_hex(&chunk);
+        let object_key = ObjectKey::parse("protocols/oci/test/blob").unwrap();
+        assert_eq!(
+            finalize_s3_multipart_upload_session(
+                root.path(),
+                &backend,
+                &session_id,
+                session,
+                &object_key,
+                &digest,
+                b"",
+            )
             .await
-            .unwrap();
-    assert_eq!(usize::try_from(length).unwrap(), chunk.len());
-
-    // One full 8 MiB part should have been uploaded.
-    let s = read_session(root.path(), &session_id).await;
-    let uploaded = s.s3_multipart.as_ref().unwrap().uploaded_part_ids.len();
-    assert_eq!(uploaded, 1, "expected 1 full part, got {uploaded}");
+            .unwrap(),
+            PutOutcome::Inserted
+        );
+        backend.assert_completed(&upload_id, &chunk.chunks(part_size).collect::<Vec<_>>());
+    }
 }
 
 #[tokio::test]
@@ -1344,10 +1186,7 @@ async fn s3_multipart_hash_mismatch_aborts() {
 
     // The mock should have recorded the abort on the multipart session.
     let s = read_session(root.path(), &session_id).await;
-    let upload_id = s.s3_multipart.as_ref().map(|m| m.upload_id.clone());
-    if let Some(upload_id) = upload_id {
-        backend.assert_aborted(&upload_id);
-    }
+    backend.assert_aborted(&s.s3_multipart.unwrap().upload_id);
 }
 
 #[allow(clippy::shadow_unrelated)]
@@ -1417,19 +1256,16 @@ fn validate_repository_accepts_valid_name() {
 }
 
 #[test]
-fn validate_repository_rejects_empty() {
-    assert!(matches!(
-        super::validate_repository(""),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn validate_repository_rejects_traversal() {
-    assert!(matches!(
-        super::validate_repository("../assets"),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
+fn validate_repository_rejects_invalid_names() {
+    for repository in ["", "../assets", "Team/assets", "team//assets"] {
+        assert!(
+            matches!(
+                super::validate_repository(repository),
+                Err(OciAdapterError::InvalidRepositoryName)
+            ),
+            "{repository:?}"
+        );
+    }
 }
 
 #[test]
@@ -1471,64 +1307,36 @@ fn upload_body_path_for_session_rejects_invalid_id() {
 }
 
 #[test]
-fn upload_session_length_without_multipart_returns_none() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: false,
-        s3_multipart: None,
-    };
-    assert_eq!(super::upload_session_length(&session), None);
-}
-
-#[test]
-fn upload_session_length_with_multipart_returns_length() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: true,
-        s3_multipart: Some(crate::OciS3MultipartUploadSession {
-            temporary_object_key: "tmp/key".to_owned(),
-            upload_id: "upload-1".to_owned(),
-            uploaded_part_ids: vec![],
-            total_length: 42,
-            sha256_state: crate::SerializableSha256State::default(),
-        }),
-    };
-    assert_eq!(super::upload_session_length(&session), Some(42));
-}
-
-#[test]
-fn upload_session_length_with_multipart_no_data_returns_zero() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: true,
-        s3_multipart: None,
-    };
-    assert_eq!(super::upload_session_length(&session), Some(0));
+fn upload_session_length_tracks_multipart_state() {
+    for (use_s3_multipart, total_length, expected) in [
+        (false, None, None),
+        (true, None, Some(0)),
+        (true, Some(0), Some(0)),
+        (true, Some(42), Some(42)),
+    ] {
+        let session = OciUploadSession {
+            use_s3_multipart,
+            s3_multipart: total_length.map(|total_length| crate::OciS3MultipartUploadSession {
+                temporary_object_key: "tmp/key".to_owned(),
+                upload_id: "upload-1".to_owned(),
+                uploaded_part_ids: vec![],
+                total_length,
+                sha256_state: crate::SerializableSha256State::default(),
+            }),
+            ..upload_session_fixture()
+        };
+        assert_eq!(
+            super::upload_session_length(&session),
+            expected,
+            "{session:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn touch_upload_session_persists_updated_timestamp() {
     let root = temp_root();
-    let session_id = super::create_upload_session(
-        root.path(),
-        NO_BACKEND,
-        "repo",
-        None,
-        ttl(),
-        max_sessions(),
-        false,
-    )
-    .await
-    .unwrap();
+    let session_id = create_test_session(root.path(), false).await.unwrap();
     let session = super::read_upload_session(root.path(), &session_id, ttl())
         .await
         .unwrap();
@@ -1549,103 +1357,112 @@ async fn touch_upload_session_persists_updated_timestamp() {
 
 #[tokio::test]
 async fn abort_s3_multipart_upload_session_no_multipart_returns_ok() {
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: false,
-        s3_multipart: None,
-    };
+    let session = upload_session_fixture();
     let backend = TestBackend;
     let result = super::abort_s3_multipart_upload_session(&backend, &session).await;
     assert!(result.is_ok());
 }
 
 #[test]
-fn oci_tag_target_key_global_namespace() {
-    let key = super::oci_tag_target_key("team/assets", VALID_DIGEST, "latest", None).unwrap();
-    let s = key.as_str();
-    assert!(s.contains("protocols/oci/global/repos/"));
-    assert!(s.contains("/tag-targets/"));
-    assert!(s.contains(VALID_DIGEST));
-    assert!(s.ends_with("/latest"));
+fn oci_keys_reject_invalid_repositories() {
+    for (case, result) in [
+        (
+            "oci_manifest_key_rejects_empty_repo",
+            super::oci_manifest_key("", VALID_DIGEST_FULL, None).err(),
+        ),
+        (
+            "oci_blob_key_empty_repo_errors",
+            oci_blob_key("", VALID_DIGEST_FULL, None).err(),
+        ),
+        (
+            "oci_tag_target_key_empty_repo_errors",
+            super::oci_tag_target_key("", VALID_DIGEST, "latest", None).err(),
+        ),
+        (
+            "oci_tag_target_prefix_empty_repo_errors",
+            super::oci_tag_target_prefix("", VALID_DIGEST, None).err(),
+        ),
+        (
+            "oci_tag_key_invalid_repo_errors",
+            super::oci_tag_key("", "latest", None).err(),
+        ),
+        (
+            "oci_manifest_prefix_invalid_repo_errors",
+            super::oci_manifest_prefix("", None).err(),
+        ),
+        (
+            "oci_tag_prefix_invalid_repo_errors",
+            super::oci_tag_prefix("", None).err(),
+        ),
+        (
+            "oci_manifest_media_type_key_empty_repo_errors",
+            super::oci_manifest_media_type_key(
+                "",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                None,
+            )
+            .err(),
+        ),
+    ] {
+        assert!(
+            matches!(result, Some(OciAdapterError::InvalidRepositoryName)),
+            "{case}: {result:?}"
+        );
+    }
 }
 
 #[test]
-fn oci_tag_target_key_with_scope() {
-    let scope = test_scope();
-    let key = super::oci_tag_target_key("team/assets", VALID_DIGEST, "v1", Some(&scope)).unwrap();
-    let s = key.as_str();
-    assert!(!s.contains("/global/"));
-    assert!(s.contains("/tag-targets/"));
+fn oci_keys_reject_invalid_tags() {
+    for (case, result) in [
+        (
+            "oci_tag_key_invalid_tag_uppercase",
+            super::oci_tag_key("team/assets", "-starts-with-hyphen", None).err(),
+        ),
+        (
+            "oci_tag_key_rejects_invalid_tag_starting_with_hyphen",
+            super::oci_tag_key("repo", "-invalid", None).err(),
+        ),
+        (
+            "oci_tag_key_empty_tag_errors",
+            oci_tag_key("team/assets", "", None).err(),
+        ),
+        (
+            "oci_tag_target_key_empty_tag_errors",
+            super::oci_tag_target_key("team/assets", VALID_DIGEST, "", None).err(),
+        ),
+        (
+            "oci_tag_key_invalid_tag_errors",
+            super::oci_tag_key("team/assets", "bad/tag", None).err(),
+        ),
+    ] {
+        assert!(
+            matches!(result, Some(OciAdapterError::InvalidManifestReference)),
+            "{case}: {result:?}"
+        );
+    }
 }
 
 #[test]
-fn oci_tag_target_key_empty_repo_errors() {
-    assert!(matches!(
-        super::oci_tag_target_key("", VALID_DIGEST, "latest", None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_tag_target_key_empty_tag_errors() {
-    assert!(matches!(
-        super::oci_tag_target_key("team/assets", VALID_DIGEST, "", None),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
-}
-
-#[test]
-fn oci_tag_target_prefix_global_namespace() {
-    let prefix = super::oci_tag_target_prefix("team/assets", VALID_DIGEST, None).unwrap();
-    let s = prefix.as_str();
-    assert!(s.contains("protocols/oci/global/repos/"));
-    assert!(s.contains("/tag-targets/"));
-    assert!(s.contains(VALID_DIGEST));
-    assert!(s.ends_with('/'));
-}
-
-#[test]
-fn oci_tag_target_prefix_with_scope() {
-    let scope = test_scope();
-    let prefix = super::oci_tag_target_prefix("team/assets", VALID_DIGEST, Some(&scope)).unwrap();
-    let s = prefix.as_str();
-    assert!(!s.contains("/global/"));
-    assert!(s.contains("/tag-targets/"));
-}
-
-#[test]
-fn oci_tag_target_prefix_empty_repo_errors() {
-    assert!(matches!(
-        super::oci_tag_target_prefix("", VALID_DIGEST, None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_tag_target_prefix_invalid_digest_errors() {
-    assert!(matches!(
-        super::oci_tag_target_prefix("team/assets", "not-a-digest", None),
-        Err(OciAdapterError::InvalidDigest)
-    ));
-}
-
-#[test]
-fn oci_tag_key_invalid_tag_errors() {
-    assert!(matches!(
-        super::oci_tag_key("team/assets", "bad/tag", None),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
-}
-
-#[test]
-fn oci_tag_key_invalid_repo_errors() {
-    assert!(matches!(
-        super::oci_tag_key("", "latest", None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
+fn oci_keys_reject_invalid_digests() {
+    for (case, result) in [
+        (
+            "oci_tag_target_prefix_invalid_digest_errors",
+            super::oci_tag_target_prefix("team/assets", "not-a-digest", None).err(),
+        ),
+        (
+            "oci_tag_target_key_invalid_digest_errors",
+            super::oci_tag_target_key("team/assets", "bad", "latest", None).err(),
+        ),
+        (
+            "oci_tag_target_prefix_errors_with_invalid_digest",
+            super::oci_tag_target_prefix("repo", "short", None).err(),
+        ),
+    ] {
+        assert!(
+            matches!(result, Some(OciAdapterError::InvalidDigest)),
+            "{case}: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1856,28 +1673,6 @@ async fn append_upload_bytes_large_content() {
 }
 
 #[tokio::test]
-async fn upload_body_integrity_handles_various_content() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Write some data and check integrity
-    let data = b"integrity check";
-    append_upload_bytes(root.path(), &session_id, data)
-        .await
-        .unwrap();
-    let (sha256_hex, integrity) = upload_body_integrity(root.path(), &session_id)
-        .await
-        .unwrap();
-
-    // Verify the SHA-256 matches
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let expected = hex::encode(hasher.finalize());
-    assert_eq!(sha256_hex, expected);
-    assert_eq!(integrity.length(), data.len() as u64);
-}
-
-#[tokio::test]
 async fn upload_body_integrity_not_found() {
     let root = temp_root();
     let session_id = create_test_session(root.path(), false).await.unwrap();
@@ -1907,22 +1702,6 @@ async fn read_upload_session_missing_local_body_returns_not_found() {
 }
 
 #[test]
-fn oci_tag_target_key_with_none_scope_uses_global() {
-    let key = super::oci_tag_target_key(
-        "team/assets",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "stable",
-        None,
-    )
-    .unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("/global/"),
-        "expected global namespace without scope, got: {s}"
-    );
-}
-
-#[test]
 fn oci_blob_key_empty_digest_fails() {
     // Empty digest produces an invalid path component that fails validation
     let result = super::oci_blob_key("repo", "", None);
@@ -1930,50 +1709,6 @@ fn oci_blob_key_empty_digest_fails() {
         result.is_err(),
         "empty digest should produce an error: got: {result:?}"
     );
-}
-
-#[test]
-fn oci_manifest_key_rejects_empty_repo() {
-    let result = super::oci_manifest_key("", VALID_DIGEST_FULL, None);
-    assert!(matches!(
-        result,
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_manifest_key_rejects_invalid_digest() {
-    // The function doesn't validate the digest, it just uses it as part of the key path
-    let result = super::oci_manifest_key("repo", "sha256:nothex", None);
-    assert!(result.is_ok(), "digest is used as opaque path component");
-}
-
-#[test]
-fn oci_tag_key_rejects_invalid_tag_starting_with_hyphen() {
-    let result = super::oci_tag_key("repo", "-invalid", None);
-    assert!(matches!(
-        result,
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
-}
-
-#[test]
-fn oci_manifest_prefix_works_with_scope() {
-    let result = super::oci_manifest_prefix("team/assets", Some(&test_scope()));
-    assert!(result.is_ok());
-}
-
-#[test]
-fn oci_tag_target_prefix_with_none_scope() {
-    let prefix = super::oci_tag_target_prefix(
-        "team/assets",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        None,
-    )
-    .unwrap();
-    let s = prefix.as_str();
-    assert!(s.contains("/global/"));
-    assert!(s.contains("/tag-targets/"));
 }
 
 #[tokio::test]
@@ -2003,107 +1738,16 @@ async fn lock_upload_sessions_reentrant_same_process() {
 }
 
 #[test]
-fn validate_repository_rejects_uppercase() {
-    assert!(matches!(
-        super::validate_repository("Team/assets"),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn validate_repository_rejects_double_slash() {
-    assert!(matches!(
-        super::validate_repository("team//assets"),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
 fn parse_reference_rejects_invalid_digest() {
-    assert!(matches!(
-        super::parse_reference("sha256:nothex"),
-        Err(OciAdapterError::InvalidDigest)
-    ));
-}
-
-#[test]
-fn oci_blob_key_includes_digest_in_path() {
-    let key = super::oci_blob_key("team/assets", "short-digest", None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("short-digest"),
-        "digest should be embedded in key, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_key_includes_digest_in_path() {
-    let key = super::oci_manifest_key("team/assets", "any-digest-string", None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("any-digest-string"),
-        "digest should be embedded in key, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_media_type_key_includes_digest_in_path() {
-    let key = super::oci_manifest_media_type_key("team/assets", "test-digest", None).unwrap();
-    let s = key.as_str();
-    assert!(
-        s.contains("test-digest"),
-        "digest should be embedded in key, got: {s}"
-    );
-}
-
-#[test]
-fn oci_manifest_prefix_invalid_repo_errors() {
-    assert!(matches!(
-        super::oci_manifest_prefix("", None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_tag_prefix_invalid_repo_errors() {
-    assert!(matches!(
-        super::oci_tag_prefix("", None),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_tag_target_key_invalid_digest_errors() {
-    assert!(matches!(
-        super::oci_tag_target_key("team/assets", "bad", "latest", None),
-        Err(OciAdapterError::InvalidDigest)
-    ));
-}
-
-#[test]
-fn oci_tag_key_with_scope_uses_hashed_namespace() {
-    let scope = test_scope();
-    let key = super::oci_tag_key("team/assets", "stable", Some(&scope)).unwrap();
-    let s = key.as_str();
-    // Must have a 64-char hex namespace (not "global")
-    assert!(
-        !s.contains("/global/"),
-        "expected scoped namespace, got: {s}"
-    );
-    assert!(
-        s.contains("/tags/stable"),
-        "expected /tags/stable, got: {s}"
-    );
-}
-
-#[test]
-fn oci_tag_key_invalid_tag_uppercase() {
-    // Tags must be valid OCI references; uppercase tags are allowed per spec,
-    // but we test what validate_oci_tag actually rejects.
-    assert!(matches!(
-        super::oci_tag_key("team/assets", "-starts-with-hyphen", None),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
+    for reference in ["sha256:nothex", "sha256:xyz-not-hex"] {
+        assert!(
+            matches!(
+                parse_reference(reference),
+                Err(OciAdapterError::InvalidDigest)
+            ),
+            "{reference:?}"
+        );
+    }
 }
 
 // ── S3 multipart error branch coverage tests ──────────────────────────────
@@ -2234,9 +1878,7 @@ async fn s3_finalize_part_upload_error_aborts() {
     assert!(result.is_err());
     // The upload should have been aborted
     let s = read_session(root.path(), &session_id).await;
-    if let Some(m) = s.s3_multipart {
-        backend.assert_aborted(&m.upload_id);
-    }
+    backend.assert_aborted(&s.s3_multipart.unwrap().upload_id);
 }
 
 #[tokio::test]
@@ -2274,9 +1916,7 @@ async fn s3_finalize_complete_error_aborts() {
     assert!(result.is_err());
     // The upload should have been aborted
     let s = read_session(root.path(), &session_id).await;
-    if let Some(m) = s.s3_multipart {
-        backend.assert_aborted(&m.upload_id);
-    }
+    backend.assert_aborted(&s.s3_multipart.unwrap().upload_id);
 }
 
 #[tokio::test]
@@ -2341,131 +1981,87 @@ async fn s3_read_upload_tail_io_error() {
 
 #[allow(clippy::shadow_unrelated)]
 #[tokio::test]
-async fn s3_write_upload_tail_empty_removes_file() {
-    // write_upload_tail with empty bytes removes existing tail file → line 1158 (Ok branch)
-    let root = temp_root();
-    let backend = MockS3Backend::new();
-    let session_id = create_s3_session(root.path(), &backend).await;
-
-    // Append 1 byte (creates tail file with 1 byte)
-    let session = read_session(root.path(), &session_id).await;
-    let (_session, _) =
-        append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, b"x")
-            .await
-            .unwrap();
-
-    // Now append exactly 8MiB - 1 byte so total = 8MiB, tail gets drained, write_upload_tail
-    // called with empty bytes, removes the existing tail file → line 1158 (Ok)
-    let remaining = vec![b'y'; 8 * 1024 * 1024 - 1];
-    let session = read_session(root.path(), &session_id).await;
-    let result =
-        append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, &remaining)
-            .await;
-    assert!(result.is_ok(), "append with exact chunk should succeed");
-}
-
-#[tokio::test]
-async fn s3_write_upload_tail_remove_non_existent() {
-    // write_upload_tail with empty bytes, no tail file → line 1159 (NotFound → Ok)
-    // This happens when the first append is exactly 8MiB (no previous tail file)
-    let root = temp_root();
-    let backend = MockS3Backend::new();
-    let session_id = create_s3_session(root.path(), &backend).await;
-
-    // Append exactly 8MiB — the full chunk gets uploaded, tail is empty,
-    // write_upload_tail(empty) tries to remove the non-existent tail file → NotFound → Ok
-    let chunk = vec![b'z'; 8 * 1024 * 1024];
-    let session = read_session(root.path(), &session_id).await;
-    let result =
-        append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, &chunk).await;
-    assert!(result.is_ok(), "exact chunk append should succeed");
-}
-
-// ── IO error branch tests ─────────────────────────────────────────────────
-
-#[tokio::test]
-async fn read_upload_session_io_error_on_inaccessible_metadata() {
-    // read_upload_session: non-NotFound IO error reading metadata → line 500
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Replace the upload directory with a file so path resolution fails with ENOTDIR
-    let upload_dir = crate::upload_dir(root.path());
-    let _ = tokio::fs::remove_dir_all(&upload_dir).await;
-    tokio::fs::write(&upload_dir, b"not-a-dir").await.unwrap();
-
-    let result = read_upload_session(root.path(), &session_id, ttl()).await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
-    // The error should NOT be NotFound (it's an Io error from failed path resolution)
-    match result {
-        Err(OciAdapterError::NotFound) => panic!("expected non-NotFound error"),
-        Err(OciAdapterError::Io(_)) => {} // expected
-        Err(other) => panic!("unexpected error: {other:?}"),
-        Ok(_) => panic!("expected error"),
+async fn exact_multipart_chunk_leaves_no_tail_with_or_without_existing_tail() {
+    for prefix in [b"".as_slice(), b"x"] {
+        let root = temp_root();
+        let backend = MockS3Backend::new();
+        let session_id = create_s3_session(root.path(), &backend).await;
+        let session = read_session(root.path(), &session_id).await;
+        let (session, _) =
+            append_s3_multipart_upload_bytes(root.path(), &backend, &session_id, session, prefix)
+                .await
+                .unwrap();
+        let tail_path = crate::upload_tail_path(root.path(), &session_id);
+        assert_eq!(tail_path.is_file(), !prefix.is_empty());
+        let remaining = vec![b'y'; crate::types::OCI_S3_MULTIPART_CHUNK_BYTES - prefix.len()];
+        let (_, length) = append_s3_multipart_upload_bytes(
+            root.path(),
+            &backend,
+            &session_id,
+            session,
+            &remaining,
+        )
+        .await
+        .unwrap();
+        assert_eq!(length, crate::types::OCI_S3_MULTIPART_CHUNK_BYTES as u64);
+        assert!(!tail_path.exists());
+        let persisted = read_session(root.path(), &session_id).await;
+        assert_eq!(persisted.s3_multipart.unwrap().uploaded_part_ids.len(), 1);
     }
 }
 
 #[tokio::test]
-async fn upload_length_io_error_on_inaccessible_body() {
-    // upload_length: non-NotFound IO error (line 583)
+async fn upload_operations_preserve_io_errors_when_upload_directory_is_a_file() {
     let root = temp_root();
     let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Replace upload directory with a file so path resolution fails
     let upload_dir = crate::upload_dir(root.path());
-    let _ = tokio::fs::remove_dir_all(&upload_dir).await;
+    tokio::fs::remove_dir_all(&upload_dir).await.unwrap();
     tokio::fs::write(&upload_dir, b"not-a-dir").await.unwrap();
 
-    let result = upload_length(root.path(), &session_id).await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
-    match result {
-        Err(OciAdapterError::NotFound) => panic!("expected non-NotFound error"),
-        Err(OciAdapterError::Io(_)) => {} // expected
-        Err(other) => panic!("unexpected error: {other:?}"),
-        Ok(_) => panic!("expected error"),
+    for (operation, result) in [
+        (
+            "read",
+            read_upload_session(root.path(), &session_id, ttl())
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "length",
+            upload_length(root.path(), &session_id).await.map(|_| ()),
+        ),
+        (
+            "append",
+            append_upload_bytes(root.path(), &session_id, b"data")
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "delete",
+            delete_upload_session(root.path(), &session_id).await,
+        ),
+        (
+            "count",
+            super::count_active_upload_sessions(root.path(), ttl())
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "purge",
+            purge_expired_upload_sessions::<TestBackend>(
+                root.path(),
+                NO_BACKEND,
+                ttl(),
+                crate::fs::unix_now_seconds_checked().unwrap(),
+            )
+            .await,
+        ),
+    ] {
+        assert!(
+            matches!(result, Err(OciAdapterError::Io(_))),
+            "{operation}: {result:?}"
+        );
     }
-}
-
-#[tokio::test]
-async fn append_upload_bytes_io_error_on_inaccessible_body() {
-    // map_not_found: non-NotFound IO error → line 536
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Replace upload directory with a file so path resolution fails
-    let upload_dir = crate::upload_dir(root.path());
-    let _ = tokio::fs::remove_dir_all(&upload_dir).await;
-    tokio::fs::write(&upload_dir, b"not-a-dir").await.unwrap();
-
-    let result = append_upload_bytes(root.path(), &session_id, b"data").await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
-    match result {
-        Err(OciAdapterError::NotFound) => panic!("expected non-NotFound error"),
-        Err(OciAdapterError::Io(_)) => {} // expected
-        Err(other) => panic!("unexpected error: {other:?}"),
-        Ok(_) => panic!("expected error"),
-    }
-}
-
-#[tokio::test]
-async fn delete_upload_session_returns_first_error() {
-    // delete_upload_session: first_error set on non-NotFound error (lines 699-702)
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Replace upload directory with a file so deletion of all three paths fails
-    let upload_dir = crate::upload_dir(root.path());
-    let _ = tokio::fs::remove_dir_all(&upload_dir).await;
-    tokio::fs::write(&upload_dir, b"not-a-dir").await.unwrap();
-
-    let result = delete_upload_session(root.path(), &session_id).await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
-    match result {
-        Err(OciAdapterError::NotFound) => panic!("expected non-NotFound error"),
-        Err(OciAdapterError::Io(_)) => {} // expected
-        Err(other) => panic!("unexpected error: {other:?}"),
-        Ok(_) => panic!("expected error"),
-    }
+    assert_eq!(tokio::fs::read(&upload_dir).await.unwrap(), b"not-a-dir");
 }
 
 #[tokio::test]
@@ -2502,202 +2098,119 @@ async fn canonical_key_matches_object_key() {
 // ── count_active_upload_sessions branch tests ────────────────────────────
 
 #[tokio::test]
-async fn count_active_sessions_read_dir_error() {
-    // count_active_upload_sessions: read_dir fails with non-NotFound error (line 940)
+async fn count_active_sessions_skips_unreadable_invalid_and_expired_metadata() {
     let root = temp_root();
-    // Create a file at the upload_dir path so read_dir fails with ENOTDIR or similar
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(root.path().join("oci-uploads"))
-        .await
-        .unwrap();
-    // Remove the directory and replace with a file
-    let _ = tokio::fs::remove_dir(&upload_dir).await;
-    tokio::fs::write(&upload_dir, b"not-a-directory")
-        .await
-        .unwrap();
-    let result = super::count_active_upload_sessions(root.path(), ttl()).await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
-}
-
-#[tokio::test]
-async fn count_active_sessions_skips_unreadable_json() {
-    // count_active_upload_sessions: fs::read fails → continue (line 951)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    // Create a directory with .json name (read will fail with EISDIR)
-    let dir_path = upload_dir.join("unreadable.json");
-    tokio::fs::create_dir(&dir_path).await.unwrap();
-    let count = super::count_active_upload_sessions(root.path(), ttl())
-        .await
-        .unwrap();
-    assert_eq!(count, 0, "unreadable json should be skipped");
-}
-
-#[tokio::test]
-async fn count_active_sessions_skips_invalid_json() {
-    // count_active_upload_sessions: serde_json::from_slice fails → continue (line 954)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    let json_path = upload_dir.join("invalid.json");
-    tokio::fs::write(&json_path, b"not-valid-json")
-        .await
-        .unwrap();
-    let count = super::count_active_upload_sessions(root.path(), ttl())
-        .await
-        .unwrap();
-    assert_eq!(count, 0, "invalid json should be skipped");
-}
-
-#[tokio::test]
-async fn count_active_sessions_skips_expired_session() {
-    // count_active_upload_sessions: expired session → continue (line 957)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    // Write an expired session (last_touched very old)
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: false,
-        s3_multipart: None,
+    create_test_session(root.path(), false).await.unwrap();
+    let unreadable = crate::upload_metadata_path(root.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    tokio::fs::create_dir(&unreadable).await.unwrap();
+    let invalid = crate::upload_metadata_path(root.path(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    tokio::fs::write(&invalid, b"not-valid-json").await.unwrap();
+    let expired_id = "cccccccccccccccccccccccccccccccc";
+    let expired_session = OciUploadSession {
+        created_at_unix_seconds: 1,
+        last_touched_unix_seconds: 1,
+        ..upload_session_fixture()
     };
-    let bytes = serde_json::to_vec(&session).unwrap();
-    let json_path = upload_dir.join("expired.json");
-    tokio::fs::write(&json_path, &bytes).await.unwrap();
-    let count = super::count_active_upload_sessions(root.path(), ttl())
+    super::persist_upload_session(root.path(), expired_id, &expired_session)
         .await
         .unwrap();
-    assert_eq!(count, 0, "expired session should be skipped");
+    // The expiry case must pass evidence validation before the counter skips it.
+    crate::fs::read_persisted_upload_session(root.path(), expired_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::count_active_upload_sessions(root.path(), ttl())
+            .await
+            .unwrap(),
+        1,
+    );
+    assert!(unreadable.is_dir());
+    assert_eq!(tokio::fs::read(&invalid).await.unwrap(), b"not-valid-json");
+    assert!(crate::upload_metadata_path(root.path(), expired_id).is_file());
 }
 
-// ── purge_expired_upload_sessions branch tests ───────────────────────────
-
 #[tokio::test]
-async fn purge_expired_session_stem_not_utf8_bin() {
-    // purge_expired_upload_sessions: file with .bin extension and non-UTF-8 stem → continue (line 1005)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    // Create a .bin file with non-UTF-8 name
-    #[cfg(unix)]
-    {
-        let bad_name = std::ffi::OsStr::from_bytes(b"\xff\xfe.bin");
-        let bad_path = upload_dir.join(bad_name);
-        tokio::fs::write(&bad_path, b"orphan").await.unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+async fn purge_skips_invalid_session_stems() {
+    for extension in ["bin", "json", "tail"] {
+        let root = temp_root();
+        let path = crate::upload_dir(root.path()).join(format!("invalid-stem.{extension}"));
+        tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        // File should remain since it was skipped (stem not valid session ID → continue on 1008)
-        // Actually on 1005: file_stem().and_then(OsStr::to_str) returns None → continue
-        // The file should NOT be removed (no metadata exists, but the non-UTF-8 stem
-        // skips the orphan-removal logic entirely — it continues at line 1005)
-        assert!(bad_path.exists(), "non-UTF-8 stem file should be skipped");
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = upload_dir;
-    }
-}
-
-#[tokio::test]
-async fn purge_expired_session_stem_validation_skips_bin() {
-    // purge_expired_upload_sessions: .bin file with invalid session ID stem → continue (line 1008)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    let bin_path = upload_dir.join("invalid-stem.bin");
-    tokio::fs::write(&bin_path, b"orphan").await.unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+        tokio::fs::write(&path, b"retained").await.unwrap();
+        purge_expired_upload_sessions::<TestBackend>(
+            root.path(),
+            NO_BACKEND,
+            ttl(),
+            crate::fs::unix_now_seconds_checked().unwrap(),
+        )
         .await
         .unwrap();
-    // File should remain (stem fails validation → continue)
-    assert!(
-        bin_path.exists(),
-        "invalid-stem .bin file should be skipped"
-    );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"retained",
+            "{extension}"
+        );
+    }
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn purge_expired_session_stem_not_utf8_json() {
-    // purge_expired_upload_sessions: .json file with non-UTF-8 stem → continue (line 1021)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    #[cfg(unix)]
-    {
-        let bad_name = std::ffi::OsStr::from_bytes(b"\xfe\xff.json");
-        let bad_path = upload_dir.join(bad_name);
-        tokio::fs::write(&bad_path, b"{}").await.unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+async fn purge_skips_non_utf8_session_stems() {
+    for name in [
+        b"\xff\xfe.bin".as_slice(),
+        b"\xfe\xff.json",
+        b"\xff\xfe.tail",
+    ] {
+        let root = temp_root();
+        let path = crate::upload_dir(root.path()).join(std::ffi::OsStr::from_bytes(name));
+        tokio::fs::create_dir_all(path.parent().unwrap())
             .await
             .unwrap();
-        // File should remain (non-UTF-8 stem → continue at line 1021)
-        assert!(bad_path.exists(), "non-UTF-8 json should be skipped");
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = upload_dir;
-    }
-}
-
-#[tokio::test]
-async fn purge_expired_session_stem_validation_skips_json() {
-    // purge_expired_upload_sessions: .json file with invalid session ID stem → continue (line 1024)
-    let root = temp_root();
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-    let json_path = upload_dir.join("invalid-stem.json");
-    tokio::fs::write(&json_path, b"{}").await.unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
+        tokio::fs::write(&path, b"retained").await.unwrap();
+        purge_expired_upload_sessions::<TestBackend>(
+            root.path(),
+            NO_BACKEND,
+            ttl(),
+            crate::fs::unix_now_seconds_checked().unwrap(),
+        )
         .await
         .unwrap();
-    assert!(
-        json_path.exists(),
-        "invalid-stem .json file should be skipped"
-    );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            b"retained",
+            "{name:?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn purge_expired_session_read_error_deletes() {
-    // purge_expired_upload_sessions: read error on .json file → delete (lines 1028-1030)
+async fn purge_preserves_session_files_when_metadata_read_fails() {
     let root = temp_root();
     let session_id = create_test_session(root.path(), false).await.unwrap();
+    append_upload_bytes(root.path(), &session_id, b"retained body")
+        .await
+        .unwrap();
+    let metadata_path = crate::upload_metadata_path(root.path(), &session_id);
+    tokio::fs::remove_file(&metadata_path).await.unwrap();
+    tokio::fs::create_dir(&metadata_path).await.unwrap();
 
-    // Replace the metadata file with a directory (read will fail, should trigger delete)
-    let meta_path = crate::upload_metadata_path(root.path(), &session_id);
-    let _ = tokio::fs::remove_file(&meta_path).await;
-    tokio::fs::create_dir(&meta_path).await.unwrap();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    // purge may return an error (delete_upload_session may fail on the directory)
-    let result =
-        purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now).await;
-    // The function may error because delete_upload_session failed on the directory content
-    // but we should hit the read-error branch regardless
-    let _ = result;
+    let result = purge_expired_upload_sessions::<TestBackend>(
+        root.path(),
+        NO_BACKEND,
+        ttl(),
+        crate::fs::unix_now_seconds_checked().unwrap(),
+    )
+    .await;
+    assert!(matches!(result, Err(OciAdapterError::Io(_))));
+    assert!(metadata_path.is_dir());
+    assert_eq!(
+        tokio::fs::read(crate::upload_body_path(root.path(), &session_id))
+            .await
+            .unwrap(),
+        b"retained body",
+    );
+    assert!(crate::fs::upload_evidence_journal_path(root.path(), &session_id).is_file());
 }
 
 #[tokio::test]
@@ -2733,28 +2246,6 @@ async fn purge_expired_s3_multipart_abort() {
 
     // The S3 multipart upload should have been aborted
     backend.assert_aborted(&upload_id);
-}
-
-#[tokio::test]
-async fn purge_expired_read_dir_error() {
-    // purge_expired_upload_sessions: read_dir fails with non-NotFound error (line 995)
-    let root = temp_root();
-    // Create a file at the upload_dir path so read_dir fails
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(root.path().join("oci-uploads"))
-        .await
-        .unwrap();
-    let _ = tokio::fs::remove_dir(&upload_dir).await;
-    tokio::fs::write(&upload_dir, b"not-a-directory")
-        .await
-        .unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let result =
-        purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now).await;
-    assert!(result.is_err(), "expected error when upload_dir is a file");
 }
 
 // ── write_upload_tail non-NotFound IO error (line 1163) ───────────────────
@@ -2831,153 +2322,70 @@ async fn purge_expired_read_error_is_preserved_with_permission_denied() {
     );
 }
 
-// ── purge_expired_upload_sessions — isolated expired + fresh ──────────────
-
-#[allow(clippy::shadow_unrelated)]
-#[tokio::test]
-async fn purge_expired_upload_sessions_removes_expired_and_keeps_fresh_sequentially() {
-    let root = temp_root();
-
-    // 1. Create an expired session and purge it.
-    let expired_id = create_test_session(root.path(), false).await.unwrap();
-    let far_future = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 10_000;
-    purge_expired_upload_sessions::<TestBackend>(
-        root.path(),
-        NO_BACKEND,
-        NonZeroU64::new(1).unwrap(),
-        far_future,
-    )
-    .await
-    .unwrap();
-    let result = read_upload_session(root.path(), &expired_id, ttl()).await;
-    assert!(
-        matches!(result, Err(OciAdapterError::NotFound)),
-        "expired session should be purged"
-    );
-
-    // 2. Create a fresh session and verify it survives a normal purge.
-    let fresh_id = create_test_session(root.path(), false).await.unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    purge_expired_upload_sessions::<TestBackend>(root.path(), NO_BACKEND, ttl(), now)
-        .await
-        .unwrap();
-    let result = read_upload_session(root.path(), &fresh_id, ttl()).await;
-    assert!(result.is_ok(), "fresh session should survive purge");
-}
-
-// ── Unix anchored-file closure coverage (path-escape closures) ────────────
-// These test the error-factory closures passed to open_anchored_target.
-// They are only invoked when the path escapes the root.
-
-#[cfg(unix)]
-#[test]
-fn open_anchored_file_rejects_escaped_path() {
-    let root = temp_root();
-    let escaped = root.path().join("../../../etc/passwd");
-    let result = super::open_anchored_file(root.path(), &escaped);
-    assert!(result.is_err(), "path escaping root should be rejected");
-}
-
-#[cfg(unix)]
-#[test]
-fn read_file_anchored_rejects_escaped_path() {
-    let root = temp_root();
-    let escaped = root.path().join("../../../etc/hostname");
-    let result = super::read_file_anchored(root.path(), &escaped);
-    assert!(result.is_err(), "path escaping root should be rejected");
-}
-
-#[cfg(unix)]
-#[test]
-fn delete_file_anchored_rejects_escaped_path() {
-    let root = temp_root();
-    let escaped = root.path().join("../../../tmp/escape");
-    let result = super::delete_file_anchored(root.path(), &escaped);
-    assert!(result.is_err(), "path escaping root should be rejected");
-}
-
-#[cfg(unix)]
-#[test]
-fn append_file_anchored_rejects_escaped_path() {
-    let root = temp_root();
-    let escaped = root.path().join("../../../tmp/escape");
-    let result = super::append_file_anchored(root.path(), &escaped, b"data");
-    assert!(result.is_err(), "path escaping root should be rejected");
-}
-
 #[cfg(unix)]
 #[tokio::test]
-async fn upload_file_len_async_rejects_escaped_path() {
+async fn anchored_file_operations_reject_escape_without_touching_outside_content() {
     let root = temp_root();
-    let escaped = root.path().join("../../../etc/passwd");
-    let result = super::upload_file_len_async(root.path(), &escaped).await;
-    assert!(result.is_err(), "path escaping root should be rejected");
+    let outside = temp_root();
+    let sentinel = outside.path().join("sentinel");
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    for escaped in [
+        sentinel.clone(),
+        root.path()
+            .join("..")
+            .join(outside.path().file_name().unwrap())
+            .join("sentinel"),
+    ] {
+        for (operation, result) in [
+            (
+                "open",
+                super::open_anchored_file(root.path(), &escaped).map(|_| ()),
+            ),
+            (
+                "read",
+                super::read_file_anchored(root.path(), &escaped).map(|_| ()),
+            ),
+            ("delete", super::delete_file_anchored(root.path(), &escaped)),
+            (
+                "append",
+                super::append_file_anchored(root.path(), &escaped, b"data").map(|_| ()),
+            ),
+            (
+                "length",
+                super::upload_file_len_async(root.path(), &escaped)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "exists",
+                super::upload_file_exists_async(root.path(), &escaped).await,
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "{operation}: {result:?}"
+            );
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    }
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn upload_file_exists_async_rejects_escaped_path() {
+async fn persist_upload_session_rejects_metadata_directory() {
     let root = temp_root();
-    let escaped = root.path().join("../../../etc/passwd");
-    let result = super::upload_file_exists_async(root.path(), &escaped).await;
-    assert!(result.is_err(), "path escaping root should be rejected");
-}
-
-// ── create_upload_session metadata write failure cleanup (lines 481-482) ──
-// This tests that create_upload_session cleans up properly when
-// write_upload_metadata fails (e.g., metadata path is a directory).
-// We pre-create a directory at the metadata path by first creating a
-// session, noting its ID, then recreating the scenario.
-
-#[tokio::test]
-async fn create_upload_session_metadata_write_failure_cleans_up() {
-    let root = temp_root();
-
-    // Create the oci-uploads directory
-    let upload_dir = crate::upload_dir(root.path());
-    tokio::fs::create_dir_all(&upload_dir).await.unwrap();
-
-    // We cannot predict the session_id, so we create a session, grab its ID,
-    // delete the session files, then create a directory at the metadata path.
-    // Then we try to call persist_upload_session (which calls
-    // write_upload_metadata) and verify the error propagates.
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-
-    // Delete the session's files so we can recreate the metadata path as dir
-    delete_upload_session(root.path(), &session_id)
-        .await
-        .unwrap();
-
-    // Create a directory at the metadata path (makes write fail)
-    let meta_path = crate::upload_metadata_path(root.path(), &session_id);
-    tokio::fs::create_dir_all(&meta_path).await.unwrap();
-
-    // Create a minimal session object and try to persist it
+    let session_id = "0123456789abcdef";
+    let metadata_path = crate::upload_metadata_path(root.path(), session_id);
+    tokio::fs::create_dir_all(&metadata_path).await.unwrap();
     let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
         created_at_unix_seconds: 1,
         last_touched_unix_seconds: 1,
-        use_s3_multipart: false,
-        s3_multipart: None,
+        ..upload_session_fixture()
     };
-    let result = super::persist_upload_session(root.path(), &session_id, &session).await;
-    assert!(
-        result.is_err(),
-        "persist should fail when metadata path is a directory"
-    );
-    match &result {
-        Err(OciAdapterError::Io(_)) | Err(OciAdapterError::BlockingTask(_)) => {} // expected
-        Err(other) => panic!("expected Io or BlockingTask error, got: {other:?}"),
-        Ok(_) => panic!("expected error"),
-    }
+    assert!(matches!(
+        super::persist_upload_session(root.path(), session_id, &session).await,
+        Err(OciAdapterError::Io(_) | OciAdapterError::BlockingTask(_))
+    ));
+    assert!(metadata_path.is_dir());
 }
 
 #[tokio::test]
@@ -2985,20 +2393,6 @@ async fn append_upload_bytes_invalid_session_id_returns_invalid_upload_session()
     let root = temp_root();
     let result = append_upload_bytes(root.path(), "bad/session/id", b"data").await;
     assert!(matches!(result, Err(OciAdapterError::InvalidUploadSession)));
-}
-
-#[tokio::test]
-async fn upload_body_integrity_empty_session() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let (sha256_hex, integrity) = upload_body_integrity(root.path(), &session_id)
-        .await
-        .unwrap();
-    let mut hasher = Sha256::new();
-    hasher.update(b"");
-    let expected = hex::encode(hasher.finalize());
-    assert_eq!(sha256_hex, expected);
-    assert_eq!(integrity.length(), 0);
 }
 
 // ── Additional edge case tests ─────────────────────────────────────────────
@@ -3011,45 +2405,6 @@ fn oci_blob_key_with_path_traversal_digest_rejected() {
         result.is_err(),
         "path traversal in digest should produce an error"
     );
-}
-
-#[test]
-fn oci_manifest_media_type_key_empty_repo_errors() {
-    assert!(matches!(
-        super::oci_manifest_media_type_key(
-            "",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            None
-        ),
-        Err(OciAdapterError::InvalidRepositoryName)
-    ));
-}
-
-#[test]
-fn oci_tag_target_prefix_errors_with_invalid_digest() {
-    assert!(matches!(
-        super::oci_tag_target_prefix("repo", "short", None),
-        Err(OciAdapterError::InvalidDigest)
-    ));
-}
-
-#[test]
-fn parse_reference_rejects_digest_with_garbage_suffix() {
-    // "sha256:" prefix detected but hex is wrong → InvalidDigest
-    assert!(matches!(
-        super::parse_reference("sha256:xyz-not-hex"),
-        Err(OciAdapterError::InvalidDigest)
-    ));
-}
-
-#[test]
-fn parse_reference_with_colon_behaves_as_tag() {
-    // "md5:" is not a "sha256:" prefix, so it's treated as a tag.
-    // Tags cannot contain colons, so it gets InvalidManifestReference.
-    assert!(matches!(
-        super::parse_reference("md5:00112233445566778899aabbccddeeff"),
-        Err(OciAdapterError::InvalidManifestReference)
-    ));
 }
 
 #[test]
@@ -3079,24 +2434,9 @@ fn upload_body_path_for_session_contains_bin_extension() {
 }
 
 #[tokio::test]
-async fn upload_length_with_zero_length_body() {
-    let root = temp_root();
-    let session_id = create_test_session(root.path(), false).await.unwrap();
-    let len = upload_length(root.path(), &session_id).await.unwrap();
-    assert_eq!(len, 0, "fresh session should have zero length");
-}
-
-#[tokio::test]
 async fn touch_upload_session_invalid_session_id_errors() {
     let root = temp_root();
-    let session = OciUploadSession {
-        repository: "repo".to_owned(),
-        scope_namespace: "global".to_owned(),
-        created_at_unix_seconds: 0,
-        last_touched_unix_seconds: 0,
-        use_s3_multipart: false,
-        s3_multipart: None,
-    };
+    let session = upload_session_fixture();
     let result = super::touch_upload_session(root.path(), "bad/session/id", session).await;
     assert!(matches!(result, Err(OciAdapterError::InvalidUploadSession)));
 }
@@ -3115,41 +2455,20 @@ mod write_file_atomically_tests {
     }
 
     #[test]
-    fn creates_file_with_expected_content() {
-        let (_dir, root) = temp_root();
-        let path = root.join("metadata.json");
-        let payload = b"{\"key\":\"value\"}";
-        crate::write_file_atomically(&root, &path, payload).unwrap();
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, payload);
-    }
-
-    #[test]
-    fn overwrites_existing_file() {
-        let (_dir, root) = temp_root();
-        let path = root.join("data.json");
-        crate::write_file_atomically(&root, &path, b"first").unwrap();
-        crate::write_file_atomically(&root, &path, b"second").unwrap();
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"second");
-    }
-
-    #[test]
-    fn handles_empty_bytes() {
-        let (_dir, root) = temp_root();
-        let path = root.join("empty.json");
-        crate::write_file_atomically(&root, &path, b"").unwrap();
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"");
-    }
-
-    #[test]
-    fn writes_into_nested_subdirectory() {
-        let (_dir, root) = temp_root();
-        let path = root.join("sub/dir/file.json");
-        crate::write_file_atomically(&root, &path, b"nested").unwrap();
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"nested");
+    fn creates_and_overwrites_files_with_expected_content() {
+        for (relative_path, payload) in [
+            ("metadata.json", b"{\"key\":\"value\"}".as_slice()),
+            ("data.json", b"first"),
+            ("empty.json", b""),
+            ("sub/dir/file.json", b"nested"),
+        ] {
+            let (_dir, root) = temp_root();
+            let path = root.join(relative_path);
+            crate::write_file_atomically(&root, &path, payload).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), payload, "{relative_path}");
+            crate::write_file_atomically(&root, &path, b"second").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"second", "{relative_path}");
+        }
     }
 
     #[test]
@@ -3196,25 +2515,34 @@ mod write_file_atomically_tests {
             result.is_err(),
             "rename should fail when target is a non-empty directory"
         );
-        // The temporary file must have been cleaned up:
-        // the directory should still contain only "child".
-        let entries: Vec<_> = std::fs::read_dir(&target)
+        assert_eq!(std::fs::read(target.join("child")).unwrap(), b"x");
+        let remaining: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .map(|entry| entry.unwrap().path())
             .collect();
-        assert_eq!(entries.len(), 1, "temp file should have been cleaned up");
+        assert_eq!(remaining, [target], "temporary sibling must be removed");
     }
+}
 
-    #[cfg(unix)]
-    #[test]
-    fn post_rename_parent_anchor_check_passes() {
-        // Verifies that ensure_parent_path_matches_anchor passes after a
-        // successful atomic write — the post-rename integrity check should
-        // not reject a valid path.
-        let (_dir, root) = temp_root();
-        let path = root.join("metadata.json");
-        crate::write_file_atomically(&root, &path, b"payload").unwrap();
-        let contents = std::fs::read(&path).unwrap();
-        assert_eq!(contents, b"payload");
+#[test]
+fn upload_snapshot_v1_preserves_the_serialized_session_schema() {
+    let mut session = upload_session_fixture();
+    for multipart in [false, true] {
+        session.use_s3_multipart = multipart;
+        if multipart {
+            let mut sha256_state = super::SerializableSha256State::default();
+            sha256_state.update(b"abc").unwrap();
+            session.s3_multipart = Some(super::OciS3MultipartUploadSession {
+                temporary_object_key: "temporary/object".into(),
+                upload_id: "upload-id".into(),
+                uploaded_part_ids: vec!["first".into(), "second".into()],
+                total_length: 3,
+                sha256_state,
+            });
+        }
+        assert_eq!(
+            serde_json::to_vec(&session.reliability_snapshot_v1()).unwrap(),
+            serde_json::to_vec(&session).unwrap(),
+        );
     }
 }

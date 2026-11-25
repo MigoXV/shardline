@@ -860,19 +860,13 @@ mod tests {
             CompressionScheme::LZ4,
         );
 
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let expected_hash = merkle_hash_to_shardline_hash(xorb_hash);
 
         let mut reader = Cursor::new(serialized.serialized_data);
         let validated = validate_serialized_xorb(&mut reader, expected_hash);
 
-        assert!(validated.is_ok());
-        let Ok(validated) = validated else {
-            return;
-        };
+        let validated = validated.expect("expected valid validated");
         for budget in [0, 10, 11] {
             let (metadata, decoded) = super::validate_serialized_xorb_with_data(
                 &mut reader,
@@ -908,10 +902,7 @@ mod tests {
         assert_eq!(validated.unpacked_length(), 11);
 
         let decoded = decode_serialized_xorb_chunks(&mut reader, &validated);
-        assert!(decoded.is_ok());
-        let Ok(decoded) = decoded else {
-            return;
-        };
+        let decoded = decoded.expect("expected valid decoded");
         assert_eq!(
             decoded.first().map(|chunk| chunk.data()),
             Some(first.as_slice())
@@ -934,10 +925,7 @@ mod tests {
             CompressionScheme::None,
         );
 
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let wrong_hash = ShardlineHash::from_bytes([9; 32]);
         let mut reader = Cursor::new(serialized.serialized_data);
         let result = validate_serialized_xorb(&mut reader, wrong_hash);
@@ -982,17 +970,11 @@ mod tests {
             vec![(chunk_hash, 5)],
             CompressionScheme::None,
         );
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let expected_hash = merkle_hash_to_shardline_hash(xorb_hash);
         let mut reader = Cursor::new(serialized.serialized_data.as_slice());
         let validated = validate_serialized_xorb(&mut reader, expected_hash);
-        assert!(validated.is_ok());
-        let Ok(validated) = validated else {
-            return;
-        };
+        let validated = validated.expect("expected valid validated");
         let first_chunk = validated.chunks().first();
         assert!(first_chunk.is_some());
         let Some(first_chunk) = first_chunk else {
@@ -1042,17 +1024,11 @@ mod tests {
             CompressionScheme::LZ4,
         );
 
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let expected_hash = merkle_hash_to_shardline_hash(xorb_hash);
         let mut reader = Cursor::new(serialized.serialized_data);
         let validated = validate_serialized_xorb(&mut reader, expected_hash);
-        assert!(validated.is_ok());
-        let Ok(validated) = validated else {
-            return;
-        };
+        let validated = validated.expect("expected valid validated");
         let mut visited = 0_u8;
 
         let result = try_for_each_serialized_xorb_chunk(&mut reader, &validated, |_chunk| {
@@ -1270,17 +1246,11 @@ mod tests {
             vec![(first_hash, 4), (second_hash, 8)],
             CompressionScheme::None,
         );
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let expected_hash = merkle_hash_to_shardline_hash(xorb_hash);
         let mut reader = Cursor::new(serialized.serialized_data);
         let validated = validate_serialized_xorb(&mut reader, expected_hash);
-        assert!(validated.is_ok());
-        let Ok(validated) = validated else {
-            return;
-        };
+        let validated = validated.expect("expected valid validated");
 
         let mut count = 0_usize;
         let result = try_for_each_serialized_xorb_chunk(&mut reader, &validated, |_chunk| {
@@ -1325,23 +1295,14 @@ mod tests {
             ],
             CompressionScheme::LZ4,
         );
-        assert!(serialized.is_ok());
-        let Ok(serialized) = serialized else {
-            return;
-        };
+        let serialized = serialized.expect("expected valid serialized");
         let expected_hash = merkle_hash_to_shardline_hash(xorb_hash);
         let mut reader = Cursor::new(serialized.serialized_data);
         let validated = validate_serialized_xorb(&mut reader, expected_hash);
-        assert!(validated.is_ok());
-        let Ok(validated) = validated else {
-            return;
-        };
+        let validated = validated.expect("expected valid validated");
 
         let decoded = decode_serialized_xorb_chunks(&mut reader, &validated);
-        assert!(decoded.is_ok());
-        let Ok(decoded) = decoded else {
-            return;
-        };
+        let decoded = decoded.expect("expected valid decoded");
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].data(), first.as_slice());
         assert_eq!(decoded[1].data(), second.as_slice());
@@ -1947,14 +1908,11 @@ mod tests {
             Vec::new(),
             CompressionScheme::None,
         );
-        // serialized_xorb_object_from_components with 0 chunks might produce
-        // an invalid xorb - just test that any errors are caught
-        if let Ok(serialized) = serialized {
-            let hash = ShardlineHash::from_bytes([0; 32]);
-            let mut reader = Cursor::new(serialized.serialized_data);
-            let result = validate_serialized_xorb(&mut reader, hash);
-            assert!(result.is_err(), "expected error for empty chunks xorb");
-        }
+        let serialized = serialized.expect("expected serialized zero-chunk fixture");
+        let hash = ShardlineHash::from_bytes([0; 32]);
+        let mut reader = Cursor::new(serialized.serialized_data);
+        let result = validate_serialized_xorb(&mut reader, hash);
+        assert!(result.is_err(), "expected error for empty chunks xorb");
     }
 
     // ── XorbVisitError display and source ──────────────────────────────
@@ -2210,13 +2168,12 @@ mod tests {
             vec![],
             CompressionScheme::None,
         );
-        if let Ok(s) = serialized {
-            assert_eq!(s.num_chunks, 0);
-            let hash_to_check = ShardlineHash::from_bytes([0xab; 32]);
-            let mut reader = Cursor::new(s.serialized_data);
-            let result = validate_serialized_xorb(&mut reader, hash_to_check);
-            assert!(result.is_err(), "zero-chunk xorb should fail validation");
-        }
+        let serialized = serialized.expect("expected serialized zero-chunk fixture");
+        assert_eq!(serialized.num_chunks, 0);
+        let hash_to_check = ShardlineHash::from_bytes([0xab; 32]);
+        let mut reader = Cursor::new(serialized.serialized_data);
+        let result = validate_serialized_xorb(&mut reader, hash_to_check);
+        assert!(result.is_err(), "zero-chunk xorb should fail validation");
     }
 
     // ── validate_serialized_xorb with reconstructed seek after validation ─

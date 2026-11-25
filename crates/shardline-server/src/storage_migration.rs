@@ -167,9 +167,8 @@ pub fn run_storage_migration(
         }
 
         let bytes = read_full_object(&source, metadata.key(), metadata.length())?;
-        let observed_length = u64::try_from(bytes.len())?;
-        validate_source_object_matches_content_addressed_key(metadata.key(), &bytes)?;
-        let integrity = ObjectIntegrity::new(chunk_hash(&bytes), observed_length);
+        let integrity = source_object_integrity(metadata.key(), &bytes)?;
+        let observed_length = integrity.length();
         let outcome =
             destination.put_if_absent(metadata.key(), ObjectBody::from_vec(bytes), &integrity)?;
         match outcome {
@@ -188,17 +187,17 @@ pub fn run_storage_migration(
     Ok(report)
 }
 
-fn validate_source_object_matches_content_addressed_key(
-    key: &ObjectKey,
-    bytes: &[u8],
-) -> Result<(), ServerError> {
-    if let Some(expected_hash) = chunk_hash_from_chunk_object_key_if_present(key)? {
+fn source_object_integrity(key: &ObjectKey, bytes: &[u8]) -> Result<ObjectIntegrity, ServerError> {
+    let length = u64::try_from(bytes.len())?;
+    let expected_chunk_hash = chunk_hash_from_chunk_object_key_if_present(key)?;
+    let physical_hash = chunk_hash(bytes);
+    if let Some(expected_hash) = expected_chunk_hash {
         // XorbCdcV1 chunk objects are stored LZ4-compressed with a 4-byte
         // little-endian uncompressed-size prefix (see download_stream.rs), so
         // their content hash only matches after decompression. FixedChunkV1
         // objects are stored raw. Either verification passing is sufficient;
         // corrupt objects fail both.
-        let observed_hash = xet_hash_hex_string(chunk_hash(bytes));
+        let observed_hash = xet_hash_hex_string(physical_hash);
         let mut matches = observed_hash == expected_hash;
         if !matches {
             let decompressed_size = bytes
@@ -229,7 +228,7 @@ fn validate_source_object_matches_content_addressed_key(
         ensure_observed_hash_matches_key(key, expected_hash, &observed_hash)?;
     }
 
-    Ok(())
+    Ok(ObjectIntegrity::new(physical_hash, length))
 }
 
 fn ensure_observed_hash_matches_key(
@@ -267,8 +266,7 @@ mod tests {
 
     use super::{
         StorageMigrationEndpoint, StorageMigrationOptions, StorageMigrationReport, endpoint_store,
-        ensure_observed_hash_matches_key, run_storage_migration,
-        validate_source_object_matches_content_addressed_key,
+        ensure_observed_hash_matches_key, run_storage_migration, source_object_integrity,
     };
     use crate::{
         ServerError,
@@ -432,15 +430,6 @@ mod tests {
         assert!(with_dry_run.dry_run);
     }
 
-    #[test]
-    fn storage_migration_options_debug_and_clone() {
-        let source = StorageMigrationEndpoint::LocalStateRoot(PathBuf::from("/src"));
-        let dest = StorageMigrationEndpoint::LocalStateRoot(PathBuf::from("/dst"));
-        let options = StorageMigrationOptions::new(source, dest);
-        let debug = format!("{options:?}");
-        assert!(debug.contains("dry_run"));
-    }
-
     // ── StorageMigrationReport ────────────────────────────────────────────
 
     #[test]
@@ -516,7 +505,6 @@ mod tests {
     fn ensure_observed_hash_matches_key_err_when_not_equal() {
         let key = ObjectKey::parse("aa/aaa").unwrap();
         let result = ensure_observed_hash_matches_key(&key, "abc", "xyz");
-        assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ServerError::ObjectStore(_)));
         let msg = format!("{err}");
@@ -524,55 +512,58 @@ mod tests {
     }
 
     #[test]
-    fn storage_migration_copies_local_objects_idempotently() {
-        let source = tempfile::tempdir();
-        assert!(source.is_ok());
-        let Ok(source) = source else {
-            return;
-        };
-        let destination = tempfile::tempdir();
-        assert!(destination.is_ok());
-        let Ok(destination) = destination else {
-            return;
-        };
-        let source_store = ServerObjectStore::local(source.path().join("chunks"));
-        assert!(source_store.is_ok());
-        let Ok(source_store) = source_store else {
-            return;
-        };
+    fn local_migration_preserves_dry_run_prefix_copy_and_idempotency_contracts() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source_store = ServerObjectStore::local(source.path().join("chunks")).unwrap();
         let body = b"payload";
-        let key = chunk_object_key_for_computed_hash(chunk_hash(body)).map(|(_hash, key)| key);
-        assert!(key.is_ok());
-        let Ok(key) = key else {
-            return;
-        };
+        let key = chunk_object_key_for_computed_hash(chunk_hash(body))
+            .unwrap()
+            .1;
         let integrity = ObjectIntegrity::new(chunk_hash(body), 7);
-        let put = source_store.put_if_absent(&key, ObjectBody::from_slice(body), &integrity);
-        assert!(put.is_ok());
-
+        source_store
+            .put_if_absent(&key, ObjectBody::from_slice(body), &integrity)
+            .unwrap();
         let options = StorageMigrationOptions::new(
             StorageMigrationEndpoint::LocalStateRoot(source.path().to_path_buf()),
             StorageMigrationEndpoint::LocalStateRoot(destination.path().to_path_buf()),
         );
-        let first = run_storage_migration(&options);
-        assert!(first.is_ok());
-        if let Ok(first) = first {
-            assert_eq!(first.scanned_objects, 1);
-            assert_eq!(first.inserted_objects, 1);
-            assert_eq!(first.already_present_objects, 0);
-            assert_eq!(first.copied_bytes, 7);
-        }
 
-        let second = run_storage_migration(&options);
-        assert!(second.is_ok());
-        if let Ok(second) = second {
-            assert_eq!(second.scanned_objects, 1);
-            assert_eq!(second.inserted_objects, 0);
-            assert_eq!(second.already_present_objects, 1);
-        }
+        let dry = run_storage_migration(&options.clone().with_dry_run(true)).unwrap();
+        assert_eq!(dry.scanned_objects, 1);
+        assert_eq!(dry.scanned_bytes, 7);
+        assert_eq!(dry.inserted_objects, 0);
+        assert_eq!(dry.copied_bytes, 0);
+        assert!(dry.dry_run);
+        let destination_path = destination.path().join("chunks").join(key.as_str());
+        assert!(!destination_path.exists());
+
+        let excluded = run_storage_migration(
+            &options
+                .clone()
+                .with_prefix("nonexistent-prefix/".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(excluded.scanned_objects, 0);
+        assert_eq!(excluded.inserted_objects, 0);
+        assert!(!destination_path.exists());
+
+        let first = run_storage_migration(&options).unwrap();
+        assert_eq!(first.scanned_objects, 1);
+        assert_eq!(first.inserted_objects, 1);
+        assert_eq!(first.already_present_objects, 0);
+        assert_eq!(first.copied_bytes, 7);
+        assert_eq!(fs::read(&destination_path).unwrap(), body);
+
+        let second = run_storage_migration(&options).unwrap();
+        assert_eq!(second.scanned_objects, 1);
+        assert_eq!(second.inserted_objects, 0);
+        assert_eq!(second.already_present_objects, 1);
+        assert_eq!(second.copied_bytes, 0);
+        assert_eq!(fs::read(destination_path).unwrap(), body);
     }
 
-    // ── validate_source_object_matches_content_addressed_key ─────────────
+    // ── source_object_integrity ─────────────
 
     #[test]
     fn migration_preserves_existing_objects_in_new_evidence_namespace() {
@@ -662,7 +653,7 @@ mod tests {
     fn validate_source_ok_for_non_content_addressed_key() {
         // A key that does not match any content-addressed pattern should pass
         let key = ObjectKey::parse("some/arbitrary/key.bin").unwrap();
-        let result = validate_source_object_matches_content_addressed_key(&key, b"any bytes");
+        let result = source_object_integrity(&key, b"any bytes");
         assert!(result.is_ok());
     }
 
@@ -681,7 +672,7 @@ mod tests {
         );
 
         // Call with wrong bytes (should trigger hash mismatch)
-        let result = validate_source_object_matches_content_addressed_key(&key, b"wrong-bytes");
+        let result = source_object_integrity(&key, b"wrong-bytes");
         assert!(result.is_err(), "expected err for hash mismatch, got ok");
         let err = result.unwrap_err();
         assert!(matches!(err, ServerError::ObjectStore(_)));
@@ -697,10 +688,13 @@ mod tests {
         let correct_hash = chunk_hash(body);
         let key = chunk_object_key(&xet_hash_hex_string(correct_hash)).unwrap();
         let compressed = lz4_flex::compress_prepend_size(body);
-        let result = validate_source_object_matches_content_addressed_key(&key, &compressed);
-        assert!(
-            result.is_ok(),
-            "expected ok for compressed chunk, got {result:?}"
+        let result = source_object_integrity(&key, &compressed);
+        assert_eq!(
+            result.unwrap(),
+            ObjectIntegrity::new(
+                chunk_hash(&compressed),
+                u64::try_from(compressed.len()).unwrap()
+            )
         );
     }
 
@@ -715,7 +709,7 @@ mod tests {
         let parsed = shard_hash_from_object_key_if_present(&key).unwrap();
         assert!(parsed.is_some(), "key should parse shard hash: {key_str}");
 
-        let result = validate_source_object_matches_content_addressed_key(&key, b"wrong-bytes");
+        let result = source_object_integrity(&key, b"wrong-bytes");
         assert!(
             result.is_err(),
             "expected err for shard hash mismatch, got ok"
@@ -761,28 +755,13 @@ mod tests {
 
     #[test]
     fn storage_migration_rejects_corrupt_source_chunk_key() {
-        let source = tempfile::tempdir();
-        assert!(source.is_ok());
-        let Ok(source) = source else {
-            return;
-        };
-        let destination = tempfile::tempdir();
-        assert!(destination.is_ok());
-        let Ok(destination) = destination else {
-            return;
-        };
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
         let key =
             ObjectKey::parse("aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(key.is_ok());
-        let Ok(key) = key else {
-            return;
-        };
+        let key = key.expect("expected valid key");
         let source_path = source.path().join("chunks").join(key.as_str());
-        let parent = source_path.parent();
-        assert!(parent.is_some());
-        let Some(parent) = parent else {
-            return;
-        };
+        let parent = source_path.parent().unwrap();
         let created = fs::create_dir_all(parent);
         assert!(created.is_ok());
         let written = fs::write(&source_path, b"corrupt-source-bytes");
@@ -809,66 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_migration_dry_run_does_not_write() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        let body = b"dry-run-payload";
-        let key = chunk_object_key_for_computed_hash(chunk_hash(body))
-            .map(|(_hash, key)| key)
-            .unwrap();
-        let source_store = ServerObjectStore::local(source.path().join("chunks")).unwrap();
-        let integrity = ObjectIntegrity::new(chunk_hash(body), body.len() as u64);
-        source_store
-            .put_if_absent(&key, ObjectBody::from_slice(body), &integrity)
-            .unwrap();
-
-        let options = StorageMigrationOptions::new(
-            StorageMigrationEndpoint::LocalStateRoot(source.path().to_path_buf()),
-            StorageMigrationEndpoint::LocalStateRoot(destination.path().to_path_buf()),
-        )
-        .with_dry_run(true);
-        let report = run_storage_migration(&options).unwrap();
-        assert_eq!(report.scanned_objects, 1);
-        assert_eq!(report.scanned_bytes, body.len() as u64);
-        assert_eq!(report.inserted_objects, 0);
-        assert_eq!(report.copied_bytes, 0);
-        assert!(report.dry_run);
-
-        // Verify destination is untouched
-        let dest_path = destination.path().join("chunks").join(key.as_str());
-        assert!(!dest_path.exists());
-    }
-
-    #[test]
-    fn storage_migration_local_to_local_with_different_prefixes() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-
-        let body = b"prefix-test-data";
-        let key = chunk_object_key_for_computed_hash(chunk_hash(body))
-            .map(|(_hash, key)| key)
-            .unwrap();
-
-        let source_store = ServerObjectStore::local(source.path().join("chunks")).unwrap();
-        let integrity = ObjectIntegrity::new(chunk_hash(body), body.len() as u64);
-        source_store
-            .put_if_absent(&key, ObjectBody::from_slice(body), &integrity)
-            .unwrap();
-
-        // Use a prefix that won't match
-        let options = StorageMigrationOptions::new(
-            StorageMigrationEndpoint::LocalStateRoot(source.path().to_path_buf()),
-            StorageMigrationEndpoint::LocalStateRoot(destination.path().to_path_buf()),
-        )
-        .with_prefix("nonexistent-prefix/".to_owned());
-        let report = run_storage_migration(&options).unwrap();
-        assert_eq!(report.scanned_objects, 0);
-        assert_eq!(report.inserted_objects, 0);
-    }
-
-    #[test]
-    fn validate_source_object_matches_content_addressed_key_xorb_path() {
+    fn source_object_integrity_xorb_path() {
         // Create a valid xorb key pattern: xorbs/default/{prefix}/{hash}.xorb
         let hash_hex = "aa".repeat(32);
         let key_str = format!("xorbs/default/{}/{}.xorb", &hash_hex[..2], hash_hex);
@@ -879,8 +799,7 @@ mod tests {
         assert!(parsed.is_some(), "key should parse xorb hash: {key_str}");
 
         // Call with bytes that are not a valid serialized xorb
-        let result =
-            validate_source_object_matches_content_addressed_key(&key, b"not-a-valid-xorb");
+        let result = source_object_integrity(&key, b"not-a-valid-xorb");
         assert!(
             result.is_err(),
             "expected err for invalid xorb bytes, got ok"
@@ -891,13 +810,13 @@ mod tests {
     fn validate_source_xorb_non_xorb_key_does_not_validate_as_xorb() {
         // A key without the xorb format should skip the xorb check
         let key = ObjectKey::parse("some/random/key.bin").unwrap();
-        let result = validate_source_object_matches_content_addressed_key(&key, b"any-data");
+        let result = source_object_integrity(&key, b"any-data");
         assert!(result.is_ok(), "non-xorb key should pass validation");
         // Also test that a valid xorb key pattern but with invalid xorb data fails
         let hash_hex = "bb".repeat(32);
         let key_str = format!("xorbs/default/{}/{}.xorb", &hash_hex[..2], hash_hex);
         let key = ObjectKey::parse(&key_str).unwrap();
-        let result = validate_source_object_matches_content_addressed_key(&key, b"\0\0\0\0");
+        let result = source_object_integrity(&key, b"\0\0\0\0");
         assert!(result.is_err(), "invalid xorb bytes should fail validation");
     }
 }

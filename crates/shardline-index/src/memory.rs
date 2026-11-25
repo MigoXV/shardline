@@ -283,9 +283,7 @@ impl ReconstructionStore for MemoryIndexStore {
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        file_ids.sort_by(|left, right| {
-            xet_hash_hex_string(left.hash()).cmp(&xet_hash_hex_string(right.hash()))
-        });
+        file_ids.sort_by_cached_key(|file_id| xet_hash_hex_string(file_id.hash()));
         Ok(file_ids)
     }
 
@@ -327,25 +325,8 @@ impl DedupeStore for MemoryIndexStore {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        mappings.sort_by(|left, right| {
-            xet_hash_hex_string(left.chunk_hash()).cmp(&xet_hash_hex_string(right.chunk_hash()))
-        });
+        mappings.sort_by_cached_key(|mapping| xet_hash_hex_string(mapping.chunk_hash()));
         Ok(mappings)
-    }
-
-    fn visit_dedupe_shard_mappings<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(DedupeShardMapping) -> Result<(), VisitorError>,
-    {
-        for mapping in DedupeStore::list_dedupe_shard_mappings(self).map_err(Into::into)? {
-            visitor(mapping)?;
-        }
-
-        Ok(())
     }
 
     fn delete_dedupe_shard_mapping(&self, chunk_hash: &ShardlineHash) -> Result<bool, Self::Error> {
@@ -394,21 +375,6 @@ impl LifecycleStore for MemoryIndexStore {
         Ok(candidates)
     }
 
-    fn visit_quarantine_candidates<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError>,
-    {
-        for candidate in LifecycleStore::list_quarantine_candidates(self).map_err(Into::into)? {
-            visitor(candidate)?;
-        }
-
-        Ok(())
-    }
-
     fn upsert_quarantine_candidate(
         &self,
         candidate: &QuarantineCandidate,
@@ -440,25 +406,7 @@ impl LifecycleStore for MemoryIndexStore {
         let Some(candidate) = state.quarantine.get(object_key).cloned() else {
             return Ok(false);
         };
-        // Build and validate the complete release evidence before mutating the
-        // materialized candidate map. A corrupted journal must leave the
-        // candidate recoverable, matching the transactional adapters.
-        let active_snapshot = quarantine_snapshot(&candidate, QuarantineLifecycleState::Active)?;
-        let evidence = state
-            .quarantine_evidence
-            .get(object_key)
-            .cloned()
-            .unwrap_or_default();
-        let released_snapshot =
-            quarantine_snapshot(&candidate, QuarantineLifecycleState::Released)?;
-        let (evidence, _) =
-            verify_and_append_snapshot_transition(evidence, active_snapshot, released_snapshot)
-                .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state.quarantine.remove(object_key);
-        state
-            .quarantine_evidence
-            .insert(object_key.clone(), evidence);
-        Ok(true)
+        state.release_quarantine_candidate(object_key, &candidate)
     }
 
     fn delete_quarantine_candidate_if_matches(
@@ -472,22 +420,7 @@ impl LifecycleStore for MemoryIndexStore {
         if candidate != *expected {
             return Ok(false);
         }
-        let active_snapshot = quarantine_snapshot(&candidate, QuarantineLifecycleState::Active)?;
-        let evidence = state
-            .quarantine_evidence
-            .get(expected.object_key())
-            .cloned()
-            .unwrap_or_default();
-        let released_snapshot =
-            quarantine_snapshot(&candidate, QuarantineLifecycleState::Released)?;
-        let (evidence, _) =
-            verify_and_append_snapshot_transition(evidence, active_snapshot, released_snapshot)
-                .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state.quarantine.remove(expected.object_key());
-        state
-            .quarantine_evidence
-            .insert(expected.object_key().clone(), evidence);
-        Ok(true)
+        state.release_quarantine_candidate(expected.object_key(), &candidate)
     }
 
     fn retention_hold(&self, object_key: &ObjectKey) -> Result<Option<RetentionHold>, Self::Error> {
@@ -507,21 +440,6 @@ impl LifecycleStore for MemoryIndexStore {
             verify_memory_retention_evidence(&state, hold)?;
         }
         Ok(holds)
-    }
-
-    fn visit_retention_holds<Visitor, VisitorError>(
-        &self,
-        mut visitor: Visitor,
-    ) -> Result<(), VisitorError>
-    where
-        Self::Error: Into<VisitorError>,
-        Visitor: FnMut(RetentionHold) -> Result<(), VisitorError>,
-    {
-        for hold in LifecycleStore::list_retention_holds(self).map_err(Into::into)? {
-            visitor(hold)?;
-        }
-
-        Ok(())
     }
 
     fn upsert_retention_hold(&self, hold: &RetentionHold) -> Result<(), Self::Error> {
@@ -553,22 +471,7 @@ impl LifecycleStore for MemoryIndexStore {
         let Some(hold) = state.retention_holds.get(object_key).cloned() else {
             return Ok(false);
         };
-        let evidence = state
-            .retention_evidence
-            .get(object_key)
-            .cloned()
-            .unwrap_or_default();
-        let (evidence, _) = verify_and_append_snapshot_transition(
-            evidence,
-            retention_snapshot(&hold, RetentionHoldLifecycleState::Active)?,
-            retention_snapshot(&hold, RetentionHoldLifecycleState::Released)?,
-        )
-        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state
-            .retention_evidence
-            .insert(object_key.clone(), evidence);
-        state.retention_holds.remove(object_key);
-        Ok(true)
+        state.release_retention_hold(object_key, &hold)
     }
 
     fn delete_retention_hold_if_matches(
@@ -582,22 +485,7 @@ impl LifecycleStore for MemoryIndexStore {
         if hold != *expected {
             return Ok(false);
         }
-        let evidence = state
-            .retention_evidence
-            .get(expected.object_key())
-            .cloned()
-            .unwrap_or_default();
-        let (evidence, _) = verify_and_append_snapshot_transition(
-            evidence,
-            retention_snapshot(&hold, RetentionHoldLifecycleState::Active)?,
-            retention_snapshot(&hold, RetentionHoldLifecycleState::Released)?,
-        )
-        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state
-            .retention_evidence
-            .insert(expected.object_key().clone(), evidence);
-        state.retention_holds.remove(expected.object_key());
-        Ok(true)
+        state.release_retention_hold(expected.object_key(), &hold)
     }
 
     fn record_webhook_delivery(&self, delivery: &WebhookDelivery) -> Result<bool, Self::Error> {
@@ -612,8 +500,9 @@ impl LifecycleStore for MemoryIndexStore {
             .cloned()
             .collect::<Vec<_>>();
         deliveries.sort_by(|left, right| {
-            provider_sort_key(left.provider())
-                .cmp(provider_sort_key(right.provider()))
+            left.provider()
+                .as_str()
+                .cmp(right.provider().as_str())
                 .then_with(|| left.owner().cmp(right.owner()))
                 .then_with(|| left.repo().cmp(right.repo()))
                 .then_with(|| left.delivery_id().cmp(right.delivery_id()))
@@ -630,18 +519,7 @@ impl LifecycleStore for MemoryIndexStore {
         let Some(current) = state.webhook_deliveries.get(&key).cloned() else {
             return Ok(false);
         };
-        let evidence = state.webhook_evidence.get(&key).cloned().ok_or_else(|| {
-            MemoryIndexStoreError::Reliability("webhook evidence is missing".into())
-        })?;
-        let (evidence, _) = verify_and_append_snapshot_transition(
-            evidence,
-            webhook_snapshot(&current, WebhookDeliveryLifecycleState::Processed)?,
-            webhook_snapshot(&current, WebhookDeliveryLifecycleState::Released)?,
-        )
-        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state.webhook_deliveries.remove(&key);
-        state.webhook_evidence.insert(key, evidence);
-        Ok(true)
+        state.release_webhook_delivery(key, &current)
     }
 
     fn delete_webhook_delivery_if_matches(
@@ -656,18 +534,7 @@ impl LifecycleStore for MemoryIndexStore {
         if current != *expected {
             return Ok(false);
         }
-        let evidence = state.webhook_evidence.get(&key).cloned().ok_or_else(|| {
-            MemoryIndexStoreError::Reliability("webhook evidence is missing".into())
-        })?;
-        let (evidence, _) = verify_and_append_snapshot_transition(
-            evidence,
-            webhook_snapshot(&current, WebhookDeliveryLifecycleState::Processed)?,
-            webhook_snapshot(&current, WebhookDeliveryLifecycleState::Released)?,
-        )
-        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
-        state.webhook_deliveries.remove(&key);
-        state.webhook_evidence.insert(key, evidence);
-        Ok(true)
+        state.release_webhook_delivery(key, &current)
     }
 
     fn provider_repository_state(
@@ -702,8 +569,9 @@ impl LifecycleStore for MemoryIndexStore {
             .cloned()
             .collect::<Vec<_>>();
         states.sort_by(|left, right| {
-            provider_sort_key(left.provider())
-                .cmp(provider_sort_key(right.provider()))
+            left.provider()
+                .as_str()
+                .cmp(right.provider().as_str())
                 .then_with(|| left.owner().cmp(right.owner()))
                 .then_with(|| left.repo().cmp(right.repo()))
         });
@@ -1138,16 +1006,11 @@ impl AsyncIndexStore for MemoryIndexStore {
         key: &'operation RepoKey,
         max_revisions: usize,
     ) -> IndexStoreFuture<'operation, u64, Self::Error> {
-        let store = self.clone();
-        let key = key.clone();
-        Box::pin(
-            async move { TreeStore::prune_revisions_over_cap(&store, &key, max_revisions).await },
-        )
+        TreeStore::prune_revisions_over_cap(self, key, max_revisions)
     }
 
     fn list_revision_repo_keys(&self) -> IndexStoreFuture<'_, Vec<RepoKey>, Self::Error> {
-        let store = self.clone();
-        Box::pin(async move { TreeStore::list_revision_repo_keys(&store).await })
+        TreeStore::list_revision_repo_keys(self)
     }
 
     impl_async_lifecycle_delegation!(MemoryIndexStore);
@@ -1172,20 +1035,24 @@ impl TreeStore for MemoryIndexStore {
             created_at_unix_seconds: entry.updated_at_unix_seconds,
             updated_at_unix_seconds: entry.updated_at_unix_seconds,
         };
-        let revision_key = MemoryRevisionKey::from_record(&rev);
+        let revision_key = revision_key(&rev);
         let count_revisions = state
             .revisions
             .keys()
             .filter(|k| {
                 k.provider == entry.provider && k.owner == entry.owner && k.repo == entry.repo
             })
+            .take(max_revisions)
             .count();
         let count_entries = state
             .tree_entries
             .keys()
             .filter(|k| {
-                k.provider == entry.provider && k.owner == entry.owner && k.repo == entry.repo
+                k.namespace.provider == entry.provider
+                    && k.namespace.owner == entry.owner
+                    && k.namespace.repo == entry.repo
             })
+            .take(max_tree_entries)
             .count();
         if (count_revisions >= max_revisions && !state.revisions.contains_key(&revision_key))
             || count_entries >= max_tree_entries
@@ -1210,7 +1077,7 @@ impl TreeStore for MemoryIndexStore {
         max_revisions: usize,
     ) -> Result<RevisionCreationOutcome, Self::Error> {
         let mut state = self.lock_state()?;
-        let key = MemoryRevisionKey::from_record(rev);
+        let key = revision_key(rev);
         if state.revisions.contains_key(&key) {
             return Ok(RevisionCreationOutcome::AlreadyExists);
         }
@@ -1218,6 +1085,7 @@ impl TreeStore for MemoryIndexStore {
             .revisions
             .keys()
             .filter(|k| k.provider == rev.provider && k.owner == rev.owner && k.repo == rev.repo)
+            .take(max_revisions)
             .count();
         if count >= max_revisions {
             return Ok(RevisionCreationOutcome::LimitExceeded);
@@ -1229,9 +1097,8 @@ impl TreeStore for MemoryIndexStore {
     async fn upsert_tree_entry(&self, entry: &TreeEntry) -> Result<TreeEntryOutcome, Self::Error> {
         let key = MemoryTreeKey::from_entry(entry);
         let mut state = self.lock_state()?;
-        let existed = state.tree_entries.contains_key(&key);
-        state.tree_entries.insert(key, entry.clone());
-        Ok(TreeEntryOutcome { created: !existed })
+        let created = state.tree_entries.insert(key, entry.clone()).is_none();
+        Ok(TreeEntryOutcome { created })
     }
 
     async fn tree_entry(
@@ -1253,21 +1120,11 @@ impl TreeStore for MemoryIndexStore {
         let mut deleted = 0u64;
         if recursive {
             let prefix_with_slash = format!("{path}/");
-            let tree = &mut state.tree_entries;
-            tree.retain(|k, _| {
-                if k.provider != key.provider
-                    || k.owner != key.owner
-                    || k.repo != key.repo
-                    || k.revision != key.revision
-                {
-                    return true;
-                }
-                if k.path == path || k.path.starts_with(&prefix_with_slash) {
-                    deleted = deleted.saturating_add(1);
-                    false
-                } else {
-                    true
-                }
+            state.tree_entries.retain(|key_entry, _| {
+                let remove = key_entry.namespace == *key
+                    && (key_entry.path == path || key_entry.path.starts_with(&prefix_with_slash));
+                deleted = deleted.saturating_add(u64::from(remove));
+                !remove
             });
         } else {
             let search = MemoryTreeKey::from_key(key, path);
@@ -1291,31 +1148,23 @@ impl TreeStore for MemoryIndexStore {
         } else {
             format!("{prefix}/")
         };
-        let mut result = Vec::new();
-        for (k, entry) in &state.tree_entries {
-            if k.provider != key.provider
-                || k.owner != key.owner
-                || k.repo != key.repo
-                || k.revision != key.revision
-            {
-                continue;
-            }
-            if !prefix.is_empty() && k.path != prefix && !k.path.starts_with(&prefix_with_slash) {
-                continue;
-            }
-            if cursor.is_some_and(|c| k.path.as_str() <= c) {
-                continue;
-            }
-            result.push(entry.clone());
-            if result.len() >= limit {
-                break;
-            }
-        }
-        Ok(result)
+        Ok(state
+            .tree_entries
+            .range(MemoryTreeKey::from_key(key, prefix)..)
+            .take_while(|(entry_key, _)| entry_key.namespace == *key)
+            .filter(|(entry_key, _)| {
+                prefix.is_empty()
+                    || entry_key.path == prefix
+                    || entry_key.path.starts_with(&prefix_with_slash)
+            })
+            .filter(|(entry_key, _)| cursor.is_none_or(|after| entry_key.path.as_str() > after))
+            .take(limit)
+            .map(|(_, entry)| entry.clone())
+            .collect())
     }
 
     async fn upsert_revision(&self, rev: &RevisionRecord) -> Result<bool, Self::Error> {
-        let key = MemoryRevisionKey::from_record(rev);
+        let key = revision_key(rev);
         let mut state = self.lock_state()?;
         let existed = state.revisions.contains_key(&key);
         state
@@ -1331,7 +1180,7 @@ impl TreeStore for MemoryIndexStore {
         key: &RepoKey,
         rev: &str,
     ) -> Result<Option<RevisionRecord>, Self::Error> {
-        let search = MemoryRevisionKey::from_key(key, rev);
+        let search = TreeKey::new(&key.provider, &key.owner, &key.repo, rev);
         Ok(self.lock_state()?.revisions.get(&search).cloned())
     }
 
@@ -1353,7 +1202,9 @@ impl TreeStore for MemoryIndexStore {
             .tree_entries
             .iter()
             .filter(|(k, _)| {
-                k.provider == key.provider && k.owner == key.owner && k.repo == key.repo
+                k.namespace.provider == key.provider
+                    && k.namespace.owner == key.owner
+                    && k.namespace.repo == key.repo
             })
             .count();
         Ok(u64::try_from(count).unwrap_or(u64::MAX))
@@ -1366,31 +1217,25 @@ impl TreeStore for MemoryIndexStore {
         limit: usize,
     ) -> Result<Vec<RevisionRecord>, Self::Error> {
         let state = self.lock_state()?;
-        // MemoryRevisionKey orders by (provider, owner, repo, revision), so a
-        // filtered BTreeMap iteration is already ordered by revision name and a
-        // keyset cursor on the revision name resumes correctly.
         Ok(state
             .revisions
-            .iter()
-            .filter(|(k, _)| {
+            .range(TreeKey::new(&key.provider, &key.owner, &key.repo, cursor.unwrap_or(""))..)
+            .take_while(|(k, _)| {
                 k.provider == key.provider && k.owner == key.owner && k.repo == key.repo
             })
-            .filter(|(k, _)| !cursor.is_some_and(|c| k.revision.as_str() <= c))
-            .map(|(_, v)| v.clone())
+            .filter(|(k, _)| cursor.is_none_or(|c| k.revision.as_str() > c))
             .take(limit)
+            .map(|(_, v)| v.clone())
             .collect())
     }
 
     async fn delete_revision(&self, key: &RepoKey, rev: &str) -> Result<u64, Self::Error> {
         let mut state = self.lock_state()?;
-        let revision_key = MemoryRevisionKey::from_key(key, rev);
+        let revision_key = TreeKey::new(&key.provider, &key.owner, &key.repo, rev);
         let removed = state.revisions.remove(&revision_key).is_some();
-        state.tree_entries.retain(|k, _| {
-            !(k.provider == key.provider
-                && k.owner == key.owner
-                && k.repo == key.repo
-                && k.revision == rev)
-        });
+        state
+            .tree_entries
+            .retain(|entry_key, _| entry_key.namespace != revision_key);
         Ok(u64::from(removed))
     }
 
@@ -1403,34 +1248,22 @@ impl TreeStore for MemoryIndexStore {
         // Collect this repo's rows and sort oldest-created-first (created-at,
         // then revision name as the deterministic tiebreaker) — the same
         // eviction order the SQL backends use.
-        let mut rows: Vec<(MemoryRevisionKey, u64, String)> = state
+        let mut rows: Vec<_> = state
             .revisions
             .iter()
             .filter(|(k, _)| {
                 k.provider == key.provider && k.owner == key.owner && k.repo == key.repo
             })
-            .map(|(k, v)| (k.clone(), v.created_at_unix_seconds, v.revision.clone()))
+            .map(|(key, revision)| (revision.created_at_unix_seconds, key.clone()))
             .collect();
-        rows.sort_by(
-            |(_, left_created, left_revision), (_, right_created, right_revision)| {
-                left_created
-                    .cmp(right_created)
-                    .then_with(|| left_revision.cmp(right_revision))
-            },
-        );
-        let Some(over_cap) = rows.len().checked_sub(max_revisions) else {
-            return Ok(0);
-        };
+        rows.sort_unstable();
+        let over_cap = rows.len().saturating_sub(max_revisions);
         let removed = u64::try_from(over_cap).unwrap_or(u64::MAX);
-        for (pruned_key, _, _) in rows.into_iter().take(over_cap) {
-            let pruned_revision = pruned_key.revision.clone();
+        for (_, pruned_key) in rows.into_iter().take(over_cap) {
             state.revisions.remove(&pruned_key);
-            state.tree_entries.retain(|k, _| {
-                !(k.provider == key.provider
-                    && k.owner == key.owner
-                    && k.repo == key.repo
-                    && k.revision == pruned_revision)
-            });
+            state
+                .tree_entries
+                .retain(|entry_key, _| entry_key.namespace != pruned_key);
         }
         Ok(removed)
     }
@@ -1442,19 +1275,8 @@ impl TreeStore for MemoryIndexStore {
             .keys()
             .map(|k| RepoKey::new(&k.provider, &k.owner, &k.repo))
             .collect();
-        keys.sort();
         keys.dedup();
         Ok(keys)
-    }
-}
-
-const fn provider_sort_key(provider: RepositoryProvider) -> &'static str {
-    match provider {
-        RepositoryProvider::GitHub => "github",
-        RepositoryProvider::Gitea => "gitea",
-        RepositoryProvider::GitLab => "gitlab",
-        RepositoryProvider::Codeberg => "codeberg",
-        RepositoryProvider::Generic => "generic",
     }
 }
 
@@ -1495,7 +1317,73 @@ struct MemoryIndexState {
     upload_intents: HashMap<String, UploadIntent>,
     reliability_events: HashMap<String, Vec<LifecycleEvent>>,
     tree_entries: BTreeMap<MemoryTreeKey, TreeEntry>,
-    revisions: BTreeMap<MemoryRevisionKey, RevisionRecord>,
+    revisions: BTreeMap<TreeKey, RevisionRecord>,
+}
+
+impl MemoryIndexState {
+    fn release_quarantine_candidate(
+        &mut self,
+        object_key: &ObjectKey,
+        candidate: &QuarantineCandidate,
+    ) -> Result<bool, MemoryIndexStoreError> {
+        // Build and validate the complete release evidence before mutating the
+        // materialized candidate map. A corrupted journal must leave the
+        // candidate recoverable, matching the transactional adapters.
+        let active_snapshot = quarantine_snapshot(candidate, QuarantineLifecycleState::Active)?;
+        let evidence = self
+            .quarantine_evidence
+            .get(object_key)
+            .cloned()
+            .unwrap_or_default();
+        let released_snapshot = quarantine_snapshot(candidate, QuarantineLifecycleState::Released)?;
+        let (evidence, _) =
+            verify_and_append_snapshot_transition(evidence, active_snapshot, released_snapshot)
+                .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
+        self.quarantine.remove(object_key);
+        self.quarantine_evidence
+            .insert(object_key.clone(), evidence);
+        Ok(true)
+    }
+
+    fn release_retention_hold(
+        &mut self,
+        object_key: &ObjectKey,
+        hold: &RetentionHold,
+    ) -> Result<bool, MemoryIndexStoreError> {
+        let evidence = self
+            .retention_evidence
+            .get(object_key)
+            .cloned()
+            .unwrap_or_default();
+        let (evidence, _) = verify_and_append_snapshot_transition(
+            evidence,
+            retention_snapshot(hold, RetentionHoldLifecycleState::Active)?,
+            retention_snapshot(hold, RetentionHoldLifecycleState::Released)?,
+        )
+        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
+        self.retention_evidence.insert(object_key.clone(), evidence);
+        self.retention_holds.remove(object_key);
+        Ok(true)
+    }
+
+    fn release_webhook_delivery(
+        &mut self,
+        key: MemoryWebhookDeliveryKey,
+        current: &WebhookDelivery,
+    ) -> Result<bool, MemoryIndexStoreError> {
+        let evidence = self.webhook_evidence.get(&key).cloned().ok_or_else(|| {
+            MemoryIndexStoreError::Reliability("webhook evidence is missing".into())
+        })?;
+        let (evidence, _) = verify_and_append_snapshot_transition(
+            evidence,
+            webhook_snapshot(current, WebhookDeliveryLifecycleState::Processed)?,
+            webhook_snapshot(current, WebhookDeliveryLifecycleState::Released)?,
+        )
+        .map_err(|error| MemoryIndexStoreError::Reliability(error.to_string()))?;
+        self.webhook_deliveries.remove(&key);
+        self.webhook_evidence.insert(key, evidence);
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1539,61 +1427,33 @@ impl MemoryWebhookDeliveryKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryTreeKey {
-    provider: String,
-    owner: String,
-    repo: String,
-    revision: String,
+    namespace: TreeKey,
     path: String,
 }
 
 impl MemoryTreeKey {
     fn from_entry(entry: &TreeEntry) -> Self {
         Self {
-            provider: entry.provider.clone(),
-            owner: entry.owner.clone(),
-            repo: entry.repo.clone(),
-            revision: entry.revision.clone(),
+            namespace: TreeKey::new(&entry.provider, &entry.owner, &entry.repo, &entry.revision),
             path: entry.path.clone(),
         }
     }
 
     fn from_key(key: &TreeKey, path: &str) -> Self {
         Self {
-            provider: key.provider.clone(),
-            owner: key.owner.clone(),
-            repo: key.repo.clone(),
-            revision: key.revision.clone(),
+            namespace: key.clone(),
             path: path.to_owned(),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct MemoryRevisionKey {
-    provider: String,
-    owner: String,
-    repo: String,
-    revision: String,
-}
-
-impl MemoryRevisionKey {
-    fn from_record(rev: &RevisionRecord) -> Self {
-        Self {
-            provider: rev.provider.clone(),
-            owner: rev.owner.clone(),
-            repo: rev.repo.clone(),
-            revision: rev.revision.clone(),
-        }
-    }
-
-    fn from_key(key: &RepoKey, rev: &str) -> Self {
-        Self {
-            provider: key.provider.clone(),
-            owner: key.owner.clone(),
-            repo: key.repo.clone(),
-            revision: rev.to_owned(),
-        }
-    }
+fn revision_key(revision: &RevisionRecord) -> TreeKey {
+    TreeKey::new(
+        &revision.provider,
+        &revision.owner,
+        &revision.repo,
+        &revision.revision,
+    )
 }
 
 /// Opaque in-memory file-record locator.
@@ -1651,6 +1511,40 @@ impl MemoryRecordStore {
         Ok(())
     }
 
+    fn visit_records<VisitorError>(
+        &self,
+        kind: MemoryRecordKind,
+        repository: Option<&RepositoryRecordScope>,
+        mut visitor: impl FnMut(StoredRecord<MemoryRecordLocator>) -> Result<(), VisitorError>,
+    ) -> Result<(), VisitorError>
+    where
+        MemoryRecordStoreError: Into<VisitorError>,
+    {
+        // Capture one ordered snapshot and release the lock before callbacks.
+        let records = {
+            let state = self.lock_state().map_err(Into::into)?;
+            let records = match kind {
+                MemoryRecordKind::Latest => &state.latest_records,
+                MemoryRecordKind::Version => &state.version_records,
+            };
+            records
+                .iter()
+                .filter(|(locator, _)| {
+                    repository.is_none_or(|repository| locator.matches_repository(repository))
+                })
+                .map(|(locator, entry)| StoredRecord {
+                    locator: locator.clone(),
+                    bytes: entry.bytes.clone(),
+                    modified_since_epoch: entry.modified_since_epoch,
+                })
+                .collect::<Vec<_>>()
+        };
+        for record in records {
+            visitor(record)?;
+        }
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, MemoryRecordState>, MemoryRecordStoreError> {
         self.state
             .lock()
@@ -1675,35 +1569,9 @@ impl RecordTraversal for MemoryRecordStore {
         })
     }
 
-    fn visit_latest_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            let locators = self
-                .lock_state()
-                .map_err(Into::into)?
-                .latest_records
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for locator in locators {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
-
     fn visit_latest_records<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> RecordStoreFuture<'operation, (), VisitorError>
     where
         Self: Sync,
@@ -1711,24 +1579,7 @@ impl RecordTraversal for MemoryRecordStore {
         Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let records = self
-                .lock_state()
-                .map_err(Into::into)?
-                .latest_records
-                .iter()
-                .map(|(locator, entry)| StoredRecord {
-                    locator: locator.clone(),
-                    bytes: entry.bytes.clone(),
-                    modified_since_epoch: entry.modified_since_epoch,
-                })
-                .collect::<Vec<_>>();
-            for record in records {
-                visitor(record)?;
-            }
-
-            Ok(())
-        })
+        Box::pin(async move { self.visit_records(MemoryRecordKind::Latest, None, visitor) })
     }
 
     fn list_version_record_locators(
@@ -1762,7 +1613,7 @@ impl RecordTraversal for MemoryRecordStore {
     fn visit_repository_latest_records<'operation, Visitor, VisitorError>(
         &'operation self,
         repository: &'operation RepositoryRecordScope,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> RecordStoreFuture<'operation, (), VisitorError>
     where
         Self: Sync,
@@ -1770,25 +1621,9 @@ impl RecordTraversal for MemoryRecordStore {
         Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let records = self
-                .lock_state()
-                .map_err(Into::into)?
-                .latest_records
-                .iter()
-                .filter(|(locator, _entry)| locator.matches_repository(repository))
-                .map(|(locator, entry)| StoredRecord {
-                    locator: locator.clone(),
-                    bytes: entry.bytes.clone(),
-                    modified_since_epoch: entry.modified_since_epoch,
-                })
-                .collect::<Vec<_>>();
-            for record in records {
-                visitor(record)?;
-            }
-
-            Ok(())
-        })
+        Box::pin(
+            async move { self.visit_records(MemoryRecordKind::Latest, Some(repository), visitor) },
+        )
     }
 
     fn list_repository_version_record_locators<'operation>(
@@ -1806,35 +1641,9 @@ impl RecordTraversal for MemoryRecordStore {
         })
     }
 
-    fn visit_version_record_locators<'operation, Visitor, VisitorError>(
-        &'operation self,
-        mut visitor: Visitor,
-    ) -> RecordStoreFuture<'operation, (), VisitorError>
-    where
-        Self: Sync,
-        Self::Error: Into<VisitorError> + 'operation,
-        Visitor: FnMut(Self::Locator) -> Result<(), VisitorError> + Send + 'operation,
-        VisitorError: Send + 'operation,
-    {
-        Box::pin(async move {
-            let locators = self
-                .lock_state()
-                .map_err(Into::into)?
-                .version_records
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for locator in locators {
-                visitor(locator)?;
-            }
-
-            Ok(())
-        })
-    }
-
     fn visit_version_records<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> RecordStoreFuture<'operation, (), VisitorError>
     where
         Self: Sync,
@@ -1842,30 +1651,13 @@ impl RecordTraversal for MemoryRecordStore {
         Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let records = self
-                .lock_state()
-                .map_err(Into::into)?
-                .version_records
-                .iter()
-                .map(|(locator, entry)| StoredRecord {
-                    locator: locator.clone(),
-                    bytes: entry.bytes.clone(),
-                    modified_since_epoch: entry.modified_since_epoch,
-                })
-                .collect::<Vec<_>>();
-            for record in records {
-                visitor(record)?;
-            }
-
-            Ok(())
-        })
+        Box::pin(async move { self.visit_records(MemoryRecordKind::Version, None, visitor) })
     }
 
     fn visit_repository_version_records<'operation, Visitor, VisitorError>(
         &'operation self,
         repository: &'operation RepositoryRecordScope,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> RecordStoreFuture<'operation, (), VisitorError>
     where
         Self: Sync,
@@ -1873,25 +1665,9 @@ impl RecordTraversal for MemoryRecordStore {
         Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let records = self
-                .lock_state()
-                .map_err(Into::into)?
-                .version_records
-                .iter()
-                .filter(|(locator, _entry)| locator.matches_repository(repository))
-                .map(|(locator, entry)| StoredRecord {
-                    locator: locator.clone(),
-                    bytes: entry.bytes.clone(),
-                    modified_since_epoch: entry.modified_since_epoch,
-                })
-                .collect::<Vec<_>>();
-            for record in records {
-                visitor(record)?;
-            }
-
-            Ok(())
-        })
+        Box::pin(
+            async move { self.visit_records(MemoryRecordKind::Version, Some(repository), visitor) },
+        )
     }
 
     fn read_record_bytes<'operation>(
@@ -2037,7 +1813,7 @@ pub enum MemoryRecordStoreError {
     Json(#[from] SerdeJsonError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum MemoryRecordKind {
     Latest,
     Version,
@@ -2302,11 +2078,7 @@ mod tests {
     #[test]
     fn local_index_store_satisfies_index_store_lifecycle_contract() {
         let storage = shardline_test_support::TempStorage::new();
-        let store = LocalIndexStore::new(storage.path_buf());
-        assert!(store.is_ok());
-        let Ok(store) = store else {
-            return;
-        };
+        let store = LocalIndexStore::new(storage.path_buf()).unwrap();
 
         assert_index_store_lifecycle_contract(&store, |store, file_id, reconstruction, xorb_id| {
             store.insert_reconstruction(file_id, reconstruction)?;
@@ -2317,60 +2089,44 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_satisfies_record_store_lifecycle_contract() {
         let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
+        let record = scoped_file_record().unwrap();
 
-        let inserted_version = store.insert_version_record(&record);
-        assert!(inserted_version.is_ok());
-        let written_latest = store.write_latest_record(&record).await;
-        assert!(written_latest.is_ok());
+        store.insert_version_record(&record).unwrap();
+        store.write_latest_record(&record).await.unwrap();
 
         let latest_locator = store.latest_record_locator(&record);
         let version_locator = store.version_record_locator(&record);
 
-        let latest_locators = store.list_latest_record_locators().await;
-        assert!(latest_locators.is_ok());
-        if let Ok(latest_locators) = latest_locators {
-            assert_eq!(latest_locators, vec![latest_locator.clone()]);
-        }
+        let latest_locators = store.list_latest_record_locators().await.unwrap();
+        assert_eq!(latest_locators, vec![latest_locator.clone()]);
 
-        let version_locators = store.list_version_record_locators().await;
-        assert!(version_locators.is_ok());
-        if let Ok(version_locators) = version_locators {
-            assert_eq!(version_locators, vec![version_locator.clone()]);
-        }
+        let version_locators = store.list_version_record_locators().await.unwrap();
+        assert_eq!(version_locators, vec![version_locator.clone()]);
 
         let latest_exists = store.record_locator_exists(&latest_locator).await;
         assert!(matches!(latest_exists, Ok(true)));
         let version_exists = store.record_locator_exists(&version_locator).await;
         assert!(matches!(version_exists, Ok(true)));
 
-        let latest_bytes = store.read_latest_record_bytes(&record).await;
-        assert!(latest_bytes.is_ok());
-        if let Ok(Some(latest_bytes)) = latest_bytes {
-            let decoded = from_slice::<FileRecord>(&latest_bytes);
-            assert!(matches!(decoded, Ok(ref decoded) if decoded == &record));
-        }
+        let latest_bytes = store
+            .read_latest_record_bytes(&record)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = from_slice::<FileRecord>(&latest_bytes);
+        assert!(matches!(decoded, Ok(ref decoded) if decoded == &record));
 
-        let version_bytes = store.read_record_bytes(&version_locator).await;
-        assert!(version_bytes.is_ok());
-        if let Ok(version_bytes) = version_bytes {
-            let decoded = from_slice::<FileRecord>(&version_bytes);
-            assert!(matches!(decoded, Ok(ref decoded) if decoded == &record));
-        }
+        let version_bytes = store.read_record_bytes(&version_locator).await.unwrap();
+        let decoded = from_slice::<FileRecord>(&version_bytes);
+        assert!(matches!(decoded, Ok(ref decoded) if decoded == &record));
 
         let version_modified = store.modified_since_epoch(&version_locator).await;
         assert!(matches!(version_modified, Ok(duration) if duration > Duration::ZERO));
 
-        let deleted_latest = store.delete_record_locator(&latest_locator).await;
-        assert!(deleted_latest.is_ok());
+        store.delete_record_locator(&latest_locator).await.unwrap();
         let latest_exists_after_delete = store.record_locator_exists(&latest_locator).await;
         assert!(matches!(latest_exists_after_delete, Ok(false)));
-        let pruned = store.prune_empty_latest_records().await;
-        assert!(pruned.is_ok());
+        store.prune_empty_latest_records().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2405,17 +2161,15 @@ mod tests {
         let repository = RepositoryRecordScope::new(RepositoryProvider::GitHub, "team", "assets");
         let locators = store
             .list_repository_version_record_locators(&repository)
-            .await;
-        assert!(locators.is_ok());
-        if let Ok(locators) = locators {
-            assert_eq!(
-                locators,
-                vec![
-                    store.version_record_locator(&main_record),
-                    store.version_record_locator(&release_record),
-                ]
-            );
-        }
+            .await
+            .unwrap();
+        assert_eq!(
+            locators,
+            vec![
+                store.version_record_locator(&main_record),
+                store.version_record_locator(&release_record),
+            ]
+        );
     }
 
     #[test]
@@ -2424,15 +2178,13 @@ mod tests {
         let ids = store.list_reconstruction_file_ids().unwrap();
         assert!(ids.is_empty());
 
-        let hash1 = ShardlineHash::from_bytes([10; 32]);
-        let hash2 = ShardlineHash::from_bytes([11; 32]);
+        // Xet reverses each eight-byte hash group before hexadecimal encoding.
+        // These hashes have opposite raw-byte and Xet ordering.
+        let hash1 = ShardlineHash::from_bytes(*b"10000000000000000000000000000000");
+        let hash2 = ShardlineHash::from_bytes(*b"01000000000000000000000000000000");
         let file_id1 = FileId::new(hash1);
         let file_id2 = FileId::new(hash2);
-        let range = ChunkRange::new(0, 1);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ChunkRange::new(0, 1).unwrap();
         let reconstruction1 =
             FileReconstruction::new(vec![ReconstructionTerm::new(XorbId::new(hash1), range, 64)]);
         let reconstruction2 = FileReconstruction::new(vec![ReconstructionTerm::new(
@@ -2449,9 +2201,18 @@ mod tests {
             .unwrap();
 
         let ids = store.list_reconstruction_file_ids().unwrap();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&file_id1));
-        assert!(ids.contains(&file_id2));
+        assert_eq!(ids, vec![file_id1, file_id2]);
+
+        let mappings: Vec<_> = [hash1, hash2]
+            .into_iter()
+            .map(|hash| {
+                DedupeShardMapping::new(hash, ObjectKey::parse("shards/order.shard").unwrap())
+            })
+            .collect();
+        for mapping in mappings.iter().rev() {
+            store.upsert_dedupe_shard_mapping(mapping).unwrap();
+        }
+        assert_eq!(store.list_dedupe_shard_mappings().unwrap(), mappings);
     }
 
     #[test]
@@ -2459,11 +2220,7 @@ mod tests {
         let store = MemoryIndexStore::new();
         let hash = ShardlineHash::from_bytes([12; 32]);
         let file_id = FileId::new(hash);
-        let range = ChunkRange::new(0, 1);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ChunkRange::new(0, 1).unwrap();
         let reconstruction =
             FileReconstruction::new(vec![ReconstructionTerm::new(XorbId::new(hash), range, 64)]);
 
@@ -2496,11 +2253,7 @@ mod tests {
     fn memory_index_store_dedupe_shard_mapping_roundtrip() {
         let store = MemoryIndexStore::new();
         let hash = ShardlineHash::from_bytes([14; 32]);
-        let key = ObjectKey::parse("shards/aa/example.shard");
-        assert!(key.is_ok());
-        let Ok(key) = key else {
-            return;
-        };
+        let key = ObjectKey::parse("shards/aa/example.shard").unwrap();
         let mapping = DedupeShardMapping::new(hash, key);
 
         assert!(store.dedupe_shard_mapping(&hash).unwrap().is_none());
@@ -2934,55 +2687,100 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_latest_records() {
-        let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
-        store.write_latest_record(&record).await.unwrap();
-
-        let mut visited = Vec::new();
-        store
-            .visit_latest_records(|stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
-            })
-            .await
-            .unwrap();
-        assert_eq!(visited.len(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_version_records() {
-        let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
-        store.insert_version_record(&record).unwrap();
-
-        let mut visited = Vec::new();
-        store
-            .visit_version_records(|stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
-            })
-            .await
-            .unwrap();
-        assert_eq!(visited.len(), 1);
+    async fn memory_record_visitors_preserve_scope_snapshot_and_callback_contract() {
+        for (version, scoped) in [(false, false), (false, true), (true, false), (true, true)] {
+            for stop_on_first in [false, true] {
+                let store = MemoryRecordStore::new();
+                for (provider, owner, name, revision) in [
+                    (Some(RepositoryProvider::GitHub), "team", "assets", "main"),
+                    (Some(RepositoryProvider::GitHub), "team", "assets", "dev"),
+                    (Some(RepositoryProvider::GitHub), "other", "assets", "main"),
+                    (Some(RepositoryProvider::GitHub), "team", "other", "main"),
+                    (Some(RepositoryProvider::Gitea), "team", "assets", "main"),
+                    (None, "", "", ""),
+                ] {
+                    let mut record = scoped_file_record().unwrap();
+                    record.repository_scope = provider.map(|provider| {
+                        RepositoryScope::new(provider, owner, name, Some(revision)).unwrap()
+                    });
+                    store.write_latest_record(&record).await.unwrap();
+                    store.insert_version_record(&record).unwrap();
+                }
+                let repository =
+                    RepositoryRecordScope::new(RepositoryProvider::GitHub, "team", "assets");
+                let locators = match (version, scoped) {
+                    (false, false) => store.list_latest_record_locators().await,
+                    (false, true) => {
+                        store
+                            .list_repository_latest_record_locators(&repository)
+                            .await
+                    }
+                    (true, false) => store.list_version_record_locators().await,
+                    (true, true) => {
+                        store
+                            .list_repository_version_record_locators(&repository)
+                            .await
+                    }
+                }
+                .unwrap();
+                assert_eq!(locators.len(), if scoped { 2 } else { 6 });
+                let mut expected = Vec::new();
+                for locator in locators {
+                    expected.push(crate::StoredRecord {
+                        bytes: store.read_record_bytes(&locator).await.unwrap(),
+                        modified_since_epoch: store.modified_since_epoch(&locator).await.unwrap(),
+                        locator,
+                    });
+                }
+                let last = expected.last().unwrap();
+                let locator = last.locator.clone();
+                let mut changed: FileRecord = serde_json::from_slice(&last.bytes).unwrap();
+                changed.total_bytes = 999;
+                let mut visited = Vec::new();
+                let mut visitor = |stored| {
+                    // A callback can overwrite a later row without changing this snapshot.
+                    store
+                        .insert_record(locator.clone(), serde_json::to_vec(&changed).unwrap())
+                        .unwrap();
+                    visited.push(stored);
+                    if stop_on_first {
+                        Err(MemoryRecordStoreError::RecordNotFound)
+                    } else {
+                        Ok(())
+                    }
+                };
+                let result = match (version, scoped) {
+                    (false, false) => store.visit_latest_records(&mut visitor).await,
+                    (false, true) => {
+                        store
+                            .visit_repository_latest_records(&repository, &mut visitor)
+                            .await
+                    }
+                    (true, false) => store.visit_version_records(&mut visitor).await,
+                    (true, true) => {
+                        store
+                            .visit_repository_version_records(&repository, &mut visitor)
+                            .await
+                    }
+                };
+                if stop_on_first {
+                    assert!(matches!(
+                        result,
+                        Err(MemoryRecordStoreError::RecordNotFound)
+                    ));
+                    expected.truncate(1);
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(visited, expected);
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_visit_latest_record_locators() {
         let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
+        let record = scoped_file_record().unwrap();
         store.write_latest_record(&record).await.unwrap();
 
         let mut visited = Vec::new();
@@ -3000,11 +2798,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_visit_version_record_locators() {
         let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
+        let record = scoped_file_record().unwrap();
         store.insert_version_record(&record).unwrap();
 
         let mut visited = Vec::new();
@@ -3020,71 +2814,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_repository_latest_records() {
-        let store = MemoryRecordStore::new();
-        let scope =
-            RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let record = file_record_with_scope(scope, "a");
-        store.write_latest_record(&record).await.unwrap();
-
-        let repository = RepositoryRecordScope::new(RepositoryProvider::GitHub, "team", "assets");
-
-        // list_repository_latest_record_locators
-        let locators = store
-            .list_repository_latest_record_locators(&repository)
-            .await
-            .unwrap();
-        assert_eq!(locators.len(), 1);
-
-        // visit_repository_latest_records
-        let mut visited = Vec::new();
-        store
-            .visit_repository_latest_records(&repository, |stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
-            })
-            .await
-            .unwrap();
-        assert_eq!(visited.len(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_repository_version_records() {
-        let store = MemoryRecordStore::new();
-        let scope =
-            RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let record = file_record_with_scope(scope, "a");
-        store.insert_version_record(&record).unwrap();
-
-        let repository = RepositoryRecordScope::new(RepositoryProvider::GitHub, "team", "assets");
-
-        let mut visited = Vec::new();
-        store
-            .visit_repository_version_records(&repository, |stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
-            })
-            .await
-            .unwrap();
-        assert_eq!(visited.len(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn memory_record_store_record_locator_exists_false() {
         let store = MemoryRecordStore::new();
-        let record = scoped_file_record();
-        assert!(record.is_some());
-        let Some(record) = record else {
-            return;
-        };
+        let record = scoped_file_record().unwrap();
         let locator = store.version_record_locator(&record);
 
         let exists = store.record_locator_exists(&locator).await.unwrap();
@@ -3107,11 +2839,7 @@ mod tests {
         let hash = ShardlineHash::from_bytes([9; 32]);
         let file_id = FileId::new(hash);
         let xorb_id = XorbId::new(hash);
-        let range = ChunkRange::new(2, 5);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ChunkRange::new(2, 5).unwrap();
         let reconstruction =
             FileReconstruction::new(vec![ReconstructionTerm::new(xorb_id, range, 128)]);
 
@@ -3120,37 +2848,24 @@ mod tests {
         let missing_xorb = store.contains_xorb(&xorb_id);
         assert!(matches!(missing_xorb, Ok(false)));
 
-        let seeded = seed_index(store, &file_id, &reconstruction, &xorb_id);
-        assert!(seeded.is_ok());
+        seed_index(store, &file_id, &reconstruction, &xorb_id).unwrap();
 
         let loaded_reconstruction = store.reconstruction(&file_id);
         assert!(matches!(loaded_reconstruction, Ok(Some(ref loaded)) if loaded == &reconstruction));
         let contains_xorb = store.contains_xorb(&xorb_id);
         assert!(matches!(contains_xorb, Ok(true)));
 
-        let object_key = ObjectKey::parse("xorbs/default/aa/bb/hash.xorb");
-        assert!(object_key.is_ok());
-        let Ok(object_key) = object_key else {
-            return;
-        };
-        let candidate = QuarantineCandidate::new(object_key.clone(), 128, 10, 20);
-        assert!(candidate.is_ok());
-        let Ok(candidate) = candidate else {
-            return;
-        };
+        let object_key = ObjectKey::parse("xorbs/default/aa/bb/hash.xorb").unwrap();
+        let candidate = QuarantineCandidate::new(object_key.clone(), 128, 10, 20).unwrap();
 
         let missing_candidate = store.quarantine_candidate(&object_key);
         assert!(matches!(missing_candidate, Ok(None)));
-        let upserted = store.upsert_quarantine_candidate(&candidate);
-        assert!(upserted.is_ok());
+        store.upsert_quarantine_candidate(&candidate).unwrap();
 
         let loaded_candidate = store.quarantine_candidate(&object_key);
         assert!(matches!(loaded_candidate, Ok(Some(ref loaded)) if loaded == &candidate));
-        let listed_candidates = store.list_quarantine_candidates();
-        assert!(listed_candidates.is_ok());
-        if let Ok(listed_candidates) = listed_candidates {
-            assert_eq!(listed_candidates, vec![candidate.clone()]);
-        }
+        let listed_candidates = store.list_quarantine_candidates().unwrap();
+        assert_eq!(listed_candidates, vec![candidate.clone()]);
         let mut visited_candidates = Vec::new();
         let visited_candidates_result = store.visit_quarantine_candidates(|entry| {
             visited_candidates.push(entry);
@@ -3171,24 +2886,17 @@ mod tests {
             "provider deletion grace".to_owned(),
             30,
             Some(90),
-        );
-        assert!(hold.is_ok());
-        let Ok(hold) = hold else {
-            return;
-        };
+        )
+        .unwrap();
 
         let missing_hold = store.retention_hold(&object_key);
         assert!(matches!(missing_hold, Ok(None)));
-        let upserted_hold = store.upsert_retention_hold(&hold);
-        assert!(upserted_hold.is_ok());
+        store.upsert_retention_hold(&hold).unwrap();
 
         let loaded_hold = store.retention_hold(&object_key);
         assert!(matches!(loaded_hold, Ok(Some(ref loaded)) if loaded == &hold));
-        let listed_holds = store.list_retention_holds();
-        assert!(listed_holds.is_ok());
-        if let Ok(listed_holds) = listed_holds {
-            assert_eq!(listed_holds, vec![hold.clone()]);
-        }
+        let listed_holds = store.list_retention_holds().unwrap();
+        assert_eq!(listed_holds, vec![hold.clone()]);
         let mut visited_holds = Vec::new();
         let visited_holds_result = store.visit_retention_holds(|entry| {
             visited_holds.push(entry);
@@ -3210,11 +2918,8 @@ mod tests {
             "assets".to_owned(),
             "delivery-1".to_owned(),
             100,
-        );
-        assert!(webhook_delivery.is_ok());
-        let Ok(webhook_delivery) = webhook_delivery else {
-            return;
-        };
+        )
+        .unwrap();
         let recorded_delivery = store.record_webhook_delivery(&webhook_delivery);
         assert!(matches!(recorded_delivery, Ok(true)));
         let duplicate_delivery = store.record_webhook_delivery(&webhook_delivery);
@@ -3230,6 +2935,7 @@ mod tests {
         };
 
         Some(FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "a".repeat(64),
             total_bytes: 8,
@@ -3261,6 +2967,7 @@ mod tests {
 
     fn file_record_with_scope(scope: RepositoryScope, content_seed: &str) -> FileRecord {
         FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: content_seed.repeat(64),
             total_bytes: 0,
@@ -3423,6 +3130,8 @@ mod tests {
 
         let result = store.delete_quarantine_candidate(&key);
         assert!(matches!(result, Err(MemoryIndexStoreError::Reliability(_))));
+        let result = store.delete_quarantine_candidate_if_matches(&candidate);
+        assert!(matches!(result, Err(MemoryIndexStoreError::Reliability(_))));
         assert!(store.state.lock().unwrap().quarantine.contains_key(&key));
     }
 
@@ -3515,6 +3224,10 @@ mod tests {
 
         let result = LifecycleStore::retention_hold(&store, &key);
         assert!(matches!(result, Err(MemoryIndexStoreError::Reliability(_))));
+        let result = store.delete_retention_hold(&key);
+        assert!(matches!(result, Err(MemoryIndexStoreError::Reliability(_))));
+        let result = store.delete_retention_hold_if_matches(&hold);
+        assert!(matches!(result, Err(MemoryIndexStoreError::Reliability(_))));
         assert!(
             store
                 .state
@@ -3593,92 +3306,102 @@ mod tests {
         );
     }
 
-    // ── visit methods with no records ──────────────────────────────────────
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_latest_records_empty() {
+    async fn memory_record_store_empty_visitor_contract() {
         let store = MemoryRecordStore::new();
-        let mut visited = Vec::new();
         store
-            .visit_latest_records(|stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
+            .visit_latest_records(|_| -> Result<(), MemoryRecordStoreError> {
+                panic!("empty latest_records visitor received a record")
             })
             .await
             .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_version_records_empty() {
-        let store = MemoryRecordStore::new();
-        let mut visited = Vec::new();
         store
-            .visit_version_records(|stored| {
-                visited.push(stored);
-                Ok::<(), MemoryRecordStoreError>(())
+            .visit_version_records(|_| -> Result<(), MemoryRecordStoreError> {
+                panic!("empty version_records visitor received a record")
             })
             .await
             .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_latest_record_locators_empty() {
-        let store = MemoryRecordStore::new();
-        let mut visited = Vec::new();
         store
-            .visit_latest_record_locators(|loc| {
-                visited.push(loc);
-                Ok::<(), MemoryRecordStoreError>(())
+            .visit_latest_record_locators(|_| -> Result<(), MemoryRecordStoreError> {
+                panic!("empty latest_record_locators visitor received a record")
             })
             .await
             .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_record_store_visit_version_record_locators_empty() {
-        let store = MemoryRecordStore::new();
-        let mut visited = Vec::new();
         store
-            .visit_version_record_locators(|loc| {
-                visited.push(loc);
-                Ok::<(), MemoryRecordStoreError>(())
+            .visit_version_record_locators(|_| -> Result<(), MemoryRecordStoreError> {
+                panic!("empty version_record_locators visitor received a record")
             })
             .await
             .unwrap();
-        assert!(visited.is_empty());
     }
 
-    // ── Empty lifecycle list methods ───────────────────────────────────────
-
-    #[test]
-    fn memory_index_store_list_webhook_deliveries_empty() {
-        let store = MemoryIndexStore::new();
-        let deliveries = store.list_webhook_deliveries().unwrap();
-        assert!(deliveries.is_empty());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_record_locator_visitors_release_lock_and_stop_on_error() {
+        for version in [false, true] {
+            let store = MemoryRecordStore::new();
+            let mut record = scoped_file_record().unwrap();
+            for name in ["b", "a"] {
+                record.file_id = name.into();
+                store.write_latest_record(&record).await.unwrap();
+                store.insert_version_record(&record).unwrap();
+            }
+            let expected = if version {
+                store.list_version_record_locators().await.unwrap()
+            } else {
+                store.list_latest_record_locators().await.unwrap()
+            };
+            assert_eq!(expected.len(), 2);
+            let mut visited = Vec::new();
+            let visitor = |locator| {
+                visited.push(locator);
+                store.insert_version_record(&record).unwrap();
+                Err::<(), _>(MemoryRecordStoreError::RecordNotFound)
+            };
+            let result = if version {
+                store.visit_version_record_locators(visitor).await
+            } else {
+                store.visit_latest_record_locators(visitor).await
+            };
+            assert!(matches!(
+                result,
+                Err(MemoryRecordStoreError::RecordNotFound)
+            ));
+            assert_eq!(visited, vec![expected[0].clone()]);
+        }
     }
 
     #[test]
-    fn memory_index_store_list_retention_holds_empty() {
+    fn memory_index_store_empty_lifecycle_contract() {
         let store = MemoryIndexStore::new();
-        let holds = store.list_retention_holds().unwrap();
-        assert!(holds.is_empty());
-    }
-
-    #[test]
-    fn memory_index_store_list_quarantine_candidates_empty() {
-        let store = MemoryIndexStore::new();
-        let candidates = store.list_quarantine_candidates().unwrap();
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn memory_index_store_list_provider_repository_states_empty() {
-        let store = MemoryIndexStore::new();
-        let states = store.list_provider_repository_states().unwrap();
-        assert!(states.is_empty());
+        assert!(store.list_webhook_deliveries().unwrap().is_empty());
+        assert!(store.list_retention_holds().unwrap().is_empty());
+        assert!(store.list_quarantine_candidates().unwrap().is_empty());
+        assert!(store.list_provider_repository_states().unwrap().is_empty());
+        LifecycleStore::visit_webhook_deliveries(
+            &store,
+            |_| -> Result<(), MemoryIndexStoreError> {
+                panic!("empty webhook_deliveries visitor received a record")
+            },
+        )
+        .unwrap();
+        LifecycleStore::visit_retention_holds(&store, |_| -> Result<(), MemoryIndexStoreError> {
+            panic!("empty retention_holds visitor received a record")
+        })
+        .unwrap();
+        LifecycleStore::visit_quarantine_candidates(
+            &store,
+            |_| -> Result<(), MemoryIndexStoreError> {
+                panic!("empty quarantine_candidates visitor received a record")
+            },
+        )
+        .unwrap();
+        LifecycleStore::visit_provider_repository_states(
+            &store,
+            |_| -> Result<(), MemoryIndexStoreError> {
+                panic!("empty provider_repository_states visitor received a record")
+            },
+        )
+        .unwrap();
     }
 
     // ── Repository-scoped listing with populated stores ───────────────────
@@ -3770,56 +3493,6 @@ mod tests {
             .await
             .unwrap();
         assert!(locators.is_empty());
-    }
-
-    // ── Empty visit lifecycle methods ──────────────────────────────────────
-
-    #[test]
-    fn memory_index_store_visit_webhook_deliveries_empty() {
-        let store = MemoryIndexStore::new();
-        let mut visited = Vec::new();
-        LifecycleStore::visit_webhook_deliveries(&store, |d| {
-            visited.push(d);
-            Ok::<(), MemoryIndexStoreError>(())
-        })
-        .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[test]
-    fn memory_index_store_visit_retention_holds_empty() {
-        let store = MemoryIndexStore::new();
-        let mut visited = Vec::new();
-        LifecycleStore::visit_retention_holds(&store, |h| {
-            visited.push(h);
-            Ok::<(), MemoryIndexStoreError>(())
-        })
-        .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[test]
-    fn memory_index_store_visit_quarantine_candidates_empty() {
-        let store = MemoryIndexStore::new();
-        let mut visited = Vec::new();
-        LifecycleStore::visit_quarantine_candidates(&store, |c| {
-            visited.push(c);
-            Ok::<(), MemoryIndexStoreError>(())
-        })
-        .unwrap();
-        assert!(visited.is_empty());
-    }
-
-    #[test]
-    fn memory_index_store_visit_provider_repository_states_empty() {
-        let store = MemoryIndexStore::new();
-        let mut visited = Vec::new();
-        LifecycleStore::visit_provider_repository_states(&store, |s| {
-            visited.push(s);
-            Ok::<(), MemoryIndexStoreError>(())
-        })
-        .unwrap();
-        assert!(visited.is_empty());
     }
 
     // ── MemoryIndexStoreError Display / Debug / Clone ─────────────────────

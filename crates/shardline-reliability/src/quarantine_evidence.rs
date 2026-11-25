@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain};
-use crate::snapshot_log::SnapshotEvidenceLog;
+use crate::snapshot_event::{
+    SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain, verify_snapshot_chain_for,
+};
+use crate::snapshot_log::{SnapshotEvidenceLog, verify_and_reactivate_snapshot};
 use crate::{OperationIdentity, OperationKind, ReliabilityError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,12 +139,7 @@ pub fn verify_quarantine_lifecycle_events(
     events: &[QuarantineLifecycleEvent],
     expected: &QuarantineSnapshot,
 ) -> Result<(), ReliabilityError> {
-    verify_quarantine_lifecycle_chain(events)?;
-    if events.last().is_some_and(|event| event.after == *expected) {
-        Ok(())
-    } else {
-        Err(ReliabilityError::StateMismatch)
-    }
+    verify_snapshot_chain_for(events, expected)
 }
 
 pub type QuarantineEvidenceLog = SnapshotEvidenceLog<QuarantineSnapshot>;
@@ -160,24 +157,12 @@ pub type QuarantineEvidenceLog = SnapshotEvidenceLog<QuarantineSnapshot>;
 /// Returns an error when the evidence chain is invalid, the prior state is
 /// not `Released`, or the new snapshot cannot be appended.
 pub fn verify_and_reactivate_quarantine(
-    mut evidence: QuarantineEvidenceLog,
+    evidence: QuarantineEvidenceLog,
     snapshot: QuarantineSnapshot,
 ) -> Result<(QuarantineEvidenceLog, bool), ReliabilityError> {
-    if evidence.events().is_empty() {
-        return Ok((QuarantineEvidenceLog::baseline(snapshot)?, true));
-    }
-    if !evidence.is_head_only() {
-        verify_snapshot_chain(evidence.events())?;
-    }
-    let last = evidence
-        .events()
-        .last()
-        .ok_or(ReliabilityError::OperationMismatch)?;
-    if last.after.state != QuarantineLifecycleState::Released {
-        return Err(ReliabilityError::StateMismatch);
-    }
-    evidence.record(snapshot)?;
-    Ok((evidence, false))
+    verify_and_reactivate_snapshot(evidence, snapshot, |previous| {
+        previous.state == QuarantineLifecycleState::Released
+    })
 }
 
 #[cfg(test)]

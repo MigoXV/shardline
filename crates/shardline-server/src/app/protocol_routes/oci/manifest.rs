@@ -249,13 +249,7 @@ pub(crate) async fn oci_delete_manifest(
         .await?;
     repository_guard.assert_current().await?;
 
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build delete manifest response body");
-            ServerError::Overflow
-        })
+    Ok(StatusCode::ACCEPTED.into_response())
 }
 
 async fn resolve_manifest_digest(
@@ -1046,22 +1040,6 @@ mod tests {
     fn accept_type_wildcard() {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/*"));
-        assert!(
-            ensure_manifest_representation_is_acceptable(
-                &headers,
-                "application/vnd.oci.image.manifest.v1+json"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn accept_subtype_wildcard() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/vnd.oci.image.manifest.v1+json"),
-        );
         assert!(
             ensure_manifest_representation_is_acceptable(
                 &headers,

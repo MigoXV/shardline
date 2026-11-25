@@ -347,7 +347,60 @@ ttl_seconds = 30
 provider = "local"
 provider_token_issuer = "shardline"
 provider_token_ttl_seconds = 300
+
+# Optional Hub ref archive shadow mode. Omit this entire section to leave the
+# database's persisted mode untouched; use mode = "off" only to disable it.
+[recovery.hub]
+mode = "shadow"
+deployment_id = "prod-eu1"
+key_id = "hub-ref-archive-2026-01"
+signing_key_path = "/run/secrets/hub-ref-archive-seed"
+
+[recovery.hub.archive]
+adapter = "s3"
+
+[recovery.hub.archive.s3]
+endpoint = "https://archive.example.com"
+region = "us-east-1"
+bucket = "shardline-recovery"
+prefix = "hub-ref-events"
 ```
+
+Hub recovery signing material is a separate 32-byte Ed25519 seed loaded from
+`signing_key_path`; it is never accepted inline. The archive S3 settings reuse
+the typed S3 storage configuration but have their own `SHARDLINE_HUB_RECOVERY_S3_*`
+credentials and endpoint environment names, so they do not read payload-store
+credentials. The startup overlap check rejects matching endpoint/bucket
+namespaces with equal or ancestor prefixes. It cannot recognize provider aliases
+or prove that different credentials imply independent retention. If both stores
+use the ambient AWS provider chain, configure separate process/role credentials
+for the archive instead of assuming the store settings create a separate
+authority. Configure a
+separate archive account or bucket policy, deny ordinary service deletion, and
+apply retention/versioning controls at the storage provider. SHADOW mode only
+records and archives evidence; it does not establish restore readiness.
+
+The server changes the persisted Hub outbox mode only when `recovery.hub.mode`
+is explicit. An omitted mode preserves the database value; if that value is
+already `shadow`, a replica without recovery settings fails startup instead of
+serving writes that would bypass the archive. Set `mode = "off"` explicitly to
+disable the outbox. Re-enabling after an OFF interval with archived history is
+rejected by the SQL mode transition.
+
+Every replica serving the same Hub database must use the same recovery mode,
+deployment ID, key ID, signing seed, and archive destination. The mode is
+database-wide: an explicit OFF on one replica disables event capture for every
+replica. Coordinate changes across the deployment and do not roll mixed OFF and
+SHADOW settings. There is no signing-key ring or in-place key rotation yet;
+changing the seed prevents verification of predecessor archive receipts. Keep
+the configured seed stable for the lifetime of the chain.
+
+In SHADOW, a background worker pages at most 16 pending repositories at a time
+and archives at most one next event per repository in that page. Failed events
+stay pending and are retried after the cursor cycles. Shutdown cancels the
+worker's current async operation; each page and archive attempt also uses the
+server's existing request deadline. This is asynchronous evidence capture and
+does not change the normal Hub publication response.
 
 Place credentials in a separate `.env` file:
 
@@ -906,7 +959,8 @@ The discovery document's `jwks_uri` must be hosted on the issuer's own host and
 the discovery fetch never follows redirects. IdPs that serve keys from a
 different host (e.g. Google serves JWKS from `www.googleapis.com`) must list
 that host in `SHARDLINE_AUTH_OIDC_JWKS_HOST_ALLOWLIST` (comma-separated).
-`SHARDLINE_AUTH_OIDC_AUDIENCE` optionally requires a specific `aud` claim.
+`SHARDLINE_AUTH_OIDC_AUDIENCE` is required at startup and pins the token
+recipient; missing or mismatched `aud` claims are rejected.
 
 ### JWKS
 
@@ -915,7 +969,13 @@ Validate tokens against a JSON Web Key Set endpoint:
 ```text
 SHARDLINE_AUTH_PROVIDER=jwks
 SHARDLINE_AUTH_JWKS_URL=https://example.com/.well-known/jwks.json
+SHARDLINE_AUTH_JWKS_ISSUER=https://example.com
+SHARDLINE_AUTH_JWKS_AUDIENCE=storage
 ```
+
+JWKS also requires an audience at startup. For signed repository assignments
+independent of the identity subject, configure the shared
+[external resource claims mapping](AUTHENTICATION.md#external-resource-claims).
 
 ### Passthrough
 

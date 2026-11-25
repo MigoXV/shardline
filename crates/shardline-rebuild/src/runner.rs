@@ -3,8 +3,8 @@ use std::hash::Hash;
 
 use shardline_index::{
     AsyncIndexStore, DedupeShardMapping, RecordMutation, RecordTraversal, parse_xet_hash_hex,
-    xet_hash_hex_string,
 };
+use shardline_protocol::ShardlineHash;
 use shardline_server_core::{
     OpsRecordStore, ServerObjectStore, ShardMetadataLimits, checked_increment,
 };
@@ -39,41 +39,23 @@ where
     IndexAdapter: AsyncIndexStore + Sync,
     IndexAdapter::Error: Into<RebuildError>,
 {
-    let mut report = IndexRebuildReport {
-        scanned_version_records: 0,
-        scanned_retained_shards: 0,
-        rebuilt_latest_records: 0,
-        unchanged_latest_records: 0,
-        removed_stale_latest_records: 0,
-        scanned_reconstructions: 0,
-        unchanged_reconstructions: 0,
-        removed_stale_reconstructions: 0,
-        rebuilt_dedupe_shard_mappings: 0,
-        unchanged_dedupe_shard_mappings: 0,
-        removed_stale_dedupe_shard_mappings: 0,
-        preserved_latest_records_unreadable_version: Vec::new(),
-        issues: Vec::new(),
-    };
+    let mut report = IndexRebuildReport::default();
     let mut candidates = HashMap::new();
     let mut native_xorbs = HashSet::new();
     RecordTraversal::visit_version_records(record_store, |entry| {
         report.scanned_version_records = checked_increment(report.scanned_version_records)?;
-        if record_store.supports_native_locations()
-            && let Ok(record) = shardline_server_core::parse_stored_file_record_bytes(&entry.bytes)
-            && record.storage_layout()
-                == shardline_index::FileRecordStorageLayout::ReferencedObjectTerms
-        {
-            native_xorbs.extend(record.chunks.into_iter().map(|term| term.hash));
-        }
-        collect_candidate(record_store, entry, &mut candidates, &mut report)
+        collect_candidate(
+            record_store,
+            entry,
+            &mut candidates,
+            &mut native_xorbs,
+            &mut report,
+        );
+        Ok::<(), RebuildError>(())
     })
     .await?;
 
-    let mut desired_latest_paths = HashSet::new();
     for candidate in candidates.values() {
-        let latest_path = RecordTraversal::latest_record_locator(record_store, &candidate.record);
-        desired_latest_paths.insert(latest_path.clone());
-
         let record_bytes = serde_json::to_vec(&candidate.record)?;
         let existing_bytes =
             RecordTraversal::read_latest_record_bytes(record_store, &candidate.record)
@@ -105,7 +87,7 @@ where
     //
     // Gated on run cleanliness (like `prune_stale_reconstructions`): when any
     // version record failed to parse or validate, the candidate set is
-    // incomplete, so a latest record excluded from `desired_latest_paths` may
+    // incomplete, so a latest record excluded from `candidates` may
     // belong to a file whose version record is unreadable rather than to a
     // deleted file. Deleting it then would destroy a valid, authoritative
     // latest record (index loss + GC orphans for a fully intact file). A dirty
@@ -116,7 +98,7 @@ where
     if report.is_clean() {
         let mut stale_latest_paths = Vec::new();
         RecordTraversal::visit_latest_record_locators(record_store, |path| {
-            if !desired_latest_paths.contains(&path) {
+            if !candidates.contains_key(&path) {
                 stale_latest_paths.push(path);
             }
 
@@ -136,7 +118,8 @@ where
             .map_err(Into::into)?;
     }
 
-    let desired_reconstructions = desired_reconstruction_file_ids(candidates.values());
+    // Consume complete records; later phases need only file IDs.
+    let desired_reconstructions = desired_reconstruction_file_ids(candidates.into_values());
     prune_stale_reconstructions(index_store, &desired_reconstructions, &mut report).await?;
 
     rebuild_dedupe_shard_mappings(
@@ -162,26 +145,21 @@ where
     Ok(report)
 }
 
-pub(super) fn desired_reconstruction_file_ids<'record, Locator, Records>(
+pub(super) fn desired_reconstruction_file_ids<Locator, Records>(
     records: Records,
-) -> HashSet<String>
+) -> HashSet<ShardlineHash>
 where
-    Records: IntoIterator<Item = &'record VersionCandidate<Locator>>,
-    Locator: 'record,
+    Records: IntoIterator<Item = VersionCandidate<Locator>>,
 {
     records
         .into_iter()
-        .filter_map(|candidate| {
-            parse_xet_hash_hex(&candidate.record.file_id)
-                .ok()
-                .map(xet_hash_hex_string)
-        })
+        .filter_map(|candidate| parse_xet_hash_hex(&candidate.record.file_id).ok())
         .collect::<HashSet<_>>()
 }
 
 pub(super) async fn prune_stale_reconstructions<IndexAdapter>(
     index_store: &IndexAdapter,
-    desired_reconstructions: &HashSet<String>,
+    desired_reconstructions: &HashSet<ShardlineHash>,
     report: &mut IndexRebuildReport,
 ) -> Result<(), RebuildError>
 where
@@ -198,8 +176,7 @@ where
         .map_err(Into::into)?;
     for file_id in existing_file_ids {
         report.scanned_reconstructions = checked_increment(report.scanned_reconstructions)?;
-        let file_id_hex = xet_hash_hex_string(file_id.hash());
-        if desired_reconstructions.contains(&file_id_hex) {
+        if desired_reconstructions.contains(&file_id.hash()) {
             report.unchanged_reconstructions = checked_increment(report.unchanged_reconstructions)?;
             continue;
         }
@@ -236,15 +213,14 @@ where
 {
     let prefix =
         ObjectPrefix::parse("shards/").map_err(|_error| RebuildError::InvalidContentHash)?;
-    let mut desired = HashMap::<String, DedupeShardMapping>::new();
+    let mut desired = HashMap::<ShardlineHash, DedupeShardMapping>::new();
     let issue_count_before_scan = report.issue_count();
 
     object_store.visit_prefix(&prefix, |metadata| -> Result<(), RebuildError> {
         report.scanned_retained_shards = checked_increment(report.scanned_retained_shards)?;
-        let shard_key = metadata.key().clone();
-        let shard_location = shard_key.as_str().to_owned();
+        let shard_key = metadata.key();
         let (mut shard_reader, length) = object_store
-            .materialize_bounded_object_if_present(&shard_key, 0)?
+            .materialize_bounded_object_if_present(shard_key, 0)?
             .ok_or(shardline_server_core::ServerObjectStoreError::NotFound)?;
         if length != metadata.length() {
             return Err(
@@ -259,23 +235,23 @@ where
                     push_issue(
                         report,
                         IndexRebuildIssueKind::InvalidRetainedShard,
-                        shard_location,
+                        shard_key.as_str().to_owned(),
                         IndexRebuildIssueDetail::InvalidRetainedShard(detail),
-                    )?;
+                    );
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
             };
 
         for chunk_hash_hex in chunk_hashes {
-            let mapping =
-                DedupeShardMapping::new(parse_xet_hash_hex(&chunk_hash_hex)?, shard_key.clone());
-            match desired.get(&chunk_hash_hex) {
-                Some(existing)
-                    if existing.shard_object_key().as_str()
-                        <= mapping.shard_object_key().as_str() => {}
+            let chunk_hash = parse_xet_hash_hex(&chunk_hash_hex)?;
+            match desired.get(&chunk_hash) {
+                Some(existing) if existing.shard_object_key().as_str() <= shard_key.as_str() => {}
                 _ => {
-                    desired.insert(chunk_hash_hex, mapping);
+                    desired.insert(
+                        chunk_hash,
+                        DedupeShardMapping::new(chunk_hash, shard_key.clone()),
+                    );
                 }
             }
         }
@@ -289,13 +265,13 @@ where
     let mut existing = HashMap::new();
     index_store
         .visit_dedupe_shard_mappings(|mapping| {
-            existing.insert(xet_hash_hex_string(mapping.chunk_hash()), mapping);
+            existing.insert(mapping.chunk_hash(), mapping);
             Ok::<(), RebuildError>(())
         })
         .await?;
 
-    for (chunk_hash_hex, mapping) in &desired {
-        match existing.get(chunk_hash_hex) {
+    for (chunk_hash, mapping) in desired {
+        match existing.remove(&chunk_hash) {
             Some(existing_mapping)
                 if existing_mapping.shard_object_key() == mapping.shard_object_key() =>
             {
@@ -304,7 +280,7 @@ where
             }
             _ => {
                 index_store
-                    .upsert_dedupe_shard_mapping(mapping)
+                    .upsert_dedupe_shard_mapping(&mapping)
                     .await
                     .map_err(Into::into)?;
                 report.rebuilt_dedupe_shard_mappings =
@@ -317,11 +293,7 @@ where
     // and deletion. Server entry points hold that barrier; generic store callers
     // provide their own ownership so a concurrent shard publication cannot be
     // removed using an older inventory.
-    for (chunk_hash_hex, mapping) in existing {
-        if desired.contains_key(&chunk_hash_hex) {
-            continue;
-        }
-
+    for mapping in existing.into_values() {
         let deleted = index_store
             .delete_dedupe_shard_mapping_if_matches(&mapping)
             .await

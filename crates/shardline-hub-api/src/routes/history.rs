@@ -31,8 +31,7 @@ pub(crate) async fn repo_commits(
     let repo_id = format!("{ns}/{repo}");
     state
         .store
-        .get_repo(&repo_id)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&repo_id)?
         .ok_or(HubApiError::RepoNotFound)?;
     let head = crate::git::smart_http::resolve_commit_id(
         &state,
@@ -57,15 +56,9 @@ pub(crate) async fn repo_commits(
     let mut result = Vec::new();
     let mut next = Some(head);
     while let Some(sha) = next.take() {
-        if !visited.insert(sha.clone()) {
-            return Err(HubApiError::CasError(
-                "cyclic repository history".to_owned(),
-            ));
-        }
         let revision = state
             .store
-            .get_revision(&repo_id, &sha)
-            .map_err(|error| HubApiError::CasError(error.to_string()))?
+            .get_revision(&repo_id, &sha)?
             .ok_or_else(|| HubApiError::CasError("incomplete repository history".to_owned()))?;
         let seconds = i64::try_from(revision.created_at_unix_seconds)
             .map_err(|e| HubApiError::CasError(e.to_string()))?;
@@ -84,6 +77,7 @@ pub(crate) async fn repo_commits(
             "title": title,
             "message": description,
         }));
+        visited.insert(sha);
         next = if snapshot.is_some() {
             None
         } else {
@@ -129,6 +123,47 @@ pub(crate) async fn repo_commits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn corrupt_history_never_returns_a_successful_page_or_continuation() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        let (root, state) = crate::routes::tests::make_test_state();
+        let repo = "alice/history";
+        state
+            .store
+            .create_repo(shardline_index::hub::HubRepoType::Model, repo, false)
+            .unwrap();
+        let head = state.store.resolve_revision(repo, "main").unwrap().unwrap();
+        let app = crate::routes::router::router(false).with_state(state);
+        let request = || {
+            Request::builder()
+                .uri("/api/models/alice/history/commits/main?limit=1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let connection = rusqlite::Connection::open(root.path().join("metadata.sqlite3")).unwrap();
+        for parent in [head.clone(), "f".repeat(64)] {
+            connection
+                .execute(
+                    "UPDATE shardline_hub_revisions SET parent_sha=?1 WHERE repo_id=?2 AND sha=?3",
+                    rusqlite::params![parent, repo, head],
+                )
+                .unwrap();
+            let response = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(response.headers().get(LINK).is_none());
+        }
+    }
 
     #[tokio::test]
     async fn history_continuation_rechecks_branch_access_after_deletion_and_replacement() {

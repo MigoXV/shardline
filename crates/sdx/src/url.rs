@@ -73,6 +73,11 @@ impl XetUrl {
         let url = Url::parse(input).map_err(|error| {
             SdxError::InvalidEndpoint(format!("cannot parse {input:?}: {error}"))
         })?;
+        Self::from_parsed_url(&url, input)
+    }
+
+    /// Shares identity/path decoding with the builder's stricter endpoint parser.
+    pub(crate) fn from_parsed_url(url: &Url, input: &str) -> Result<Self, SdxError> {
         if url.scheme() != "xet" {
             return Err(SdxError::InvalidEndpoint(format!(
                 "unsupported scheme {:?} in {input:?}; expected xet://",
@@ -96,54 +101,35 @@ impl XetUrl {
             api_base.push_str(&port.to_string());
         }
 
-        let raw_segments: Vec<&str> = url
-            .path_segments()
-            .map(|segments| segments.collect())
-            .unwrap_or_default();
-        if raw_segments.len() < 4 {
+        let mut raw_segments = url
+            .path()
+            .strip_prefix('/')
+            .unwrap_or_else(|| url.path())
+            .splitn(5, '/');
+        let identity: [_; 4] = std::array::from_fn(|_| raw_segments.next());
+        let [Some(provider), Some(owner), Some(repo), Some(revision)] = identity else {
             return Err(SdxError::InvalidEndpoint(format!(
                 "expected provider/owner/repo/revision (plus optional path) in {input:?}, got {} segment(s)",
-                raw_segments.len()
+                identity.into_iter().flatten().count()
             )));
-        }
-        let (identity, path_segments) = raw_segments.split_at(4);
-        let identity: Vec<String> = identity
-            .iter()
-            .map(|segment| decode_segment(segment, input))
-            .collect::<Result<_, _>>()?;
-        if identity.iter().any(|segment| segment.is_empty()) {
+        };
+        let provider = decode_segment(provider, input)?;
+        let owner = decode_segment(owner, input)?;
+        let repo = decode_segment(repo, input)?;
+        let revision = decode_segment(revision, input)?;
+        if [&provider, &owner, &repo, &revision]
+            .into_iter()
+            .any(String::is_empty)
+        {
             return Err(SdxError::InvalidEndpoint(format!(
                 "empty segment in repository identity in {input:?}"
             )));
         }
-        let (provider, owner, repo, revision) = match identity.as_slice() {
-            [provider, owner, repo, revision] => (
-                provider.clone(),
-                owner.clone(),
-                repo.clone(),
-                revision.clone(),
-            ),
-            _ => {
-                return Err(SdxError::InvalidEndpoint(format!(
-                    "invalid repository identity in {input:?}"
-                )));
-            }
-        };
-        // Path segments may include a trailing empty segment for a trailing
-        // slash; drop trailing empties, decode the rest, and re-append a single
-        // trailing slash to denote a directory.
-        let mut path_segments: Vec<String> = path_segments
-            .iter()
-            .map(|segment| decode_segment(segment, input))
-            .collect::<Result<_, _>>()?;
-        while path_segments
-            .last()
-            .is_some_and(|segment| segment.is_empty())
-        {
-            path_segments.pop();
-        }
+        // Remove trailing empty encoded segments before decoding: a percent-
+        // encoded slash is content and must not be trimmed as a separator.
+        let encoded_path = raw_segments.next().unwrap_or_default();
+        let mut path = decode_segment(encoded_path.trim_end_matches('/'), input)?;
         let trailing_slash = url.path().ends_with('/');
-        let mut path = path_segments.join("/");
         if trailing_slash && !path.is_empty() {
             path.push('/');
         }
@@ -193,13 +179,8 @@ impl XetUrl {
     #[must_use]
     pub fn with_path(&self, path: &str) -> XetUrl {
         let path = path.trim_matches('/');
-        let trailing_dir = path.is_empty() && self.path.ends_with('/');
         let mut url = self.clone();
-        url.path = if trailing_dir {
-            String::new()
-        } else {
-            path.to_owned()
-        };
+        url.path = path.to_owned();
         url.raw = url.display();
         url
     }
@@ -207,14 +188,7 @@ impl XetUrl {
     /// Returns the canonical `xet://` form of this URL.
     #[must_use]
     pub fn display(&self) -> String {
-        let mut out = format!(
-            "xet://{}/{}/{}/{}/{}",
-            self.authority(),
-            crate::tree::encode_path_segment(&self.provider),
-            crate::tree::encode_path_segment(&self.owner),
-            crate::tree::encode_path_segment(&self.repo),
-            crate::tree::encode_path_segment(&self.revision)
-        );
+        let mut out = self.endpoint_url();
         if !self.path.is_empty() {
             out.push('/');
             out.push_str(&crate::tree::encode_path_segments(&self.path));
@@ -306,9 +280,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_percent_encoded_segments() {
-        let url = XetUrl::parse("xet://example.com/github/team/assets/main/a%20b/c.txt").unwrap();
-        assert_eq!(url.path, "a b/c.txt");
+    fn parses_encoded_paths_and_preserves_directory_suffixes() {
+        for (suffix, expected) in [
+            ("a%20b/c.txt", "a b/c.txt"),
+            ("dir//", "dir/"),
+            ("%2F", "/"),
+            ("%2F//", "//"),
+            ("a%2Fb/c%2F", "a/b/c/"),
+            ("%E2%82%AC/%F0%9F%94%91", "€/🔑"),
+            ("a//b", "a//b"),
+            ("//", ""),
+        ] {
+            let input = format!("xet://example.com/github/team/assets/main/{suffix}");
+            assert_eq!(XetUrl::parse(&input).unwrap().path, expected, "{input}");
+        }
+        // Invalid UTF-8 must not become valid by combining separate segments.
+        for suffix in ["%FF", "%E2/%82%AC"] {
+            let input = format!("xet://example.com/github/team/assets/main/{suffix}");
+            assert!(matches!(
+                XetUrl::parse(&input),
+                Err(SdxError::InvalidEndpoint(_))
+            ));
+        }
     }
 
     #[test]
@@ -322,39 +315,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_host() {
-        let err = XetUrl::parse("xet:///github/team/assets/main").unwrap_err();
-        assert!(matches!(err, SdxError::InvalidEndpoint(_)));
-    }
-
-    #[test]
-    fn rejects_wrong_scheme() {
-        let err = XetUrl::parse("http://example.com/github/team/assets/main").unwrap_err();
-        assert!(matches!(err, SdxError::InvalidEndpoint(_)));
-    }
-
-    #[test]
-    fn rejects_query_and_fragment() {
-        assert!(XetUrl::parse("xet://h/g/o/r/r?x=1").is_err());
-        assert!(XetUrl::parse("xet://h/g/o/r/r#frag").is_err());
-    }
-
-    #[test]
-    fn rejects_too_few_segments() {
-        for input in ["xet://h/g", "xet://h/g/o", "xet://h/g/o/r"] {
-            let err = XetUrl::parse(input).unwrap_err();
+    fn rejects_invalid_endpoints() {
+        for input in [
+            "xet:///github/team/assets/main",
+            "http://example.com/github/team/assets/main",
+            "xet://h/g/o/r/r?x=1",
+            "xet://h/g/o/r/r#frag",
+            "xet://h/g",
+            "xet://h/g/o",
+            "xet://h/g/o/r",
+            "xet://h/g//o/r",
+        ] {
             assert!(
-                matches!(err, SdxError::InvalidEndpoint(_)),
-                "expected error for {input}"
+                matches!(XetUrl::parse(input), Err(SdxError::InvalidEndpoint(_))),
+                "{input}"
             );
         }
-    }
-
-    #[test]
-    fn rejects_empty_identity_segment() {
-        // A double slash in the identity yields an empty segment.
-        let err = XetUrl::parse("xet://h/g//o/r").unwrap_err();
-        assert!(matches!(err, SdxError::InvalidEndpoint(_)));
     }
 
     #[test]

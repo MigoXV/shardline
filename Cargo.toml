@@ -19,9 +19,9 @@ documentation = "https://docs.rs/shardline"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
-arrow-array = "60.0.0"
-arrow-json = "60.0.0"
-arrow-schema = "60.0.0"
+arrow-array = "60.1.0"
+arrow-json = "60.1.0"
+arrow-schema = "60.1.0"
 async-trait = "0.1.92"
 dotenvy = "0.15"
 toml = "0.8"
@@ -40,8 +40,9 @@ ed25519-dalek = { version = "2", features = ["pem", "pkcs8"] }
 # Keep v2 in public APIs; StateChronicle 0.2 uses v3 internally.
 statechronicle-ed25519 = { package = "ed25519-dalek", version = "3" }
 flate2 = "1"
-futures-util = "0.3"
-gearhash = "0.1.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# The default Gear table is part of the persisted CDC boundary contract.
+gearhash = "=0.1.3"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
@@ -50,7 +51,7 @@ jsonwebtoken = "9"
 libc = "0.2.177"
 libfuzzer-sys = "0.4"
 object_store = { version = "0.14.2", default-features = false }
-parquet = { version = "60.0.0", default-features = false, features = [
+parquet = { version = "60.1.0", default-features = false, features = [
     "arrow",
     "snap",
     "brotli",
@@ -58,11 +59,11 @@ parquet = { version = "60.0.0", default-features = false, features = [
     "lz4",
     "zstd",
 ] }
-redis = "1.0.2"
+redis = { version = "1.0.2", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 reqwest = { version = "0.12.28", default-features = false }
-rusqlite = "0.39"
-rustix = { version = "1", features = ["process", "time"] }
+rusqlite = "0.41"
+rustix = { version = "1.1.6", features = ["process", "time"] }
 serde = "1.0"
 serde_json = "1.0"
 sha1 = "0.10"
@@ -75,7 +76,7 @@ shardline-fsck = { version = "1.13.0", path = "crates/shardline-fsck" }
 shardline-gc = { version = "1.13.0", path = "crates/shardline-gc" }
 shardline-hub-api = { version = "1.13.0", path = "crates/shardline-hub-api" }
 shardline-index = { version = "1.13.0", path = "crates/shardline-index" }
-shardline-metrics = { version = "1.13.0", path = "crates/shardline-metrics" }
+shardline-metrics = { version = "1.13.0", path = "crates/shardline-metrics", default-features = false }
 shardline-protocol = { version = "1.13.0", path = "crates/shardline-protocol" }
 shardline-protocol-adapters = { version = "1.13.0", path = "crates/shardline-protocol-adapters" }
 shardline-rebuild = { version = "1.13.0", path = "crates/shardline-rebuild" }
@@ -85,7 +86,7 @@ shardline-oci-adapter = { version = "1.13.0", path = "crates/shardline-oci-adapt
 shardline-s3-adapter = { version = "1.13.0", path = "crates/shardline-s3-adapter" }
 shardline-server = { version = "1.13.0", path = "crates/shardline-server" }
 shardline-server-core = { version = "1.13.0", path = "crates/shardline-server-core" }
-shardline-storage = { version = "1.13.0", path = "crates/shardline-storage" }
+shardline-storage = { version = "1.13.0", path = "crates/shardline-storage", default-features = false }
 shardline-test-support = { version = "1.13.0", path = "crates/shardline-test-support" }
 shardline-validation = { version = "1.13.0", path = "crates/shardline-validation" }
 shardline-auth = { version = "1.13.0", path = "crates/shardline-auth" }
@@ -131,7 +132,6 @@ strip = "none"
 debug = 2
 opt-level = 0
 overflow-checks = true
-incremental = false
 panic = "unwind"
 lto = false
 
@@ -139,6 +139,11 @@ lto = false
 # in debug/test builds too: hashing debug sections must not consume recovery
 # deadlines before a CLI can acquire its database ownership. Checks stay enabled.
 [profile.dev.package.sha2]
+opt-level = 3
+
+# Native history checks retain every signature verification in dev/test builds.
+# Optimize curve arithmetic so large evidence fixtures remain practical.
+[profile.dev.package.curve25519-dalek]
 opt-level = 3
 
 [workspace.lints.rust]
@@ -222,3 +227,9 @@ flat_map_option = "deny"
 # Upstream fix for stranded HTTP/1 requests when a pooled connection closes.
 # https://github.com/hyperium/hyper/pull/4222
 hyper = { git = "https://github.com/hyperium/hyper", rev = "97fff93e53f9e6a993f2d6a25d50883b7b8752a7" }
+
+# Resolver-only compatibility with patched bundled SQLite (RUSTSEC-2026-0459).
+# SQLx is used for PostgreSQL; its optional SQLite driver is not compiled.
+# Remove after a SQLx registry release allows libsqlite3-sys 0.39.
+# https://github.com/launchbadge/sqlx/pull/4502
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }

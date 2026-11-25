@@ -1,4 +1,5 @@
 use shardline_protocol::RepositoryScope;
+use shardline_server_core::validate_content_hash_with;
 use shardline_storage::{ObjectKey, ObjectPrefix};
 
 use crate::{
@@ -87,28 +88,33 @@ pub fn parse_reference(reference: &str) -> Result<OciReference, OciAdapterError>
 pub fn oci_blob_key(
     repository: &str,
     digest_hex: &str,
+    scope: Option<&RepositoryScope>,
+) -> Result<ObjectKey, OciAdapterError> {
+    oci_object_key(repository, digest_hex, scope, "blobs")
+}
+
+// Digest strings remain opaque here for compatibility with existing object keys.
+// Tombstone reconstruction below separately requires a verified SHA-256 digest.
+fn oci_object_key(
+    repository: &str,
+    digest: &str,
     repository_scope: Option<&RepositoryScope>,
+    object_namespace: &str,
 ) -> Result<ObjectKey, OciAdapterError> {
     validate_repository(repository)?;
     validate_oci_repository_scope(repository, repository_scope)?;
     object_key(&format!(
-        "protocols/oci/{}/repos/{}/blobs/{}",
+        "protocols/oci/{}/repos/{}/{object_namespace}/{digest}",
         scope_namespace(repository_scope),
         stable_hex_id(repository),
-        digest_hex
     ))
 }
 
 fn validate_scope_namespace(scope_namespace: &str) -> Result<(), OciAdapterError> {
-    if scope_namespace == "global"
-        || (scope_namespace.len() == 64
-            && scope_namespace
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
-    {
+    if scope_namespace == "global" {
         return Ok(());
     }
-    Err(OciAdapterError::InvalidContentHash)
+    validate_content_hash_with(scope_namespace, || OciAdapterError::InvalidContentHash)
 }
 
 fn oci_object_key_from_namespace(
@@ -119,7 +125,7 @@ fn oci_object_key_from_namespace(
 ) -> Result<ObjectKey, OciAdapterError> {
     validate_repository(repository)?;
     validate_scope_namespace(scope_namespace)?;
-    parse_sha256_digest(&format!("sha256:{digest_hex}"))?;
+    validate_content_hash_with(digest_hex, || OciAdapterError::InvalidDigest)?;
     object_key(&format!(
         "protocols/oci/{scope_namespace}/repos/{}/{object_namespace}/{digest_hex}",
         stable_hex_id(repository),
@@ -145,16 +151,9 @@ pub fn oci_blob_key_from_namespace(
 pub fn oci_manifest_key(
     repository: &str,
     digest_hex: &str,
-    repository_scope: Option<&RepositoryScope>,
+    scope: Option<&RepositoryScope>,
 ) -> Result<ObjectKey, OciAdapterError> {
-    validate_repository(repository)?;
-    validate_oci_repository_scope(repository, repository_scope)?;
-    object_key(&format!(
-        "protocols/oci/{}/repos/{}/manifests/{}",
-        scope_namespace(repository_scope),
-        stable_hex_id(repository),
-        digest_hex
-    ))
+    oci_object_key(repository, digest_hex, scope, "manifests")
 }
 
 /// Rebuilds an OCI manifest key from its durable tombstone namespace.
@@ -176,16 +175,9 @@ pub fn oci_manifest_key_from_namespace(
 pub fn oci_manifest_media_type_key(
     repository: &str,
     digest_hex: &str,
-    repository_scope: Option<&RepositoryScope>,
+    scope: Option<&RepositoryScope>,
 ) -> Result<ObjectKey, OciAdapterError> {
-    validate_repository(repository)?;
-    validate_oci_repository_scope(repository, repository_scope)?;
-    object_key(&format!(
-        "protocols/oci/{}/repos/{}/manifest-media-types/{}",
-        scope_namespace(repository_scope),
-        stable_hex_id(repository),
-        digest_hex
-    ))
+    oci_object_key(repository, digest_hex, scope, "manifest-media-types")
 }
 
 /// Rebuilds an OCI manifest media-type key from its durable tombstone namespace.
@@ -273,7 +265,7 @@ pub fn oci_tag_target_key(
 ) -> Result<ObjectKey, OciAdapterError> {
     validate_repository(repository)?;
     validate_oci_repository_scope(repository, repository_scope)?;
-    parse_sha256_digest(&format!("sha256:{digest_hex}"))?;
+    validate_content_hash_with(digest_hex, || OciAdapterError::InvalidDigest)?;
     validate_oci_tag(tag)?;
     object_key(&format!(
         "protocols/oci/{}/repos/{}/tag-targets/{}/{}",
@@ -294,7 +286,7 @@ pub fn oci_tag_target_prefix(
 ) -> Result<ObjectPrefix, OciAdapterError> {
     validate_repository(repository)?;
     validate_oci_repository_scope(repository, repository_scope)?;
-    parse_sha256_digest(&format!("sha256:{digest_hex}"))?;
+    validate_content_hash_with(digest_hex, || OciAdapterError::InvalidDigest)?;
     ObjectPrefix::parse(&format!(
         "protocols/oci/{}/repos/{}/tag-targets/{}/",
         scope_namespace(repository_scope),

@@ -17,17 +17,9 @@ use crate::{
 #[test]
 fn local_object_store_roundtrips_metadata_ranges_inventory_and_delete() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path_buf());
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path_buf()).unwrap();
 
-    let key = ObjectKey::parse("xorbs/default/aa/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("xorbs/default/aa/hash.xorb").unwrap();
     let body = b"abcdefgh";
     let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), 8);
 
@@ -37,39 +29,22 @@ fn local_object_store_roundtrips_metadata_ranges_inventory_and_delete() {
     assert!(matches!(inserted, Ok(PutOutcome::Inserted)));
     assert!(matches!(duplicate, Ok(PutOutcome::AlreadyExists)));
     assert!(matches!(store.contains(&key), Ok(true)));
-    let metadata = store.metadata(&key);
-    assert!(matches!(metadata, Ok(Some(_))));
-    if let Ok(Some(metadata)) = metadata {
-        assert_eq!(metadata.length(), 8);
-    }
+    let metadata = store
+        .metadata(&key)
+        .expect("expected metadata lookup to succeed")
+        .expect("expected stored object metadata");
+    assert_eq!(metadata.length(), 8);
 
-    let range = ByteRange::new(2, 5);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
+    let range = ByteRange::new(2, 5).unwrap();
     let read = store.read_range(&key, range);
-    assert!(read.is_ok());
-    if let Ok(read) = read {
-        assert_eq!(read, b"cdef".to_vec());
-    }
+    let read = read.expect("expected valid read");
+    assert_eq!(read, b"cdef".to_vec());
 
-    let prefix = ObjectPrefix::parse("xorbs/default/");
-    assert!(prefix.is_ok());
-    let Ok(prefix) = prefix else {
-        return;
-    };
-    let listed = store.list_prefix(&prefix);
-    assert!(listed.is_ok());
-    let Ok(listed) = listed else {
-        return;
-    };
+    let prefix = ObjectPrefix::parse("xorbs/default/").unwrap();
+    let listed = store.list_prefix(&prefix).unwrap();
     assert_eq!(listed.len(), 1);
-    let first = listed.first();
-    assert!(first.is_some());
-    if let Some(first) = first {
-        assert_eq!(first.key(), &key);
-    }
+    let first = listed.first().expect("expected stored object in inventory");
+    assert_eq!(first.key(), &key);
     let mut visited = Vec::new();
     let visit = store.visit_prefix(&prefix, |visited_metadata| {
         visited.push(visited_metadata.key().clone());
@@ -215,17 +190,9 @@ fn local_temporary_upload_reads_each_candidate_and_existing_object_once() {
 #[test]
 fn local_object_store_rejects_integrity_mismatch_and_out_of_bounds_range() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path_buf());
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path_buf()).unwrap();
 
-    let key = ObjectKey::parse("xorbs/default/bb/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("xorbs/default/bb/hash.xorb").unwrap();
     let wrong_integrity = ObjectIntegrity::new(super::util::chunk_hash(b"abc"), 4);
 
     let result = store.put_if_absent(&key, ObjectBody::from_slice(b"abc"), &wrong_integrity);
@@ -238,11 +205,7 @@ fn local_object_store_rejects_integrity_mismatch_and_out_of_bounds_range() {
     let inserted = store.put_if_absent(&key, ObjectBody::from_slice(b"abc"), &integrity);
     assert!(matches!(inserted, Ok(PutOutcome::Inserted)));
 
-    let range = ByteRange::new(1, 5);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
+    let range = ByteRange::new(1, 5).unwrap();
     let read = store.read_range(&key, range);
     assert!(matches!(read, Err(LocalObjectStoreError::RangeOutOfBounds)));
 }
@@ -250,16 +213,8 @@ fn local_object_store_rejects_integrity_mismatch_and_out_of_bounds_range() {
 #[test]
 fn local_object_store_installs_temporary_file_without_buffering() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-    let key = ObjectKey::parse("xorbs/default/dd/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
+    let key = ObjectKey::parse("xorbs/default/dd/hash.xorb").unwrap();
     let temporary = storage.path().join("body.tmp");
     let write = fs::write(&temporary, b"streamed-body");
     assert!(write.is_ok());
@@ -269,11 +224,7 @@ fn local_object_store_installs_temporary_file_without_buffering() {
 
     assert!(matches!(inserted, Ok(PutOutcome::Inserted)));
     assert!(!temporary.exists());
-    let range = ByteRange::new(0, 12);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
+    let range = ByteRange::new(0, 12).unwrap();
     let read = store.read_range(&key, range);
     assert!(matches!(read, Ok(bytes) if bytes == b"streamed-body"));
 }
@@ -281,16 +232,8 @@ fn local_object_store_installs_temporary_file_without_buffering() {
 #[test]
 fn local_object_store_temporary_file_duplicate_is_idempotent() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-    let key = ObjectKey::parse("xorbs/default/ee/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
+    let key = ObjectKey::parse("xorbs/default/ee/hash.xorb").unwrap();
     let body = b"same-body";
     let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), 9);
     let inserted = store.put_if_absent(&key, ObjectBody::from_slice(body), &integrity);
@@ -308,16 +251,8 @@ fn local_object_store_temporary_file_duplicate_is_idempotent() {
 #[test]
 fn local_object_store_temporary_file_rejects_conflicting_existing_object() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-    let key = ObjectKey::parse("xorbs/default/ef/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
+    let key = ObjectKey::parse("xorbs/default/ef/hash.xorb").unwrap();
     let inserted = store.put_if_absent(
         &key,
         ObjectBody::from_slice(b"same-size"),
@@ -349,11 +284,7 @@ fn local_object_store_open_is_non_mutating_until_write() {
 
     assert!(!root.exists());
 
-    let key = ObjectKey::parse("xorbs/default/cc/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("xorbs/default/cc/hash.xorb").unwrap();
     let contains = store.contains(&key);
 
     assert!(matches!(contains, Ok(false)));
@@ -395,11 +326,7 @@ fn local_object_store_list_prefix_rejects_symlinked_root_ancestor() {
     let linked = symlink(&target, &link);
     assert!(linked.is_ok());
     let store = LocalObjectStore::open(link.join("objects"));
-    let prefix = ObjectPrefix::parse("aa/");
-    assert!(prefix.is_ok());
-    let Ok(prefix) = prefix else {
-        return;
-    };
+    let prefix = ObjectPrefix::parse("aa/").unwrap();
 
     let listed = store.list_prefix(&prefix);
 
@@ -414,11 +341,7 @@ fn local_object_store_maps_validated_key_under_root() {
     let storage = shardline_test_support::TempStorage::new();
     let root = storage.path().join("objects");
     let store = LocalObjectStore::open(root.clone());
-    let key = ObjectKey::parse("aa/hash");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("aa/hash").unwrap();
 
     let path = store.path_for_key(&key);
 
@@ -428,23 +351,11 @@ fn local_object_store_maps_validated_key_under_root() {
 #[test]
 fn local_object_store_rejects_corrupted_existing_object_under_same_key() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
 
-    let key = ObjectKey::parse("xorbs/default/dd/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("xorbs/default/dd/hash.xorb").unwrap();
     let path = store.path_for_key(&key);
-    let parent = path.parent();
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
+    let parent = path.parent().unwrap();
     let created = fs::create_dir_all(parent);
     assert!(created.is_ok());
 
@@ -516,37 +427,21 @@ fn local_object_store_does_not_confirm_replaced_pinned_object_as_durable() {
 #[test]
 fn local_object_store_rejects_symlinked_object_path() {
     let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
     let outside = storage.path().join("outside-secret");
     let outside_write = fs::write(&outside, b"secret");
     assert!(outside_write.is_ok());
 
-    let key = ObjectKey::parse("xorbs/default/ff/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    let key = ObjectKey::parse("xorbs/default/ff/hash.xorb").unwrap();
     let path = store.path_for_key(&key);
-    let parent = path.parent();
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
+    let parent = path.parent().unwrap();
     let created = fs::create_dir_all(parent);
     assert!(created.is_ok());
     let linked = symlink(&outside, &path);
     assert!(linked.is_ok());
 
     let metadata = store.metadata(&key);
-    let range = ByteRange::new(0, 5);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
+    let range = ByteRange::new(0, 5).unwrap();
     let read = store.read_range(&key, range);
 
     assert!(matches!(
@@ -560,52 +455,44 @@ fn local_object_store_rejects_symlinked_object_path() {
 }
 
 #[cfg(unix)]
+struct SymlinkedParent {
+    _storage: shardline_test_support::TempStorage,
+    store: LocalObjectStore,
+    key: ObjectKey,
+    outside: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl SymlinkedParent {
+    fn new(prefix: &str, contents: Option<&[u8]>) -> Self {
+        let storage = shardline_test_support::TempStorage::new();
+        let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
+        let key = ObjectKey::parse(&format!("xorbs/default/{prefix}/hash.xorb")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        if let Some(contents) = contents {
+            fs::write(outside.path().join("hash.xorb"), contents).unwrap();
+        }
+        let path = store.path_for_key(&key);
+        let link = path.parent().unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(outside.path(), link).unwrap();
+        Self {
+            _storage: storage,
+            store,
+            key,
+            outside,
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn local_object_store_rejects_symlinked_parent_directory_reads() {
-    let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let fixture = SymlinkedParent::new("aa", Some(b"secret"));
 
-    let key = ObjectKey::parse("xorbs/default/aa/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
-    let outside = tempfile::tempdir();
-    assert!(outside.is_ok());
-    let Ok(outside) = outside else {
-        return;
-    };
-    let outside_path = outside.path().join("hash.xorb");
-    let outside_write = fs::write(&outside_path, b"secret");
-    assert!(outside_write.is_ok());
-
-    let link = storage
-        .path()
-        .join("objects")
-        .join("xorbs")
-        .join("default")
-        .join("aa");
-    let parent = link.parent();
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
-    let created = fs::create_dir_all(parent);
-    assert!(created.is_ok());
-    let linked = symlink(outside.path(), &link);
-    assert!(linked.is_ok());
-
-    let metadata = store.metadata(&key);
-    let range = ByteRange::new(0, 5);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
-    let read = store.read_range(&key, range);
+    let metadata = fixture.store.metadata(&fixture.key);
+    let range = ByteRange::new(0, 5).unwrap();
+    let read = fixture.store.read_range(&fixture.key, range);
 
     assert!(matches!(
         metadata,
@@ -620,198 +507,88 @@ fn local_object_store_rejects_symlinked_parent_directory_reads() {
 #[cfg(unix)]
 #[test]
 fn local_object_store_rejects_symlinked_parent_directory_writes() {
-    let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-
-    let key = ObjectKey::parse("xorbs/default/bb/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
-    let outside = tempfile::tempdir();
-    assert!(outside.is_ok());
-    let Ok(outside) = outside else {
-        return;
-    };
-    let link = storage
-        .path()
-        .join("objects")
-        .join("xorbs")
-        .join("default")
-        .join("bb");
-    let parent = link.parent();
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
-    let created = fs::create_dir_all(parent);
-    assert!(created.is_ok());
-    let linked = symlink(outside.path(), &link);
-    assert!(linked.is_ok());
+    let fixture = SymlinkedParent::new("bb", None);
 
     let body = b"payload";
     let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), 7);
-    let result = store.put_if_absent(&key, ObjectBody::from_slice(body), &integrity);
+    let result =
+        fixture
+            .store
+            .put_if_absent(&fixture.key, ObjectBody::from_slice(body), &integrity);
 
     assert!(matches!(
         result,
         Err(LocalObjectStoreError::InvalidObjectPath)
     ));
     assert!(
-        !outside.path().join("hash.xorb").exists(),
+        !fixture.outside.path().join("hash.xorb").exists(),
         "object write escaped into a symlink target outside the object root"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn local_object_store_put_overwrite_rejects_parent_swap_race() {
-    let storage = shardline_test_support::TempStorage::new();
-    let outside = tempfile::tempdir();
-    assert!(outside.is_ok());
-    let Ok(outside) = outside else {
-        return;
-    };
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+fn local_object_store_writes_reject_parent_swap_race() {
+    for (overwrite, prefix, body, moved_name) in [
+        (false, "dd", b"payload".as_slice(), "swapped-object-parent"),
+        (
+            true,
+            "ee",
+            b"payload for overwrite".as_slice(),
+            "swapped-overwrite-parent",
+        ),
+    ] {
+        let storage = shardline_test_support::TempStorage::new();
+        let outside = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(storage.path().join("objects")).unwrap();
+        let key = ObjectKey::parse(&format!("xorbs/default/{prefix}/hash.xorb")).unwrap();
+        let path = store.path_for_key(&key);
+        let parent = path.parent().map(PathBuf::from).unwrap();
+        let moved_parent = storage.path().join(moved_name);
+        let moved_parent_for_hook = moved_parent.clone();
+        let escape_dir = outside.path().to_path_buf();
 
-    let key = ObjectKey::parse("xorbs/default/ee/hash.xorb").unwrap();
-    let path = store.path_for_key(&key);
-    let parent = path.parent().map(PathBuf::from).unwrap();
-    let moved_parent = storage.path().join("swapped-overwrite-parent");
-    let escape_dir = outside.path().to_path_buf();
+        set_before_local_write_hook(path, move || {
+            fs::rename(&parent, &moved_parent_for_hook).unwrap();
+            symlink(&escape_dir, &parent).unwrap();
+        });
 
-    set_before_local_write_hook(path, move || {
-        let renamed = fs::rename(&parent, &moved_parent);
-        assert!(renamed.is_ok());
-        let linked = symlink(&escape_dir, &parent);
-        assert!(linked.is_ok());
-    });
-
-    let body = b"payload for overwrite";
-    let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), 21);
-    let result = store.put_overwrite(&key, ObjectBody::from_slice(body), &integrity);
-
-    assert!(matches!(
-        result,
-        Err(LocalObjectStoreError::Io(error)) if error.kind() == IoErrorKind::InvalidData
-    ));
-    assert!(
-        !outside.path().join("hash.xorb").exists(),
-        "object write escaped into an attacker-controlled symlink target"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn local_object_store_rejects_parent_swap_race() {
-    let storage = shardline_test_support::TempStorage::new();
-    let outside = tempfile::tempdir();
-    assert!(outside.is_ok());
-    let Ok(outside) = outside else {
-        return;
-    };
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-
-    let key = ObjectKey::parse("xorbs/default/dd/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
-    let path = store.path_for_key(&key);
-    let parent = path.parent().map(PathBuf::from);
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
-    let moved_parent = storage.path().join("swapped-object-parent");
-    let moved_parent_for_hook = moved_parent.clone();
-    let escape_dir = outside.path().to_path_buf();
-
-    set_before_local_write_hook(path, move || {
-        let renamed = fs::rename(&parent, &moved_parent_for_hook);
-        assert!(renamed.is_ok());
-        let linked = symlink(&escape_dir, &parent);
-        assert!(linked.is_ok());
-    });
-
-    let body = b"payload";
-    let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), 7);
-    let result = store.put_if_absent(&key, ObjectBody::from_slice(body), &integrity);
-
-    assert!(matches!(
-        result,
-        Err(LocalObjectStoreError::Io(error)) if error.kind() == IoErrorKind::InvalidData
-    ));
-    assert!(
-        !outside.path().join("hash.xorb").exists(),
-        "object write escaped into an attacker-controlled symlink target"
-    );
-    assert!(
-        !moved_parent.join("hash.xorb").exists(),
-        "object write left a committed file behind in the detached original directory"
-    );
+        let integrity = ObjectIntegrity::new(super::util::chunk_hash(body), body.len() as u64);
+        let result = if overwrite {
+            store.put_overwrite(&key, ObjectBody::from_slice(body), &integrity)
+        } else {
+            store
+                .put_if_absent(&key, ObjectBody::from_slice(body), &integrity)
+                .map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(LocalObjectStoreError::Io(error)) if error.kind() == IoErrorKind::InvalidData
+        ));
+        assert!(
+            !outside.path().join("hash.xorb").exists(),
+            "object write escaped into an attacker-controlled symlink target"
+        );
+        assert!(
+            !moved_parent.join("hash.xorb").exists(),
+            "object write left a committed file behind in the detached original directory"
+        );
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn local_object_store_rejects_symlinked_parent_directory_deletes() {
-    let storage = shardline_test_support::TempStorage::new();
-    let store = LocalObjectStore::new(storage.path().join("objects"));
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    let fixture = SymlinkedParent::new("cc", Some(b"secret"));
 
-    let key = ObjectKey::parse("xorbs/default/cc/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
-    let outside = tempfile::tempdir();
-    assert!(outside.is_ok());
-    let Ok(outside) = outside else {
-        return;
-    };
-    let outside_path = outside.path().join("hash.xorb");
-    let outside_write = fs::write(&outside_path, b"secret");
-    assert!(outside_write.is_ok());
-
-    let link = storage
-        .path()
-        .join("objects")
-        .join("xorbs")
-        .join("default")
-        .join("cc");
-    let parent = link.parent();
-    assert!(parent.is_some());
-    let Some(parent) = parent else {
-        return;
-    };
-    let created = fs::create_dir_all(parent);
-    assert!(created.is_ok());
-    let linked = symlink(outside.path(), &link);
-    assert!(linked.is_ok());
-
-    let result = store.delete_if_present(&key);
+    let result = fixture.store.delete_if_present(&fixture.key);
 
     assert!(matches!(
         result,
         Err(LocalObjectStoreError::InvalidObjectPath)
     ));
     assert!(
-        outside_path.exists(),
+        fixture.outside.path().join("hash.xorb").exists(),
         "object delete escaped into a symlink target outside the object root"
     );
 }
@@ -1296,77 +1073,52 @@ fn local_object_store_put_if_absent_fails_when_root_is_file_not_directory() {
 
 #[test]
 fn local_store_error_display_io() {
-    let err = LocalObjectStoreError::Io(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "nope",
-    ));
-    assert!(
-        err.to_string()
-            .contains("local object store operation failed")
-    );
+    for message in ["nope", "disk error"] {
+        let err = LocalObjectStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            message,
+        ));
+        assert!(
+            err.to_string()
+                .contains("local object store operation failed")
+        );
+    }
 }
 
 #[test]
-fn local_store_error_display_integrity_length_mismatch() {
-    let err = LocalObjectStoreError::IntegrityLengthMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body length did not match expected integrity"
-    );
-}
-
-#[test]
-fn local_store_error_display_integrity_hash_mismatch() {
-    let err = LocalObjectStoreError::IntegrityHashMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body hash did not match expected integrity"
-    );
-}
-
-#[test]
-fn local_store_error_display_existing_object_conflict() {
-    let err = LocalObjectStoreError::ExistingObjectConflict;
-    assert_eq!(
-        err.to_string(),
-        "object key already exists with conflicting bytes"
-    );
-}
-
-#[test]
-fn local_store_error_display_range_out_of_bounds() {
-    let err = LocalObjectStoreError::RangeOutOfBounds;
-    assert_eq!(
-        err.to_string(),
-        "requested byte range exceeded stored object length"
-    );
-}
-
-#[test]
-fn local_store_error_display_invalid_stored_key() {
-    let err = LocalObjectStoreError::InvalidStoredKey;
-    assert_eq!(
-        err.to_string(),
-        "stored object path could not be represented as a valid object key"
-    );
-}
-
-#[test]
-fn local_store_error_display_invalid_object_path() {
-    let err = LocalObjectStoreError::InvalidObjectPath;
-    assert_eq!(
-        err.to_string(),
-        "validated object key could not be mapped to a local path"
-    );
-}
-
-#[test]
-fn local_store_error_display_invalid_start_after() {
-    let err = LocalObjectStoreError::InvalidStartAfter;
-    assert_eq!(
-        err.to_string(),
-        "start_after key is outside the requested prefix"
-    );
+fn local_store_error_display_messages() {
+    for (error, message) in [
+        (
+            LocalObjectStoreError::IntegrityLengthMismatch,
+            "object body length did not match expected integrity",
+        ),
+        (
+            LocalObjectStoreError::IntegrityHashMismatch,
+            "object body hash did not match expected integrity",
+        ),
+        (
+            LocalObjectStoreError::ExistingObjectConflict,
+            "object key already exists with conflicting bytes",
+        ),
+        (
+            LocalObjectStoreError::RangeOutOfBounds,
+            "requested byte range exceeded stored object length",
+        ),
+        (
+            LocalObjectStoreError::InvalidStoredKey,
+            "stored object path could not be represented as a valid object key",
+        ),
+        (
+            LocalObjectStoreError::InvalidObjectPath,
+            "validated object key could not be mapped to a local path",
+        ),
+        (
+            LocalObjectStoreError::InvalidStartAfter,
+            "start_after key is outside the requested prefix",
+        ),
+    ] {
+        assert_eq!(error.to_string(), message);
+    }
 }
 
 // ── chunk_hash ───────────────────────────────────────────────────────────
@@ -1569,79 +1321,6 @@ fn local_map_directory_path_error_io_variant() {
     assert!(matches!(result, LocalObjectStoreError::Io(_)));
 }
 
-// ── LocalObjectStoreError Display variants ─────────────────────────────
-
-#[test]
-fn local_error_display_io() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "disk error");
-    let err = LocalObjectStoreError::Io(io_err);
-    let msg = err.to_string();
-    assert!(msg.contains("local object store operation failed"));
-}
-
-#[test]
-fn local_error_display_integrity_length_mismatch() {
-    let err = LocalObjectStoreError::IntegrityLengthMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body length did not match expected integrity"
-    );
-}
-
-#[test]
-fn local_error_display_integrity_hash_mismatch() {
-    let err = LocalObjectStoreError::IntegrityHashMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body hash did not match expected integrity"
-    );
-}
-
-#[test]
-fn local_error_display_existing_object_conflict() {
-    let err = LocalObjectStoreError::ExistingObjectConflict;
-    assert_eq!(
-        err.to_string(),
-        "object key already exists with conflicting bytes"
-    );
-}
-
-#[test]
-fn local_error_display_range_out_of_bounds() {
-    let err = LocalObjectStoreError::RangeOutOfBounds;
-    assert_eq!(
-        err.to_string(),
-        "requested byte range exceeded stored object length"
-    );
-}
-
-#[test]
-fn local_error_display_invalid_stored_key() {
-    let err = LocalObjectStoreError::InvalidStoredKey;
-    assert_eq!(
-        err.to_string(),
-        "stored object path could not be represented as a valid object key"
-    );
-}
-
-#[test]
-fn local_error_display_invalid_object_path() {
-    let err = LocalObjectStoreError::InvalidObjectPath;
-    assert_eq!(
-        err.to_string(),
-        "validated object key could not be mapped to a local path"
-    );
-}
-
-#[test]
-fn local_error_display_invalid_start_after() {
-    let err = LocalObjectStoreError::InvalidStartAfter;
-    assert_eq!(
-        err.to_string(),
-        "start_after key is outside the requested prefix"
-    );
-}
-
 #[test]
 fn local_error_source_io() {
     use std::error::Error;
@@ -1681,55 +1360,38 @@ fn local_list_flat_namespace_rejects_start_after_outside_prefix() {
 // ── existing_object_outcome verifies the expected digest and length ───────
 
 #[test]
-fn local_existing_object_outcome_matches_expected_integrity() {
-    let storage = shardline_test_support::TempStorage::new();
-    let path = storage.path().join("target.bin");
-    std::fs::write(&path, b"exact match").unwrap();
-    let result = super::io::existing_object_outcome(
-        storage.path(),
-        &path,
-        &ObjectIntegrity::new(super::util::chunk_hash(b"exact match"), 11),
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn local_existing_object_outcome_rejects_wrong_digest() {
-    let storage = shardline_test_support::TempStorage::new();
-    let path = storage.path().join("target2.bin");
-    std::fs::write(&path, b"exact match").unwrap();
-    let result = super::io::existing_object_outcome(
-        storage.path(),
-        &path,
-        &ObjectIntegrity::new(super::util::chunk_hash(b"wrong bytes"), 11),
-    );
-    assert!(result.is_err());
-}
-
-#[test]
-fn local_existing_object_outcome_accepts_empty_object() {
-    let storage = shardline_test_support::TempStorage::new();
-    let path = storage.path().join("target3.bin");
-    std::fs::write(&path, b"").unwrap();
-    let result = super::io::existing_object_outcome(
-        storage.path(),
-        &path,
-        &ObjectIntegrity::new(super::util::chunk_hash(b""), 0),
-    );
-    assert!(result.is_ok());
-}
-
-#[test]
-fn local_existing_object_outcome_rejects_wrong_length() {
-    let storage = shardline_test_support::TempStorage::new();
-    let path = storage.path().join("target4.bin");
-    std::fs::write(&path, b"existing data").unwrap();
-    let result = super::io::existing_object_outcome(
-        storage.path(),
-        &path,
-        &ObjectIntegrity::new(super::util::chunk_hash(b"different data"), 14),
-    );
-    assert!(result.is_err());
+fn local_existing_object_outcome_integrity_contract() {
+    for (name, bytes, hash_bytes, length, valid) in [
+        (
+            "target.bin",
+            b"exact match".as_slice(),
+            b"exact match".as_slice(),
+            11,
+            true,
+        ),
+        (
+            "target2.bin",
+            b"exact match".as_slice(),
+            b"wrong bytes".as_slice(),
+            11,
+            false,
+        ),
+        ("target3.bin", b"".as_slice(), b"".as_slice(), 0, true),
+        (
+            "target4.bin",
+            b"existing data".as_slice(),
+            b"different data".as_slice(),
+            14,
+            false,
+        ),
+    ] {
+        let storage = shardline_test_support::TempStorage::new();
+        let path = storage.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        let integrity = ObjectIntegrity::new(super::util::chunk_hash(hash_bytes), length);
+        let result = super::io::existing_object_outcome(storage.path(), &path, &integrity);
+        assert_eq!(result.is_ok(), valid, "{name}: {result:?}");
+    }
 }
 
 // ── remove_temporary_file with non-existent file ──────────────────────────

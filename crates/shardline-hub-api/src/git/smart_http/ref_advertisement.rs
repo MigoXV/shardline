@@ -34,18 +34,7 @@ pub(super) fn resolve_repo_id(_repo_type: &str, ns: &str, repo: &str) -> String 
     format!("{ns}/{repo}")
 }
 
-#[cfg(test)]
-pub(super) fn authorize_read(state: &HubState, headers: &HeaderMap) -> Result<(), HubApiError> {
-    authorize_read_with_context(state, headers).map(|_| ())
-}
-
-#[cfg(test)]
-pub(super) fn authorize_write(state: &HubState, headers: &HeaderMap) -> Result<(), HubApiError> {
-    authorize_write_with_context(state, headers).map(|_| ())
-}
-
-/// Like [`authorize_read`] but returns the verified auth context so the caller
-/// can enforce a token→repository binding.
+/// Authorizes reading and returns the verified context for repository binding.
 pub(super) fn authorize_read_with_context(
     state: &HubState,
     headers: &HeaderMap,
@@ -57,8 +46,7 @@ pub(super) fn authorize_read_with_context(
     }
 }
 
-/// Like [`authorize_write`] but returns the verified auth context so the caller
-/// can enforce a token→repository binding.
+/// Authorizes writing and returns the verified context for repository binding.
 pub(super) fn authorize_write_with_context(
     state: &HubState,
     headers: &HeaderMap,
@@ -74,29 +62,19 @@ use shardline_protocol::TokenScope;
 
 /// Validates a Git refname for receive-pack.
 ///
-/// Rejects empty refnames, refnames with ASCII control characters,
-/// refnames that do not start with `refs/`, and refnames containing
-/// `..` path components (path traversal).
+/// Requires the `refs/` namespace and rejects Git-reserved spellings, control
+/// characters, whitespace, and path traversal components.
 pub(crate) fn is_valid_refname(refname: &str) -> bool {
-    if refname.is_empty()
-        || refname.ends_with('.')
-        || refname.contains("..")
-        || refname.contains("@{")
-    {
-        return false;
-    }
-    if refname
-        .bytes()
-        .any(|b| b <= 0x20 || b == 0x7f || b"~^:?*[\\".contains(&b))
-    {
-        return false;
-    }
-    if !refname.starts_with("refs/") {
-        return false;
-    }
-    !refname
-        .split('/')
-        .any(|c| c.is_empty() || c.starts_with('.') || c.ends_with(".lock"))
+    refname.starts_with("refs/")
+        && !refname.ends_with('.')
+        && !refname.contains("..")
+        && !refname.contains("@{")
+        && !refname
+            .bytes()
+            .any(|byte| byte <= 0x20 || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+        && refname.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
 }
 
 /// Collects all refs from the HubStore for a given repo.
@@ -121,10 +99,7 @@ pub(super) fn filter_refs(
         // HEAD is an alias for the repository default, not for the caller's branch.
         // HubRepo.default_branch is a legacy commit identity, not a ref name.
         // collect_refs_sync synthesizes HEAD from the live main ref.
-        let default = state
-            .store
-            .resolve_revision(repo_id, "main")
-            .map_err(|e| HubApiError::CasError(e.to_string()))?;
+        let default = state.store.resolve_revision(repo_id, "main")?;
         refs.retain(|reference| {
             if reference.name == "HEAD" {
                 visible.contains("main") && default.as_deref() == Some(reference.sha1.as_str())
@@ -155,55 +130,41 @@ fn collect_refs_sync(state: &HubState, repo_id: &str) -> Result<Vec<GitRef>, Hub
             HubApiError::RepoNotFound
         })?;
 
+    let fallback_head = store_refs
+        .iter()
+        .find(|r| r.ref_name == "main")
+        .map(|r| r.sha.clone());
     let mut refs = Vec::new();
     let mut seen_refs = std::collections::HashSet::new();
 
-    for store_ref in &store_refs {
-        if store_ref.ref_name == "HEAD" || store_ref.ref_name.is_empty() {
-            if seen_refs.insert("HEAD".to_owned()) {
-                refs.push(GitRef {
-                    name: "HEAD".to_owned(),
-                    sha1: store_ref.sha.clone(),
-                });
-            }
+    for store_ref in store_refs {
+        let name = if store_ref.ref_name == "HEAD" || store_ref.ref_name.is_empty() {
+            "HEAD".to_owned()
         } else if store_ref.ref_name.starts_with("refs/") {
-            if seen_refs.insert(store_ref.ref_name.clone()) {
-                refs.push(GitRef {
-                    name: store_ref.ref_name.clone(),
-                    sha1: store_ref.sha.clone(),
-                });
-            }
+            store_ref.ref_name
         } else {
-            let full_ref = format!("refs/heads/{}", store_ref.ref_name);
-            if seen_refs.insert(full_ref.clone()) {
-                refs.push(GitRef {
-                    name: full_ref,
-                    sha1: store_ref.sha.clone(),
-                });
-            }
+            format!("refs/heads/{}", store_ref.ref_name)
+        };
+        if seen_refs.insert(name.clone()) {
+            refs.push(GitRef {
+                name,
+                sha1: store_ref.sha,
+            });
         }
     }
 
     // If no HEAD was explicitly set, point HEAD at the active default branch.
     if !seen_refs.contains("HEAD")
-        && let Some(main_ref) = store_refs.iter().find(|r| r.ref_name == "main")
+        && let Some(sha1) = fallback_head
     {
-        refs.insert(
-            0,
-            GitRef {
-                name: "HEAD".to_owned(),
-                sha1: main_ref.sha.clone(),
-            },
-        );
+        refs.push(GitRef {
+            name: "HEAD".to_owned(),
+            sha1,
+        });
     }
 
+    // Normalized names are HEAD or refs/*, so this also places HEAD first.
     refs.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // Ensure HEAD is first.
-    if let Some(pos) = refs.iter().position(|r| r.name == "HEAD") {
-        let head = refs.remove(pos);
-        refs.insert(0, head);
-    }
 
     Ok(refs)
 }

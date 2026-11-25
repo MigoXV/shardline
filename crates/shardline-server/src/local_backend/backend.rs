@@ -1,23 +1,15 @@
 use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use shardline_index::{
-    FileChunkRecord, LocalIndexStore, LocalRecordStore, OciObjectKey, OciObjectStore, OciTagEntry,
-    OciTagStore, ReconstructionStore, RecordTraversal, RepoKey, RevisionRecord, S3ObjectEntry,
-    S3ObjectIndexStore, TreeEntry, TreeKey, TreeStore,
+    LocalIndexStore, LocalRecordStore, OciObjectKey, OciObjectStore, OciTagEntry,
+    ReconstructionStore, RecordTraversal,
 };
-use shardline_protocol::unix_now_seconds_lossy;
-use shardline_reliability::verify_lifecycle_chain_ends_at;
-use shardline_storage::{ObjectPrefix, ObjectStore};
+use shardline_storage::ObjectStore;
 
 use crate::{
-    ServerError, ServerFrontend,
-    chunk_store::chunk_hash_from_chunk_object_key_if_present,
-    config::default_upload_max_in_flight_chunks,
-    local_path::ensure_directory_path_components_are_not_symlinked,
-    model::ServerStatsResponse,
-    object_store::{ServerObjectStore, visit_object_prefix},
-    overflow::{checked_add, checked_increment},
-    validation::validate_content_hash,
+    ServerError, ServerFrontend, config::default_upload_max_in_flight_chunks,
+    local_path::ensure_directory_path_components_are_not_symlinked, model::ServerStatsResponse,
+    object_store::ServerObjectStore,
 };
 
 use super::records::read_record;
@@ -40,6 +32,14 @@ pub struct LocalBackend {
 }
 
 impl LocalBackend {
+    pub(crate) const fn index_store(&self) -> &LocalIndexStore {
+        &self.index_store
+    }
+
+    pub(crate) async fn lock_metadata_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.metadata_write_lock.lock().await
+    }
+
     pub(crate) const fn record_store(&self) -> &LocalRecordStore {
         &self.record_store
     }
@@ -205,36 +205,7 @@ impl LocalBackend {
     ///
     /// Returns [`ServerError`] when local metadata cannot be traversed.
     pub async fn stats(&self) -> Result<ServerStatsResponse, ServerError> {
-        let object_store = self.object_store();
-        let prefix = ObjectPrefix::parse("").map_err(|_error| ServerError::InvalidContentHash)?;
-        let mut objects = 0_u64;
-        let mut object_bytes = 0_u64;
-        let mut chunks = 0_u64;
-        let mut chunk_bytes = 0_u64;
-        visit_object_prefix(&object_store, &prefix, |metadata| {
-            objects = checked_increment(objects)?;
-            object_bytes = checked_add(object_bytes, metadata.length())?;
-            let is_chunk = chunk_hash_from_chunk_object_key_if_present(metadata.key())?.is_some();
-            if is_chunk {
-                chunks = checked_increment(chunks)?;
-                chunk_bytes = checked_add(chunk_bytes, metadata.length())?;
-            }
-
-            Ok(())
-        })?;
-        let files = u64::try_from(
-            RecordTraversal::list_latest_record_locators(&self.record_store)
-                .await?
-                .len(),
-        )?;
-
-        Ok(ServerStatsResponse {
-            objects,
-            object_bytes,
-            chunks,
-            chunk_bytes,
-            files,
-        })
+        crate::storage_stats::storage_stats(&self.object_store(), &self.record_store).await
     }
 
     pub(crate) fn object_store(&self) -> ServerObjectStore {
@@ -268,212 +239,15 @@ impl LocalBackend {
         minimum_age: std::time::Duration,
         pass: &crate::upload_intent_recovery::startup::RecoveryPass,
     ) -> Result<bool, ServerError> {
-        use shardline_index::{UploadIntentState, UploadIntentStore};
-        use shardline_storage::{AsyncObjectStore, ObjectKey};
-        use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-        let mut reconciled = 0u64;
-        let mut pending_files = false;
-        for state in &[
-            UploadIntentState::Created,
-            UploadIntentState::Storing,
-            UploadIntentState::Stored,
-            UploadIntentState::MetadataCommitted,
-        ] {
-            if pass.stopped() {
-                return Ok(pending_files);
-            }
-            let intents = match self.index_store.intents_by_state(*state).await {
-                Ok(intents) => intents,
-                Err(e) => {
-                    // If the intents table does not exist yet (no migration has created it),
-                    // there is nothing to reconcile. Log and continue.
-                    tracing::debug!("intent query skipped (table may not exist): {e}");
-                    continue;
-                }
-            };
-            for intent in &intents {
-                if pass.stopped() {
-                    return Ok(pending_files);
-                }
-                if !pass.visits(intent) {
-                    continue;
-                }
-                let reliability_events = self
-                    .index_store
-                    .reliability_events(intent.intent_id())
-                    .await?;
-                if let Err(error) =
-                    verify_lifecycle_chain_ends_at(&reliability_events, intent.state())
-                {
-                    let current = self.index_store.intent_by_id(intent.intent_id()).await?;
-                    if current
-                        .as_ref()
-                        .is_none_or(|current| current.state() != intent.state())
-                    {
-                        continue;
-                    }
-                    return Err(ServerError::Io(std::io::Error::other(error.to_string())));
-                }
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO);
-                let age = now.saturating_sub(intent.created_at());
-                if age < minimum_age {
-                    continue;
-                }
-                tracing::warn!(
-                    intent_id = %intent.intent_id(),
-                    state = ?intent.state(),
-                    age_secs = age.as_secs(),
-                    "reconciling stuck intent"
-                );
-                let file_intent = intent.object_key().starts_with("record/");
-                if file_intent
-                    && !crate::upload_intent_recovery::file_publication_may_have_completed(intent)
-                {
-                    tracing::warn!(intent_id = %intent.intent_id(), "file upload has no Stored checkpoint; preserving unfinished intent for a fresh validated request");
-                    continue;
-                }
-                let visible_file_record = if let Some(file_id) =
-                    intent.object_key().strip_prefix("record/")
-                {
-                    let crate::upload_intent_recovery::FileRecoveryScope::Known(scope) =
-                        crate::upload_intent_recovery::file_recovery_scope(&reliability_events)
-                    else {
-                        tracing::warn!(intent_id = %intent.intent_id(), "legacy file scope cannot be verified; preserving unfinished intent");
-                        continue;
-                    };
-                    match self.read_record(file_id, None, scope.as_ref()).await {
-                        Ok(record) => {
-                            if pass.defers_file_bytes() {
-                                pending_files |= crate::upload_intent_recovery::file_record_has_expected_identity(intent, &reliability_events, &record);
-                                continue;
-                            }
-                            match crate::upload_intent_recovery::file_record_matches_intent(
-                                intent,
-                                &reliability_events,
-                                record,
-                                self.object_store(),
-                                self.stream_work_pool.clone(),
-                                pass,
-                            )
-                            .await
-                            {
-                                Ok(matches) => matches,
-                                Err(error) => {
-                                    tracing::warn!(intent_id = %intent.intent_id(), %error, "file upload verification unavailable; preserving unfinished intent");
-                                    false
-                                }
-                            }
-                        }
-                        Err(ServerError::NotFound) => false,
-                        Err(error) => return Err(error),
-                    }
-                } else {
-                    false
-                };
-                if pass.stopped() {
-                    return Ok(pending_files);
-                }
-                if visible_file_record {
-                    // The atomic file-record commit is the visibility boundary.
-                    // Walk every durable boundary so recovery remains valid even
-                    // when the process stopped while the intent was still Stored.
-                    let mut recovery_from = intent.state();
-                    for recovery_state in [
-                        UploadIntentState::Storing,
-                        UploadIntentState::Stored,
-                        UploadIntentState::MetadataCommitted,
-                        UploadIntentState::Visible,
-                    ] {
-                        if pass.stopped() {
-                            return Ok(pending_files);
-                        }
-                        let transitioned = transition_intent_for_recovery(
-                            &self.index_store,
-                            intent.intent_id(),
-                            recovery_from,
-                            recovery_state,
-                        )
-                        .await;
-                        match transitioned {
-                            Ok(true) => recovery_from = recovery_state,
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::warn!(
-                                    intent_id = %intent.intent_id(),
-                                    %error,
-                                    "intent recovery transition failed"
-                                );
-                                return Err(error);
-                            }
-                        }
-                    }
-                    reconciled = reconciled.saturating_add(1);
-                    continue;
-                }
-                if file_intent {
-                    // This is a logical record key, not a physical CAS object.
-                    // Missing or unrelated latest metadata cannot settle it.
-                    tracing::warn!(intent_id = %intent.intent_id(), "file upload outcome cannot be verified; preserving unfinished intent for a fresh validated request");
-                    continue;
-                }
-                let target_state = match ObjectKey::parse(intent.object_key()) {
-                    Ok(key) => match AsyncObjectStore::metadata(&self.object_store, &key).await? {
-                        Some(metadata) if metadata.length() != intent.object_length()
-                            && !crate::upload_intent_recovery::native_xorb_has_equivalent_encoding(
-                                intent, self.object_store.clone(), &self.stream_work_pool,
-                            ).await? => {
-                            Some(UploadIntentState::Failed)
-                        }
-                        Some(_) if intent.state() == UploadIntentState::MetadataCommitted => {
-                            Some(UploadIntentState::Visible)
-                        }
-                        Some(_) => {
-                            // The immutable write may have committed before its
-                            // response was lost. Earlier states do not prove that
-                            // protocol metadata is visible (notably for shards),
-                            // so preserve the retryable state instead of guessing.
-                            tracing::warn!(
-                                intent_id = %intent.intent_id(),
-                                state = ?intent.state(),
-                                "durable object found for in-flight intent; preserving for retry"
-                            );
-                            None
-                        }
-                        None if crate::upload_intent_recovery::missing_request_key_is_inconclusive(intent) => {
-                            tracing::warn!(intent_id = %intent.intent_id(), "native shard request key is absent; normalized storage may use another key, preserving for validated retry");
-                            None
-                        }
-                        None => Some(UploadIntentState::Failed),
-                    },
-                    Err(_) => Some(UploadIntentState::Failed),
-                };
-                let Some(target_state) = target_state else {
-                    continue;
-                };
-                match transition_intent_for_recovery(
-                    &self.index_store,
-                    intent.intent_id(),
-                    intent.state(),
-                    target_state,
-                )
-                .await
-                {
-                    Ok(_) => reconciled = reconciled.saturating_add(1),
-                    Err(error) => tracing::warn!(
-                        intent_id = %intent.intent_id(),
-                        error = %error,
-                        "intent transition failed, skipping"
-                    ),
-                }
-            }
-        }
-        if reconciled > 0 {
-            tracing::info!(count = reconciled, "intent reconciliation complete");
-        }
-        Ok(pending_files)
+        crate::upload_intent_recovery::reconcile(
+            &self.index_store,
+            self.object_store(),
+            self.stream_work_pool.clone(),
+            minimum_age,
+            pass,
+            |file_id, scope| async move { self.read_record(&file_id, None, scope.as_ref()).await },
+        )
+        .await
     }
 
     pub(crate) async fn read_record(
@@ -499,160 +273,6 @@ impl LocalBackend {
         self.read_record(file_id, None, None).await
     }
 
-    pub(crate) async fn upsert_s3_object_with_multipart_count(
-        &self,
-        entry: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<(), ServerError> {
-        self.index_store
-            .upsert_s3_object_with_multipart_count(entry, part_count)
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_with_multipart_count(
-        &self,
-        expected: Option<&S3ObjectEntry>,
-        replacement: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .compare_and_swap_s3_object_with_multipart_count(expected, replacement, part_count)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_metadata(
-        &self,
-        expected: &S3ObjectEntry,
-        replacement: &S3ObjectEntry,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .compare_and_swap_s3_object_metadata(expected, replacement)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Deletes one S3 object listing-index row, returning whether a row was removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index delete fails.
-    pub(crate) async fn delete_s3_object(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .delete_s3_object(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Scans S3 object listing rows for a scope namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index scan fails.
-    pub(crate) async fn scan_s3_objects(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_objects(scope_namespace, prefix, cursor, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn scan_s3_objects_from(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        start: Option<shardline_index::S3ObjectScanStart<'_>>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_objects_from(scope_namespace, prefix, start, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Resolves exactly one S3 object listing row by its full raw key (no
-    /// prefix matching).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index lookup fails.
-    pub(crate) async fn scan_s3_object_exact(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_object_exact(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn scan_s3_object_exact_with_multipart_count(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<(S3ObjectEntry, Option<u32>)>, ServerError> {
-        self.index_store
-            .scan_s3_object_exact_with_multipart_count(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn insert_oci_tag_if_absent(
-        &self,
-        entry: &OciTagEntry,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .insert_oci_tag_if_absent(entry)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn oci_tag(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        tag: &str,
-    ) -> Result<Option<OciTagEntry>, ServerError> {
-        self.index_store
-            .oci_tag(scope_namespace, repository, tag)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn list_oci_tags(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<OciTagEntry>, ServerError> {
-        self.index_store
-            .list_oci_tags(scope_namespace, repository, cursor, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn oci_object_is_deleted(
-        &self,
-        key: &OciObjectKey,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .oci_object_is_deleted(key)
-            .await
-            .map_err(ServerError::from)
-    }
-
     pub(crate) async fn publish_oci_object(
         &self,
         key: &OciObjectKey,
@@ -666,175 +286,6 @@ impl LocalBackend {
         self.index_store.delete_oci_object(key).await?;
         Ok(())
     }
-
-    /// Resolves a single canonical path to its tree entry, if any.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index lookup fails.
-    pub(crate) async fn resolve_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-    ) -> Result<Option<TreeEntry>, ServerError> {
-        Ok(self.index_store.tree_entry(key, path).await?)
-    }
-
-    /// Scans raw tree rows for a revision under `prefix`, resuming after `cursor`,
-    /// returning at most `limit` raw rows ordered by path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index scan fails.
-    pub(crate) async fn scan_tree_raw(
-        &self,
-        key: &TreeKey,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<TreeEntry>, ServerError> {
-        Ok(self
-            .index_store
-            .scan_tree(key, prefix, cursor, limit)
-            .await?)
-    }
-
-    /// Validates the referenced file record, then atomically checks repository
-    /// capacity and publishes the revision and path mapping. Storage transactions
-    /// serialize registration with revision deletion/pruning across connections.
-    /// Existing revision creation time is preserved while update time refreshes.
-    /// An existing revision remains usable at the revision cap; the tree-entry
-    /// cap retains the existing rule that refreshes at full capacity are rejected.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError::UnregisteredFile`] when no record exists in the revision
-    /// scope, [`ServerError::InvalidContentHash`] for a malformed `file_id`,
-    /// [`ServerError::TooManyRevisions`] at the per-repo revision or tree-entry cap,
-    /// or the adapter error when persistence fails.
-    pub(crate) async fn register_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-        file_id: &str,
-        repository_scope: Option<&shardline_protocol::RepositoryScope>,
-        max_revisions_per_repo: NonZeroUsize,
-        max_tree_entries_per_repo: NonZeroUsize,
-    ) -> Result<super::RegisterPathOutcome, ServerError> {
-        let _guard = self.metadata_write_lock.lock().await;
-        validate_content_hash(file_id)?;
-        let record = match self.read_record(file_id, None, repository_scope).await {
-            Ok(record) => record,
-            Err(ServerError::NotFound) => {
-                return Err(ServerError::UnregisteredFile(key.revision.clone()));
-            }
-            Err(error) => return Err(error),
-        };
-        let now = unix_now_seconds_lossy();
-        let entry = TreeEntry {
-            provider: key.provider.clone(),
-            owner: key.owner.clone(),
-            repo: key.repo.clone(),
-            revision: key.revision.clone(),
-            path: path.to_owned(),
-            file_id: file_id.to_owned(),
-            size_bytes: record.total_bytes,
-            updated_at_unix_seconds: now,
-        };
-        let outcome = match self
-            .index_store
-            .register_tree_entry(
-                &entry,
-                max_revisions_per_repo.get(),
-                max_tree_entries_per_repo.get(),
-            )
-            .await?
-        {
-            shardline_index::TreeRegistrationOutcome::Registered(outcome) => outcome,
-            shardline_index::TreeRegistrationOutcome::LimitExceeded => {
-                return Err(ServerError::TooManyRevisions);
-            }
-        };
-        Ok(super::RegisterPathOutcome {
-            entry,
-            created: outcome.created,
-        })
-    }
-
-    /// Deletes one path mapping (or the path and every descendant when `recursive`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index deletion fails.
-    pub(crate) async fn delete_tree_path(
-        &self,
-        key: &TreeKey,
-        path: &str,
-        recursive: bool,
-    ) -> Result<u64, ServerError> {
-        Ok(self
-            .index_store
-            .delete_tree_entries(key, path, recursive)
-            .await?)
-    }
-
-    /// Lists the revision registry for a repository, resuming after `cursor`
-    /// and returning at most `limit` rows (bounded in the index backend).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index lookup fails.
-    pub(crate) async fn list_revisions(
-        &self,
-        key: &RepoKey,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<RevisionRecord>, ServerError> {
-        Ok(self.index_store.list_revisions(key, cursor, limit).await?)
-    }
-
-    /// Creates a revision registry row, returning whether it was newly created.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index insertion fails.
-    pub(crate) async fn create_revision(
-        &self,
-        rev: &RevisionRecord,
-        max_revisions: usize,
-    ) -> Result<shardline_index::RevisionCreationOutcome, ServerError> {
-        Ok(self
-            .index_store
-            .create_revision_bounded(rev, max_revisions)
-            .await?)
-    }
-
-    /// Deletes a revision and all of its tree entries, returning whether the revision
-    /// previously existed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index deletion fails.
-    pub(crate) async fn delete_revision(
-        &self,
-        key: &RepoKey,
-        rev: &str,
-    ) -> Result<bool, ServerError> {
-        let removed = self.index_store.delete_revision(key, rev).await?;
-        Ok(removed > 0)
-    }
-}
-
-async fn transition_intent_for_recovery(
-    store: &shardline_index::LocalIndexStore,
-    intent_id: &str,
-    before: shardline_index::UploadIntentState,
-    after: shardline_index::UploadIntentState,
-) -> Result<bool, ServerError> {
-    if !before.can_transition_to(after) {
-        return Ok(false);
-    }
-    Ok(shardline_index::UploadIntentStore::transition_intent(store, intent_id, after).await?)
 }
 
 /// Computes the BLAKE3 content hash used to address a chunk.
@@ -851,130 +302,18 @@ async fn transition_intent_for_recovery(
 /// assert_eq!(hash.hex_string().len(), 64);
 /// assert_eq!(hash, chunk_hash(b"hello world"));
 /// ```
-#[must_use]
-pub fn chunk_hash(bytes: &[u8]) -> shardline_protocol::ShardlineHash {
-    let digest = blake3::hash(bytes);
-    shardline_protocol::ShardlineHash::from_bytes(*digest.as_bytes())
-}
-
-pub(crate) fn content_hash(
-    total_bytes: u64,
-    chunk_size: u64,
-    chunks: &[FileChunkRecord],
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&total_bytes.to_le_bytes());
-    hasher.update(&chunk_size.to_le_bytes());
-    for chunk in chunks {
-        hasher.update(chunk.hash.as_bytes());
-        hasher.update(&chunk.offset.to_le_bytes());
-        hasher.update(&chunk.length.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
+pub use shardline_server_core::chunk_hash;
+pub(crate) use shardline_server_core::content_hash;
 
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
 
-    use shardline_index::{FileChunkRecord, UploadIntent, UploadIntentState, UploadIntentStore};
+    use shardline_index::{UploadIntent, UploadIntentState, UploadIntentStore};
     use shardline_protocol::ShardlineHash;
     use shardline_storage::{ObjectBody, ObjectIntegrity, ObjectKey, ObjectStore};
 
     use super::LocalBackend;
-    use super::{chunk_hash, content_hash};
-
-    #[test]
-    fn chunk_hash_is_deterministic() {
-        let data = b"hello world";
-        let hash1 = chunk_hash(data);
-        let hash2 = chunk_hash(data);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn chunk_hash_differs_for_different_inputs() {
-        let hash1 = chunk_hash(b"hello");
-        let hash2 = chunk_hash(b"world");
-        assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn chunk_hash_returns_fixed_length() {
-        let hash = chunk_hash(b"test data");
-        assert_eq!(hash.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn chunk_hash_empty_input() {
-        let hash = chunk_hash(b"");
-        // Should still produce a valid hash
-        assert_eq!(hash.as_bytes().len(), 32);
-    }
-
-    #[test]
-    fn content_hash_is_deterministic() {
-        let chunks = [FileChunkRecord {
-            hash: "abc".to_owned(),
-            offset: 0,
-            length: 10,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 10,
-        }];
-        let hash1 = content_hash(10, 10, &chunks);
-        let hash2 = content_hash(10, 10, &chunks);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn content_hash_differs_for_different_chunks() {
-        let chunks_a = [FileChunkRecord {
-            hash: "abc".to_owned(),
-            offset: 0,
-            length: 10,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 10,
-        }];
-        let chunks_b = [FileChunkRecord {
-            hash: "def".to_owned(),
-            offset: 0,
-            length: 10,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 10,
-        }];
-        assert_ne!(
-            content_hash(10, 10, &chunks_a),
-            content_hash(10, 10, &chunks_b)
-        );
-    }
-
-    #[test]
-    fn content_hash_empty_chunks() {
-        let hash = content_hash(0, 0, &[]);
-        assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 64); // blake3 hex is 64 chars
-    }
-
-    #[test]
-    fn content_hash_includes_total_bytes_and_chunk_size() {
-        let chunks = [FileChunkRecord {
-            hash: "abc".to_owned(),
-            offset: 0,
-            length: 10,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 10,
-        }];
-        // Different total_bytes should produce different hashes
-        assert_ne!(content_hash(10, 10, &chunks), content_hash(20, 10, &chunks));
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn local_backend_new_creates_directories() {
@@ -1425,7 +764,6 @@ mod tests {
             NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
         )
         .await;
-        assert!(backend.is_ok());
         let backend = backend.unwrap();
         assert_eq!(backend.public_base_url(), "http://127.0.0.1:8080");
     }
@@ -1480,47 +818,5 @@ mod tests {
             "ready() with blackhole store should succeed since metadata returns Ok(None), got: {:?}",
             result.err()
         );
-    }
-
-    #[test]
-    fn content_hash_with_single_chunk() {
-        let chunks = [FileChunkRecord {
-            hash: "abc".to_owned(),
-            offset: 0,
-            length: 10,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 10,
-        }];
-        let hash = content_hash(10, 10, &chunks);
-        assert_eq!(hash.len(), 64); // blake3 hex
-    }
-
-    #[test]
-    fn content_hash_with_multiple_chunks() {
-        let chunks = [
-            FileChunkRecord {
-                hash: "abc".to_owned(),
-                offset: 0,
-                length: 10,
-                range_start: 0,
-                range_end: 1,
-                packed_start: 0,
-                packed_end: 10,
-            },
-            FileChunkRecord {
-                hash: "def".to_owned(),
-                offset: 10,
-                length: 20,
-                range_start: 1,
-                range_end: 2,
-                packed_start: 10,
-                packed_end: 30,
-            },
-        ];
-        let hash = content_hash(30, 10, &chunks);
-        assert_eq!(hash.len(), 64);
-        assert!(!hash.is_empty());
     }
 }

@@ -5,227 +5,55 @@ use crate::{ServerError, ServerFrontend, object_store::ServerObjectStore};
 use super::{
     DEFAULT_WEBHOOK_DELIVERY_RETENTION_SECONDS, LifecycleRepairBoundary, LifecycleRepairOptions,
     LifecycleRepairReport, WEBHOOK_DELIVERY_FUTURE_SKEW_SECONDS,
-    classification::{
-        classify_quarantine_repair_action, classify_retention_hold_repair_action,
-        classify_webhook_delivery_repair_action,
-    },
+    classification::{classify_quarantine_repair_action, classify_webhook_delivery_repair_action},
     fault_injection::interrupt_at,
     orchestrator::run_lifecycle_repair_with_stores_at_time,
     reachability::{collect_record_object_references, collect_referenced_object_keys},
-    types::{
-        QuarantineRepairAction, RepairReachability, RetentionHoldRepairAction,
-        WebhookDeliveryRepairAction,
-    },
+    types::{QuarantineRepairAction, RepairReachability, WebhookDeliveryRepairAction},
 };
 
-// ── classify_quarantine_repair_action ──────────────────────────────────
-
 #[test]
-fn classify_quarantine_missing_object_is_delete_missing() {
-    assert_eq!(
-        classify_quarantine_repair_action(false, false, false),
-        QuarantineRepairAction::DeleteMissing
-    );
+fn quarantine_classification_covers_all_flags_and_precedence() {
+    use QuarantineRepairAction::{DeleteHeld, DeleteMissing, DeleteReachable, Keep};
+    for (exists, reachable, held, expected) in [
+        (false, false, false, DeleteMissing),
+        (false, false, true, DeleteMissing),
+        (false, true, false, DeleteMissing),
+        (false, true, true, DeleteMissing),
+        (true, false, false, Keep),
+        (true, false, true, DeleteHeld),
+        (true, true, false, DeleteReachable),
+        (true, true, true, DeleteReachable),
+    ] {
+        assert_eq!(
+            classify_quarantine_repair_action(exists, reachable, held),
+            expected,
+            "exists={exists}, reachable={reachable}, held={held}"
+        );
+    }
 }
 
 #[test]
-fn classify_quarantine_reachable_object_is_delete_reachable() {
-    assert_eq!(
-        classify_quarantine_repair_action(true, true, false),
-        QuarantineRepairAction::DeleteReachable
-    );
-}
-
-#[test]
-fn classify_quarantine_held_object_is_delete_held() {
-    assert_eq!(
-        classify_quarantine_repair_action(true, false, true),
-        QuarantineRepairAction::DeleteHeld
-    );
-}
-
-#[test]
-fn classify_quarantine_keep_when_none_apply() {
-    assert_eq!(
-        classify_quarantine_repair_action(true, false, false),
-        QuarantineRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_quarantine_missing_takes_precedence_over_reachable() {
-    // object does not exist → DeleteMissing regardless of reachability
-    assert_eq!(
-        classify_quarantine_repair_action(false, true, false),
-        QuarantineRepairAction::DeleteMissing
-    );
-}
-
-// ── classify_retention_hold_repair_action ──────────────────────────────
-
-#[test]
-fn classify_retention_hold_expired_release_is_delete_expired() {
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(50), 10, true, 100),
-        RetentionHoldRepairAction::DeleteExpired
-    );
-}
-
-#[test]
-fn classify_retention_hold_future_object_is_kept() {
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(150), 10, false, 100),
-        RetentionHoldRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_retention_hold_expired_takes_precedence_over_missing() {
-    // release_after (50) <= now (100) → DeleteExpired (checked first)
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(50), 10, false, 100),
-        RetentionHoldRepairAction::DeleteExpired
-    );
-}
-
-#[test]
-fn classify_retention_hold_keep_when_not_expired_and_object_exists() {
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(150), 10, true, 100),
-        RetentionHoldRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_retention_hold_no_release_is_keep_when_object_exists() {
-    assert_eq!(
-        classify_retention_hold_repair_action(None, 10, true, 100),
-        RetentionHoldRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_retention_hold_permanent_hold_kept_when_object_missing() {
-    // Permanent holds (release_after = None) are NEVER removed by lifecycle repair,
-    // even if the object is temporarily missing — preventing transient metadata
-    // backend hiccups from silently dropping operator-placed protection.
-    assert_eq!(
-        classify_retention_hold_repair_action(None, 10, false, 100),
-        RetentionHoldRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_retention_hold_exact_expiry_is_delete_expired() {
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(100), 10, true, 100),
-        RetentionHoldRepairAction::DeleteExpired
-    );
-}
-
-// ── classify_webhook_delivery_repair_action ────────────────────────────
-
-#[test]
-fn classify_webhook_delivery_future_is_delete_future() {
-    assert_eq!(
-        classify_webhook_delivery_repair_action(500, 100, 400),
-        WebhookDeliveryRepairAction::DeleteFuture
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_stale_is_delete_stale() {
-    assert_eq!(
-        classify_webhook_delivery_repair_action(50, 100, 400),
-        WebhookDeliveryRepairAction::DeleteStale
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_keep_when_within_window() {
-    assert_eq!(
-        classify_webhook_delivery_repair_action(200, 100, 400),
-        WebhookDeliveryRepairAction::Keep
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_future_takes_precedence_over_stale() {
-    // processed_at (500) > max_processed_at (400) → DeleteFuture
-    // even though it would also be stale (cutoff=100)
-    assert_eq!(
-        classify_webhook_delivery_repair_action(500, 100, 400),
-        WebhookDeliveryRepairAction::DeleteFuture
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_exact_stale_cutoff_is_delete_stale() {
-    assert_eq!(
-        classify_webhook_delivery_repair_action(100, 100, 400),
-        WebhookDeliveryRepairAction::DeleteStale
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_zero_processed_is_keep_when_within_window() {
-    assert_eq!(
-        classify_webhook_delivery_repair_action(0, 100, 400),
-        WebhookDeliveryRepairAction::DeleteStale
-    );
-}
-
-#[test]
-fn classify_webhook_delivery_all_zero_boundaries() {
-    // All zero: not future (0 <= 0) and not stale (0 <= 0) → DeleteStale
-    assert_eq!(
-        classify_webhook_delivery_repair_action(0, 0, 0),
-        WebhookDeliveryRepairAction::DeleteStale
-    );
-}
-
-#[test]
-fn classify_retention_hold_release_at_epoch_is_expired() {
-    // release_after = 0 (epoch), now = 0 → 0 <= 0 → expired
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(0), 0, true, 0),
-        RetentionHoldRepairAction::DeleteExpired
-    );
-}
-
-#[test]
-fn classify_retention_hold_release_at_epoch_object_missing() {
-    // release_after = 0, now = 0 → expired (takes priority over missing)
-    assert_eq!(
-        classify_retention_hold_repair_action(Some(0), 0, false, 0),
-        RetentionHoldRepairAction::DeleteExpired
-    );
-}
-
-#[test]
-fn classify_quarantine_all_false_is_delete_missing() {
-    assert_eq!(
-        classify_quarantine_repair_action(false, false, false),
-        QuarantineRepairAction::DeleteMissing
-    );
-}
-
-#[test]
-fn classify_quarantine_all_true_is_delete_missing_precedence() {
-    // object_exists=false takes precedence, even if reachable and held
-    assert_eq!(
-        classify_quarantine_repair_action(false, true, true),
-        QuarantineRepairAction::DeleteMissing
-    );
-}
-
-#[test]
-fn classify_quarantine_reachable_and_held_is_delete_reachable() {
-    // is_reachable checked before is_held → DeleteReachable
-    assert_eq!(
-        classify_quarantine_repair_action(true, true, true),
-        QuarantineRepairAction::DeleteReachable
-    );
+fn webhook_classification_covers_cutoffs_and_future_precedence() {
+    use WebhookDeliveryRepairAction::{DeleteFuture, DeleteStale, Keep};
+    for (processed, stale_cutoff, future_cutoff, expected) in [
+        (500, 100, 400, DeleteFuture),
+        (50, 100, 400, DeleteStale),
+        (200, 100, 400, Keep),
+        (100, 100, 400, DeleteStale),
+        (101, 100, 400, Keep),
+        (400, 100, 400, Keep),
+        (401, 100, 400, DeleteFuture),
+        (0, 100, 400, DeleteStale),
+        (0, 0, 0, DeleteStale),
+        (500, 600, 400, DeleteFuture),
+    ] {
+        assert_eq!(
+            classify_webhook_delivery_repair_action(processed, stale_cutoff, future_cutoff),
+            expected,
+            "processed={processed}, stale_cutoff={stale_cutoff}, future_cutoff={future_cutoff}"
+        );
+    }
 }
 
 // ── LifecycleRepairOptions ─────────────────────────────────────────────
@@ -236,62 +64,6 @@ fn lifecycle_repair_options_default() {
     assert_eq!(
         options.webhook_retention_seconds,
         DEFAULT_WEBHOOK_DELIVERY_RETENTION_SECONDS
-    );
-}
-
-#[test]
-fn lifecycle_repair_options_debug_and_clone() {
-    let options = LifecycleRepairOptions {
-        webhook_retention_seconds: 3600,
-    };
-    let cloned = options;
-    assert_eq!(options, cloned);
-    let debug = format!("{options:?}");
-    assert!(debug.contains("3600"));
-}
-
-// ── Enum formatting ────────────────────────────────────────────────────
-
-#[test]
-fn quarantine_repair_action_debug_format() {
-    assert_eq!(format!("{:?}", QuarantineRepairAction::Keep), "Keep");
-    assert_eq!(
-        format!("{:?}", QuarantineRepairAction::DeleteMissing),
-        "DeleteMissing"
-    );
-    assert_eq!(
-        format!("{:?}", QuarantineRepairAction::DeleteReachable),
-        "DeleteReachable"
-    );
-    assert_eq!(
-        format!("{:?}", QuarantineRepairAction::DeleteHeld),
-        "DeleteHeld"
-    );
-}
-
-#[test]
-fn retention_hold_repair_action_debug_format() {
-    assert_eq!(format!("{:?}", RetentionHoldRepairAction::Keep), "Keep");
-    assert_eq!(
-        format!("{:?}", RetentionHoldRepairAction::DeleteExpired),
-        "DeleteExpired"
-    );
-    assert_eq!(
-        format!("{:?}", RetentionHoldRepairAction::DeleteMissing),
-        "DeleteMissing"
-    );
-}
-
-#[test]
-fn webhook_delivery_repair_action_debug_format() {
-    assert_eq!(format!("{:?}", WebhookDeliveryRepairAction::Keep), "Keep");
-    assert_eq!(
-        format!("{:?}", WebhookDeliveryRepairAction::DeleteStale),
-        "DeleteStale"
-    );
-    assert_eq!(
-        format!("{:?}", WebhookDeliveryRepairAction::DeleteFuture),
-        "DeleteFuture"
     );
 }
 
@@ -317,41 +89,11 @@ fn repair_reachability_default_has_empty_sets() {
     assert_eq!(reachability.scanned_records, 0);
 }
 
-#[test]
-fn repair_reachability_can_accumulate_keys() {
-    let mut reachability = RepairReachability::default();
-    reachability
-        .referenced_object_keys
-        .insert("key1".to_owned());
-    reachability
-        .live_dedupe_chunk_hashes
-        .insert("hash1".to_owned());
-    reachability.scanned_records = 42;
-    assert_eq!(reachability.referenced_object_keys.len(), 1);
-    assert!(reachability.referenced_object_keys.contains("key1"));
-    assert_eq!(reachability.live_dedupe_chunk_hashes.len(), 1);
-    assert!(reachability.live_dedupe_chunk_hashes.contains("hash1"));
-    assert_eq!(reachability.scanned_records, 42);
-}
-
 // ── LifecycleRepairReport ──────────────────────────────────────────────
 
 #[test]
 fn lifecycle_repair_report_all_fields_default_to_zero() {
-    let report = LifecycleRepairReport {
-        scanned_records: 0,
-        referenced_objects: 0,
-        scanned_quarantine_candidates: 0,
-        removed_missing_quarantine_candidates: 0,
-        removed_reachable_quarantine_candidates: 0,
-        removed_held_quarantine_candidates: 0,
-        scanned_retention_holds: 0,
-        removed_expired_retention_holds: 0,
-        removed_missing_retention_holds: 0,
-        scanned_webhook_deliveries: 0,
-        removed_stale_webhook_deliveries: 0,
-        removed_future_webhook_deliveries: 0,
-    };
+    let report = LifecycleRepairReport::default();
     assert_eq!(report.scanned_records, 0);
     assert_eq!(report.referenced_objects, 0);
     assert_eq!(report.scanned_quarantine_candidates, 0);
@@ -366,50 +108,6 @@ fn lifecycle_repair_report_all_fields_default_to_zero() {
     assert_eq!(report.removed_future_webhook_deliveries, 0);
 }
 
-#[test]
-fn lifecycle_repair_report_non_zero_fields() {
-    let report = LifecycleRepairReport {
-        scanned_records: 100,
-        referenced_objects: 50,
-        scanned_quarantine_candidates: 10,
-        removed_missing_quarantine_candidates: 2,
-        removed_reachable_quarantine_candidates: 3,
-        removed_held_quarantine_candidates: 1,
-        scanned_retention_holds: 20,
-        removed_expired_retention_holds: 5,
-        removed_missing_retention_holds: 1,
-        scanned_webhook_deliveries: 30,
-        removed_stale_webhook_deliveries: 10,
-        removed_future_webhook_deliveries: 2,
-    };
-    assert_eq!(report.scanned_records, 100);
-    assert_eq!(report.removed_stale_webhook_deliveries, 10);
-    assert_eq!(report.removed_future_webhook_deliveries, 2);
-    let debug = format!("{:?}", report);
-    assert!(debug.contains("scanned_records: 100"));
-    assert!(debug.contains("referenced_objects: 50"));
-}
-
-#[test]
-fn lifecycle_repair_report_clone_and_eq() {
-    let report = LifecycleRepairReport {
-        scanned_records: 5,
-        referenced_objects: 3,
-        scanned_quarantine_candidates: 0,
-        removed_missing_quarantine_candidates: 0,
-        removed_reachable_quarantine_candidates: 0,
-        removed_held_quarantine_candidates: 0,
-        scanned_retention_holds: 0,
-        removed_expired_retention_holds: 0,
-        removed_missing_retention_holds: 0,
-        scanned_webhook_deliveries: 0,
-        removed_stale_webhook_deliveries: 0,
-        removed_future_webhook_deliveries: 0,
-    };
-    let cloned = report.clone();
-    assert_eq!(report, cloned);
-}
-
 // ── collect_record_object_references ──────────────────────────────────
 
 /// Creates a valid 64-char hex hash string.
@@ -419,6 +117,7 @@ fn valid_hash() -> String {
 
 fn make_stored_chunks_record(chunks: Vec<FileChunkRecord>) -> Vec<u8> {
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "test-file".to_owned(),
         content_hash: valid_hash(),
         total_bytes: 1024,
@@ -519,6 +218,7 @@ fn collect_references_empty_chunks_does_not_increment_records() {
     // A record with no chunks should still increment scanned_records (the record
     // itself is scanned) but produce no keys or hashes.
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "empty".to_owned(),
         content_hash: valid_hash(),
         total_bytes: 0,
@@ -641,6 +341,7 @@ fn collect_references_deduplicates_keys() {
 fn make_referenced_terms_record(chunks: Vec<FileChunkRecord>) -> Vec<u8> {
     // chunk_size = 0 triggers ReferencedObjectTerms layout
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "test-term-file".to_owned(),
         content_hash: valid_hash(),
         total_bytes: 1024,
@@ -782,6 +483,7 @@ fn seed_object(store: &ServerObjectStore, key: &ObjectKey) {
 /// Helper: build a [`FileRecord`] with a single chunk for the given hash.
 fn single_chunk_record(file_id: &str, hash: &str, chunk_size: u64) -> FileRecord {
     FileRecord {
+        deduplication_domain: None,
         file_id: file_id.to_owned(),
         content_hash: valid_hash(),
         total_bytes: 256,
@@ -1947,6 +1649,7 @@ async fn repair_removes_reachable_quarantine_for_repointed_single_chunk_xorb() {
     seed_object(&object_store, &member_key);
 
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "repointed-file".to_owned(),
         content_hash: valid_hash(),
         total_bytes: data.len() as u64,
@@ -2007,6 +1710,7 @@ async fn repair_multi_chunk_xorb_members_all_reachable() {
     seed_object(&object_store, &member2);
 
     let record = FileRecord {
+        deduplication_domain: None,
         file_id: "repointed-multi".to_owned(),
         content_hash: valid_hash(),
         total_bytes: (data1.len() + data2.len()) as u64,

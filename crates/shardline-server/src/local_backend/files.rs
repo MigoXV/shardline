@@ -1,19 +1,17 @@
 use axum::body::Bytes;
 use shardline_cas::{CasCoordinator, CasLimits};
 use shardline_index::FileRecord;
-use shardline_index::{FileRecordStorageLayout, UploadIntent, UploadIntentState};
-use shardline_protocol::{ByteRange, RepositoryScope, parse_http_byte_range};
+use shardline_index::{UploadIntent, UploadIntentState};
+use shardline_protocol::{ByteRange, RepositoryScope};
 use shardline_storage::ObjectStore;
 use std::num::NonZeroU64;
-use tokio::task;
 
 use super::LocalBackend;
 use crate::{
     ServerError, ShardMetadataLimits,
     chunk_store::chunk_object_key,
-    download_stream::{ServerByteStream, collect_file_record_bytes, file_record_byte_stream},
+    download_stream::{ServerByteStream, download_file_record_bytes, file_record_response_stream},
     model::UploadFileResponse,
-    object_store::reconstruct_file_record_bytes,
     upload_ingest::{
         FileUploadIngestor, RequestBodyReader, UploadStorage, read_native_body, upload_attempt_id,
     },
@@ -106,27 +104,13 @@ impl LocalBackend {
         let record = self
             .read_record(file_id, content_hash, repository_scope)
             .await?;
-        let total_bytes = record.total_bytes;
-        crate::metrics::record_object_read_by_repr(record.storage_repr.as_str(), total_bytes);
-        let stream = if record.storage_layout() == FileRecordStorageLayout::ReferencedObjectTerms {
-            if range.is_some() {
-                return Err(ServerError::RangeNotSatisfiable);
-            }
-            crate::server_frontend::xet::referenced_file_record_byte_stream(
-                self.object_store(),
-                record,
-                self.stream_work_pool.clone(),
-            )?
-        } else {
-            file_record_byte_stream(
-                self.object_store(),
-                record,
-                range,
-                self.stream_work_pool.clone(),
-            )
-            .await?
-        };
-        Ok((stream, total_bytes))
+        file_record_response_stream(
+            self.object_store(),
+            record,
+            range,
+            self.stream_work_pool.clone(),
+        )
+        .await
     }
 
     /// Stores a file version as deduplicated content chunks.
@@ -176,35 +160,20 @@ impl LocalBackend {
         .await
     }
 
-    /// Internal S3 responses expose no independently downloadable chunk list.
-    pub(crate) async fn upload_s3_protocol_stream(
+    /// Internal protocols publish packed records without public chunk responses.
+    pub(crate) async fn upload_protocol_stream(
         &self,
         file_id: &str,
         body: RequestBodyReader,
+        expected_sha256: Option<&str>,
+        reuse_scope: Option<&RepositoryScope>,
     ) -> Result<UploadFileResponse, ServerError> {
         self.upload_file_stream_with_storage(
             file_id,
             body,
             None,
-            None,
-            UploadStorage::ProtocolContainers,
-        )
-        .await
-    }
-
-    /// Internal digest protocols return no independently downloadable chunk list.
-    pub(crate) async fn upload_digest_protocol_stream(
-        &self,
-        file_id: &str,
-        body: RequestBodyReader,
-        expected_sha256: &str,
-    ) -> Result<UploadFileResponse, ServerError> {
-        self.upload_file_stream_with_storage(
-            file_id,
-            body,
-            None,
-            Some(expected_sha256),
-            UploadStorage::ProtocolContainers,
+            expected_sha256,
+            UploadStorage::ProtocolContainers(reuse_scope.cloned()),
         )
         .await
     }
@@ -256,9 +225,10 @@ impl LocalBackend {
             self.upload_max_in_flight_chunks,
             &self.packing_work_pool,
         );
-        if matches!(storage, UploadStorage::ProtocolContainers) {
-            ingestor =
-                ingestor.with_packed_protocol_storage(&object_store, &self.packing_work_pool);
+        if let UploadStorage::ProtocolContainers(reuse_scope) = storage {
+            ingestor = ingestor
+                .with_packed_protocol_storage(&object_store, &self.packing_work_pool)
+                .with_protocol_chunk_reuse(crate::ServerBackend::Local(self.clone()), reuse_scope);
         }
         ingestor.ingest_body(&object_store, &mut body).await?;
 
@@ -395,25 +365,6 @@ impl LocalBackend {
         )?)
     }
 
-    pub(crate) async fn reconstruction_http_range(
-        &self,
-        file_id: &str,
-        content_hash: Option<&str>,
-        range_header: &str,
-        repository_scope: Option<&RepositoryScope>,
-    ) -> Result<FileReconstructionResponse, ServerError> {
-        let record = self
-            .read_record(file_id, content_hash, repository_scope)
-            .await?;
-        let requested_range =
-            parse_http_byte_range(range_header, record.total_bytes).map_err(ServerError::from)?;
-        Ok(build_reconstruction_response(
-            self.public_base_url(),
-            &record,
-            Some(requested_range),
-        )?)
-    }
-
     /// Loads the logical byte length for a file version.
     ///
     /// # Errors
@@ -462,24 +413,13 @@ impl LocalBackend {
         let record = self
             .read_record(file_id, content_hash, repository_scope)
             .await?;
-        let object_store = self.object_store();
-
-        // ReferencedObjectTerms layout (shard/xorb-referenced) is handled
-        // by the raw reconstruct path; StoredChunks layout (ingestor/CDC)
-        // uses the streaming path for LZ4 decompression and xorb packing.
-        if matches!(
-            record.storage_layout(),
-            FileRecordStorageLayout::ReferencedObjectTerms
-        ) {
-            let server_frontends = self.server_frontends.clone();
-            return task::spawn_blocking(move || {
-                reconstruct_file_record_bytes(&object_store, &server_frontends, &record)
-            })
-            .await
-            .map_err(ServerError::BlockingTask)?;
-        }
-
-        collect_file_record_bytes(object_store, record, self.stream_work_pool.clone()).await
+        download_file_record_bytes(
+            self.object_store(),
+            &self.server_frontends,
+            record,
+            &self.stream_work_pool,
+        )
+        .await
     }
 
     /// Reads a stored chunk by hash.
@@ -488,13 +428,7 @@ impl LocalBackend {
     ///
     /// Returns [`ServerError`] when the hash is invalid or the chunk is missing.
     pub async fn read_chunk(&self, hash_hex: &str) -> Result<Vec<u8>, ServerError> {
-        let object_key = chunk_object_key(hash_hex)?;
-        match crate::object_store::read_small_object(self.object_store(), object_key).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(ServerError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        crate::native_chunk_read::read_indexed_member(
+        crate::native_chunk_read::read_chunk(
             self.object_store(),
             hash_hex,
             &self.stream_work_pool,
@@ -805,9 +739,11 @@ mod tests {
             .await
             .unwrap();
         let protocol = backends[1]
-            .upload_s3_protocol_stream(
+            .upload_protocol_stream(
                 "protocol.bin",
                 RequestBodyReader::from_bytes(content.clone()),
+                None,
+                None,
             )
             .await
             .unwrap();

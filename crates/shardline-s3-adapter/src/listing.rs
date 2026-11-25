@@ -15,46 +15,6 @@ use crate::{S3Error, types::Contents};
 /// The S3 `ListObjectsV2` maximum page size.
 pub const MAX_LIST_KEYS: usize = 1000;
 
-/// A typed `ListObjectsV2` query-parameter name.
-///
-/// [`ListParam::parse`] owns the literal name table; the params parser matches
-/// the enum only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListParam {
-    /// `prefix`.
-    Prefix,
-    /// `delimiter`.
-    Delimiter,
-    /// `max-keys`.
-    MaxKeys,
-    /// `continuation-token`.
-    ContinuationToken,
-    /// `start-after`.
-    StartAfter,
-    /// `marker` (ListObjects v1).
-    Marker,
-    /// `encoding-type`.
-    EncodingType,
-}
-
-impl ListParam {
-    /// Parses a raw query-parameter name into the typed set. Unknown names
-    /// (for example `fetch-owner` which real S3 clients
-    /// send) return `None` and are ignored.
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "prefix" => Some(Self::Prefix),
-            "delimiter" => Some(Self::Delimiter),
-            "max-keys" => Some(Self::MaxKeys),
-            "continuation-token" => Some(Self::ContinuationToken),
-            "start-after" => Some(Self::StartAfter),
-            "marker" => Some(Self::Marker),
-            "encoding-type" => Some(Self::EncodingType),
-            _ => None,
-        }
-    }
-}
-
 /// A validated `ListObjectsV2` grouping delimiter (exactly one character).
 ///
 /// [`Delimiter::parse`] rejects empty (treated as "no delimiter") and
@@ -97,7 +57,7 @@ impl Delimiter {
 pub fn parse_list_objects_url_encoding(query: &[(String, String)]) -> Result<bool, S3Error> {
     let mut requested = false;
     for (name, value) in query {
-        if matches!(ListParam::parse(name), Some(ListParam::EncodingType)) {
+        if name == "encoding-type" {
             if value != "url" {
                 return Err(S3Error::invalid_argument("encoding-type must be url"));
             }
@@ -171,20 +131,17 @@ pub fn parse_list_objects_v1_params(
         marker: None,
     };
     for (name, value) in query {
-        match ListParam::parse(name) {
-            Some(ListParam::Prefix) => params.prefix = value.clone(),
-            Some(ListParam::Delimiter) => params.delimiter = Delimiter::parse(value)?,
-            Some(ListParam::MaxKeys) => {
+        match name.as_str() {
+            "prefix" => params.prefix = value.clone(),
+            "delimiter" => params.delimiter = Delimiter::parse(value)?,
+            "max-keys" => {
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|_error| S3Error::invalid_argument("invalid max-keys"))?;
                 params.max_keys = parsed.min(MAX_LIST_KEYS);
             }
-            Some(ListParam::Marker) => params.marker = Some(value.clone()),
-            Some(ListParam::ContinuationToken) => {} // v2-only; ignored by v1
-            Some(ListParam::StartAfter) => {}        // v2-only; ignored by v1
-            Some(ListParam::EncodingType) => {}      // validated separately
-            None => {}
+            "marker" => params.marker = Some(value.clone()),
+            _ => {}
         }
     }
     Ok(params)
@@ -229,22 +186,20 @@ pub fn parse_list_objects_v2_params(
         start_after: None,
     };
     for (name, value) in query {
-        match ListParam::parse(name) {
-            Some(ListParam::Prefix) => params.prefix = value.clone(),
-            Some(ListParam::Delimiter) => params.delimiter = Delimiter::parse(value)?,
-            Some(ListParam::MaxKeys) => {
+        match name.as_str() {
+            "prefix" => params.prefix = value.clone(),
+            "delimiter" => params.delimiter = Delimiter::parse(value)?,
+            "max-keys" => {
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|_error| S3Error::invalid_argument("invalid max-keys"))?;
                 params.max_keys = parsed.min(MAX_LIST_KEYS);
             }
-            Some(ListParam::ContinuationToken) => {
+            "continuation-token" => {
                 params.continuation_token = Some(decode_continuation_token(value)?);
             }
-            Some(ListParam::StartAfter) => params.start_after = Some(value.clone()),
-            Some(ListParam::Marker) => {} // v1-only; ignored by ListObjectsV2
-            Some(ListParam::EncodingType) => {} // validated separately
-            None => {}
+            "start-after" => params.start_after = Some(value.clone()),
+            _ => {}
         }
     }
     Ok(params)
@@ -288,45 +243,34 @@ pub fn group_page(
     let mut contents = Vec::new();
     let mut common_prefixes = Vec::new();
     let mut next_cursor = None;
-    let mut rows = 0_usize;
     let mut remaining = entries.into_iter().peekable();
-    while let Some(entry) = remaining.next() {
-        if rows >= max_keys {
+    for _ in 0..max_keys {
+        let Some(entry) = remaining.next() else {
             break;
-        }
-        let key = entry.object_key.clone();
-        // The index guarantees every key starts with the prefix; keys that do
-        // not (defensive) are surfaced as ordinary Contents rows.
-        let Some(remainder) = key.strip_prefix(prefix) else {
-            contents.push(contents_row(&entry, &key));
-            next_cursor = Some(key);
-            rows = rows.saturating_add(1);
-            continue;
         };
-        if let Some(delimiter) = delimiter
-            && let Some((head, _tail)) = remainder.split_once(delimiter)
-        {
-            // CommonPrefixes rollup: `prefix` + the leading segment up to and
-            // including the delimiter. Consume every key under it.
-            let group_prefix = format!("{prefix}{head}{delimiter}");
-            let mut group_last = key;
-            while let Some(peeked) = remaining.peek() {
-                if peeked.object_key.starts_with(&group_prefix) {
-                    group_last = peeked.object_key.clone();
-                    remaining.next();
-                } else {
-                    break;
-                }
+        // Keys outside the index prefix remain ordinary Contents rows.
+        let group_prefix = delimiter.and_then(|delimiter| {
+            let remainder = entry.object_key.strip_prefix(prefix)?;
+            let (head, _) = remainder.split_once(delimiter)?;
+            Some(format!("{prefix}{head}{delimiter}"))
+        });
+        if let Some(group_prefix) = group_prefix {
+            // Consume every key under this CommonPrefixes rollup.
+            let mut group_last = entry.object_key;
+            while let Some(child) =
+                remaining.next_if(|candidate| candidate.object_key.starts_with(&group_prefix))
+            {
+                group_last = child.object_key;
             }
             common_prefixes.push(group_prefix);
             next_cursor = Some(group_last);
-            rows = rows.saturating_add(1);
         } else {
-            contents.push(contents_row(&entry, &key));
-            next_cursor = Some(key);
-            rows = rows.saturating_add(1);
+            // Defer copying a content cursor until the last row is known.
+            next_cursor = None;
+            contents.push(contents_row(entry));
         }
     }
+    let next_cursor = next_cursor.or_else(|| contents.last().map(|row| row.key.clone()));
     ListPage {
         contents,
         common_prefixes,
@@ -335,11 +279,11 @@ pub fn group_page(
     }
 }
 
-fn contents_row(entry: &shardline_index::S3ObjectEntry, key: &str) -> Contents {
+fn contents_row(entry: shardline_index::S3ObjectEntry) -> Contents {
     Contents {
-        key: key.to_owned(),
+        key: entry.object_key,
         size_bytes: entry.size_bytes,
-        etag: entry.etag.clone(),
+        etag: entry.etag,
         last_modified_iso8601: format_iso8601(entry.updated_at_unix_seconds),
     }
 }
@@ -458,12 +402,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_params_rejects_bad_max_keys() {
-        assert!(parse_list_objects_v2_params(&query(&[("max-keys", "many")])).is_err());
-        assert!(parse_list_objects_v2_params(&query(&[("max-keys", "-1")])).is_err());
-    }
-
-    #[test]
     fn parse_params_decodes_continuation_token() {
         let token = encode_continuation_token("data/2.txt");
         let params =
@@ -480,14 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_params_rejects_malformed_continuation_token() {
-        assert!(
-            parse_list_objects_v2_params(&query(&[("continuation-token", "not-base64!!")]))
-                .is_err()
-        );
-    }
-
-    #[test]
     fn parse_params_empty_delimiter_is_none() {
         let params = parse_list_objects_v2_params(&query(&[("delimiter", "")])).unwrap();
         assert_eq!(params.delimiter, None);
@@ -496,46 +426,52 @@ mod tests {
     // ── token roundtrip ─────────────────────────────────────────────────────
 
     #[test]
-    fn continuation_token_roundtrip() {
+    fn continuation_tokens_roundtrip_and_reject_invalid_cursors() {
         for cursor in ["", "a", "data/2.txt", "spaces and ünïcode/keys"] {
             let token = encode_continuation_token(cursor);
             assert_eq!(decode_continuation_token(&token).unwrap(), cursor);
+            let params =
+                parse_list_objects_v2_params(&query(&[("continuation-token", &token)])).unwrap();
+            assert_eq!(params.cursor(), Some(cursor));
         }
-    }
-
-    #[test]
-    fn decode_continuation_token_rejects_garbage() {
-        assert!(decode_continuation_token("!!!").is_err());
-        assert!(
-            decode_continuation_token("").is_ok(),
-            "empty decodes to empty"
-        );
-        assert_eq!(decode_continuation_token("").unwrap(), "");
+        // /w== is valid base64 containing invalid UTF-8.
+        for token in ["!!!", "not-base64!!", "/w=="] {
+            for error in [
+                decode_continuation_token(token).unwrap_err(),
+                parse_list_objects_v2_params(&query(&[("continuation-token", token)])).unwrap_err(),
+            ] {
+                assert_eq!(error.code, "InvalidArgument", "{token}");
+            }
+        }
     }
 
     // ── group_page ──────────────────────────────────────────────────────────
 
     #[test]
     fn group_page_empty_batch() {
-        let page = group_page(Vec::new(), "", None, MAX_LIST_KEYS);
-        assert!(page.contents.is_empty());
-        assert!(page.common_prefixes.is_empty());
-        assert_eq!(page.next_cursor, None);
-        assert!(!page.is_truncated);
+        for (prefix, delimiter) in [("", None), ("dir/very/long", Some('/'))] {
+            let page = group_page(Vec::new(), prefix, delimiter, MAX_LIST_KEYS);
+            assert!(page.contents.is_empty());
+            assert!(page.common_prefixes.is_empty());
+            assert_eq!(page.next_cursor, None);
+            assert!(!page.is_truncated);
+        }
     }
 
     #[test]
     fn group_page_single_key() {
-        let page = group_page(vec![entry("a.txt")], "", None, MAX_LIST_KEYS);
-        let (contents, prefixes) = keys(&page);
-        assert_eq!(contents, vec!["a.txt"]);
-        assert!(prefixes.is_empty());
-        assert_eq!(page.next_cursor.as_deref(), Some("a.txt"));
-        assert!(!page.is_truncated);
-        let row = &page.contents[0];
-        assert_eq!(row.size_bytes, "a.txt".len() as u64);
-        assert_eq!(row.etag, "etag:a.txt");
-        assert_eq!(row.last_modified_iso8601, "2026-07-27T00:00:00Z");
+        for (prefix, delimiter) in [("", None), ("", Some('/')), ("elsewhere", Some('.'))] {
+            let page = group_page(vec![entry("a.txt")], prefix, delimiter, MAX_LIST_KEYS);
+            let (contents, prefixes) = keys(&page);
+            assert_eq!(contents, vec!["a.txt"]);
+            assert!(prefixes.is_empty());
+            assert_eq!(page.next_cursor.as_deref(), Some("a.txt"));
+            assert!(!page.is_truncated);
+            let row = &page.contents[0];
+            assert_eq!(row.size_bytes, "a.txt".len() as u64);
+            assert_eq!(row.etag, "etag:a.txt");
+            assert_eq!(row.last_modified_iso8601, "2026-07-27T00:00:00Z");
+        }
     }
 
     #[test]
@@ -584,22 +520,29 @@ mod tests {
     }
 
     #[test]
-    fn group_page_max_keys_truncation() {
-        let entries = vec![entry("a.txt"), entry("b.txt"), entry("c.txt")];
-        let page = group_page(entries, "", None, 2);
-        let (contents, _prefixes) = keys(&page);
-        assert_eq!(contents, vec!["a.txt", "b.txt"]);
-        assert_eq!(page.next_cursor.as_deref(), Some("b.txt"));
-        assert!(page.is_truncated);
-    }
-
-    #[test]
-    fn group_page_not_truncated_when_batch_fits() {
-        let entries = vec![entry("a.txt"), entry("b.txt")];
-        let page = group_page(entries, "", None, 2);
-        let (contents, _prefixes) = keys(&page);
-        assert_eq!(contents, vec!["a.txt", "b.txt"]);
-        assert!(!page.is_truncated);
+    fn group_page_flat_limits_and_cursors() {
+        for (input, limit, expected, truncated) in [
+            (
+                vec!["a.txt", "b.txt", "c.txt"],
+                2,
+                vec!["a.txt", "b.txt"],
+                true,
+            ),
+            (vec!["a.txt", "b.txt"], 2, vec!["a.txt", "b.txt"], false),
+            (
+                vec!["a.txt", "b.txt", "c.txt"],
+                MAX_LIST_KEYS,
+                vec!["a.txt", "b.txt", "c.txt"],
+                false,
+            ),
+        ] {
+            let page = group_page(input.into_iter().map(entry).collect(), "", None, limit);
+            let (contents, prefixes) = keys(&page);
+            assert_eq!(contents, expected);
+            assert!(prefixes.is_empty());
+            assert_eq!(page.next_cursor.as_deref(), expected.last().copied());
+            assert_eq!(page.is_truncated, truncated);
+        }
     }
 
     #[test]
@@ -652,16 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn group_page_flat_set_no_delimiter() {
-        let entries = vec![entry("a.txt"), entry("b.txt"), entry("c.txt")];
-        let page = group_page(entries, "", None, MAX_LIST_KEYS);
-        let (contents, prefixes) = keys(&page);
-        assert_eq!(contents, vec!["a.txt", "b.txt", "c.txt"]);
-        assert!(prefixes.is_empty());
-        assert_eq!(page.next_cursor.as_deref(), Some("c.txt"));
-    }
-
-    #[test]
     fn format_iso8601_known_timestamp() {
         assert_eq!(format_iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_iso8601(1_785_110_400), "2026-07-27T00:00:00Z");
@@ -686,16 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn group_page_prefix_matching_nothing_is_empty() {
-        // A prefix longer than any key (a superset) matches no rows.
-        let page = group_page(Vec::new(), "dir/very/long", Some('/'), MAX_LIST_KEYS);
-        assert!(page.contents.is_empty());
-        assert!(page.common_prefixes.is_empty());
-        assert_eq!(page.next_cursor, None);
-        assert!(!page.is_truncated);
-    }
-
-    #[test]
     fn parse_params_accept_zero_max_keys_for_both_versions() {
         let zero = query(&[("max-keys", "0")]);
         assert_eq!(parse_list_objects_v1_params(&zero).unwrap().max_keys, 0);
@@ -712,16 +635,6 @@ mod tests {
                 assert!(!page.is_truncated);
                 assert!(page.next_cursor.is_none());
             }
-        }
-    }
-
-    #[test]
-    fn parse_params_rejects_multi_char_delimiter() {
-        for delimiter in ["//", "ab", "%%"] {
-            let result = parse_list_objects_v2_params(&query(&[("delimiter", delimiter)]));
-            assert!(result.is_err(), "delimiter {delimiter:?} must be rejected");
-            let error = result.unwrap_err();
-            assert_eq!(error.code, "InvalidArgument");
         }
     }
 
@@ -756,12 +669,9 @@ mod tests {
         assert_eq!(params.delimiter, Some(Delimiter('/')));
         assert_eq!(params.max_keys, 12);
         assert_eq!(params.marker.as_deref(), Some("dir/old"));
-        assert!(parse_list_objects_v1_params(&query(&[("max-keys", "-1")])).is_err());
-        assert!(parse_list_objects_v1_params(&query(&[("max-keys", "bad")])).is_err());
-        assert!(parse_list_objects_v1_params(&query(&[("delimiter", "//")])).is_err());
     }
     #[test]
-    fn url_encoding_is_opt_in_and_rejects_unsupported_values() {
+    fn url_encoding_is_opt_in_and_preserves_raw_keys() {
         assert!(!parse_list_objects_url_encoding(&[]).unwrap());
         let raw = query(&[
             ("encoding-type", "url"),
@@ -775,9 +685,27 @@ mod tests {
         assert_eq!(v1.prefix, "é/+%");
         assert_eq!(v1.marker.as_deref(), Some("a%2Fb"));
         assert_eq!(v2.start_after.as_deref(), Some("é/+%"));
-        for value in ["", "URL", "base64"] {
-            assert!(parse_list_objects_v1_params(&query(&[("encoding-type", value)])).is_err());
-            assert!(parse_list_objects_v2_params(&query(&[("encoding-type", value)])).is_err());
+    }
+    #[test]
+    fn both_listing_versions_reject_invalid_common_parameters() {
+        for (name, value) in [
+            ("max-keys", "many"),
+            ("max-keys", "-1"),
+            ("max-keys", "bad"),
+            ("delimiter", "//"),
+            ("delimiter", "ab"),
+            ("delimiter", "%%"),
+            ("encoding-type", ""),
+            ("encoding-type", "URL"),
+            ("encoding-type", "base64"),
+        ] {
+            let query = query(&[(name, value)]);
+            for error in [
+                parse_list_objects_v1_params(&query).unwrap_err(),
+                parse_list_objects_v2_params(&query).unwrap_err(),
+            ] {
+                assert_eq!(error.code, "InvalidArgument", "{name}={value:?}");
+            }
         }
     }
 }

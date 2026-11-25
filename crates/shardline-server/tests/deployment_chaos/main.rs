@@ -39,7 +39,9 @@ use shardline_server::{
 };
 use shardline_server_core::{AuthProvider, ServerObjectStoreError, auth::LocalHmacProvider};
 use shardline_storage::{ObjectKey, ObjectPrefix, ObjectStore as _, S3ObjectStoreConfig};
+use shardline_test_support::deterministic_bytes;
 use shardline_test_support::{S3FaultProxy, S3ProxyFault};
+
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
@@ -63,6 +65,8 @@ mod native_source_gc;
 mod maintenance_history;
 
 mod local_protocol_upgrade;
+
+mod adjacent_release_cutover;
 
 mod git_receive_pack;
 
@@ -159,18 +163,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
-}
-
-fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed | 1;
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        out.push((state & 0xff) as u8);
-    }
-    out
 }
 
 /// Extract the text of the first `<{tag}>..</{tag}>` element from an XML body
@@ -770,6 +762,7 @@ async fn try_boot_chaos_stack(drill: &str) -> Option<ChaosStack> {
                 "-p".to_owned(),
                 project,
                 "ps".to_owned(),
+                "--all".to_owned(),
                 "-q".to_owned(),
                 service.to_owned(),
             ])
@@ -817,6 +810,17 @@ async fn try_boot_chaos_stack(drill: &str) -> Option<ChaosStack> {
         cleanup_compose_project(&compose_file, &project);
         return None;
     };
+    // MinIO's health endpoint can be ready before the one-shot client creates
+    // the bucket. Released servers require that bucket on their first upload.
+    let Some(initializer) = service_container("chaos-minio-init").await else {
+        eprintln!("SKIPPED: {drill} — isolated bucket initializer is unavailable");
+        return None;
+    };
+    let initialized = docker_run_owned(vec!["wait".to_owned(), initializer]).await;
+    if !initialized.status.success() || String::from_utf8_lossy(&initialized.stdout).trim() != "0" {
+        eprintln!("SKIPPED: {drill} — isolated bucket initializer did not succeed");
+        return None;
+    }
     if !ensure_chaos_stack_ready(drill, &stack).await {
         cleanup_compose_project(&compose_file, &project);
         return None;
@@ -965,6 +969,22 @@ async fn wait_s3_object_count_grows(
 // ---------------------------------------------------------------------------
 // DeploymentServer — the HOST `shardline` binary as a child process.
 // ---------------------------------------------------------------------------
+
+fn log_deployment_binary_identity(label: &str, binary: &Path) {
+    let version = Command::new(binary)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("read {label} binary version from {binary:?}: {error}"));
+    assert!(version.status.success(), "{label} binary --version failed");
+    let bytes = std::fs::read(binary)
+        .unwrap_or_else(|error| panic!("read {label} binary bytes from {binary:?}: {error}"));
+    eprintln!(
+        "deployment binary {label}: path={} version={} sha256={:x}",
+        binary.display(),
+        String::from_utf8_lossy(&version.stdout).trim(),
+        Sha256::digest(bytes)
+    );
+}
 
 fn resolve_shardline_binary() -> Option<PathBuf> {
     let binary = try_resolve_shardline_binary();
@@ -2239,9 +2259,24 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
     let Some(previous_binary) = resolve_n_minus_one_binary(drill) else {
         return;
     };
+    log_deployment_binary_identity("candidate", &current_binary);
+    log_deployment_binary_identity("predecessor", &previous_binary);
+    assert_eq!(
+        chaos_pg_url(),
+        stack.pg_url,
+        "deployment processes and migration commands must target the same isolated database"
+    );
+    eprintln!(
+        "chaos({drill}): postgres target={}",
+        stack
+            .pg_url
+            .split_once('@')
+            .map_or_else(|| "<redacted>".to_owned(), |(_, target)| target.to_owned())
+    );
     // N-1 owns the initial schema. Core migrations require the explicit drain
     // boundary below; owner-installed additive frontend state can be installed
     // under the existing write barrier while compatible old writers remain live.
+    eprintln!("chaos({drill}): phase=predecessor-migration");
     migrate_chaos_postgres_with_binary(&previous_binary, &stack.pg_url).await;
 
     // Seed the shared object with N-1 before starting the rollout. This
@@ -2259,11 +2294,20 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
         &environment,
         seed_root.path(),
     );
+    eprintln!("chaos({drill}): phase=predecessor-seed-start");
     seed_node.wait_ready(Duration::from_secs(20)).await;
     let token = mint_token("drill", "drill", TokenScope::Write);
     let old_bytes = deterministic_bytes(98_323, 601);
     let seed_put = s3_put(&seed_node.base_url(), &token, "f-old", old_bytes.clone()).await;
-    assert_eq!(seed_put.status().as_u16(), 200, "N-1 seed write");
+    let seed_status = seed_put.status();
+    assert_eq!(
+        seed_status.as_u16(),
+        200,
+        "N-1 seed write: response={}, server log={}",
+        seed_put.text().await.unwrap(),
+        seed_node.log_contents(),
+    );
+    eprintln!("chaos({drill}): phase=predecessor-seed-complete");
     drop(seed_node);
 
     let old_a_root = TempDir::new().unwrap();
@@ -2284,8 +2328,10 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
         &environment,
         old_b_root.path(),
     );
+    eprintln!("chaos({drill}): phase=predecessor-peers-start");
     node_a.wait_ready(Duration::from_secs(20)).await;
     node_b.wait_ready(Duration::from_secs(20)).await;
+    eprintln!("chaos({drill}): phase=predecessor-peers-ready");
 
     assert_s3_bytes(&node_b.base_url(), &token, "f-old", &old_bytes, "N-1 peer").await;
 
@@ -2320,12 +2366,14 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
         // state. This specific error therefore distinguishes additive owner
         // setup from an unknown, pending or corrupt core migration history.
         Err(shardline_server::DatabaseMigrationError::FrontendSchemaIncompatible(_)) => {
+            eprintln!("chaos({drill}): phase=candidate-migration");
             migrate_chaos_postgres_with_binary(&current_binary, &stack.pg_url).await;
             let pool = sqlx::PgPool::connect(&stack.pg_url).await.unwrap();
             shardline_server::check_database_schema_compatibility(&pool)
                 .await
                 .unwrap();
             pool.close().await;
+            eprintln!("chaos({drill}): phase=candidate-migration-verified");
             true
         }
         Err(shardline_server::DatabaseMigrationError::PendingMigrations { .. }) => false,
@@ -2336,6 +2384,7 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
     };
     if incremental {
         drop(node_a);
+        eprintln!("chaos({drill}): phase=candidate-start-after-migration");
         node_a = DeploymentServer::spawn_at(
             &current_binary,
             &bind_addr,
@@ -2343,6 +2392,7 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
             new_a_root.path(),
         );
         node_a.wait_ready(Duration::from_secs(20)).await;
+        eprintln!("chaos({drill}): phase=candidate-ready-after-migration");
         assert_s3_bytes(
             &node_a.base_url(),
             &token,
@@ -2489,6 +2539,7 @@ async fn drill_deploy_f_real_mixed_version_rollout_and_rollback() {
         )
         .await;
         drop(node_a);
+        eprintln!("chaos({drill}): phase=predecessor-rollback-start-after-current-writes");
         node_a = DeploymentServer::spawn_at(
             &previous_binary,
             &bind_addr,

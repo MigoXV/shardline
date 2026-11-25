@@ -29,6 +29,7 @@ async fn shared_xorb_transfer_does_not_expose_another_repositorys_terms()
         storage.path().to_owned(),
         NonZeroUsize::new(128).ok_or("invalid fixture chunk size")?,
     )
+    .with_selective_serialized_xorb_ranges(true)
     .with_token_signing_key(b"test-signing-key-32-bytes-long!!".to_vec())?
     .with_admin_read_token(TEST_ADMIN_TOKEN.as_bytes().to_vec())?;
     let server = spawn(async move { serve_with_listener(config, listener).await });
@@ -379,6 +380,7 @@ async fn shared_xorb_transfer_does_not_expose_another_repositorys_terms()
         candidate.chunks[1].hash = xet_hash_hex(&other);
         let position = u64::try_from(added % 2)?;
         let record = shardline_index::FileRecord {
+            deduplication_domain: None,
             file_id: format!("stale-dedup-candidate-{nonce}"),
             content_hash: xet_hash_hex(&file_hash(&[if position == 0 {
                 chunks[0]

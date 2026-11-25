@@ -2,7 +2,6 @@ use std::borrow::Borrow;
 
 use shardline_protocol::{HashParseError, ShardlineHash};
 
-const HASH_HEX_LENGTH: usize = 64;
 const XET_HASH_GROUP_BYTES: usize = 8;
 
 /// Parses the reordered lowercase hash text used by Xet API paths and persisted Xet metadata.
@@ -12,31 +11,10 @@ const XET_HASH_GROUP_BYTES: usize = 8;
 /// Returns [`HashParseError`] when the string has the wrong length, contains
 /// non-lowercase hexadecimal characters, or cannot be decoded into 32 bytes.
 pub fn parse_xet_hash_hex(value: &str) -> Result<ShardlineHash, HashParseError> {
-    if value.len() != HASH_HEX_LENGTH {
-        return Err(HashParseError::InvalidLength);
+    let mut bytes = *ShardlineHash::parse_hex(value)?.as_bytes();
+    for chunk in bytes.as_chunks_mut::<XET_HASH_GROUP_BYTES>().0 {
+        chunk.reverse();
     }
-
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(HashParseError::InvalidCharacter(
-            "non-lowercase hexadecimal character".to_owned(),
-        ));
-    }
-
-    let decoded =
-        hex::decode(value).map_err(|e| HashParseError::InvalidCharacter(e.to_string()))?;
-    let reordered = decoded
-        .as_chunks::<XET_HASH_GROUP_BYTES>()
-        .0
-        .iter()
-        .flat_map(|chunk| chunk.iter().rev().copied())
-        .collect::<Vec<u8>>();
-    let bytes = <[u8; 32]>::try_from(reordered).map_err(|vec| {
-        let _ = vec;
-        HashParseError::InvalidLength
-    })?;
 
     Ok(ShardlineHash::from_bytes(bytes))
 }
@@ -44,41 +22,11 @@ pub fn parse_xet_hash_hex(value: &str) -> Result<ShardlineHash, HashParseError> 
 /// Returns the reordered lowercase hash text used by Xet API paths and persisted Xet metadata.
 #[must_use]
 pub fn xet_hash_hex_string(hash: impl Borrow<ShardlineHash>) -> String {
-    let hash = hash.borrow();
-    let mut encoded = Vec::with_capacity(HASH_HEX_LENGTH);
-    for chunk in hash.as_bytes().as_chunks::<XET_HASH_GROUP_BYTES>().0 {
-        for byte in chunk.iter().rev() {
-            append_lower_hex_byte(&mut encoded, *byte);
-        }
+    let mut bytes = *hash.borrow().as_bytes();
+    for chunk in bytes.as_chunks_mut::<XET_HASH_GROUP_BYTES>().0 {
+        chunk.reverse();
     }
-
-    String::from_utf8(encoded).unwrap_or_default()
-}
-
-fn append_lower_hex_byte(output: &mut Vec<u8>, byte: u8) {
-    output.push(lower_hex_digit(byte >> 4));
-    output.push(lower_hex_digit(byte & 0x0f));
-}
-
-const fn lower_hex_digit(nibble: u8) -> u8 {
-    match nibble {
-        0 => b'0',
-        1 => b'1',
-        2 => b'2',
-        3 => b'3',
-        4 => b'4',
-        5 => b'5',
-        6 => b'6',
-        7 => b'7',
-        8 => b'8',
-        9 => b'9',
-        10 => b'a',
-        11 => b'b',
-        12 => b'c',
-        13 => b'd',
-        14 => b'e',
-        _ => b'f',
-    }
+    hex::encode(bytes)
 }
 
 #[cfg(test)]
@@ -104,45 +52,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_xet_hash_hex_rejects_short_string() {
-        assert!(matches!(
-            parse_xet_hash_hex("abc"),
-            Err(shardline_protocol::HashParseError::InvalidLength)
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_long_string() {
-        assert!(matches!(
-            parse_xet_hash_hex(&"a".repeat(65)),
-            Err(shardline_protocol::HashParseError::InvalidLength)
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_uppercase() {
-        let hex = "A".repeat(64);
-        assert!(matches!(
-            parse_xet_hash_hex(&hex),
-            Err(shardline_protocol::HashParseError::InvalidCharacter(_))
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_non_hex_characters() {
-        let hex = format!("{}z{}", "a".repeat(32), "b".repeat(31));
-        assert!(matches!(
-            parse_xet_hash_hex(&hex),
-            Err(shardline_protocol::HashParseError::InvalidCharacter(_))
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_empty_string() {
-        assert!(matches!(
-            parse_xet_hash_hex(""),
-            Err(shardline_protocol::HashParseError::InvalidLength)
-        ));
+    fn parser_rejects_wrong_lengths_and_noncanonical_characters() {
+        for value in [String::new(), "abc".to_owned(), "a".repeat(65)] {
+            assert!(
+                matches!(
+                    parse_xet_hash_hex(&value),
+                    Err(shardline_protocol::HashParseError::InvalidLength)
+                ),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "A".repeat(64),
+            format!("{}z{}", "a".repeat(32), "b".repeat(31)),
+        ] {
+            assert!(
+                matches!(
+                    parse_xet_hash_hex(&value),
+                    Err(shardline_protocol::HashParseError::InvalidCharacter(_))
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

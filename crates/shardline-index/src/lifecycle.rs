@@ -235,24 +235,20 @@ impl ProviderRepositoryState {
             provider: self.provider,
             owner: self.owner.clone(),
             repo: self.repo.clone(),
-            last_access_changed_at_unix_seconds: max_optional_timestamp(
-                self.last_access_changed_at_unix_seconds,
-                incoming.last_access_changed_at_unix_seconds,
-            ),
+            last_access_changed_at_unix_seconds: self
+                .last_access_changed_at_unix_seconds
+                .max(incoming.last_access_changed_at_unix_seconds),
             last_revision_pushed_at_unix_seconds,
             last_pushed_revision,
-            last_cache_invalidated_at_unix_seconds: max_optional_timestamp(
-                self.last_cache_invalidated_at_unix_seconds,
-                incoming.last_cache_invalidated_at_unix_seconds,
-            ),
-            last_authorization_rechecked_at_unix_seconds: max_optional_timestamp(
-                self.last_authorization_rechecked_at_unix_seconds,
-                incoming.last_authorization_rechecked_at_unix_seconds,
-            ),
-            last_drift_checked_at_unix_seconds: max_optional_timestamp(
-                self.last_drift_checked_at_unix_seconds,
-                incoming.last_drift_checked_at_unix_seconds,
-            ),
+            last_cache_invalidated_at_unix_seconds: self
+                .last_cache_invalidated_at_unix_seconds
+                .max(incoming.last_cache_invalidated_at_unix_seconds),
+            last_authorization_rechecked_at_unix_seconds: self
+                .last_authorization_rechecked_at_unix_seconds
+                .max(incoming.last_authorization_rechecked_at_unix_seconds),
+            last_drift_checked_at_unix_seconds: self
+                .last_drift_checked_at_unix_seconds
+                .max(incoming.last_drift_checked_at_unix_seconds),
         }
     }
 
@@ -308,13 +304,6 @@ impl ProviderRepositoryState {
     #[must_use]
     pub const fn last_drift_checked_at_unix_seconds(&self) -> Option<u64> {
         self.last_drift_checked_at_unix_seconds
-    }
-}
-
-fn max_optional_timestamp(current: Option<u64>, incoming: Option<u64>) -> Option<u64> {
-    match (current, incoming) {
-        (Some(current), Some(incoming)) => Some(current.max(incoming)),
-        (current, incoming) => current.or(incoming),
     }
 }
 
@@ -778,15 +767,16 @@ mod tests {
     #[test]
     fn retention_hold_release_at_exact_boundary_is_inactive() {
         let key = ObjectKey::parse("xorbs/default/aa/bb/hash.xorb").unwrap();
-        let hold = RetentionHold::new(key, "exact release".to_owned(), 10, Some(20)).unwrap();
-        assert!(
-            !hold.is_active_at(20),
-            "hold with release_at=20 should be inactive at t=20"
-        );
-        assert!(
-            !hold.is_active_at(21),
-            "hold with release_at=20 should be inactive at t=21"
-        );
+        for release in [0, 20, u64::MAX] {
+            let hold =
+                RetentionHold::new(key.clone(), "exact release".to_owned(), 0, Some(release))
+                    .unwrap();
+            if release > 0 {
+                assert!(hold.is_active_at(release - 1));
+            }
+            assert!(!hold.is_active_at(release));
+            assert!(!hold.is_active_at(release.saturating_add(1)));
+        }
     }
 
     #[test]

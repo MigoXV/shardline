@@ -1,46 +1,31 @@
-//! Upload session layer (M3b, `docs/SDX_PLAN.md` §4.4.2 / §9-M3).
+//! Streaming uploads with session deduplication and bounded Xorb admission.
 //!
-//! [`UploadSession`] owns the write-path transport (the M2a
-//! [`TransferClient`], write-scoped token resolution, the M3a
-//! [`DedupClient`], and a fixed upload-permit semaphore — adaptive concurrency
-//! is M4) and coordinates the push-style ingest loop:
+//! [`UploadSession`] coordinates chunking, deduplication, Xorb uploads, and
+//! final shard publication:
 //!
-//! 1. Data is fed as 8 MiB [`INGESTION_BLOCK_SIZE`] blocks (files/readers via
-//!    a `spawn_blocking` compute thread that also runs the CDC chunker, so the
-//!    blocking task emits zero-copy [`Bytes`] chunk slices).
-//! 2. Each chunk is checked against the **session dedup store**, then against
-//!    the eligibility-gated **global dedup query** (`GET
-//!    /v1/chunks/default-merkledb/{hash}`, 404 = miss, 429 surfaced without
-//!    retry). A hit imports the returned shard's xorb reference and skips the
-//!    chunk upload; a miss stages the chunk into the pending xorb buffer.
-//! 3. A xorb is cut when the 64 MiB / 8192 condition or the
-//!    [`SERIALIZED_XORB_SAFETY_CAP_BYTES`] worst-case serialized guard binds.
-//!    Cut xorbs are uploaded with a **HEAD-first idempotency probe**
-//!    (`HEAD /v1/xorbs/default/{hash}`) and a **streaming-body POST** (512 KiB
-//!    progress blocks, explicit `Content-Length`) from a [`JoinSet`] of
-//!    parallel tasks, one upload permit each.
-//! 4. At [`UploadSession::finalize`] every xorb upload is joined, then a
-//!    session shard is serialized (fork-format v3, [`crate::shard`]) and
-//!    POSTed to `/v1/shards` — **xorbs-before-shard ordering is mandatory** and
-//!    enforced by the server (it rejects shards referencing absent xorbs).
+//! 1. Files and readers feed [`INGESTION_BLOCK_SIZE`] blocks from a blocking
+//!    compute worker. Push-style handles process owned [`Bytes`] incrementally.
+//!    Both use the shared CDC chunker and preserve chunk boundaries across writes.
+//! 2. Each chunk checks session-local locations, then an eligibility-gated global
+//!    lookup. Reused chunks reference their existing Xorb; new chunks enter the
+//!    current file's pending buffer. Global lookup misses include HTTP 404;
+//!    HTTP 429 is surfaced without retry.
+//! 3. Pending chunks are packed when the 64 MiB, 8192-chunk, or
+//!    [`SERIALIZED_XORB_SAFETY_CAP_BYTES`] bound requires a cut. Serialization
+//!    workers and queued/running POST bodies share one upload semaphore. Each
+//!    upload probes with HEAD first and retries transient transport failures.
+//! 4. [`UploadSession::finalize`] joins every Xorb upload before publishing the
+//!    session shard. Path registrations follow the shard, so referenced data is
+//!    available before metadata becomes visible. The server also rejects shards
+//!    referencing absent Xorbs.
 //!
-//! Serialization workers and queued/running xorb POST payloads share the
-//! configured upload concurrency bound. Each file also retains its bounded
-//! pending xorb tail, ingest buffers, and metadata; caller-owned input bytes
-//! and the number of simultaneously open files are separate from that bound.
+//! Each open file retains its own bounded pending tail, ingest buffers, and
+//! metadata. Caller-owned bytes and the number of open files are separate from
+//! the upload concurrency bound. Duplicate Xorbs can avoid POST through the HEAD
+//! probe; the pending tail is not aggregated across files.
 //!
-//! # Deltas vs upstream / plan
-//!
-//! - Path addressing (`remote`) is M5; the uploaded file's identity is its
-//!   content hash (`merklehash::file_hash`), returned as [`UploadFileInfo::file_id`].
-//! - The plan's session-tail `DataAggregator` is realized as a per-file
-//!   pending tail (each file's chunks are cut and uploaded on its own
-//!   boundary); the RAM bound and xorb-cut semantics are identical, and
-//!   duplicate xorbs across files are uploaded at most once via the HEAD
-//!   probe. A session-wide aggregator is a future refinement.
-//! - Uploads apply the M4 retry policy (xorb/shard POSTs retry transient
-//!   failures; dedup queries are 429-fail-fast). Upload permits are a fixed
-//!   semaphore (adaptive concurrency is a future default seam).
+//! Upload concurrency is fixed; adaptive concurrency is not implemented. See
+//! `docs/SDX_PLAN.md` for the design history.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -52,22 +37,22 @@ use bytes::Bytes;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use xet_core_structures::merklehash::{MerkleHash, file_hash};
+use xet_core_structures::merklehash::MerkleHash;
 
 use crate::auth::TokenService;
 use crate::chunker::{Chunk, Chunker};
 use crate::dedup::{DedupClient, DedupOutcome, is_global_dedup_eligible};
 use crate::error::{SdxError, TransferError};
 use crate::hash::{parse_xet_hash_hex, xet_hash_hex_string};
-use crate::retry::{RetryContext, RetryMarkers, RetryPolicy, RetryScope};
+use crate::retry::{RetryContext, RetryPolicy, RetryScope};
 use crate::session::DownloadSessionInner;
 use crate::shard::{
     MDB_CHUNK_WITH_GLOBAL_DEDUP_FLAG, ShardFileEntry, ShardSegment, ShardXorb, ShardXorbChunk,
-    find_chunk_in_xorbs, parse_shard_xorbs, serialize_shard,
+    find_chunk_in_xorbs, parse_shard_xorbs, serialize_shard_iter,
 };
 use crate::transfer::TransferClient;
 use crate::xorb_build::{
-    SERIALIZED_XORB_SAFETY_CAP_BYTES, build_xorb, xorb_cut_condition, xorb_max_addable_chunk,
+    SERIALIZED_XORB_SAFETY_CAP_BYTES, build_hashed_xorb, xorb_cut_condition, xorb_max_addable_chunk,
 };
 
 /// Size of each ingest block fed to the chunker (files/readers/bytes are all
@@ -125,7 +110,7 @@ struct UploadStreamHandleInner {
     operation: Mutex<()>,
     pipeline: StdMutex<Option<FileUploadPipeline>>,
     cancellation: CancellationToken,
-    result: Arc<OnceLock<UploadFileInfo>>,
+    result: OnceLock<UploadFileInfo>,
     task_id: u64,
     started: AtomicBool,
     finished: AtomicBool,
@@ -237,8 +222,7 @@ impl UploadStreamHandle {
     #[cfg(not(target_family = "wasm"))]
     pub fn write_blocking(&self, data: impl Into<Bytes>) -> Result<(), SdxError> {
         let data = data.into();
-        let handle = self.clone();
-        crate::stream::global_blocking_runtime()?.block_on(async move { handle.write(data).await })
+        crate::stream::global_blocking_runtime()?.block_on(self.write(data))
     }
 
     /// Finalizes this file's ingest: flushes the pending tail into a xorb,
@@ -378,10 +362,7 @@ impl UploadSessionInner {
             tokens: Some(self.tokens.clone()),
             scope: RetryScope::Write,
             // 403 on an upload re-issues the write token once (loop-guarded).
-            markers: RetryMarkers {
-                retry_on_403: true,
-                ..RetryMarkers::default()
-            },
+            refresh_on_forbidden: true,
         }
     }
 
@@ -389,10 +370,10 @@ impl UploadSessionInner {
     /// miss, 429 fail-fast).
     fn dedup_retry_context(&self) -> RetryContext {
         RetryContext {
-            policy: self.retry_policy.clone(),
+            policy: self.retry_policy.clone().with_retry_on_429(false),
             tokens: Some(self.tokens.clone()),
             scope: RetryScope::Write,
-            markers: RetryMarkers::dedup(),
+            refresh_on_forbidden: false,
         }
     }
 
@@ -439,6 +420,7 @@ impl SerializationGate {
 }
 
 /// Session-wide state shared by all file pipelines in this session.
+#[derive(Default)]
 struct SessionState {
     /// chunk hash → xorb + index for chunks placed/imported this session
     /// (the session dedup store).
@@ -478,43 +460,20 @@ impl SessionState {
     }
 }
 
-impl Default for SessionState {
-    fn default() -> Self {
-        Self {
-            chunk_locations: HashMap::new(),
-            xorb_infos: HashMap::new(),
-            file_reports: Vec::new(),
-            file_infos: Vec::new(),
-            xorb_upload_tasks: JoinSet::new(),
-            pending_registrations: Vec::new(),
-            global_chunk_index: 0,
-            last_global_query_index: None,
-            finalized: false,
-            background_failure: None,
-        }
-    }
-}
-
 /// Where a chunk lives: inside which xorb and at which chunk index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkLocation {
     xorb_hash: MerkleHash,
     chunk_index: u32,
-    unpacked_len: u64,
 }
 
 /// One file's chunk in file order.
 #[derive(Debug, Clone, Copy)]
-enum Placement {
-    /// Chunk staged into a new xorb (not yet cut).
-    New { hash: MerkleHash, len: u64 },
-    /// Chunk already stored; references an existing xorb.
-    Known {
-        hash: MerkleHash,
-        len: u64,
-        xorb_hash: MerkleHash,
-        chunk_index: u32,
-    },
+struct Placement {
+    hash: MerkleHash,
+    len: u64,
+    /// Existing location for reused content; new chunks resolve after packing.
+    location: Option<ChunkLocation>,
 }
 
 /// Per-file ingest pipeline: chunker + dedup + pending-xorb buffer.
@@ -522,17 +481,12 @@ struct FileUploadPipeline {
     session: UploadSession,
     chunker: Chunker,
     placements: Vec<Placement>,
-    /// Per `Placement::New`, in order, the (xorb_hash, xorb chunk index) the
-    /// chunk was cut into.
-    new_chunk_xorbs: Vec<(MerkleHash, u32)>,
+    /// Physical locations for new chunks, in placement order.
+    new_chunk_locations: Vec<ChunkLocation>,
     /// Pending new chunks not yet cut into a xorb, with their file offsets.
-    pending: Vec<(Chunk, u64)>,
+    pending: Vec<(Bytes, u64, MerkleHash)>,
     pending_bytes: usize,
-    /// Next file offset (cumulative over all chunks).
-    next_file_offset: u64,
     total_bytes: u64,
-    inserted_chunks: u64,
-    reused_chunks: u64,
 }
 
 impl FileUploadPipeline {
@@ -542,13 +496,10 @@ impl FileUploadPipeline {
             session,
             chunker: Chunker::new(chunk_target),
             placements: Vec::new(),
-            new_chunk_xorbs: Vec::new(),
+            new_chunk_locations: Vec::new(),
             pending: Vec::new(),
             pending_bytes: 0,
-            next_file_offset: 0,
             total_bytes: 0,
-            inserted_chunks: 0,
-            reused_chunks: 0,
         }
     }
 
@@ -568,122 +519,99 @@ impl FileUploadPipeline {
         Ok(())
     }
 
-    /// Processes one chunk: session dedup, then eligibility-gated global dedup,
-    /// then staging into the pending xorb buffer.
+    /// Looks up reuse before staging new chunks, then records each placement once.
     async fn process_chunk(&mut self, chunk: Chunk) -> Result<(), SdxError> {
         let hash = chunk.hash();
         let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        let location = self.find_chunk_location(&hash).await?;
+        if location.is_none() {
+            let chunk_len = chunk.len();
+            if needs_xorb_cut(self.pending_bytes, self.pending.len(), chunk_len) {
+                self.cut_xorb().await?;
+            }
+            self.pending.push((chunk.data, self.total_bytes, hash));
+            self.pending_bytes = self.pending_bytes.saturating_add(chunk_len);
+            let mut state = self.session.inner.state.lock().await;
+            state.global_chunk_index = state.global_chunk_index.saturating_add(1);
+        }
+        self.placements.push(Placement {
+            hash,
+            len,
+            location,
+        });
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        Ok(())
+    }
 
-        // 1. Session dedup store.
-        let session_hit = {
-            let state = self.session.inner.state.lock().await;
-            state.chunk_locations.get(&hash).copied()
+    /// Resolves session reuse first, then an eligibility-gated global lookup.
+    async fn find_chunk_location(
+        &self,
+        hash: &MerkleHash,
+    ) -> Result<Option<ChunkLocation>, SdxError> {
+        // Reserve an eligible global query only on a session miss, under
+        // the same lock as the reuse lookup. Network work stays outside it.
+        let (session_hit, eligible) = {
+            let mut state = self.session.inner.state.lock().await;
+            let session_hit = state.chunk_locations.get(hash).copied();
+            let eligible = session_hit.is_none()
+                && is_global_dedup_eligible(
+                    state.global_chunk_index,
+                    hash,
+                    state.last_global_query_index,
+                );
+            if eligible {
+                state.last_global_query_index = Some(state.global_chunk_index);
+            }
+            (session_hit, eligible)
         };
-        if let Some(location) = session_hit {
-            self.placements.push(Placement::Known {
-                hash,
-                len,
-                xorb_hash: location.xorb_hash,
-                chunk_index: location.chunk_index,
-            });
-            self.reused_chunks = self.reused_chunks.saturating_add(1);
-            self.account_chunk(len);
-            return Ok(());
+        if session_hit.is_some() {
+            return Ok(session_hit);
         }
 
-        // 2. Eligibility-gated global dedup query.
-        let (global_index, eligible) = {
-            let state = self.session.inner.state.lock().await;
-            (
-                state.global_chunk_index,
-                is_global_dedup_eligible(
-                    state.global_chunk_index,
-                    &hash,
-                    state.last_global_query_index,
-                ),
-            )
-        };
         if eligible {
-            self.session
-                .inner
-                .state
-                .lock()
-                .await
-                .last_global_query_index = Some(global_index);
-            let session = self.session.clone();
+            let session = &self.session;
             let (base, token) = session.inner.cas_credentials().await?;
-            let hash_hex = xet_hash_hex_string(hash);
+            let hash_hex = xet_hash_hex_string(*hash);
             // Dedup queries are 429-fail-fast and treat 404 as a miss.
             let retry = session.inner.dedup_retry_context();
-            let dedup = session.inner.dedup.clone();
+            let dedup = &session.inner.dedup;
             let outcome = retry
                 .run(token, |tok| {
-                    let dedup = dedup.clone();
-                    let base = base.clone();
-                    let hash_hex = hash_hex.clone();
-                    async move { dedup.query_raw(&base, &tok, &hash_hex).await }
+                    let base = &base;
+                    let hash_hex = &hash_hex;
+                    async move { dedup.query_raw(base, &tok, hash_hex).await }
                 })
                 .await?;
             if let DedupOutcome::Present { shard_body } = outcome
                 && let Ok(xorbs) = parse_shard_xorbs(&shard_body)
-                && let Some((xorb, index)) = find_chunk_in_xorbs(&xorbs, &hash)
+                && let Some((xorb, index)) = find_chunk_in_xorbs(&xorbs, hash)
             {
-                {
-                    let mut state = self.session.inner.state.lock().await;
-                    let location = ChunkLocation {
-                        xorb_hash: xorb.xorb_hash,
-                        chunk_index: index,
-                        unpacked_len: len,
-                    };
-                    state.chunk_locations.insert(hash, location);
-                    // Import the xorb info, marking the referenced chunk with
-                    // the global-dedup flag so the server re-indexes it.
-                    let mut imported = xorb.clone();
-                    if let Some(imported_chunk) = imported
-                        .chunks
-                        .get_mut(usize::try_from(index).unwrap_or(usize::MAX))
-                    {
-                        imported_chunk.flags |= MDB_CHUNK_WITH_GLOBAL_DEDUP_FLAG;
-                    }
-                    state
-                        .xorb_infos
-                        .entry(imported.xorb_hash)
-                        .or_insert(imported);
-                    state.global_chunk_index = state.global_chunk_index.saturating_add(1);
-                }
-                self.placements.push(Placement::Known {
-                    hash,
-                    len,
+                let location = ChunkLocation {
                     xorb_hash: xorb.xorb_hash,
                     chunk_index: index,
-                });
-                self.reused_chunks = self.reused_chunks.saturating_add(1);
-                self.account_chunk(len);
-                return Ok(());
+                };
+                {
+                    let mut state = self.session.inner.state.lock().await;
+                    state.chunk_locations.insert(*hash, location);
+                    // Import only absent xorb info, marking the referenced
+                    // chunk for server re-indexing after global dedup.
+                    state.xorb_infos.entry(xorb.xorb_hash).or_insert_with(|| {
+                        let mut imported = xorb.clone();
+                        if let Some(imported_chunk) = imported
+                            .chunks
+                            .get_mut(usize::try_from(index).unwrap_or(usize::MAX))
+                        {
+                            imported_chunk.flags |= MDB_CHUNK_WITH_GLOBAL_DEDUP_FLAG;
+                        }
+                        imported
+                    });
+                    state.global_chunk_index = state.global_chunk_index.saturating_add(1);
+                }
+                return Ok(Some(location));
             }
         }
 
-        // 3. Stage as new content; cut a xorb first if the limits bind.
-        let chunk_len = chunk.len();
-        if needs_xorb_cut(self.pending_bytes, self.pending.len(), chunk_len) {
-            self.cut_xorb().await?;
-        }
-        let file_offset = self.next_file_offset;
-        self.pending.push((chunk, file_offset));
-        self.pending_bytes = self.pending_bytes.saturating_add(chunk_len);
-        self.placements.push(Placement::New { hash, len });
-        self.inserted_chunks = self.inserted_chunks.saturating_add(1);
-        self.account_chunk(len);
-        {
-            let mut state = self.session.inner.state.lock().await;
-            state.global_chunk_index = state.global_chunk_index.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    const fn account_chunk(&mut self, len: u64) {
-        self.next_file_offset = self.next_file_offset.saturating_add(len);
-        self.total_bytes = self.total_bytes.saturating_add(len);
+        Ok(None)
     }
 
     /// Cuts the pending buffer into a xorb: HEAD-probe, streaming POST (or
@@ -704,11 +632,8 @@ impl FileUploadPipeline {
             .map_err(|_error| {
                 SdxError::UploadSession("upload permit semaphore closed".to_owned())
             })?;
-        let pairs: Vec<(Bytes, u64)> = self
-            .pending
-            .iter()
-            .map(|(chunk, offset)| (chunk.data.clone(), *offset))
-            .collect();
+        let pairs = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
         #[cfg(test)]
         let serialization_gate = self.session.inner.serialization_gate.clone();
         let (built, upload_permit) = tokio::task::spawn_blocking(move || {
@@ -717,24 +642,25 @@ impl FileUploadPipeline {
             if let Some(gate) = serialization_gate {
                 gate.wait()?;
             }
-            let built = build_xorb(&pairs)?;
+            let built = build_hashed_xorb(&pairs)?;
             Ok::<_, SdxError>((built, permit))
         })
         .await
         .map_err(|error| SdxError::TaskJoin(error.to_string()))??;
 
+        // The worker consumed the raw chunks before credentials, HEAD, or
+        // POST can wait on the network.
+
+        let xorb_hash = parse_xet_hash_hex(&built.xorb_hash_hex)?;
         // HEAD-first idempotency probe (retried on transient failures).
         let (base, token) = self.session.inner.cas_credentials().await?;
         let retry = self.session.inner.upload_retry_context();
-        let transfer = self.session.inner.transfer.clone();
-        let xorb_hash_hex = built.xorb_hash_hex.clone();
-        let base_head = base.clone();
+        let transfer = &self.session.inner.transfer;
+        let xorb_hash_hex = &built.xorb_hash_hex;
+        let base_head = &base;
         let exists = retry
-            .run(token.clone(), move |tok| {
-                let hclient = transfer.clone();
-                let b = base_head.clone();
-                let hash = xorb_hash_hex.clone();
-                async move { hclient.head_xorb(&b, &tok, &hash).await }
+            .run(token.clone(), |tok| async move {
+                transfer.head_xorb(base_head, &tok, xorb_hash_hex).await
             })
             .await?;
         if exists {
@@ -744,7 +670,7 @@ impl FileUploadPipeline {
                 .fetch_add(1, Ordering::Relaxed);
         } else {
             let upload_transfer = self.session.inner.transfer.clone();
-            let hash = built.xorb_hash_hex.clone();
+            let hash = built.xorb_hash_hex;
             let body = Bytes::from(built.serialized);
             let mut state = self.session.inner.state.lock().await;
             state.check_background_failure()?;
@@ -766,23 +692,18 @@ impl FileUploadPipeline {
                 // Retry the streaming xorb POST with backoff/refresh; the
                 // serialized bytes are in memory, so replays are safe.
                 retry
-                    .run(token, move |tok| {
-                        let tclient = upload_transfer.clone();
-                        let base = base.clone();
-                        let hash = hash.clone();
+                    .run(token, |tok| {
+                        let tclient = &upload_transfer;
+                        let base = &base;
+                        let hash = &hash;
                         let body = body.clone();
-                        async move { tclient.upload_xorb(&base, &tok, &hash, body).await }
+                        async move { tclient.upload_xorb(base, &tok, hash, body).await }
                     })
                     .await?;
                 Ok(())
             });
         }
 
-        let xorb_hash = parse_xet_hash_hex(&built.xorb_hash_hex)?;
-        let num_bytes_in_xorb = built
-            .chunk_entries
-            .iter()
-            .fold(0u64, |acc, entry| acc.saturating_add(entry.raw_length));
         let mut chunks = Vec::with_capacity(built.chunk_entries.len());
         let mut unpacked_offset = 0u64;
         for entry in &built.chunk_entries {
@@ -796,27 +717,20 @@ impl FileUploadPipeline {
         }
         let shard_xorb = ShardXorb {
             xorb_hash,
-            num_bytes_in_xorb,
+            num_bytes_in_xorb: unpacked_offset,
             chunks,
         };
 
         let mut state = self.session.inner.state.lock().await;
-        state
-            .xorb_infos
-            .entry(xorb_hash)
-            .or_insert_with(|| shard_xorb.clone());
-        for (index, (chunk, _offset)) in self.pending.iter().enumerate() {
+        state.xorb_infos.entry(xorb_hash).or_insert(shard_xorb);
+        for entry in &built.chunk_entries {
             let location = ChunkLocation {
                 xorb_hash,
-                chunk_index: u32::try_from(index).unwrap_or(u32::MAX),
-                unpacked_len: u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                chunk_index: entry.chunk_index,
             };
-            state.chunk_locations.insert(chunk.hash(), location);
-            self.new_chunk_xorbs
-                .push((xorb_hash, u32::try_from(index).unwrap_or(u32::MAX)));
+            state.chunk_locations.insert(entry.hash, location);
+            self.new_chunk_locations.push(location);
         }
-        self.pending.clear();
-        self.pending_bytes = 0;
         Ok(())
     }
 
@@ -834,25 +748,18 @@ impl FileUploadPipeline {
 
         // Build the file's segments from the ordered placements.
         let mut segments: Vec<ShardSegment> = Vec::new();
-        let mut new_index = 0usize;
+        let mut new_locations = self.new_chunk_locations.iter();
         for placement in &self.placements {
-            let (xorb_hash, chunk_index, len) = match placement {
-                Placement::Known {
-                    xorb_hash,
-                    chunk_index,
-                    len,
-                    ..
-                } => (*xorb_hash, u64::from(*chunk_index), *len),
-                Placement::New { len, .. } => {
-                    let (xorb_hash, chunk_index) = self
-                        .new_chunk_xorbs
-                        .get(new_index)
-                        .copied()
-                        .unwrap_or_else(|| (MerkleHash::default(), 0));
-                    new_index = new_index.saturating_add(1);
-                    (xorb_hash, u64::from(chunk_index), *len)
-                }
-            };
+            let location = placement
+                .location
+                .as_ref()
+                .or_else(|| new_locations.next())
+                .ok_or_else(|| {
+                    SdxError::UploadSession("new chunk has no Xorb location".to_owned())
+                })?;
+            let len = placement.len;
+            let xorb_hash = location.xorb_hash;
+            let chunk_index = u64::from(location.chunk_index);
             if let Some(last) = segments.last_mut()
                 && last.xorb_hash == xorb_hash
                 && last.chunk_index_end == chunk_index
@@ -869,32 +776,32 @@ impl FileUploadPipeline {
             });
         }
 
-        let chunk_list: Vec<(MerkleHash, u64)> = self
-            .placements
-            .iter()
-            .map(|placement| match placement {
-                Placement::New { hash, len } | Placement::Known { hash, len, .. } => (*hash, *len),
-            })
-            .collect();
-        let file_hash = file_hash(&chunk_list);
+        let native_file_hash = shardline_xet_core::merklehash::file_hash_from_iter(
+            self.placements
+                .iter()
+                .map(|placement| (<[u8; 32]>::from(placement.hash).into(), placement.len)),
+        );
+        let file_hash = MerkleHash::from(<[u8; 32]>::from(native_file_hash));
         let file_entry = ShardFileEntry {
             file_hash,
             segments,
         };
 
         let xorb_count = self
-            .new_chunk_xorbs
+            .new_chunk_locations
             .iter()
-            .map(|(hash, _)| *hash)
+            .map(|location| location.xorb_hash)
             .collect::<std::collections::HashSet<_>>()
             .len() as u64;
+        let chunk_count = u64::try_from(self.placements.len()).unwrap_or(u64::MAX);
+        let inserted_chunks = u64::try_from(self.new_chunk_locations.len()).unwrap_or(u64::MAX);
         let info = UploadFileInfo {
             file_id: xet_hash_hex_string(file_hash),
             total_bytes: self.total_bytes,
-            chunk_count: u64::try_from(chunk_list.len()).unwrap_or(u64::MAX),
+            chunk_count,
             xorb_count,
-            inserted_chunks: self.inserted_chunks,
-            reused_chunks: self.reused_chunks,
+            inserted_chunks,
+            reused_chunks: chunk_count.saturating_sub(inserted_chunks),
         };
 
         let mut state = self.session.inner.state.lock().await;
@@ -914,12 +821,6 @@ fn needs_xorb_cut(pending_bytes: usize, pending_chunks: usize, next_len: usize) 
             pending_chunks,
             SERIALIZED_XORB_SAFETY_CAP_BYTES,
         ) < next_len
-}
-
-/// One batch emitted by the blocking ingest task.
-enum ChunkBatch {
-    Chunks(Vec<Chunk>),
-    Done,
 }
 
 /// Upload session for one repository (write side).
@@ -1026,19 +927,14 @@ impl UploadSession {
         let _operation = self.inner.lifecycle.read().await;
         self.check_not_finalized().await?;
         let mut pipeline = FileUploadPipeline::new(self.clone());
-        let (tx, mut rx) = mpsc::channel::<Result<ChunkBatch, SdxError>>(2);
+        let (tx, mut rx) = mpsc::channel::<Vec<Chunk>>(2);
         let chunk_target = self.inner.chunk_target_size;
         let reader_task =
             tokio::task::spawn_blocking(move || feed_reader(reader, &tx, chunk_target));
 
-        while let Some(batch) = rx.recv().await {
-            match batch? {
-                ChunkBatch::Chunks(chunks) => {
-                    for chunk in chunks {
-                        pipeline.process_chunk(chunk).await?;
-                    }
-                }
-                ChunkBatch::Done => break,
+        while let Some(chunks) = rx.recv().await {
+            for chunk in chunks {
+                pipeline.process_chunk(chunk).await?;
             }
         }
         // Channel EOF can mean a reader error or panic rather than successful
@@ -1074,7 +970,7 @@ impl UploadSession {
                 operation: Mutex::new(()),
                 pipeline: StdMutex::new(Some(FileUploadPipeline::new(self.clone()))),
                 cancellation: CancellationToken::new(),
-                result: Arc::new(OnceLock::new()),
+                result: OnceLock::new(),
                 task_id: id,
                 started: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
@@ -1128,20 +1024,18 @@ impl UploadSession {
         }
 
         let (file_infos, xorb_infos, files) = {
-            let state = self.inner.state.lock().await;
+            let mut state = self.inner.state.lock().await;
             (
-                state.file_infos.clone(),
-                state
-                    .xorb_infos
-                    .values()
-                    .cloned()
-                    .collect::<Vec<ShardXorb>>(),
-                state.file_reports.clone(),
+                std::mem::take(&mut state.file_infos),
+                std::mem::take(&mut state.xorb_infos),
+                std::mem::take(&mut state.file_reports),
             )
         };
 
         if !file_infos.is_empty() {
-            let shard = serialize_shard(&file_infos, &xorb_infos);
+            let shard = Bytes::from(serialize_shard_iter(&file_infos, xorb_infos.values()));
+            drop(file_infos);
+            drop(xorb_infos);
             let (base, token) = self.inner.cas_credentials().await?;
             let _permit = self
                 .inner
@@ -1153,13 +1047,13 @@ impl UploadSession {
                 })?;
             let retry = self.inner.upload_retry_context();
             retry
-                .run(token, move |tok| {
+                .run(token, |tok| {
                     let shard = shard.clone();
-                    let base = base.clone();
+                    let base = &base;
                     async move {
                         self.inner
                             .shard_transfer
-                            .upload_shard(&base, &tok, shard)
+                            .upload_shard(base, &tok, shard)
                             .await
                     }
                 })
@@ -1217,14 +1111,14 @@ impl UploadSession {
 }
 
 /// Blocking ingest task: reads `reader` in 8 MiB blocks, chunks on the compute
-/// thread, and forwards zero-copy chunk batches (then a `Done` marker).
+/// thread, and forwards zero-copy chunk batches. The task result reports completion.
 fn feed_reader<R: Read + Send + 'static>(
     mut reader: R,
-    tx: &mpsc::Sender<Result<ChunkBatch, SdxError>>,
+    tx: &mpsc::Sender<Vec<Chunk>>,
     chunk_target: usize,
 ) -> Result<(), SdxError> {
     let send = |batch| {
-        tx.blocking_send(Ok(batch))
+        tx.blocking_send(batch)
             .map_err(|_error| SdxError::UploadSession("ingest channel closed".to_owned()))
     };
     let mut chunker = Chunker::new(chunk_target);
@@ -1244,13 +1138,13 @@ fn feed_reader<R: Read + Send + 'static>(
         let block = Bytes::copy_from_slice(buffer.get(..n).unwrap_or_default());
         let chunks = chunker.next_block_bytes(&block, false);
         if !chunks.is_empty() {
-            send(ChunkBatch::Chunks(chunks))?;
+            send(chunks)?;
         }
     }
     if let Some(tail) = chunker.finish() {
-        send(ChunkBatch::Chunks(vec![tail]))?;
+        send(vec![tail])?;
     }
-    send(ChunkBatch::Done)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1551,6 +1445,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_new_chunk_location_does_not_publish_file_metadata() {
+        let (_server, client) = mock_client().await;
+        let session = client.upload_session().unwrap();
+        let mut pipeline = super::FileUploadPipeline::new(session.clone());
+        pipeline.placements.push(super::Placement {
+            hash: compute_chunk_hash(b"unplaced"),
+            len: 8,
+            location: None,
+        });
+        let result = pipeline.finish().await;
+        assert!(
+            matches!(result, Err(crate::SdxError::UploadSession(message))
+            if message == "new chunk has no Xorb location")
+        );
+        let state = session.inner.state.lock().await;
+        assert!(state.file_infos.is_empty());
+        assert!(state.file_reports.is_empty());
+        assert!(state.pending_registrations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_placement_file_ids_match_upstream_across_tree_sizes() {
+        let (_server, client) = mock_client().await;
+        for count in [0, 1, 2, 63, 64, 65, 255, 1023] {
+            let session = client.upload_session().unwrap();
+            let mut pipeline = super::FileUploadPipeline::new(session.clone());
+            let chunks: Vec<_> = (0..count)
+                .map(|index: u32| {
+                    (
+                        compute_chunk_hash(&index.to_le_bytes()),
+                        u64::from(index % 127),
+                    )
+                })
+                .collect();
+            for (index, &(hash, len)) in chunks.iter().enumerate() {
+                let location = super::ChunkLocation {
+                    xorb_hash: compute_chunk_hash(b"stored xorb"),
+                    chunk_index: index as u32,
+                };
+                let existing_location = if index % 2 == 0 {
+                    pipeline.new_chunk_locations.push(location);
+                    None
+                } else {
+                    Some(location)
+                };
+                pipeline.placements.push(super::Placement {
+                    hash,
+                    len,
+                    location: existing_location,
+                });
+                pipeline.total_bytes += len;
+            }
+            let info = pipeline.finish().await.unwrap();
+            let expected = xet_core_structures::merklehash::file_hash(&chunks);
+            assert_eq!(info.file_id, xet_hash_hex_string(expected));
+            assert_eq!(info.chunk_count, u64::from(count));
+            assert_eq!(
+                info.total_bytes,
+                chunks.iter().map(|(_, len)| *len).sum::<u64>()
+            );
+            assert_eq!(info.inserted_chunks, u64::from(count.div_ceil(2)));
+            assert_eq!(info.reused_chunks, u64::from(count / 2));
+            let state = session.inner.state.lock().await;
+            assert_eq!(state.file_infos[0].file_hash, expected);
+            assert_eq!(state.file_infos[0].segments.len(), usize::from(count != 0));
+        }
+    }
+
+    #[tokio::test]
     async fn upload_bytes_stores_one_xorb_and_shard() {
         let (server, client) = mock_client().await;
         let session = client.upload_session().unwrap();
@@ -1629,62 +1592,65 @@ mod tests {
         }
     }
 
-    async fn check_failed_reader_does_not_publish(remaining: usize, panic: bool) {
-        for recover in [false, true] {
-            let (server, client) = mock_client().await;
-            let session = client.upload_session().unwrap();
-            let error = session
-                .upload_stream("remote/failed.bin", FailingReader { remaining, panic })
-                .await
-                .unwrap_err();
-            if panic {
-                assert!(
-                    matches!(error, crate::SdxError::TaskJoin(message) if message.contains("owned reader panic"))
-                );
-            } else {
-                assert!(
-                    matches!(error, crate::SdxError::Io(error) if error.to_string() == "owned reader failure")
-                );
-            }
-            {
-                let state = session.inner.state.lock().await;
-                assert!(state.file_infos.is_empty());
-                assert!(state.file_reports.is_empty());
-                assert!(state.pending_registrations.is_empty());
-            }
-            let expected = if recover {
-                Some(
-                    session
-                        .upload_bytes("remote/success.bin", b"complete file".to_vec())
-                        .await
-                        .unwrap(),
-                )
-            } else {
-                None
-            };
-            let expected_shard = {
-                let state = session.inner.state.lock().await;
-                let xorbs = state.xorb_infos.values().cloned().collect::<Vec<_>>();
-                serialize_shard(&state.file_infos, &xorbs)
-            };
-            let report = session.finalize().await.unwrap();
-            assert_eq!(report.files, expected.into_iter().collect::<Vec<_>>());
-            assert_eq!(report.shard_posts, u64::from(recover));
-            let requests = server.received_requests().await.unwrap();
-            let registrations = requests
-                .iter()
-                .filter(|request| request.method.as_str() == "PUT")
-                .collect::<Vec<_>>();
-            assert_eq!(registrations.len(), usize::from(recover));
-            if recover {
-                assert!(registrations[0].url.path().ends_with("/remote/success.bin"));
-                assert_eq!(shard_post_body(&server).await, expected_shard);
-            } else {
-                assert!(
-                    requests
-                        .iter()
-                        .all(|request| request.url.path() != "/v1/shards")
-                );
+    #[tokio::test]
+    async fn failed_readers_preserve_session_publication_and_recovery_contract() {
+        for (remaining, panic) in [(0, false), (1024 * 1024, false), (0, true)] {
+            for recover in [false, true] {
+                let (server, client) = mock_client().await;
+                let session = client.upload_session().unwrap();
+                let error = session
+                    .upload_stream("remote/failed.bin", FailingReader { remaining, panic })
+                    .await
+                    .unwrap_err();
+                if panic {
+                    assert!(
+                        matches!(error, crate::SdxError::TaskJoin(message) if message.contains("owned reader panic"))
+                    );
+                } else {
+                    assert!(
+                        matches!(error, crate::SdxError::Io(error) if error.to_string() == "owned reader failure")
+                    );
+                }
+                {
+                    let state = session.inner.state.lock().await;
+                    assert!(state.file_infos.is_empty());
+                    assert!(state.file_reports.is_empty());
+                    assert!(state.pending_registrations.is_empty());
+                }
+                let expected = if recover {
+                    Some(
+                        session
+                            .upload_bytes("remote/success.bin", b"complete file".to_vec())
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let expected_shard = {
+                    let state = session.inner.state.lock().await;
+                    let xorbs = state.xorb_infos.values().cloned().collect::<Vec<_>>();
+                    serialize_shard(&state.file_infos, &xorbs)
+                };
+                let report = session.finalize().await.unwrap();
+                assert_eq!(report.files, expected.into_iter().collect::<Vec<_>>());
+                assert_eq!(report.shard_posts, u64::from(recover));
+                let requests = server.received_requests().await.unwrap();
+                let registrations = requests
+                    .iter()
+                    .filter(|request| request.method.as_str() == "PUT")
+                    .collect::<Vec<_>>();
+                assert_eq!(registrations.len(), usize::from(recover));
+                if recover {
+                    assert!(registrations[0].url.path().ends_with("/remote/success.bin"));
+                    assert_eq!(shard_post_body(&server).await, expected_shard);
+                } else {
+                    assert!(
+                        requests
+                            .iter()
+                            .all(|request| request.url.path() != "/v1/shards")
+                    );
+                }
             }
         }
     }
@@ -1800,31 +1766,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_reader_immediate_error_does_not_publish_file() {
-        check_failed_reader_does_not_publish(0, false).await;
-    }
-
-    #[tokio::test]
-    async fn failed_reader_partial_error_does_not_publish_file() {
-        check_failed_reader_does_not_publish(1024 * 1024, false).await;
-    }
-
-    #[tokio::test]
-    async fn failed_reader_panic_does_not_publish_file() {
-        check_failed_reader_does_not_publish(0, true).await;
-    }
-
-    #[tokio::test]
     async fn upload_bytes_head_probe_skips_existing_xorb() {
         // The xorb already exists server-side: HEAD returns 200 and the POST
         // must never fire (idempotent re-upload).
         let (server, client) = mock_client_opts(true, None).await;
         let session = client.upload_session().unwrap();
-        session
+        let info = session
             .upload_bytes("remote/stored.bin", b"already stored".to_vec())
             .await
             .unwrap();
         let report = session.finalize().await.unwrap();
+        assert_eq!(info.inserted_chunks, 1);
+        assert_eq!(info.reused_chunks, 0);
         assert_eq!(report.xorb_posts, 0);
         assert_eq!(report.xorb_skipped, 1);
         let requests = server.received_requests().await.unwrap_or_default();
@@ -2168,19 +2121,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn upload_report_is_comparable() {
-        let report = crate::upload::UploadReport {
-            files: Vec::new(),
-            xorb_posts: 0,
-            xorb_skipped: 0,
-            shard_posts: 0,
-        };
-        assert_eq!(report.xorb_posts, 0);
-        assert_eq!(report.files.len(), 0);
-        assert_eq!(report, report.clone());
-    }
-
     async fn build_client_with_policy(
         server: &MockServer,
         policy: crate::retry::RetryPolicy,
@@ -2389,10 +2329,10 @@ mod tests {
         );
     }
 
-    /// The xorb POST 503s twice (retryable admission), then succeeds; the M4
-    /// retry layer must replay the in-memory xorb and complete the upload.
+    /// Xorb and shard POSTs each fail twice before succeeding. Both bodies
+    /// must replay byte-for-byte before the upload can complete.
     #[tokio::test]
-    async fn upload_retries_xorb_post_on_503() {
+    async fn upload_retries_xorb_and_shard_posts_with_identical_bodies() {
         use std::time::Duration;
 
         let server = MockServer::start().await;
@@ -2432,6 +2372,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/shards"))
             .and(header("authorization", format!("Bearer {WRITE_TOKEN}")))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"error": "admitted"})))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/shards"))
+            .and(header("authorization", format!("Bearer {WRITE_TOKEN}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
             .mount(&server)
             .await;
@@ -2463,15 +2410,20 @@ mod tests {
         let report = session.finalize().await.unwrap();
         assert_eq!(report.xorb_posts, 1);
         assert_eq!(report.shard_posts, 1);
-        let xorb_posts = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .iter()
-            .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path().starts_with("/v1/xorbs/")
-            })
-            .count();
-        assert_eq!(xorb_posts, 3); // 2×503 + 1×200
+        let requests = server.received_requests().await.unwrap();
+        for prefix in ["/v1/xorbs/", "/v1/shards"] {
+            let posts: Vec<_> = requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path().starts_with(prefix)
+                })
+                .collect();
+            assert_eq!(posts.len(), 3, "{prefix}: 2×503 + 1×200");
+            let first = posts.first().unwrap();
+            assert!(
+                posts.iter().all(|request| request.body == first.body),
+                "{prefix}"
+            );
+        }
     }
 }

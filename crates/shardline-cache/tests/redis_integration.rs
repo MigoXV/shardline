@@ -10,6 +10,23 @@ use shardline_cache::{
 use shardline_protocol::SecretBytes;
 use shardline_test_support::DockerLocalStack;
 
+fn redis_fixture(ttl_seconds: u64) -> Option<(DockerLocalStack, RedisReconstructionCache)> {
+    DockerLocalStack::builder()
+        .with_redis()
+        .start()
+        .unwrap()
+        .map(|stack| {
+            let cache = RedisReconstructionCache::new(
+                &stack
+                    .redis_url()
+                    .expect("started Redis fixture must have a URL"),
+                NonZeroU64::new(ttl_seconds).unwrap(),
+            )
+            .unwrap();
+            (stack, cache)
+        })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_roundtrips_over_tls_with_mutual_authentication() {
     let Some(stack) = DockerLocalStack::builder()
@@ -45,27 +62,28 @@ async fn redis_cache_roundtrips_over_tls_with_mutual_authentication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_put_get_roundtrip() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
-    let key = ReconstructionCacheKey::latest("test-file", None);
-    let payload = b"Hello, Redis!";
-
-    // Initially empty
-    assert!(cache.get(&key).await.unwrap().is_none());
-
-    // Put
-    cache.put(&key, payload).await.unwrap();
-
-    // Get
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(payload.to_vec()));
+    for (key, payload) in [
+        (
+            ReconstructionCacheKey::latest("test-file", None),
+            b"Hello, Redis!".as_slice(),
+        ),
+        (
+            ReconstructionCacheKey::version("insert-get-test", "hash123", None),
+            b"insert and get immediately".as_slice(),
+        ),
+    ] {
+        assert!(cache.get(&key).await.unwrap().is_none(), "{key:?}");
+        cache.put(&key, payload).await.unwrap();
+        assert_eq!(
+            cache.get(&key).await.unwrap(),
+            Some(payload.to_vec()),
+            "{key:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -106,6 +124,41 @@ async fn redis_cache_serializes_cold_loads_across_replicas() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redis_cache_waiter_timeout_preserves_the_active_owners_reservation() {
+    let Some((stack, owner)) = redis_fixture(60) else {
+        return;
+    };
+    let waiter = RedisReconstructionCache::new_with_tls_and_timeout(
+        &stack.redis_url().unwrap(),
+        NonZeroU64::new(60).unwrap(),
+        RedisTlsConfig::default(),
+        Duration::from_millis(60),
+    )
+    .unwrap();
+    waiter.ready().await.unwrap();
+    let key = ReconstructionCacheKey::latest("waiter-timeout", None);
+    let reservation = match owner.get_or_reserve(&key).await.unwrap() {
+        ReconstructionCacheLookup::Reserved(reservation) => reservation,
+        ReconstructionCacheLookup::Hit(_) => panic!("test key must start cold"),
+    };
+    let result = tokio::time::timeout(Duration::from_secs(2), waiter.get_or_reserve(&key))
+        .await
+        .expect("the waiter must obey its operation deadline");
+    assert!(matches!(
+        result,
+        Err(ReconstructionCacheError::RedisTimeout)
+    ));
+    owner
+        .put_reserved(&key, b"owner-result", &reservation)
+        .await
+        .unwrap();
+    assert_eq!(
+        waiter.get(&key).await.unwrap(),
+        Some(b"owner-result".to_vec())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_releases_cancelled_load_reservations() {
     let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
         eprintln!("skipping: docker not available");
@@ -140,21 +193,24 @@ async fn redis_cache_releases_cancelled_load_reservations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redis_cache_rejects_stale_reservation_publication() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+async fn redis_cache_fences_stale_reservation_mutations() {
+    let Some((stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
+    let redis_url = stack.redis_url().unwrap();
     let file_id = "stale-distributed-loader";
     let key = ReconstructionCacheKey::latest(file_id, None);
     let stale_reservation = match cache.get_or_reserve(&key).await.unwrap() {
         ReconstructionCacheLookup::Reserved(reservation) => reservation,
         ReconstructionCacheLookup::Hit(_) => panic!("test key must start cold"),
     };
+
+    assert!(
+        cache
+            .touch_reservation(&key, &stale_reservation)
+            .await
+            .unwrap()
+    );
 
     let client = redis::Client::open(redis_url).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
@@ -175,6 +231,18 @@ async fn redis_cache_rejects_stale_reservation_publication() {
         stale_publish,
         Err(ReconstructionCacheError::LostLoadingReservation)
     ));
+    assert!(
+        !cache
+            .touch_reservation(&key, &stale_reservation)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .delete_reserved(&key, &stale_reservation)
+            .await
+            .unwrap()
+    );
     let stored: Option<Vec<u8>> = connection.get(&redis_key).await.unwrap();
     assert!(stored.is_none(), "a fenced stale loader must not publish");
     let owner: Option<String> = connection.get(&loading_key).await.unwrap();
@@ -183,69 +251,65 @@ async fn redis_cache_rejects_stale_reservation_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_delete_removes_entry() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
-    let key = ReconstructionCacheKey::latest("del-test", None);
-    cache.put(&key, b"delete me").await.unwrap();
-    assert!(cache.get(&key).await.unwrap().is_some());
-
-    let deleted = cache.delete(&key).await.unwrap();
-    assert!(deleted);
-    assert!(cache.get(&key).await.unwrap().is_none());
+    for (file_id, payload) in [
+        ("del-test", b"delete me".as_slice()),
+        ("delete-me-existing", b"to be deleted".as_slice()),
+    ] {
+        let key = ReconstructionCacheKey::latest(file_id, None);
+        cache.put(&key, payload).await.unwrap();
+        assert!(cache.get(&key).await.unwrap().is_some(), "{file_id}");
+        assert!(cache.delete(&key).await.unwrap(), "{file_id}");
+        assert!(cache.get(&key).await.unwrap().is_none(), "{file_id}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_delete_missing_returns_false() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
-    let key = ReconstructionCacheKey::latest("missing", None);
-    assert!(!cache.delete(&key).await.unwrap());
+    for file_id in ["missing", "never-inserted-key"] {
+        let key = ReconstructionCacheKey::latest(file_id, None);
+        assert!(!cache.delete(&key).await.unwrap(), "{file_id}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_overwrite_updates_value() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
-    let key = ReconstructionCacheKey::latest("overwrite-test", None);
-    cache.put(&key, b"first").await.unwrap();
-    cache.put(&key, b"second").await.unwrap();
-
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(b"second".to_vec()));
+    for (file_id, first, second) in [
+        ("overwrite-test", b"first".as_slice(), b"second".as_slice()),
+        (
+            "overwrite-test-2",
+            b"first write".as_slice(),
+            b"second write".as_slice(),
+        ),
+    ] {
+        let key = ReconstructionCacheKey::latest(file_id, None);
+        cache.put(&key, first).await.unwrap();
+        cache.put(&key, second).await.unwrap();
+        assert_eq!(
+            cache.get(&key).await.unwrap(),
+            Some(second.to_vec()),
+            "{file_id}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_works_with_repository_scope() {
     use shardline_protocol::{RepositoryProvider, RepositoryScope};
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
     let scope = RepositoryScope::new(RepositoryProvider::GitHub, "acme", "assets", Some("main"));
     let Ok(scope) = scope else {
@@ -260,27 +324,17 @@ async fn redis_cache_works_with_repository_scope() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_ready_returns_ok() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
     cache.ready().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_multiple_keys_are_independent() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
     let key_a = ReconstructionCacheKey::latest("file-a", None);
     let key_b = ReconstructionCacheKey::latest("file-b", None);
@@ -297,46 +351,25 @@ async fn redis_cache_multiple_keys_are_independent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redis_cache_version_key_latest_not_found() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    // Version key uses a content_hash
-    let key = ReconstructionCacheKey::version("file-v", "abcdef0123456789", None);
-    assert!(cache.get(&key).await.unwrap().is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_get_returns_none_for_missing_key() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
-    let key = ReconstructionCacheKey::latest("nonexistent", None);
-    assert!(cache.get(&key).await.unwrap().is_none());
+    for key in [
+        ReconstructionCacheKey::latest("nonexistent", None),
+        ReconstructionCacheKey::latest("definitely-not-cached", None),
+        ReconstructionCacheKey::version("file-v", "abcdef0123456789", None),
+    ] {
+        assert!(cache.get(&key).await.unwrap().is_none(), "{key:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_roundtrip_binary_payload() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
     // Binary data including null bytes
     let binary = vec![0u8, 1, 2, 255, 128, 64, 0, 255];
@@ -348,15 +381,9 @@ async fn redis_cache_roundtrip_binary_payload() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_ttl_expires_entries() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(1) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    // 1 second TTL
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(1).unwrap()).unwrap();
 
     let key = ReconstructionCacheKey::latest("ttl-test", None);
     cache.put(&key, b"short-lived").await.unwrap();
@@ -373,14 +400,9 @@ async fn redis_cache_ttl_expires_entries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_scoped_keys_are_distinct() {
     use shardline_protocol::{RepositoryProvider, RepositoryScope};
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
     let scope_a =
         RepositoryScope::new(RepositoryProvider::GitHub, "team-a", "repo-x", Some("main")).unwrap();
@@ -410,131 +432,22 @@ async fn redis_cache_scoped_keys_are_distinct() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redis_cache_large_payload_roundtrip() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    // 100KB payload
-    let large = vec![0xABu8; 102400];
-    let key = ReconstructionCacheKey::latest("large-payload", None);
-    cache.put(&key, &large).await.unwrap();
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(large));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_insert_and_get() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    // Use a version key for variation
-    let key = ReconstructionCacheKey::version("insert-get-test", "hash123", None);
-    let payload = b"insert and get immediately";
-
-    // Initially empty
-    assert!(cache.get(&key).await.unwrap().is_none());
-
-    // Insert
-    cache.put(&key, payload).await.unwrap();
-
-    // Retrieve
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(payload.to_vec()));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_get_missing_key_returns_none() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    let key = ReconstructionCacheKey::latest("definitely-not-cached", None);
-    let result = cache.get(&key).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_insert_overwrite() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    let key = ReconstructionCacheKey::latest("overwrite-test-2", None);
-    cache.put(&key, b"first write").await.unwrap();
-    cache.put(&key, b"second write").await.unwrap();
-
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(b"second write".to_vec()));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_delete_existing() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    let key = ReconstructionCacheKey::latest("delete-me-existing", None);
-    cache.put(&key, b"to be deleted").await.unwrap();
-    assert!(cache.get(&key).await.unwrap().is_some());
-
-    let deleted = cache.delete(&key).await.unwrap();
-    assert!(deleted);
-    assert!(cache.get(&key).await.unwrap().is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_delete_non_existent() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    let key = ReconstructionCacheKey::latest("never-inserted-key", None);
-    let deleted = cache.delete(&key).await.unwrap();
-    assert!(!deleted);
+    for (file_id, byte) in [("large-payload", 0xABu8), ("large-value-roundtrip", 0xCDu8)] {
+        let large = vec![byte; 102400];
+        let key = ReconstructionCacheKey::latest(file_id, None);
+        cache.put(&key, &large).await.unwrap();
+        assert_eq!(cache.get(&key).await.unwrap(), Some(large), "{file_id}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_redis_cache_ttl_expiry() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(2) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    // 2 second TTL
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(2).unwrap()).unwrap();
 
     let key = ReconstructionCacheKey::latest("ttl-expiry-test", None);
     cache.put(&key, b"short-lived-data").await.unwrap();
@@ -547,15 +460,9 @@ async fn test_redis_cache_ttl_expiry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_redis_cache_insert_with_custom_ttl() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(300) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    // Custom 5-minute TTL
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(300).unwrap()).unwrap();
 
     let key = ReconstructionCacheKey::latest("custom-ttl-key", None);
     cache.put(&key, b"custom ttl data").await.unwrap();
@@ -566,14 +473,9 @@ async fn test_redis_cache_insert_with_custom_ttl() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_redis_cache_bulk_insert_and_get_multiple_keys() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((_stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
 
     // Insert 100 distinct keys
     let mut expected = Vec::with_capacity(100);
@@ -598,34 +500,11 @@ async fn test_redis_cache_bulk_insert_and_get_multiple_keys() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_redis_cache_large_value_roundtrip() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
-        return;
-    };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
-
-    // 100KB payload
-    let large = vec![0xCDu8; 102400];
-    let key = ReconstructionCacheKey::latest("large-value-roundtrip", None);
-    cache.put(&key, &large).await.unwrap();
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(large));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_redis_cache_flush_all() {
-    let Some(stack) = DockerLocalStack::builder().with_redis().start().unwrap() else {
-        eprintln!("skipping: docker not available");
+    let Some((stack, cache)) = redis_fixture(3600) else {
         return;
     };
-    let Some(redis_url) = stack.redis_url() else {
-        return;
-    };
-    let cache = RedisReconstructionCache::new(&redis_url, NonZeroU64::new(3600).unwrap()).unwrap();
+    let redis_url = stack.redis_url().unwrap();
 
     // Insert some data
     let key = ReconstructionCacheKey::latest("flush-test-key", None);

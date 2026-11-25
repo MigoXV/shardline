@@ -56,36 +56,20 @@ where
     IndexAdapter::Error: std::error::Error + Into<FsckError>,
 {
     let start = std::time::Instant::now();
-    let mut report = FsckReport {
-        latest_records: 0,
-        version_records: 0,
-        inspected_chunk_references: 0,
-        inspected_dedupe_shard_mappings: 0,
-        inspected_reconstructions: 0,
-        inspected_webhook_deliveries: 0,
-        inspected_provider_repository_states: 0,
-        issues: Vec::new(),
-    };
+    let mut report = FsckReport::default();
     let mut reachability = FsckReachability::default();
 
-    scan_record_tree(
-        record_store,
-        RecordKind::Latest,
-        object_root,
-        object_store,
-        &mut reachability,
-        &mut report,
-    )
-    .await?;
-    scan_record_tree(
-        record_store,
-        RecordKind::Version,
-        object_root,
-        object_store,
-        &mut reachability,
-        &mut report,
-    )
-    .await?;
+    for kind in [RecordKind::Latest, RecordKind::Version] {
+        scan_record_tree(
+            record_store,
+            kind,
+            object_root,
+            object_store,
+            &mut reachability,
+            &mut report,
+        )
+        .await?;
+    }
     crate::native_members::inspect_missing_copies(record_store, &mut report).await?;
     inspect_dedupe_shard_mappings(
         index_store,
@@ -97,7 +81,7 @@ where
     )
     .await?;
     inspect_reconstruction_index(index_store, &mut report).await?;
-    match inspect_lifecycle_metadata(
+    if let Err(error) = inspect_lifecycle_metadata(
         index_store,
         object_root,
         object_store,
@@ -106,18 +90,15 @@ where
     )
     .await
     {
-        Ok(()) => {}
-        Err(error) => {
-            if let Some(reason) = error.reliability_reason() {
-                push_issue(
-                    &mut report,
-                    FsckIssueKind::InvalidReliabilityEvidence,
-                    "lifecycle/reliability".to_owned(),
-                    FsckIssueDetail::ReliabilityEvidenceInvalid { reason },
-                )?;
-            } else {
-                return Err(error);
-            }
+        if let Some(reason) = error.reliability_reason() {
+            push_issue(
+                &mut report,
+                FsckIssueKind::InvalidReliabilityEvidence,
+                "lifecycle/reliability".to_owned(),
+                FsckIssueDetail::ReliabilityEvidenceInvalid { reason },
+            )?;
+        } else {
+            return Err(error);
         }
     }
 
@@ -147,44 +128,35 @@ pub(crate) fn push_reconstruction_plan_issue(
     location: String,
     error: &FileRecordInvariantError,
 ) -> Result<(), FsckError> {
-    let kind = match error {
-        FileRecordInvariantError::ChunkHash(_) => FsckIssueKind::InvalidContentHash,
-        FileRecordInvariantError::EmptyChunk => FsckIssueKind::EmptyChunk,
-        FileRecordInvariantError::NonContiguousChunkOffsets => FsckIssueKind::NonContiguousChunks,
-        FileRecordInvariantError::InvalidChunkRange => FsckIssueKind::InvalidChunkRange,
-        FileRecordInvariantError::InvalidPackedRange => FsckIssueKind::InvalidPackedRange,
-        FileRecordInvariantError::LengthOverflow | FileRecordInvariantError::TotalBytesMismatch => {
-            FsckIssueKind::TotalBytesMismatch
+    use FsckIssueKind as Kind;
+    use FsckReconstructionPlanDetail as Detail;
+    let (kind, detail) = match error {
+        FileRecordInvariantError::ChunkHash(_) => {
+            (Kind::InvalidContentHash, Detail::ChunkHashInvalid)
+        }
+        FileRecordInvariantError::EmptyChunk => (Kind::EmptyChunk, Detail::EmptyChunk),
+        FileRecordInvariantError::NonContiguousChunkOffsets => {
+            (Kind::NonContiguousChunks, Detail::NonContiguousChunkOffsets)
+        }
+        FileRecordInvariantError::InvalidChunkRange => {
+            (Kind::InvalidChunkRange, Detail::InvalidChunkRange)
+        }
+        FileRecordInvariantError::InvalidPackedRange => {
+            (Kind::InvalidPackedRange, Detail::InvalidPackedRange)
+        }
+        FileRecordInvariantError::LengthOverflow => {
+            (Kind::TotalBytesMismatch, Detail::LengthOverflow)
+        }
+        FileRecordInvariantError::TotalBytesMismatch => {
+            (Kind::TotalBytesMismatch, Detail::TotalBytesMismatch)
         }
     };
     push_issue(
         report,
         kind,
         location,
-        FsckIssueDetail::InvalidReconstructionPlan(reconstruction_plan_error_detail(error)),
+        FsckIssueDetail::InvalidReconstructionPlan(detail),
     )
-}
-
-pub(crate) const fn reconstruction_plan_error_detail(
-    error: &FileRecordInvariantError,
-) -> FsckReconstructionPlanDetail {
-    match error {
-        FileRecordInvariantError::ChunkHash(_) => FsckReconstructionPlanDetail::ChunkHashInvalid,
-        FileRecordInvariantError::EmptyChunk => FsckReconstructionPlanDetail::EmptyChunk,
-        FileRecordInvariantError::NonContiguousChunkOffsets => {
-            FsckReconstructionPlanDetail::NonContiguousChunkOffsets
-        }
-        FileRecordInvariantError::InvalidChunkRange => {
-            FsckReconstructionPlanDetail::InvalidChunkRange
-        }
-        FileRecordInvariantError::InvalidPackedRange => {
-            FsckReconstructionPlanDetail::InvalidPackedRange
-        }
-        FileRecordInvariantError::LengthOverflow => FsckReconstructionPlanDetail::LengthOverflow,
-        FileRecordInvariantError::TotalBytesMismatch => {
-            FsckReconstructionPlanDetail::TotalBytesMismatch
-        }
-    }
 }
 
 pub(crate) fn record_path<RecordAdapter>(

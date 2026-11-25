@@ -207,13 +207,9 @@ async fn append_upload_bytes_impl(
 pub async fn upload_length(root: &Path, session_id: &str) -> Result<u64, OciAdapterError> {
     validate_upload_session_id(session_id)?;
     let path = upload_body_path(root, session_id);
-    upload_file_len_async(root, &path).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            OciAdapterError::NotFound
-        } else {
-            OciAdapterError::Io(error)
-        }
-    })
+    upload_file_len_async(root, &path)
+        .await
+        .map_err(map_not_found)
 }
 
 /// # Errors
@@ -239,48 +235,19 @@ pub async fn upload_body_integrity(
     upload_body_integrity_impl(root, path).await
 }
 
-#[cfg(unix)]
 async fn upload_body_integrity_impl(
     root: &Path,
     path: PathBuf,
 ) -> Result<(String, ObjectIntegrity), OciAdapterError> {
+    #[cfg(unix)]
     let root = root.to_path_buf();
-    spawn_blocking(move || {
-        let mut file = open_anchored_file(&root, &path)?;
-        let mut sha256 = Sha256::new();
-        let mut blake3 = Blake3Hasher::new();
-        let mut buffer = [0_u8; 256 * 1024];
-        let mut total_length = 0_u64;
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            let slice = buffer.get(..read).ok_or(OciAdapterError::Overflow)?;
-            sha256.update(slice);
-            blake3.update(slice);
-            total_length = total_length
-                .checked_add(u64::try_from(read).map_err(|_error| OciAdapterError::Overflow)?)
-                .ok_or(OciAdapterError::Overflow)?;
-        }
-        let sha256_hex = hex::encode(sha256.finalize());
-        let blake3_hash =
-            shardline_protocol::ShardlineHash::from_bytes(*blake3.finalize().as_bytes());
-        Ok::<_, OciAdapterError>((sha256_hex, ObjectIntegrity::new(blake3_hash, total_length)))
-    })
-    .await
-    .map_err(OciAdapterError::BlockingTask)?
-}
-
-#[cfg(not(unix))]
-async fn upload_body_integrity_impl(
-    root: &Path,
-    path: PathBuf,
-) -> Result<(String, ObjectIntegrity), OciAdapterError> {
-    use std::fs::File;
+    #[cfg(not(unix))]
     let _ = root;
     spawn_blocking(move || {
-        let mut file = File::open(&path)?;
+        #[cfg(unix)]
+        let mut file = open_anchored_file(&root, &path)?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::File::open(&path)?;
         let mut sha256 = Sha256::new();
         let mut blake3 = Blake3Hasher::new();
         let mut buffer = [0_u8; 256 * 1024];
@@ -336,15 +303,10 @@ async fn delete_upload_session_files(root: &Path, session_id: &str) -> Result<()
     ];
     let mut first_error = None;
     for path in &paths {
-        let result = delete_upload_file(root, path).await;
-        match result {
-            Ok(()) => {}
-            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(OciAdapterError::Io(error));
-                }
-            }
+        if let Err(error) = delete_upload_file(root, path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            first_error = first_error.or(Some(OciAdapterError::Io(error)));
         }
     }
     first_error.map_or_else(|| Ok(()), Err)
@@ -421,36 +383,37 @@ pub async fn repair_upload_session_evidence(
     let (evidence, snapshot_evidence) = if let Some(head) = persisted.journal_head {
         let records = read_evidence_journal(root, session_id).await?;
         let head = usize::try_from(head)?;
-        let committed = records.get(..head).ok_or_else(|| {
+        records.get(..head).ok_or_else(|| {
             OciAdapterError::Reliability("OCI evidence journal head is missing".into())
         })?;
+        let mut events = Vec::new();
+        let mut snapshot_events = Vec::new();
+        for record in records.into_iter().take(head) {
+            events.extend(record.evidence);
+            snapshot_events.extend(record.snapshot_evidence);
+        }
         (
             SessionEvidenceLog::from_events(
-                committed
-                    .iter()
-                    .flat_map(|record| record.evidence.iter().cloned())
+                events
+                    .into_iter()
                     .map(serde_json::from_value::<StateTransitionEvent>)
                     .collect::<Result<Vec<_>, _>>()?,
             )
             .map_err(|error| OciAdapterError::Reliability(error.to_string()))?,
             SnapshotEvidenceLog::from_events(
-                committed
-                    .iter()
-                    .flat_map(|record| record.snapshot_evidence.iter().cloned())
+                snapshot_events
+                    .into_iter()
                     .map(serde_json::from_value::<SnapshotEvidenceEvent<DigestSnapshot>>)
                     .collect::<Result<Vec<_>, _>>()?,
             )
             .map_err(|error| OciAdapterError::Reliability(error.to_string()))?,
         )
     } else {
-        (
-            persisted.evidence.clone(),
-            persisted.snapshot_evidence.clone(),
-        )
+        (persisted.evidence, persisted.snapshot_evidence)
     };
     let _ignored = delete_file_anchored(root, &upload_evidence_journal_path(root, session_id));
-    let reset = serde_json::to_vec(&PersistedOciUploadSession {
-        session: persisted.session.clone(),
+    let reset = PersistedOciUploadSession {
+        session: persisted.session,
         evidence: SessionEvidenceLog::default(),
         snapshot_evidence: SnapshotEvidenceLog::default(),
         journal_head: None,
@@ -466,12 +429,12 @@ pub async fn repair_upload_session_evidence(
         journal_evidence_head: None,
         journal_snapshot_head: None,
         reliability_head_metadata: false,
-    })?;
-    write_upload_metadata(root, session_id, reset).await?;
+    };
+    write_upload_metadata(root, session_id, serde_json::to_vec(&reset)?).await?;
     persist_upload_session_with_evidence(
         root,
         session_id,
-        &persisted.session,
+        &reset.session,
         &evidence,
         snapshot_evidence,
     )

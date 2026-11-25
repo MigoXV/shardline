@@ -31,6 +31,8 @@ use shardline_server::{
     ServerConfig, ServerFrontend, ServerRole, app, run_fsck, write_backup_manifest,
 };
 use shardline_server_core::{AuthProvider, auth::LocalHmacProvider};
+use shardline_test_support::{count_chunk_files, count_files_recursive, deterministic_bytes};
+
 use std::{
     net::SocketAddr,
     num::{NonZeroU64, NonZeroUsize},
@@ -70,19 +72,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
-}
-
-/// Deterministic pseudo-random payload (cheap, no RNG dependency).
-fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed | 1;
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        out.push((state & 0xff) as u8);
-    }
-    out
 }
 
 fn copy_directory_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -327,25 +316,6 @@ fn slow_body() -> (
 // ---------------------------------------------------------------------------
 // On-disk evidence helpers (blocking fs reads are fine in tests).
 // ---------------------------------------------------------------------------
-
-fn count_files_recursive(dir: &Path) -> usize {
-    let mut count: usize = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                count = count.saturating_add(count_files_recursive(&path));
-            } else {
-                count = count.saturating_add(1);
-            }
-        }
-    }
-    count
-}
-
-fn count_chunk_files(root: &Path) -> usize {
-    count_files_recursive(&root.join("chunks"))
-}
 
 // These drills stream one part per owned session. Before publication the
 // server writes to an anonymous .tmp file; part-N is now an immutable versioned

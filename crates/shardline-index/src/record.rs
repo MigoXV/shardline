@@ -103,25 +103,18 @@ const fn default_packed_end() -> u64 {
 ///
 /// Each variant maps to a unique decoder path.  The field is persisted in
 /// the `FileRecord` and defaulted for older records that predate the field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageRepresentation {
     /// Single-object whole-file storage (pre-chunking, term-referenced).
     #[serde(rename = "whole_file_v1")]
     WholeFileV1,
     /// Fixed-size chunking, no compression.
+    #[default] // Records created before this field existed used fixed chunks.
     #[serde(rename = "fixed_chunk_v1")]
     FixedChunkV1,
     /// CDC chunking + LZ4 compression + xorb container packing.
     #[serde(rename = "xorb_cdc_v1")]
     XorbCdcV1,
-}
-
-#[allow(clippy::derivable_impls)] // derive would pick WholeFileV1; legacy records default to FixedChunkV1
-impl Default for StorageRepresentation {
-    fn default() -> Self {
-        // Records created before this field existed were fixed-chunk, uncompressed.
-        Self::FixedChunkV1
-    }
 }
 
 impl StorageRepresentation {
@@ -153,8 +146,22 @@ pub struct FileRecord {
     pub storage_repr: StorageRepresentation,
     /// Optional repository namespace for provider-backed storage.
     pub repository_scope: Option<RepositoryScope>,
+    /// Optional reuse boundary independent of the record's storage namespace.
+    /// Old records inherit their repository scope, or the public global domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplication_domain: Option<crate::DeduplicationDomain>,
     /// Ordered chunks needed to reconstruct the file.
     pub chunks: Vec<FileChunkRecord>,
+}
+
+impl FileRecord {
+    /// Returns the authoritative reuse boundary without changing record locators.
+    #[must_use]
+    pub fn reuse_domain(&self) -> crate::DeduplicationDomain {
+        self.deduplication_domain.clone().unwrap_or_else(|| {
+            crate::DeduplicationDomain::from_scope(self.repository_scope.as_ref())
+        })
+    }
 }
 
 /// Maps a Hub/LFS SHA-256 identity to its native Xet file identity.
@@ -272,6 +279,7 @@ impl FileRecord {
     ///     chunk_size: 1024,
     ///     storage_repr: StorageRepresentation::FixedChunkV1,
     ///     repository_scope: None,
+    ///     deduplication_domain: None,
     ///     chunks: vec![FileChunkRecord {
     ///         hash,
     ///         offset: 0,
@@ -313,10 +321,6 @@ impl FileRecord {
         }
 
         if expected_offset != self.total_bytes {
-            return Err(FileRecordInvariantError::TotalBytesMismatch);
-        }
-
-        if self.chunks.is_empty() && self.total_bytes != 0 {
             return Err(FileRecordInvariantError::TotalBytesMismatch);
         }
 
@@ -476,6 +480,27 @@ pub trait RecordTraversal {
                 .await?;
             self.visit_repository_version_records(&scope, &mut visitor)
                 .await
+        })
+    }
+
+    /// Visits candidate records in an explicit reuse domain. Callers must still
+    /// validate authoritative metadata and member ranges. The compatibility
+    /// implementation scans records; indexed adapters use bounded hash queries.
+    fn visit_deduplication_hash_records<'operation, Visitor, VisitorError>(
+        &'operation self,
+        _domain: &'operation crate::DeduplicationDomain,
+        _hash_hex: &'operation str,
+        mut visitor: Visitor,
+    ) -> RecordStoreFuture<'operation, (), VisitorError>
+    where
+        Self: Sync,
+        Self::Error: Into<VisitorError> + 'operation,
+        Visitor: FnMut(StoredRecord<Self::Locator>) -> Result<(), VisitorError> + Send + 'operation,
+        VisitorError: Send + 'operation,
+    {
+        Box::pin(async move {
+            self.visit_latest_records(&mut visitor).await?;
+            self.visit_version_records(&mut visitor).await
         })
     }
 
@@ -669,17 +694,34 @@ mod tests {
         StorageRepresentation,
     };
 
-    #[test]
-    fn file_record_storage_layout_referenced_terms_when_chunk_size_is_zero() {
-        let record = FileRecord {
+    fn valid_chunk() -> FileChunkRecord {
+        FileChunkRecord {
+            hash: "a".repeat(64),
+            offset: 0,
+            length: 4,
+            range_start: 0,
+            range_end: 1,
+            packed_start: 0,
+            packed_end: 4,
+        }
+    }
+
+    fn whole_file_record(total_bytes: u64, chunks: Vec<FileChunkRecord>) -> FileRecord {
+        FileRecord {
+            deduplication_domain: None,
             file_id: "a".repeat(64),
             content_hash: "c".repeat(64),
-            total_bytes: 8,
+            total_bytes,
             chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
+            storage_repr: StorageRepresentation::WholeFileV1,
             repository_scope: None,
-            chunks: Vec::new(),
-        };
+            chunks,
+        }
+    }
+
+    #[test]
+    fn file_record_storage_layout_referenced_terms_when_chunk_size_is_zero() {
+        let record = whole_file_record(8, Vec::new());
         assert_eq!(
             record.storage_layout(),
             super::FileRecordStorageLayout::ReferencedObjectTerms
@@ -689,6 +731,7 @@ mod tests {
     #[test]
     fn file_record_storage_layout_stored_chunks_when_chunk_size_nonzero() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "a".repeat(64),
             content_hash: "c".repeat(64),
             total_bytes: 8,
@@ -717,23 +760,14 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_rejects_empty_chunk() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
+        let record = whole_file_record(
+            0,
+            vec![FileChunkRecord {
                 length: 0,
-                range_start: 0,
-                range_end: 1,
-                packed_start: 0,
                 packed_end: 1,
+                ..valid_chunk()
             }],
-        };
+        );
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::EmptyChunk)
@@ -742,23 +776,13 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_rejects_invalid_chunk_range() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 4,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
-                length: 4,
+        let record = whole_file_record(
+            4,
+            vec![FileChunkRecord {
                 range_start: 2,
-                range_end: 1,
-                packed_start: 0,
-                packed_end: 4,
+                ..valid_chunk()
             }],
-        };
+        );
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::InvalidChunkRange)
@@ -767,23 +791,14 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_rejects_invalid_packed_range() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 4,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
-                length: 4,
-                range_start: 0,
-                range_end: 1,
+        let record = whole_file_record(
+            4,
+            vec![FileChunkRecord {
                 packed_start: 4,
                 packed_end: 2,
+                ..valid_chunk()
             }],
-        };
+        );
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::InvalidPackedRange)
@@ -792,15 +807,7 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_rejects_empty_chunks_with_nonzero_total_bytes() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 4,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![],
-        };
+        let record = whole_file_record(4, vec![]);
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::TotalBytesMismatch)
@@ -811,26 +818,15 @@ mod tests {
     fn file_record_preserves_repository_scope_and_chunk_order() {
         let scope = RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", Some("main"))
             .unwrap();
-        let first = FileChunkRecord {
-            hash: "a".repeat(64),
-            offset: 0,
-            length: 4,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 4,
-        };
+        let first = valid_chunk();
         let second = FileChunkRecord {
             hash: "b".repeat(64),
             offset: 4,
-            length: 4,
-            range_start: 0,
-            range_end: 1,
-            packed_start: 0,
-            packed_end: 4,
+            ..valid_chunk()
         };
 
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "c".repeat(64),
             total_bytes: 8,
@@ -846,23 +842,10 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_accepts_contiguous_native_chunks() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 8,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![
-                FileChunkRecord {
-                    hash: "a".repeat(64),
-                    offset: 0,
-                    length: 4,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 4,
-                },
+        let record = whole_file_record(
+            8,
+            vec![
+                valid_chunk(),
                 FileChunkRecord {
                     hash: "b".repeat(64),
                     offset: 4,
@@ -873,30 +856,17 @@ mod tests {
                     packed_end: 8,
                 },
             ],
-        };
+        );
 
         assert!(record.validate_reconstruction_plan().is_ok());
     }
 
     #[test]
     fn file_record_reconstruction_plan_rejects_gapped_offsets() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 8,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![
-                FileChunkRecord {
-                    hash: "a".repeat(64),
-                    offset: 0,
-                    length: 4,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 4,
-                },
+        let record = whole_file_record(
+            8,
+            vec![
+                valid_chunk(),
                 FileChunkRecord {
                     hash: "b".repeat(64),
                     offset: 5,
@@ -907,7 +877,7 @@ mod tests {
                     packed_end: 8,
                 },
             ],
-        };
+        );
 
         assert!(matches!(
             record.validate_reconstruction_plan(),
@@ -918,93 +888,58 @@ mod tests {
     // ── FileRecordInvariantError Display ─────────────────────────────────
 
     #[test]
-    fn file_record_invariant_error_chunk_hash_display() {
-        let err =
-            FileRecordInvariantError::ChunkHash(shardline_protocol::HashParseError::InvalidLength);
-        assert_eq!(err.to_string(), "file record chunk hash is invalid");
-    }
-
-    #[test]
-    fn file_record_invariant_error_empty_chunk_display() {
-        let err = FileRecordInvariantError::EmptyChunk;
-        assert_eq!(
-            err.to_string(),
-            "file record chunk length must be greater than zero"
-        );
-    }
-
-    #[test]
-    fn file_record_invariant_error_non_contiguous_display() {
-        let err = FileRecordInvariantError::NonContiguousChunkOffsets;
-        assert_eq!(
-            err.to_string(),
-            "file record chunk offsets must be contiguous"
-        );
-    }
-
-    #[test]
-    fn file_record_invariant_error_invalid_chunk_range_display() {
-        let err = FileRecordInvariantError::InvalidChunkRange;
-        assert_eq!(
-            err.to_string(),
-            "file record chunk range must be non-empty and ordered"
-        );
-    }
-
-    #[test]
-    fn file_record_invariant_error_invalid_packed_range_display() {
-        let err = FileRecordInvariantError::InvalidPackedRange;
-        assert_eq!(
-            err.to_string(),
-            "file record packed byte range must be non-empty and ordered"
-        );
-    }
-
-    #[test]
-    fn file_record_invariant_error_length_overflow_display() {
-        let err = FileRecordInvariantError::LengthOverflow;
-        assert_eq!(err.to_string(), "file record chunk lengths overflowed");
-    }
-
-    #[test]
-    fn file_record_invariant_error_total_bytes_mismatch_display() {
-        let err = FileRecordInvariantError::TotalBytesMismatch;
-        assert_eq!(
-            err.to_string(),
-            "file record total bytes did not match chunk lengths"
-        );
+    fn file_record_invariant_errors_preserve_display_messages() {
+        use FileRecordInvariantError::*;
+        for (error, expected) in [
+            (
+                ChunkHash(shardline_protocol::HashParseError::InvalidLength),
+                "file record chunk hash is invalid",
+            ),
+            (
+                EmptyChunk,
+                "file record chunk length must be greater than zero",
+            ),
+            (
+                NonContiguousChunkOffsets,
+                "file record chunk offsets must be contiguous",
+            ),
+            (
+                InvalidChunkRange,
+                "file record chunk range must be non-empty and ordered",
+            ),
+            (
+                InvalidPackedRange,
+                "file record packed byte range must be non-empty and ordered",
+            ),
+            (LengthOverflow, "file record chunk lengths overflowed"),
+            (
+                TotalBytesMismatch,
+                "file record total bytes did not match chunk lengths",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected, "{error:?}");
+        }
     }
 
     #[test]
     fn file_record_reconstruction_plan_rejects_length_overflow() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![
+        let record = whole_file_record(
+            0,
+            vec![
                 FileChunkRecord {
-                    hash: "a".repeat(64),
-                    offset: 0,
                     length: u64::MAX,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
                     packed_end: 1,
+                    ..valid_chunk()
                 },
                 FileChunkRecord {
                     hash: "b".repeat(64),
                     offset: u64::MAX,
                     length: 1,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
                     packed_end: 1,
+                    ..valid_chunk()
                 },
             ],
-        };
+        );
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::LengthOverflow)
@@ -1067,23 +1002,14 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_rejects_total_bytes_mismatch() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 10,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
+        let record = whole_file_record(
+            10,
+            vec![FileChunkRecord {
                 length: 8,
-                range_start: 0,
-                range_end: 1,
-                packed_start: 0,
                 packed_end: 8,
+                ..valid_chunk()
             }],
-        };
+        );
         assert!(matches!(
             record.validate_reconstruction_plan(),
             Err(FileRecordInvariantError::TotalBytesMismatch)
@@ -1092,15 +1018,7 @@ mod tests {
 
     #[test]
     fn file_record_reconstruction_plan_accepts_empty_chunks_zero_bytes() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![],
-        };
+        let record = whole_file_record(0, vec![]);
         assert!(record.validate_reconstruction_plan().is_ok());
     }
 
@@ -1505,36 +1423,34 @@ mod tests {
         assert!(!called);
     }
 
-    #[tokio::test]
-    async fn file_record_validate_rejects_invalid_chunk_hash() {
-        let record = FileRecord {
-            file_id: "a".repeat(64),
-            content_hash: "c".repeat(64),
-            total_bytes: 1,
-            chunk_size: 0,
-            storage_repr: crate::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
+    #[test]
+    fn file_record_validate_rejects_invalid_chunk_hash() {
+        let record = whole_file_record(
+            1,
+            vec![FileChunkRecord {
                 hash: "not-a-valid-hex-string".to_owned(),
-                offset: 0,
                 length: 1,
-                range_start: 0,
-                range_end: 1,
-                packed_start: 0,
                 packed_end: 1,
+                ..valid_chunk()
             }],
-        };
-        let result = record.validate_reconstruction_plan();
-        assert!(result.is_err());
-        // The error should wrap a HashParseError via #[from]
-        match result {
-            Err(FileRecordInvariantError::ChunkHash(_)) => {} // expected
-            other => panic!("Expected ChunkHash error, got: {other:?}"),
-        }
+        );
+        assert!(matches!(
+            record.validate_reconstruction_plan(),
+            Err(FileRecordInvariantError::ChunkHash(_))
+        ));
     }
 
     #[test]
-    fn storage_representation_as_str_matches_serde_rename() {
+    fn storage_representation_preserves_wire_labels_and_legacy_default() {
+        let mut legacy = serde_json::to_value(whole_file_record(0, Vec::new())).unwrap();
+        legacy.as_object_mut().unwrap().remove("storage_repr");
+        let record: FileRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            StorageRepresentation::default(),
+            StorageRepresentation::FixedChunkV1
+        );
+        assert_eq!(record.storage_repr, StorageRepresentation::FixedChunkV1);
+
         // as_str() must stay in sync with #[serde(rename = "...")] so that
         // metric labels match the serialized representation.
         for (repr, expected) in [

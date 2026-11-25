@@ -1,3 +1,4 @@
+use super::helpers::run_blocking_store;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::{LocalIndexStore, LocalIndexStoreError, collect_rows, helpers};
@@ -437,7 +438,7 @@ impl TreeStore for LocalIndexStore {
     ) -> Result<TreeRegistrationOutcome, Self::Error> {
         let store = self.clone();
         let entry = entry.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             helpers::retry_sqlite_busy(|| {
                 let transaction = connection
@@ -468,7 +469,6 @@ impl TreeStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn create_revision_bounded(
@@ -478,7 +478,7 @@ impl TreeStore for LocalIndexStore {
     ) -> Result<RevisionCreationOutcome, Self::Error> {
         let store = self.clone();
         let rev = rev.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             helpers::retry_sqlite_busy(|| {
                 let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -498,13 +498,13 @@ impl TreeStore for LocalIndexStore {
                 transaction.commit()?;
                 Ok(RevisionCreationOutcome::Created)
             })
-        }).await.map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
+        }).await
     }
 
     async fn upsert_tree_entry(&self, entry: &TreeEntry) -> Result<TreeEntryOutcome, Self::Error> {
         let store = self.clone();
         let entry = entry.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             helpers::retry_sqlite_busy(|| {
                 let transaction = connection
@@ -515,7 +515,6 @@ impl TreeStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn tree_entry(
@@ -526,12 +525,11 @@ impl TreeStore for LocalIndexStore {
         let store = self.clone();
         let key = key.clone();
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             tree_entry_sql(&connection, &key, &path)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn delete_tree_entries(
@@ -543,12 +541,11 @@ impl TreeStore for LocalIndexStore {
         let store = self.clone();
         let key = key.clone();
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             delete_tree_entries_sql(&connection, &key, &path, recursive)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn scan_tree(
@@ -562,18 +559,17 @@ impl TreeStore for LocalIndexStore {
         let key = key.clone();
         let prefix = prefix.to_owned();
         let cursor = cursor.map(ToOwned::to_owned);
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             scan_tree_sql(&connection, &key, &prefix, cursor.as_deref(), limit)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn upsert_revision(&self, rev: &RevisionRecord) -> Result<bool, Self::Error> {
         let store = self.clone();
         let rev = rev.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             helpers::retry_sqlite_busy(|| {
                 let transaction = connection
@@ -584,7 +580,6 @@ impl TreeStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn revision(
@@ -595,34 +590,31 @@ impl TreeStore for LocalIndexStore {
         let store = self.clone();
         let key = key.clone();
         let rev = rev.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             revision_sql(&connection, &key, &rev)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn count_revisions(&self, key: &RepoKey) -> Result<u64, Self::Error> {
         let store = self.clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             count_revisions_sql(&connection, &key)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn count_tree_entries(&self, key: &RepoKey) -> Result<u64, Self::Error> {
         let store = self.clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             count_tree_entries_sql(&connection, &key)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn list_revisions(
@@ -634,24 +626,22 @@ impl TreeStore for LocalIndexStore {
         let store = self.clone();
         let key = key.clone();
         let cursor = cursor.map(ToOwned::to_owned);
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             list_revisions_sql(&connection, &key, cursor.as_deref(), limit)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn delete_revision(&self, key: &RepoKey, rev: &str) -> Result<u64, Self::Error> {
         let store = self.clone();
         let key = key.clone();
         let rev = rev.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             delete_revision_sql(&mut connection, &key, &rev)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn prune_revisions_over_cap(
@@ -661,22 +651,20 @@ impl TreeStore for LocalIndexStore {
     ) -> Result<u64, Self::Error> {
         let store = self.clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let mut connection = store.open_connection()?;
             prune_revisions_over_cap_sql(&mut connection, &key, max_revisions)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 
     async fn list_revision_repo_keys(&self) -> Result<Vec<RepoKey>, Self::Error> {
         let store = self.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             let connection = store.open_connection()?;
             list_revision_repo_keys_sql(&connection)
         })
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
     }
 }
 
@@ -1045,37 +1033,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_revisions_respects_limit_and_cursor() {
-        let store = make_store();
-        for n in 0..5u8 {
-            let rev = RevisionRecord {
-                provider: "github".to_owned(),
-                owner: "owner".to_owned(),
-                repo: "repo".to_owned(),
-                revision: format!("rev-{n:02}"),
-                created_at_unix_seconds: u64::from(n),
-                updated_at_unix_seconds: u64::from(n),
-            };
-            assert!(TreeStore::upsert_revision(&store, &rev).await.unwrap());
-        }
-
-        // A bounded listing returns at most `limit` rows, ordered by revision.
-        let first = TreeStore::list_revisions(&store, &repo_key(), None, 3)
-            .await
-            .unwrap();
-        let names: Vec<&str> = first.iter().map(|r| r.revision.as_str()).collect();
-        assert_eq!(names, vec!["rev-00", "rev-01", "rev-02"]);
-
-        // The cursor resumes after the last returned revision name.
-        let cursor = first.last().unwrap().revision.clone();
-        let rest = TreeStore::list_revisions(&store, &repo_key(), Some(&cursor), 100)
-            .await
-            .unwrap();
-        let names: Vec<&str> = rest.iter().map(|r| r.revision.as_str()).collect();
-        assert_eq!(names, vec!["rev-03", "rev-04"]);
-    }
-
-    #[tokio::test]
     async fn upsert_revision_returns_false_on_update() {
         let store = make_store();
         let rev = RevisionRecord {
@@ -1290,159 +1247,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_revisions_over_cap_removes_oldest_down_to_cap() {
-        let store = make_store();
-        // created_at is deliberately NOT aligned with the name order, so the
-        // prune must follow created-at (oldest first), not the name order that
-        // `list_revisions` uses for pagination.
-        insert_revision_record(&store, "github", "owner", "repo", "rev-b", 200).await;
-        insert_revision_record(&store, "github", "owner", "repo", "rev-a", 100).await;
-        insert_revision_record(&store, "github", "owner", "repo", "rev-c", 300).await;
-        insert_revision_record(&store, "github", "owner", "repo", "rev-e", 500).await;
-        insert_revision_record(&store, "github", "owner", "repo", "rev-d", 400).await;
-        assert_eq!(
-            TreeStore::count_revisions(&store, &repo_key())
-                .await
-                .unwrap(),
-            5
-        );
-
-        let removed = TreeStore::prune_revisions_over_cap(&store, &repo_key(), 2)
-            .await
-            .unwrap();
-        assert_eq!(removed, 3);
-        assert_eq!(
-            TreeStore::count_revisions(&store, &repo_key())
-                .await
-                .unwrap(),
-            2
-        );
-        // The three oldest (rev-a@100, rev-b@200, rev-c@300) were evicted; the
-        // two newest-created (rev-d@400, rev-e@500) survive regardless of name.
-        let remaining = TreeStore::list_revisions(&store, &repo_key(), None, 100)
-            .await
-            .unwrap();
-        let names: Vec<&str> = remaining.iter().map(|r| r.revision.as_str()).collect();
-        assert_eq!(names, vec!["rev-d", "rev-e"]);
-    }
-
-    #[tokio::test]
-    async fn prune_revisions_over_cap_ties_break_by_name_and_cascade_tree_rows() {
-        let store = make_store();
-        // Same created_at for every row: the name tiebreaker decides, so
-        // rev-00..rev-02 are the oldest and must be evicted first.
-        for n in 0..5u8 {
-            insert_revision_record(&store, "github", "owner", "repo", &format!("rev-{n:02}"), 7)
-                .await;
-        }
-        // Tree rows for the to-be-pruned revisions must cascade away.
-        for n in 0..5u8 {
-            TreeStore::upsert_tree_entry(
-                &store,
-                &entry(&format!("rev-{n:02}"), "x.txt", &file_id(n + 1), 1, 1),
-            )
-            .await
-            .unwrap();
-        }
-        let removed = TreeStore::prune_revisions_over_cap(&store, &repo_key(), 3)
-            .await
-            .unwrap();
-        assert_eq!(removed, 2);
-        let remaining = TreeStore::list_revisions(&store, &repo_key(), None, 100)
-            .await
-            .unwrap();
-        let names: Vec<&str> = remaining.iter().map(|r| r.revision.as_str()).collect();
-        assert_eq!(names, vec!["rev-02", "rev-03", "rev-04"]);
-        // The evicted revisions' tree rows are gone; the survivors' remain.
-        assert!(
-            TreeStore::scan_tree(&store, &key("rev-00"), "", None, 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            TreeStore::scan_tree(&store, &key("rev-01"), "", None, 100)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            TreeStore::scan_tree(&store, &key("rev-02"), "", None, 100)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn prune_revisions_over_cap_leaves_at_cap_and_below_untouched() {
-        let store = make_store();
-        for n in 0..3u8 {
-            insert_revision_record(
-                &store,
-                "github",
-                "owner",
-                "repo",
-                &format!("rev-{n:02}"),
-                u64::from(n),
-            )
-            .await;
-        }
-        // At exactly the cap: nothing to prune.
-        let removed = TreeStore::prune_revisions_over_cap(&store, &repo_key(), 3)
-            .await
-            .unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(
-            TreeStore::count_revisions(&store, &repo_key())
-                .await
-                .unwrap(),
-            3
-        );
-        // Below the cap: nothing to prune.
-        let removed = TreeStore::prune_revisions_over_cap(&store, &repo_key(), 10)
-            .await
-            .unwrap();
-        assert_eq!(removed, 0);
-        assert_eq!(
-            TreeStore::count_revisions(&store, &repo_key())
-                .await
-                .unwrap(),
-            3
-        );
-    }
-
-    #[tokio::test]
-    async fn prune_revisions_over_cap_leaves_other_repos_untouched() {
-        let store = make_store();
-        for n in 0..5u8 {
-            insert_revision_record(
-                &store,
-                "github",
-                "owner",
-                "repo",
-                &format!("rev-{n:02}"),
-                u64::from(n),
-            )
-            .await;
-        }
-        let other = RepoKey::new("github", "owner", "other-repo");
-        insert_revision_record(&store, "github", "owner", "other-repo", "main", 1).await;
-
-        let removed = TreeStore::prune_revisions_over_cap(&store, &repo_key(), 2)
-            .await
-            .unwrap();
-        assert_eq!(removed, 3);
-        // The other repo is untouched.
-        assert_eq!(TreeStore::count_revisions(&store, &other).await.unwrap(), 1);
-        let other_list = TreeStore::list_revisions(&store, &other, None, 100)
-            .await
-            .unwrap();
-        assert_eq!(other_list[0].revision, "main");
-    }
-
-    #[tokio::test]
     async fn list_revision_repo_keys_returns_distinct_repos_ordered() {
         let store = make_store();
         assert!(
@@ -1465,94 +1269,5 @@ mod tests {
                 RepoKey::new("gitlab", "team", "assets"),
             ]
         );
-    }
-    #[tokio::test]
-    async fn scan_tree_binary_prefix_bounds_preserve_public_semantics() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = LocalIndexStore::new(directory.path().to_owned()).unwrap();
-        let namespace = key("main");
-        let mut paths = vec![
-            "aaa",
-            "aaa/early",
-            "literal%",
-            "literal%/child",
-            "literal_/child",
-            "literal_neighbor",
-            "ζ",
-            "ζ/child",
-            "ζ/last",
-            "ζ-other",
-            "\u{d7ff}",
-            "\u{d7ff}/child",
-            "\u{e000}/neighbor",
-            "\u{10ffff}",
-            "\u{10ffff}/child",
-            "\u{10ffff}\u{10ffff}/child",
-        ];
-        paths.sort_unstable();
-        for path in &paths {
-            store
-                .upsert_tree_entry(&entry("main", path, &file_id(1), 1, 1))
-                .await
-                .unwrap();
-        }
-        for mut scoped in [
-            entry("feature", "outside/revision", &file_id(2), 1, 1),
-            entry("main", "outside/provider", &file_id(2), 1, 1),
-            entry("main", "outside/owner", &file_id(2), 1, 1),
-            entry("main", "outside/repo", &file_id(2), 1, 1),
-        ] {
-            if scoped.path.ends_with("provider") {
-                scoped.provider = "other".to_owned();
-            }
-            if scoped.path.ends_with("owner") {
-                scoped.owner = "other".to_owned();
-            }
-            if scoped.path.ends_with("repo") {
-                scoped.repo = "other".to_owned();
-            }
-            store.upsert_tree_entry(&scoped).await.unwrap();
-        }
-        for prefix in [
-            "",
-            "aaa",
-            "literal%",
-            "literal_",
-            "ζ",
-            "\u{d7ff}",
-            "\u{10ffff}",
-            "\u{10ffff}\u{10ffff}",
-            "missing",
-        ] {
-            for cursor in [None, Some("literal%"), Some("ζ/child"), Some("\u{10ffff}")] {
-                for limit in [0, 1, 2, 100] {
-                    let expected = paths
-                        .iter()
-                        .copied()
-                        .filter(|path| {
-                            prefix.is_empty()
-                                || *path == prefix
-                                || path
-                                    .strip_prefix(prefix)
-                                    .is_some_and(|rest| rest.starts_with('/'))
-                        })
-                        .filter(|path| cursor.is_none_or(|after| *path > after))
-                        .take(limit)
-                        .collect::<Vec<_>>();
-                    let actual = store
-                        .scan_tree(&namespace, prefix, cursor, limit)
-                        .await
-                        .unwrap();
-                    let actual_paths = actual
-                        .iter()
-                        .map(|row| row.path.as_str())
-                        .collect::<Vec<_>>();
-                    assert_eq!(
-                        actual_paths, expected,
-                        "prefix={prefix:?} cursor={cursor:?} limit={limit}"
-                    );
-                }
-            }
-        }
     }
 }

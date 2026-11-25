@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain};
+use crate::operation::length_prefixed_operation_id;
+use crate::snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain_for};
 use crate::snapshot_log::SnapshotEvidenceLog;
 use crate::{OperationIdentity, OperationKind, ReliabilityError};
 
@@ -10,12 +11,11 @@ pub struct OciTagOperationId(String);
 
 impl OciTagOperationId {
     fn new(scope_namespace: &str, repository: &str, tag: &str) -> Self {
-        [scope_namespace, repository, tag]
-            .into_iter()
-            .map(|value| format!("{}:{value}", value.len()))
-            .collect::<Vec<_>>()
-            .join("")
-            .into()
+        Self(length_prefixed_operation_id(&[
+            scope_namespace,
+            repository,
+            tag,
+        ]))
     }
 
     #[must_use]
@@ -106,12 +106,7 @@ pub fn verify_oci_tag_events(
     events: &[OciTagLifecycleEvent],
     expected: &OciTagSnapshot,
 ) -> Result<(), ReliabilityError> {
-    verify_snapshot_chain(events)?;
-    if events.last().is_some_and(|event| event.after == *expected) {
-        Ok(())
-    } else {
-        Err(ReliabilityError::StateMismatch)
-    }
+    verify_snapshot_chain_for(events, expected)
 }
 
 #[cfg(test)]

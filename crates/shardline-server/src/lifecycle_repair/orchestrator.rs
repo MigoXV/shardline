@@ -17,14 +17,13 @@ use crate::{
 
 use super::WEBHOOK_DELIVERY_FUTURE_SKEW_SECONDS;
 use super::classification::{
-    classify_quarantine_repair_action, classify_retention_hold_repair_action,
-    classify_webhook_delivery_repair_action,
+    classify_quarantine_repair_action, classify_webhook_delivery_repair_action,
 };
 use super::fault_injection::lifecycle_repair_failpoint;
 use super::reachability::collect_referenced_object_keys;
 use super::types::{
     LifecycleRepairBoundary, LifecycleRepairOptions, LifecycleRepairReport, QuarantineRepairAction,
-    RepairReachability, RetentionHoldRepairAction, WebhookDeliveryRepairAction,
+    RepairReachability, WebhookDeliveryRepairAction,
 };
 
 /// Repairs stale lifecycle metadata against the configured metadata backend.
@@ -63,12 +62,13 @@ pub async fn run_lifecycle_repair(
     let object_store = object_store_from_config(&config)?;
     let index_store = LocalIndexStore::open(config.root_dir().to_path_buf());
     let record_store = LocalRecordStore::open(config.root_dir().to_path_buf());
-    run_lifecycle_repair_with_stores(
+    run_lifecycle_repair_with_stores_at_time(
         &record_store,
         &index_store,
         &object_store,
         config.server_frontends(),
         options,
+        unix_now_seconds_checked()?,
     )
     .await
 }
@@ -86,37 +86,13 @@ pub async fn run_local_lifecycle_repair(
     let object_store = ServerObjectStore::local(root.join("chunks"))?;
     let index_store = LocalIndexStore::open(root.clone());
     let record_store = LocalRecordStore::open(root);
-    run_lifecycle_repair_with_stores(
+    run_lifecycle_repair_with_stores_at_time(
         &record_store,
         &index_store,
         &object_store,
         &[ServerFrontend::Xet],
         options,
-    )
-    .await
-}
-
-async fn run_lifecycle_repair_with_stores<RecordAdapter, IndexAdapter>(
-    record_store: &RecordAdapter,
-    index_store: &IndexAdapter,
-    object_store: &ServerObjectStore,
-    frontends: &[ServerFrontend],
-    options: LifecycleRepairOptions,
-) -> Result<LifecycleRepairReport, ServerError>
-where
-    RecordAdapter: RecordStore + Sync,
-    RecordAdapter::Error: Into<ServerError>,
-    IndexAdapter: AsyncIndexStore + Sync,
-    IndexAdapter::Error: Into<ServerError>,
-{
-    let now_unix_seconds = unix_now_seconds_checked()?;
-    run_lifecycle_repair_with_stores_at_time(
-        record_store,
-        index_store,
-        object_store,
-        frontends,
-        options,
-        now_unix_seconds,
+        unix_now_seconds_checked()?,
     )
     .await
 }
@@ -153,16 +129,7 @@ where
     let mut report = LifecycleRepairReport {
         scanned_records: reachability.scanned_records,
         referenced_objects: u64::try_from(reachability.referenced_object_keys.len())?,
-        scanned_quarantine_candidates: 0,
-        removed_missing_quarantine_candidates: 0,
-        removed_reachable_quarantine_candidates: 0,
-        removed_held_quarantine_candidates: 0,
-        scanned_retention_holds: 0,
-        removed_expired_retention_holds: 0,
-        removed_missing_retention_holds: 0,
-        scanned_webhook_deliveries: 0,
-        removed_stale_webhook_deliveries: 0,
-        removed_future_webhook_deliveries: 0,
+        ..LifecycleRepairReport::default()
     };
 
     let retention_holds = index_store
@@ -172,41 +139,18 @@ where
     let mut active_hold_object_keys = HashSet::new();
     for hold in retention_holds {
         report.scanned_retention_holds = checked_increment(report.scanned_retention_holds)?;
-        match classify_retention_hold_repair_action(
-            hold.release_after_unix_seconds(),
-            hold.held_at_unix_seconds(),
-            true, // Hold validity is independent of current object existence.
-            now_unix_seconds,
-        ) {
-            RetentionHoldRepairAction::Keep => {
-                active_hold_object_keys.insert(hold.object_key().clone());
-            }
-            RetentionHoldRepairAction::DeleteExpired => {
-                let deleted = index_store
-                    .delete_retention_hold_if_matches(&hold)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_expired_retention_holds =
-                        checked_increment(report.removed_expired_retention_holds)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterRetentionHoldMutation,
-                    )?;
-                }
-            }
-            RetentionHoldRepairAction::DeleteMissing => {
-                let deleted = index_store
-                    .delete_retention_hold_if_matches(&hold)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_missing_retention_holds =
-                        checked_increment(report.removed_missing_retention_holds)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterRetentionHoldMutation,
-                    )?;
-                }
-            }
+        // Holds can protect objects that have not arrived yet. Only expiry
+        // or explicit release ends that protection.
+        if hold.is_active_at(now_unix_seconds) {
+            active_hold_object_keys.insert(hold.object_key().clone());
+        } else if index_store
+            .delete_retention_hold_if_matches(&hold)
+            .await
+            .map_err(Into::into)?
+        {
+            report.removed_expired_retention_holds =
+                checked_increment(report.removed_expired_retention_holds)?;
+            lifecycle_repair_failpoint(LifecycleRepairBoundary::AfterRetentionHoldMutation)?;
         }
     }
 
@@ -226,47 +170,23 @@ where
                 .contains(candidate.object_key().as_str()),
             active_hold_object_keys.contains(candidate.object_key()),
         );
-        match action {
-            QuarantineRepairAction::Keep => {}
+        let removed = match action {
+            QuarantineRepairAction::Keep => continue,
             QuarantineRepairAction::DeleteMissing => {
-                let deleted = index_store
-                    .delete_quarantine_candidate_if_matches(&candidate)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_missing_quarantine_candidates =
-                        checked_increment(report.removed_missing_quarantine_candidates)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterQuarantineCandidateMutation,
-                    )?;
-                }
+                &mut report.removed_missing_quarantine_candidates
             }
             QuarantineRepairAction::DeleteReachable => {
-                let deleted = index_store
-                    .delete_quarantine_candidate_if_matches(&candidate)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_reachable_quarantine_candidates =
-                        checked_increment(report.removed_reachable_quarantine_candidates)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterQuarantineCandidateMutation,
-                    )?;
-                }
+                &mut report.removed_reachable_quarantine_candidates
             }
-            QuarantineRepairAction::DeleteHeld => {
-                let deleted = index_store
-                    .delete_quarantine_candidate_if_matches(&candidate)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_held_quarantine_candidates =
-                        checked_increment(report.removed_held_quarantine_candidates)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterQuarantineCandidateMutation,
-                    )?;
-                }
-            }
+            QuarantineRepairAction::DeleteHeld => &mut report.removed_held_quarantine_candidates,
+        };
+        if index_store
+            .delete_quarantine_candidate_if_matches(&candidate)
+            .await
+            .map_err(Into::into)?
+        {
+            *removed = checked_increment(*removed)?;
+            lifecycle_repair_failpoint(LifecycleRepairBoundary::AfterQuarantineCandidateMutation)?;
         }
     }
 
@@ -276,38 +196,26 @@ where
         .map_err(Into::into)?;
     for delivery in webhook_deliveries {
         report.scanned_webhook_deliveries = checked_increment(report.scanned_webhook_deliveries)?;
-        match classify_webhook_delivery_repair_action(
+        let removed = match classify_webhook_delivery_repair_action(
             delivery.processed_at_unix_seconds(),
             stale_webhook_cutoff,
             max_processed_at_unix_seconds,
         ) {
-            WebhookDeliveryRepairAction::Keep => {}
+            WebhookDeliveryRepairAction::Keep => continue,
             WebhookDeliveryRepairAction::DeleteStale => {
-                let deleted = index_store
-                    .delete_webhook_delivery_if_matches(&delivery)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_stale_webhook_deliveries =
-                        checked_increment(report.removed_stale_webhook_deliveries)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterWebhookDeliveryMutation,
-                    )?;
-                }
+                &mut report.removed_stale_webhook_deliveries
             }
             WebhookDeliveryRepairAction::DeleteFuture => {
-                let deleted = index_store
-                    .delete_webhook_delivery_if_matches(&delivery)
-                    .await
-                    .map_err(Into::into)?;
-                if deleted {
-                    report.removed_future_webhook_deliveries =
-                        checked_increment(report.removed_future_webhook_deliveries)?;
-                    lifecycle_repair_failpoint(
-                        LifecycleRepairBoundary::AfterWebhookDeliveryMutation,
-                    )?;
-                }
+                &mut report.removed_future_webhook_deliveries
             }
+        };
+        if index_store
+            .delete_webhook_delivery_if_matches(&delivery)
+            .await
+            .map_err(Into::into)?
+        {
+            *removed = checked_increment(*removed)?;
+            lifecycle_repair_failpoint(LifecycleRepairBoundary::AfterWebhookDeliveryMutation)?;
         }
     }
 

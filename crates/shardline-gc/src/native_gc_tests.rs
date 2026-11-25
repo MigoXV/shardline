@@ -6,6 +6,7 @@ use crate::{LocalGcOptions, ServerFrontend, run_gc_with_stores};
 fn generic_record(content: &[u8]) -> FileRecord {
     let member = compute_data_hash(content).hex();
     FileRecord {
+        deduplication_domain: None,
         file_id: "historical-file".to_owned(),
         content_hash: member.clone(),
         total_bytes: content.len() as u64,
@@ -138,6 +139,7 @@ async fn physical_sweep(frontends: &[ServerFrontend]) {
     // derived metadata loss. Only this immutable generic version protects bytes.
     records
         .write_version_record(&FileRecord {
+            deduplication_domain: None,
             file_id: "historical-file".to_owned(),
             content_hash: member.clone(),
             total_bytes: content.len() as u64,
@@ -200,4 +202,27 @@ async fn physical_sweep(frontends: &[ServerFrontend]) {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn member_visitor_preserves_the_original_gc_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let objects = ServerObjectStore::local(root.path().join("objects")).unwrap();
+    let hash = source(&objects, b"verified visitor failure fixture").await;
+    let key = shardline_xet_adapter::xorb_object_key(&hash).unwrap();
+    let error = crate::dispatch::visit_protocol_object_member_chunks(
+        &[ServerFrontend::Xet],
+        &objects,
+        &key,
+        |_| {
+            Err(crate::GcError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "visitor cancelled",
+            )))
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, crate::GcError::Io(ref cause)
+        if cause.kind() == std::io::ErrorKind::Interrupted
+            && cause.to_string() == "visitor cancelled"));
 }

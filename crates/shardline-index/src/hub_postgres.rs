@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use crate::store::escape_like;
 
 mod creation;
 mod file_write;
 mod object_location;
+mod recovery_outbox;
 mod ref_batch;
 
 use futures_util::TryStreamExt;
@@ -13,56 +14,62 @@ use shardline_protocol::SecretString;
 
 use crate::{
     hub::{
-        EMPTY_HUB_REVISION, HUB_TREE_READ_CEILING, HubFileEntry, HubRef, HubRefCreateOutcome,
-        HubRefPublicationMode, HubRefUpdateOutcome, HubRepo, HubRepoSearchOptions, HubRepoType,
-        HubRevision, HubStore, HubTreePage, HubTreePageEntry, HubTreePageOptions, HubWebhook,
-        HubWebhookCreateOutcome, canonical_ref_name, hub_tree_requires_recovery,
+        EMPTY_HUB_REVISION, HUB_TREE_READ_CEILING, HubFileEntry, HubRef, HubRefBatchOutcome,
+        HubRefChange, HubRefCreateOutcome, HubRefPublicationMode, HubRefUpdateOutcome, HubRepo,
+        HubRepoSearchOptions, HubRepoType, HubRevision, HubStore, HubTreePage, HubTreePageEntry,
+        HubTreePageOptions, HubWebhook, HubWebhookCreateOutcome, canonical_ref_name,
+        hub_tree_requires_recovery,
     },
     postgres::{
         PostgresIndexStore, PostgresMetadataStoreError, i64_to_u64,
-        load_postgres_latest_evidence_event, u64_to_i64,
+        load_postgres_latest_evidence_heads, load_postgres_snapshot_evidence_for, u64_to_i64,
     },
 };
 use shardline_reliability::{
     HubRefEvidenceLog, HubRefLifecycleEvent, HubRefSnapshot, OperationKind, SnapshotEvidence,
-    persisted_event_sequence, verify_and_append_snapshot_transition,
-    verify_or_repair_snapshot_evidence, verify_persisted_merkle_commit_with_previous,
+    verify_and_append_snapshot_transition, verify_or_repair_snapshot_evidence,
     verify_snapshot_evidence,
 };
-
-const fn repo_type_to_str(t: HubRepoType) -> &'static str {
-    t.as_str()
-}
 
 fn repo_type_from_str(s: &str) -> Result<HubRepoType, PostgresMetadataStoreError> {
     HubRepoType::parse_str(s).ok_or(PostgresMetadataStoreError::InvalidRepoType(s.to_owned()))
 }
 
-/// Escapes LIKE wildcards in user-supplied values to prevent pattern injection.
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('_', "\\_")
-        .replace('%', "\\%")
+fn decode_repo(row: &sqlx::postgres::PgRow) -> Result<HubRepo, PostgresMetadataStoreError> {
+    Ok(HubRepo {
+        repo_id: row.try_get("repo_id")?,
+        repo_type: repo_type_from_str(&row.try_get::<String, _>("repo_type")?)?,
+        private: row.try_get::<bool, _>("private")?,
+        default_branch: row.try_get("default_branch")?,
+        created_at_unix_seconds: i64_to_u64(row.try_get::<i64, _>("created_at_unix_seconds")?)?,
+        updated_at_unix_seconds: i64_to_u64(row.try_get::<i64, _>("updated_at_unix_seconds")?)?,
+    })
 }
 
-async fn load_hub_ref_evidence_head(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    repository: &str,
-    ref_name: &str,
-) -> Result<HubRefEvidenceLog, PostgresMetadataStoreError> {
-    let operation = HubRefSnapshot::new(repository, ref_name, None)?.evidence_operation()?;
-    let Some(value) = load_postgres_latest_evidence_event(
-        &mut **transaction,
-        OperationKind::MetadataCommit,
-        &operation.operation_id,
-    )
-    .await?
-    else {
-        return Ok(HubRefEvidenceLog::default());
-    };
-    let event = from_value::<HubRefLifecycleEvent>(value)?;
-    Ok(HubRefEvidenceLog::from_head(event)?)
+fn decode_revision(row: &sqlx::postgres::PgRow) -> Result<HubRevision, PostgresMetadataStoreError> {
+    Ok(HubRevision {
+        repo_id: row.try_get("repo_id")?,
+        ref_name: row.try_get("ref_name")?,
+        sha: row.try_get("sha")?,
+        parent_sha: row.try_get("parent_sha")?,
+        message: row.try_get("message")?,
+        created_at_unix_seconds: i64_to_u64(row.try_get::<i64, _>("created_at_unix_seconds")?)?,
+    })
+}
+
+fn decode_webhook(row: &sqlx::postgres::PgRow) -> Result<HubWebhook, PostgresMetadataStoreError> {
+    let events_str: String = row.try_get("events")?;
+    Ok(HubWebhook {
+        id: row.try_get("id")?,
+        repo_id: row.try_get("repo_id")?,
+        url: row.try_get("url")?,
+        events: events_str.split(',').map(ToOwned::to_owned).collect(),
+        secret: row
+            .try_get::<Option<String>, _>("secret")?
+            .map(SecretString::new),
+        active: row.try_get::<bool, _>("active")?,
+        created_at_unix_seconds: i64_to_u64(row.try_get::<i64, _>("created_at_unix_seconds")?)?,
+    })
 }
 
 async fn current_hub_ref_evidence(
@@ -72,7 +79,7 @@ async fn current_hub_ref_evidence(
     head_sha: Option<String>,
 ) -> Result<HubRefEvidenceLog, PostgresMetadataStoreError> {
     let snapshot = HubRefSnapshot::new(repository, ref_name, head_sha)?;
-    let evidence = load_hub_ref_evidence_head(transaction, repository, ref_name).await?;
+    let evidence = load_postgres_snapshot_evidence_for(&mut **transaction, &snapshot).await?;
     Ok(verify_or_repair_snapshot_evidence(evidence, snapshot)?.0)
 }
 
@@ -83,7 +90,7 @@ async fn verify_hub_ref_evidence(
     head_sha: Option<String>,
 ) -> Result<(), PostgresMetadataStoreError> {
     let snapshot = HubRefSnapshot::new(repository, ref_name, head_sha)?;
-    let evidence = load_hub_ref_evidence_head(transaction, repository, ref_name).await?;
+    let evidence = load_postgres_snapshot_evidence_for(&mut **transaction, &snapshot).await?;
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(())
 }
@@ -129,93 +136,24 @@ async fn verify_hub_ref_evidence_batch(
                 .operation_id,
         );
     }
-    let rows = sqlx::query(
-        "WITH requested AS (
-             SELECT operation_id
-             FROM unnest($1::text[]) AS values(operation_id)
-         )
-         SELECT requested.operation_id,
-                latest.sequence,
-                latest.event_json,
-                latest.merkle_commit_json,
-                CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM shardline_reliability_events AS missing
-                    WHERE missing.operation_kind = 'MetadataCommit'
-                      AND missing.operation_id = requested.operation_id
-                      AND missing.sequence < latest.sequence
-                      AND missing.merkle_commit_json IS NULL
-                ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE previous.merkle_commit_json END
-                    AS previous_merkle_commit_json
-         FROM requested
-         LEFT JOIN LATERAL (
-             SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = 'MetadataCommit'
-               AND operation_id = requested.operation_id
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) AS latest ON TRUE
-         LEFT JOIN LATERAL (
-             SELECT merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = 'MetadataCommit'
-               AND operation_id = requested.operation_id
-               AND sequence < latest.sequence
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) AS previous ON TRUE",
+    let mut heads = load_postgres_latest_evidence_heads(
+        &mut **transaction,
+        OperationKind::MetadataCommit,
+        &operation_ids,
     )
-    .bind(&operation_ids)
-    .fetch_all(&mut **transaction)
     .await?;
-    let mut heads = HashMap::with_capacity(operation_ids.len());
-    for row in rows {
-        let operation_id: String = row.try_get("operation_id")?;
-        let sequence: Option<i64> = row.try_get("sequence")?;
-        let event_json: Option<serde_json::Value> = row.try_get("event_json")?;
-        let merkle_commit: Option<serde_json::Value> = row.try_get("merkle_commit_json")?;
-        let previous_merkle_commit: Option<serde_json::Value> =
-            row.try_get("previous_merkle_commit_json")?;
-        heads.insert(
-            operation_id,
-            (sequence, event_json, merkle_commit, previous_merkle_commit),
-        );
-    }
     for (reference, operation_id) in refs.iter().zip(operation_ids) {
         let snapshot = HubRefSnapshot::new(
             &reference.repo_id,
             &reference.ref_name,
             Some(reference.sha.clone()),
         )?;
-        let (sequence, event_json, merkle_commit, previous_merkle_commit) = heads
-            .remove(&operation_id)
-            .ok_or(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ))?;
-        let sequence = u64::try_from(sequence.ok_or(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ))?)
-        .map_err(|error| {
-            PostgresMetadataStoreError::IntegerOutOfRange(format!("reliability sequence: {error}"))
-        })?;
-        let event_json = event_json.ok_or(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ))?;
-        if persisted_event_sequence(OperationKind::MetadataCommit, event_json.clone())? != sequence
-        {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::Merkle(
-                    "hub evidence row sequence does not match its event".into(),
-                ),
-            ));
-        }
-        verify_persisted_merkle_commit_with_previous(
-            OperationKind::MetadataCommit,
-            event_json.clone(),
-            merkle_commit,
-            previous_merkle_commit,
-        )?;
+        let event_json =
+            heads
+                .remove(&operation_id)
+                .ok_or(PostgresMetadataStoreError::Reliability(
+                    shardline_reliability::ReliabilityError::OperationMismatch,
+                ))?;
         let event = from_value::<HubRefLifecycleEvent>(event_json)?;
         let evidence = HubRefEvidenceLog::from_head(event)?;
         verify_snapshot_evidence(&evidence, &snapshot)?;
@@ -286,6 +224,23 @@ impl HubStore for PostgresIndexStore {
     ) -> Result<crate::hub::HubRefBatchOutcome, Self::Error> {
         ref_batch::apply(self, repo_id, changes)
     }
+    fn change_refs_atomically_with_manifests(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        manifests: &[shardline_reliability::HubRefBatchManifestReferenceV1],
+    ) -> Result<crate::hub::HubRefBatchOutcome, Self::Error> {
+        ref_batch::apply_with_manifests(self, repo_id, changes, manifests)
+    }
+    fn change_refs_atomically_with_prepared_revisions(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        revisions: &[HubRevision],
+        manifests: &[shardline_reliability::HubRefBatchManifestReferenceV1],
+    ) -> Result<crate::hub::HubRefBatchOutcome, Self::Error> {
+        ref_batch::apply_with_prepared_revisions(self, repo_id, changes, revisions, manifests)
+    }
     type Error = PostgresMetadataStoreError;
 
     fn create_repo(
@@ -342,18 +297,7 @@ impl HubStore for PostgresIndexStore {
                 return Ok(None);
             };
 
-            let repository = HubRepo {
-                repo_id: row.try_get("repo_id")?,
-                repo_type: repo_type_from_str(&row.try_get::<String, _>("repo_type")?)?,
-                private: row.try_get::<bool, _>("private")?,
-                default_branch: row.try_get("default_branch")?,
-                created_at_unix_seconds: i64_to_u64(
-                    row.try_get::<i64, _>("created_at_unix_seconds")?,
-                )?,
-                updated_at_unix_seconds: i64_to_u64(
-                    row.try_get::<i64, _>("updated_at_unix_seconds")?,
-                )?,
-            };
+            let repository = decode_repo(&row)?;
             verify_hub_ref_evidence(
                 &mut tx,
                 &repository.repo_id,
@@ -379,18 +323,7 @@ impl HubStore for PostgresIndexStore {
                 )
                 .fetch(&mut *tx);
                 while let Some(row) = rows.try_next().await? {
-                    repos.push(HubRepo {
-                        repo_id: row.try_get("repo_id")?,
-                        repo_type: repo_type_from_str(&row.try_get::<String, _>("repo_type")?)?,
-                        private: row.try_get::<bool, _>("private")?,
-                        default_branch: row.try_get("default_branch")?,
-                        created_at_unix_seconds: i64_to_u64(
-                            row.try_get::<i64, _>("created_at_unix_seconds")?,
-                        )?,
-                        updated_at_unix_seconds: i64_to_u64(
-                            row.try_get::<i64, _>("updated_at_unix_seconds")?,
-                        )?,
-                    });
+                    repos.push(decode_repo(&row)?);
                 }
             }
             verify_hub_repo_heads(&mut tx, &repos).await?;
@@ -459,18 +392,7 @@ impl HubStore for PostgresIndexStore {
                 .await?;
             let mut repos = Vec::with_capacity(rows.len());
             for row in rows {
-                repos.push(HubRepo {
-                    repo_id: row.try_get("repo_id")?,
-                    repo_type: repo_type_from_str(&row.try_get::<String, _>("repo_type")?)?,
-                    private: row.try_get::<bool, _>("private")?,
-                    default_branch: row.try_get("default_branch")?,
-                    created_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("created_at_unix_seconds")?,
-                    )?,
-                    updated_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("updated_at_unix_seconds")?,
-                    )?,
-                });
+                repos.push(decode_repo(&row)?);
             }
             verify_hub_repo_heads(&mut tx, &repos).await?;
             tx.commit().await?;
@@ -504,7 +426,14 @@ impl HubStore for PostgresIndexStore {
         &self,
         revision: &HubRevision,
     ) -> Result<HubRefUpdateOutcome, Self::Error> {
-        match self.publish_hub_revision_at(
+        self.publish_prepared_revision_with_manifests(revision, &[])
+    }
+    fn publish_prepared_revision_with_manifests(
+        &self,
+        revision: &HubRevision,
+        manifests: &[shardline_reliability::HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefUpdateOutcome, Self::Error> {
+        self.publish_hub_revision_at(
             &revision.repo_id,
             revision.parent_sha.as_deref(),
             &revision.sha,
@@ -512,11 +441,9 @@ impl HubStore for PostgresIndexStore {
             revision.message.as_deref().unwrap_or(""),
             HubRefPublicationMode::UpdateOnly,
             Some(revision),
-        )? {
-            HubRefCreateOutcome::Created(stored) => Ok(HubRefUpdateOutcome::Updated(stored)),
-            HubRefCreateOutcome::AlreadyExists => Ok(HubRefUpdateOutcome::Conflict),
-            HubRefCreateOutcome::Unsupported => Ok(HubRefUpdateOutcome::Unsupported),
-        }
+            manifests,
+        )
+        .map(HubRefCreateOutcome::into_update)
     }
 
     fn update_revision_if_current(
@@ -527,18 +454,15 @@ impl HubStore for PostgresIndexStore {
         ref_name: &str,
         message: &str,
     ) -> Result<HubRefUpdateOutcome, Self::Error> {
-        match self.publish_hub_revision(
+        self.publish_hub_revision(
             repo_id,
             Some(expected_sha),
             new_sha,
             ref_name,
             message,
             HubRefPublicationMode::UpdateOnly,
-        )? {
-            HubRefCreateOutcome::Created(revision) => Ok(HubRefUpdateOutcome::Updated(revision)),
-            HubRefCreateOutcome::AlreadyExists => Ok(HubRefUpdateOutcome::Conflict),
-            HubRefCreateOutcome::Unsupported => Ok(HubRefUpdateOutcome::Unsupported),
-        }
+        )
+        .map(HubRefCreateOutcome::into_update)
     }
 
     fn create_revision_if_absent(
@@ -616,44 +540,21 @@ impl HubStore for PostgresIndexStore {
         if ref_name == "main" || ref_name == "HEAD" {
             return Err(PostgresMetadataStoreError::RecordNotFound);
         }
-        let pool = self.pool().clone();
-
-        block_on_async(async {
-            let mut tx = pool.begin().await?;
-            // Match publication's repository lock so deletion cannot interleave
-            // between an updater's expected-head check and ref publication.
-            let locked_repo: Option<String> = sqlx::query_scalar(
-                "SELECT repo_id FROM shardline_hub_repos WHERE repo_id = $1 FOR UPDATE",
-            )
-            .bind(&repo_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if locked_repo.is_none() {
-                return Err(PostgresMetadataStoreError::RecordNotFound);
+        let change = HubRefChange {
+            ref_name,
+            expected_sha: Some(expected_sha),
+            new_sha: None,
+            message: String::new(),
+        };
+        match ref_batch::apply(self, &repo_id, &[change])? {
+            HubRefBatchOutcome::Applied => Ok(()),
+            HubRefBatchOutcome::Conflict => Err(PostgresMetadataStoreError::RecordNotFound),
+            HubRefBatchOutcome::Unsupported => {
+                Err(PostgresMetadataStoreError::ReliabilityEventConflict(
+                    "atomic ref deletion is unsupported".to_owned(),
+                ))
             }
-            let result = sqlx::query(
-                "DELETE FROM shardline_hub_refs WHERE repo_id = $1 AND ref_name = $2 AND sha = $3",
-            )
-            .bind(&repo_id)
-            .bind(&ref_name)
-            .bind(&expected_sha)
-            .execute(&mut *tx)
-            .await?;
-            if result.rows_affected() != 1 {
-                return Err(PostgresMetadataStoreError::RecordNotFound);
-            }
-            let before = HubRefSnapshot::new(&repo_id, &ref_name, Some(expected_sha.clone()))?;
-            let after = HubRefSnapshot::new(&repo_id, &ref_name, None)?;
-            let evidence = verify_and_append_snapshot_transition(
-                current_hub_ref_evidence(&mut tx, &repo_id, &ref_name, Some(expected_sha)).await?,
-                before,
-                after,
-            )?
-            .0;
-            persist_hub_ref_evidence(&mut tx, &evidence).await?;
-            tx.commit().await?;
-            Ok(())
-        })
+        }
     }
 
     fn list_revisions(&self, repo_id: &str) -> Result<Vec<HubRevision>, Self::Error> {
@@ -675,19 +576,7 @@ impl HubStore for PostgresIndexStore {
             .bind(&sha)
             .fetch_optional(&pool)
             .await?;
-            row.map(|row| {
-                Ok(HubRevision {
-                    repo_id: row.try_get("repo_id")?,
-                    ref_name: row.try_get("ref_name")?,
-                    sha: row.try_get("sha")?,
-                    parent_sha: row.try_get("parent_sha")?,
-                    message: row.try_get("message")?,
-                    created_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("created_at_unix_seconds")?,
-                    )?,
-                })
-            })
-            .transpose()
+            row.as_ref().map(decode_revision).transpose()
         })
     }
 
@@ -712,16 +601,7 @@ impl HubStore for PostgresIndexStore {
 
             let mut revisions = Vec::new();
             while let Some(row) = rows.try_next().await? {
-                revisions.push(HubRevision {
-                    repo_id: row.try_get("repo_id")?,
-                    ref_name: row.try_get("ref_name")?,
-                    sha: row.try_get("sha")?,
-                    parent_sha: row.try_get("parent_sha")?,
-                    message: row.try_get("message")?,
-                    created_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("created_at_unix_seconds")?,
-                    )?,
-                });
+                revisions.push(decode_revision(&row)?);
             }
             Ok((revisions.len() <= limit).then_some(revisions))
         })
@@ -905,11 +785,10 @@ impl HubStore for PostgresIndexStore {
             let query_limit =
                 i64::try_from(options.page_limit().saturating_add(1)).unwrap_or(i64::MAX);
             let mut entries = Vec::new();
-            if options.recursive {
-                let prefix_start =
-                    i32::try_from(prefix.chars().count().saturating_add(1)).unwrap_or(i32::MAX);
-                let mut rows = sqlx::query(
-                    "WITH filtered AS (
+            let prefix_start =
+                i32::try_from(prefix.chars().count().saturating_add(1)).unwrap_or(i32::MAX);
+            let sql = if options.recursive {
+                "WITH filtered AS (
                        SELECT substring(path FROM $4) COLLATE \"C\" AS relative,size,sha,is_lfs
                        FROM shardline_hub_file_entries WHERE commit_sha=$1 AND path COLLATE \"C\">=$2
                        AND ($3::text IS NULL OR path COLLATE \"C\"<$3) AND path COLLATE \"C\"<>$2),
@@ -922,26 +801,9 @@ impl HubStore for PostgresIndexStore {
                        UNION ALL SELECT 1,relative,size,sha,is_lfs FROM filtered)
                      SELECT kind,path,size,sha,is_lfs FROM entries
                      WHERE $5::text IS NULL OR (path>$5 AND EXISTS(SELECT 1 FROM entries WHERE path=$5))
-                     ORDER BY path LIMIT $6")
-                    .bind(&commit_sha).bind(&prefix).bind(&upper).bind(prefix_start).bind(&options.cursor).bind(query_limit).fetch(&mut *transaction);
-                while let Some(row) = rows.try_next().await? {
-                    let path: String = row.try_get("path")?;
-                    entries.push(if row.try_get::<i32, _>("kind")? == 0 {
-                        HubTreePageEntry::Directory { path }
-                    } else {
-                        HubTreePageEntry::File(HubFileEntry {
-                            path,
-                            size: i64_to_u64(row.try_get("size")?)?,
-                            sha: row.try_get("sha")?,
-                            is_lfs: row.try_get("is_lfs")?,
-                        })
-                    });
-                }
+                     ORDER BY path LIMIT $6"
             } else {
-                let prefix_start =
-                    i32::try_from(prefix.chars().count().saturating_add(1)).unwrap_or(i32::MAX);
-                let mut rows = sqlx::query(
-                    "WITH filtered AS (SELECT substring(path FROM $4) AS relative,size,sha,is_lfs
+                "WITH filtered AS (SELECT substring(path FROM $4) AS relative,size,sha,is_lfs
                        FROM shardline_hub_file_entries WHERE commit_sha=$1 AND path COLLATE \"C\">=$2
                        AND ($3::text IS NULL OR path COLLATE \"C\"<$3)),
                      entries AS (SELECT DISTINCT 0 AS kind,split_part(relative,'/',1) COLLATE \"C\" AS path,
@@ -951,8 +813,17 @@ impl HubStore for PostgresIndexStore {
                      SELECT kind,path,size,sha,is_lfs FROM entries
                      WHERE $5::text IS NULL OR kind>(SELECT kind FROM cursor_kind)
                        OR (kind=(SELECT kind FROM cursor_kind) AND path>$5)
-                     ORDER BY kind,path LIMIT $6")
-                    .bind(&commit_sha).bind(&prefix).bind(&upper).bind(prefix_start).bind(&options.cursor).bind(query_limit).fetch(&mut *transaction);
+                     ORDER BY kind,path LIMIT $6"
+            };
+            {
+                let mut rows = sqlx::query(sql)
+                    .bind(&commit_sha)
+                    .bind(&prefix)
+                    .bind(&upper)
+                    .bind(prefix_start)
+                    .bind(&options.cursor)
+                    .bind(query_limit)
+                    .fetch(&mut *transaction);
                 while let Some(row) = rows.try_next().await? {
                     let path: String = row.try_get("path")?;
                     entries.push(if row.try_get::<i32, _>("kind")? == 0 {
@@ -1180,20 +1051,7 @@ impl HubStore for PostgresIndexStore {
 
             let mut webhooks = Vec::new();
             while let Some(row) = rows.try_next().await? {
-                let events_str: String = row.try_get("events")?;
-                webhooks.push(HubWebhook {
-                    id: row.try_get("id")?,
-                    repo_id: row.try_get("repo_id")?,
-                    url: row.try_get("url")?,
-                    events: events_str.split(',').map(ToOwned::to_owned).collect(),
-                    secret: row
-                        .try_get::<Option<String>, _>("secret")?
-                        .map(SecretString::new),
-                    active: row.try_get::<bool, _>("active")?,
-                    created_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("created_at_unix_seconds")?,
-                    )?,
-                });
+                webhooks.push(decode_webhook(&row)?);
             }
             Ok(webhooks)
         })
@@ -1280,20 +1138,7 @@ impl HubStore for PostgresIndexStore {
 
             let mut webhooks = Vec::new();
             while let Some(row) = rows.try_next().await? {
-                let events_str: String = row.try_get("events")?;
-                webhooks.push(HubWebhook {
-                    id: row.try_get("id")?,
-                    repo_id: row.try_get("repo_id")?,
-                    url: row.try_get("url")?,
-                    events: events_str.split(',').map(ToOwned::to_owned).collect(),
-                    secret: row
-                        .try_get::<Option<String>, _>("secret")?
-                        .map(SecretString::new),
-                    active: row.try_get::<bool, _>("active")?,
-                    created_at_unix_seconds: i64_to_u64(
-                        row.try_get::<i64, _>("created_at_unix_seconds")?,
-                    )?,
-                });
+                webhooks.push(decode_webhook(&row)?);
             }
             Ok(webhooks)
         })
@@ -1310,7 +1155,16 @@ impl PostgresIndexStore {
         message: &str,
         mode: HubRefPublicationMode,
     ) -> Result<HubRefCreateOutcome, PostgresMetadataStoreError> {
-        self.publish_hub_revision_at(repo_id, parent_sha, new_sha, ref_name, message, mode, None)
+        self.publish_hub_revision_at(
+            repo_id,
+            parent_sha,
+            new_sha,
+            ref_name,
+            message,
+            mode,
+            None,
+            &[],
+        )
     }
 
     #[allow(
@@ -1326,6 +1180,7 @@ impl PostgresIndexStore {
         message: &str,
         mode: HubRefPublicationMode,
         prepared: Option<&HubRevision>,
+        manifest_refs: &[shardline_reliability::HubRefBatchManifestReferenceV1],
     ) -> Result<HubRefCreateOutcome, PostgresMetadataStoreError> {
         let pool = self.pool().clone();
         let repo_id = repo_id.to_owned();
@@ -1336,6 +1191,7 @@ impl PostgresIndexStore {
         let prepared_timestamp = prepared
             .map(|r| u64_to_i64(r.created_at_unix_seconds))
             .transpose()?;
+        let manifest_refs = manifest_refs.to_vec();
 
         block_on_async(async {
             let mut tx = pool.begin().await?;
@@ -1362,14 +1218,7 @@ impl PostgresIndexStore {
             .fetch_optional(&mut *tx)
             .await?;
 
-            if matches!(mode, HubRefPublicationMode::CreateOnly) && current_ref.is_some() {
-                return Ok(HubRefCreateOutcome::AlreadyExists);
-            }
-
-            // Strict updates never reinterpret a deleted ref as branch creation.
-            if matches!(mode, HubRefPublicationMode::UpdateOnly)
-                && (parent_sha.is_none() || current_ref.as_deref() != parent_sha.as_deref())
-            {
+            if mode.conflicts_with(current_ref.as_deref(), parent_sha.as_deref()) {
                 return Ok(HubRefCreateOutcome::AlreadyExists);
             }
 
@@ -1440,6 +1289,18 @@ impl PostgresIndexStore {
             )?
             .0;
             persist_hub_ref_evidence(&mut tx, &evidence).await?;
+            recovery_outbox::append_ref_batch(
+                &mut tx,
+                &repo_id,
+                &[HubRefChange {
+                    ref_name: ref_name.clone(),
+                    expected_sha: parent_sha.clone(),
+                    new_sha: Some(new_sha.clone()),
+                    message: message.clone(),
+                }],
+                &manifest_refs,
+            )
+            .await?;
 
             let row = sqlx::query(
                 "SELECT repo_id, ref_name, sha, parent_sha, message, created_at_unix_seconds
@@ -1450,16 +1311,7 @@ impl PostgresIndexStore {
             .fetch_one(&mut *tx)
             .await?;
 
-            let revision = HubRevision {
-                repo_id: row.try_get("repo_id")?,
-                ref_name: row.try_get("ref_name")?,
-                sha: row.try_get("sha")?,
-                parent_sha: row.try_get("parent_sha")?,
-                message: row.try_get("message")?,
-                created_at_unix_seconds: i64_to_u64(
-                    row.try_get::<i64, _>("created_at_unix_seconds")?,
-                )?,
-            };
+            let revision = decode_revision(&row)?;
             if prepared.is_some_and(|expected| !revision.matches_prepared(expected)) {
                 return Err(PostgresMetadataStoreError::RecordNotFound);
             }
@@ -1484,18 +1336,12 @@ mod tests {
     )]
     use super::*;
     use crate::hub::{BoxedHubStore, HubRepoType, HubStore};
+    use crate::postgres::connect_isolated_postgres as connect_postgres;
     use sqlx::postgres::PgPool;
 
     // ------------------------------------------------------------------
     // Pure helper function tests (no database needed)
     // ------------------------------------------------------------------
-    #[test]
-    fn repo_type_to_str_maps_all_variants() {
-        assert_eq!(repo_type_to_str(HubRepoType::Model), "model");
-        assert_eq!(repo_type_to_str(HubRepoType::Dataset), "dataset");
-        assert_eq!(repo_type_to_str(HubRepoType::Space), "space");
-    }
-
     #[test]
     fn repo_type_from_str_parses_all_variants() {
         assert_eq!(repo_type_from_str("model").unwrap(), HubRepoType::Model);
@@ -1513,25 +1359,6 @@ mod tests {
         assert_eq!(err.to_string(), "invalid repository type: unknown");
     }
 
-    #[test]
-    fn escape_like_preserves_plain_strings() {
-        assert_eq!(escape_like("hello"), "hello");
-        assert_eq!(escape_like(""), "");
-        assert_eq!(escape_like("abc123"), "abc123");
-    }
-
-    #[test]
-    fn escape_like_escapes_wildcards() {
-        assert_eq!(escape_like("foo_bar"), "foo\\_bar");
-        assert_eq!(escape_like("foo%bar"), "foo\\%bar");
-        assert_eq!(escape_like("foo\\bar"), "foo\\\\bar");
-    }
-
-    #[test]
-    fn escape_like_escapes_combined_patterns() {
-        assert_eq!(escape_like("a%b_c\\d"), "a\\%b\\_c\\\\d");
-    }
-
     // block_on_async itself is tested indirectly by every hub_postgres integration
     // test that exercises the HubStore impl (create_repo, get_repo, etc.)
 
@@ -1545,7 +1372,382 @@ mod tests {
             .expect("configured PostgreSQL fixture must connect");
         let store = make_store(pool);
         crate::hub::ref_batch_tests::contract(&store);
-        cleanup_repo(&store, "atomic/contract").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_shadow_outbox_is_domain_ordered() {
+        use crate::hub::{HubRefBatchOutcome, HubRefChange};
+        use crate::{HubRecoveryMode, HubRecoveryOutboxStore, put_hub_ref_archive_record};
+        use ed25519_dalek::SigningKey;
+        use shardline_storage::LocalObjectStore;
+        if std::env::var_os("DATABASE_URL").is_none() {
+            eprintln!("skipping Postgres outbox test: no DATABASE_URL");
+            return;
+        }
+        let pool = connect_postgres()
+            .await
+            .expect("configured PostgreSQL fixture must connect");
+        let store = make_store(pool);
+        let repo = "recovery/pg-order";
+        store.create_repo(HubRepoType::Model, repo, false).unwrap();
+        store
+            .create_revision(repo, None, "base", "main", "Initial")
+            .unwrap();
+        store
+            .create_revision(repo, Some("base"), "stable", "stable", "Stable")
+            .unwrap();
+        store
+            .set_hub_recovery_mode(HubRecoveryMode::Shadow, Some("pg-deployment"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.change_refs_atomically(repo, &[]).unwrap(),
+            HubRefBatchOutcome::Applied
+        );
+        let no_op_changes = [
+            HubRefChange {
+                ref_name: "main".into(),
+                expected_sha: Some("base".into()),
+                new_sha: Some("base".into()),
+                message: "No-op main".into(),
+            },
+            HubRefChange {
+                ref_name: "stable".into(),
+                expected_sha: Some("stable".into()),
+                new_sha: Some("stable".into()),
+                message: "No-op stable".into(),
+            },
+        ];
+        assert_eq!(
+            store.change_refs_atomically(repo, &no_op_changes).unwrap(),
+            HubRefBatchOutcome::Applied
+        );
+        let no_op_outbox_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM shardline_hub_recovery_outbox WHERE repo_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let no_op_sequence_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM shardline_hub_recovery_sequences WHERE repo_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!((no_op_outbox_count, no_op_sequence_count), (0, 0));
+        for (expected_sha, new_sha) in [("base", "one"), ("one", "two")] {
+            assert_eq!(
+                store
+                    .change_refs_atomically(
+                        repo,
+                        &[HubRefChange {
+                            ref_name: "main".into(),
+                            expected_sha: Some(expected_sha.into()),
+                            new_sha: Some(new_sha.into()),
+                            message: new_sha.into(),
+                        }],
+                    )
+                    .unwrap(),
+                HubRefBatchOutcome::Applied
+            );
+        }
+        let first = store
+            .next_pending_hub_ref_event(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.domain_sequence, 1);
+        let archive_root = shardline_test_support::TempStorage::new();
+        let archive = LocalObjectStore::new(archive_root.path().join("archive")).unwrap();
+        let signing_key = SigningKey::from_bytes(&[31; 32]);
+        let archived_first =
+            put_hub_ref_archive_record(&archive, first.event.clone(), &signing_key, "pg-test-key")
+                .await
+                .unwrap();
+        let mut out_of_order = first.clone();
+        out_of_order.domain_sequence = 2;
+        assert!(
+            store
+                .mark_hub_ref_event_archived(&out_of_order, &archived_first)
+                .await
+                .is_err()
+        );
+        store
+            .mark_hub_ref_event_archived(&first, &archived_first)
+            .await
+            .unwrap();
+        let second = store
+            .next_pending_hub_ref_event(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.domain_sequence, 2);
+        assert_eq!(second.event.after.refs[0].head_sha.as_deref(), Some("two"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_prepared_manifest_reference_is_atomic() {
+        use crate::{HubRecoveryMode, HubRecoveryOutboxStore};
+        use shardline_reliability::HubRefBatchManifestReferenceV1;
+        if std::env::var_os("DATABASE_URL").is_none() {
+            eprintln!("skipping PostgreSQL prepared-manifest test: no DATABASE_URL");
+            return;
+        }
+        let pool = connect_postgres()
+            .await
+            .expect("configured PostgreSQL fixture must connect");
+        let store = make_store(pool);
+        let repo = "recovery/pg-prepared-manifest";
+        store.create_repo(HubRepoType::Model, repo, false).unwrap();
+        store
+            .create_revision(repo, None, "base", "main", "Initial")
+            .unwrap();
+        let prepared = HubRevision {
+            repo_id: repo.to_owned(),
+            ref_name: "main".to_owned(),
+            sha: "b".repeat(40),
+            parent_sha: Some("base".to_owned()),
+            message: Some("prepared".to_owned()),
+            created_at_unix_seconds: 1234,
+        };
+        let digest = "a".repeat(64);
+        let manifest = HubRefBatchManifestReferenceV1::new(
+            "pg-manifest-deployment".into(),
+            repo.into(),
+            prepared.sha.clone(),
+            digest.clone(),
+            format!(
+                "recovery/v1/{}/{}/versions/aa/{digest}",
+                crate::hub_recovery::stable_id_segment("pg-manifest-deployment"),
+                crate::hub_recovery::stable_id_segment(repo)
+            ),
+        )
+        .unwrap();
+        assert!(
+            store
+                .publish_prepared_revision_with_manifests(
+                    &prepared,
+                    std::slice::from_ref(&manifest)
+                )
+                .is_err()
+        );
+        let head: String = sqlx::query_scalar(
+            "SELECT sha FROM shardline_hub_refs WHERE repo_id = $1 AND ref_name = 'main'",
+        )
+        .bind(repo)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(head, "base");
+        store
+            .set_hub_recovery_mode(HubRecoveryMode::Shadow, Some("pg-manifest-deployment"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .publish_prepared_revision_with_manifests(
+                    &prepared,
+                    std::slice::from_ref(&manifest)
+                )
+                .unwrap(),
+            HubRefUpdateOutcome::Updated(_)
+        ));
+        let revision = store.get_revision(repo, &prepared.sha).unwrap().unwrap();
+        assert!(revision.matches_prepared(&prepared));
+        let item = store
+            .next_pending_hub_ref_event(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.event.after.manifest_refs, vec![manifest]);
+        assert_eq!(
+            item.event.after.refs[0].head_sha.as_deref(),
+            Some(prepared.sha.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_prepared_ref_batch_preserves_timestamp_and_duplicate_sha_heads() {
+        use crate::hub::{HubRefBatchOutcome, HubRefChange};
+        use crate::{HubRecoveryMode, HubRecoveryOutboxStore};
+        use shardline_reliability::HubRefBatchManifestReferenceV1;
+        if std::env::var_os("DATABASE_URL").is_none() {
+            eprintln!("skipping PostgreSQL prepared ref batch test: no DATABASE_URL");
+            return;
+        }
+        let pool = connect_postgres()
+            .await
+            .expect("configured PostgreSQL fixture must connect");
+        let store = make_store(pool);
+        let repo = "recovery/pg-prepared-ref-batch";
+        let deployment = "pg-prepared-ref-batch-deployment";
+        store.create_repo(HubRepoType::Model, repo, false).unwrap();
+        store
+            .create_revision(repo, None, "base", "main", "Initial")
+            .unwrap();
+        store
+            .set_hub_recovery_mode(HubRecoveryMode::Shadow, Some(deployment))
+            .await
+            .unwrap();
+
+        let sha = "e".repeat(40);
+        let prepared = HubRevision {
+            repo_id: repo.to_owned(),
+            ref_name: "main".to_owned(),
+            sha: sha.clone(),
+            parent_sha: Some("base".to_owned()),
+            message: Some("prepared batch".to_owned()),
+            created_at_unix_seconds: 1234,
+        };
+        let digest = "f".repeat(64);
+        let manifest = HubRefBatchManifestReferenceV1::new(
+            deployment.to_owned(),
+            repo.to_owned(),
+            sha.clone(),
+            digest.clone(),
+            format!(
+                "recovery/v1/{}/{}/versions/ff/{digest}",
+                crate::hub_recovery::stable_id_segment(deployment),
+                crate::hub_recovery::stable_id_segment(repo),
+            ),
+        )
+        .unwrap();
+        let changes = [
+            HubRefChange {
+                ref_name: "main".into(),
+                expected_sha: Some("base".into()),
+                new_sha: Some(sha.clone()),
+                message: "prepared batch".into(),
+            },
+            HubRefChange {
+                ref_name: "refs/heads/feature".into(),
+                expected_sha: None,
+                new_sha: Some(sha.clone()),
+                message: "prepared batch".into(),
+            },
+        ];
+        assert!(
+            store
+                .change_refs_atomically_with_prepared_revisions(
+                    repo,
+                    &changes,
+                    std::slice::from_ref(&prepared),
+                    &[],
+                )
+                .is_err()
+        );
+        let extra_sha = "f".repeat(40);
+        let extra_digest = "a".repeat(64);
+        let extra_manifest = HubRefBatchManifestReferenceV1::new(
+            deployment.to_owned(),
+            repo.to_owned(),
+            extra_sha,
+            extra_digest.clone(),
+            format!(
+                "recovery/v1/{}/{}/versions/aa/{extra_digest}",
+                crate::hub_recovery::stable_id_segment(deployment),
+                crate::hub_recovery::stable_id_segment(repo),
+            ),
+        )
+        .unwrap();
+        assert!(
+            store
+                .change_refs_atomically_with_prepared_revisions(
+                    repo,
+                    &changes,
+                    std::slice::from_ref(&prepared),
+                    &[manifest.clone(), extra_manifest],
+                )
+                .is_err()
+        );
+        let sequence_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM shardline_hub_recovery_sequences WHERE repo_id = $1)",
+        )
+        .bind(repo)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(!sequence_exists);
+        assert_eq!(
+            store
+                .change_refs_atomically_with_prepared_revisions(
+                    repo,
+                    &changes,
+                    std::slice::from_ref(&prepared),
+                    std::slice::from_ref(&manifest),
+                )
+                .unwrap(),
+            HubRefBatchOutcome::Applied
+        );
+        let revision = store.get_revision(repo, &sha).unwrap().unwrap();
+        assert!(revision.matches_prepared(&prepared));
+        assert_eq!(store.list_refs(repo).unwrap().len(), 2);
+        let item = store
+            .next_pending_hub_ref_event(repo)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.event.after.refs.len(), 2);
+        assert_eq!(item.event.after.manifest_refs, [manifest]);
+        let source = store.hub_ref_checkpoint_source(repo).await.unwrap();
+        assert_eq!(source.deployment_id.as_deref(), Some(deployment));
+        assert_eq!(source.committed_sequence, 1);
+        assert_eq!(source.archived_sequence, 0);
+        assert_eq!(source.refs.len(), 2);
+        assert_eq!(
+            store
+                .hub_repositories_after(None, std::num::NonZeroUsize::new(1).unwrap())
+                .await
+                .unwrap(),
+            vec![repo.to_owned()]
+        );
+
+        let conflicting = HubRevision {
+            created_at_unix_seconds: prepared.created_at_unix_seconds + 1,
+            ..prepared
+        };
+        assert!(
+            store
+                .change_refs_atomically_with_prepared_revisions(
+                    repo,
+                    &[HubRefChange {
+                        ref_name: "stable".into(),
+                        expected_sha: None,
+                        new_sha: Some(sha.clone()),
+                        message: "prepared batch".into(),
+                    }],
+                    &[conflicting],
+                    &[],
+                )
+                .is_err()
+        );
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT last_sequence FROM shardline_hub_recovery_sequences WHERE repo_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(sequence, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn postgres_outbox_adapter_is_async_runtime_safe() {
+        use crate::{HubRecoveryMode, HubRecoveryOutboxStore};
+        if std::env::var_os("DATABASE_URL").is_none() {
+            eprintln!("skipping Postgres async outbox test: no DATABASE_URL");
+            return;
+        }
+        let pool = connect_postgres()
+            .await
+            .expect("configured PostgreSQL fixture must connect");
+        let store = make_store(pool);
+        store
+            .set_hub_recovery_mode(HubRecoveryMode::Off, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1604,98 +1806,10 @@ mod tests {
             HubRefBatchOutcome::Applied
         );
         assert_eq!(store.list_refs(repo).unwrap().len(), 2);
-        cleanup_repo(&store, repo).await;
-    }
-
-    async fn connect_postgres() -> Option<PgPool> {
-        crate::postgres::connect_isolated_postgres().await
     }
 
     fn make_store(pool: PgPool) -> PostgresIndexStore {
         PostgresIndexStore::new(pool)
-    }
-
-    async fn cleanup_repo(store: &PostgresIndexStore, repo_id: &str) {
-        // Test cleanup must satisfy the same deferred delete gate as a real
-        // mutation.  Seed a terminal evidence event for every existing ref,
-        // delete the materialized rows in that transaction, then remove the
-        // synthetic history after commit.
-        let cleanup_result = async {
-            let mut tx = store.pool().begin().await?;
-            let refs: Vec<(String, String)> = sqlx::query_as(
-                "SELECT ref_name, sha FROM shardline_hub_refs WHERE repo_id = $1",
-            )
-            .bind(repo_id)
-            .fetch_all(&mut *tx)
-            .await?;
-            for (ref_name, _sha) in &refs {
-                let operation_id = format!(
-                    "{}:{}{}:{}",
-                    repo_id.len(),
-                    repo_id,
-                    ref_name.len(),
-                    ref_name
-                );
-                let sequence: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(sequence), 0) + 1
-                     FROM shardline_reliability_events
-                     WHERE operation_kind = 'MetadataCommit' AND operation_id = $1",
-                )
-                .bind(&operation_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                let event_json = serde_json::json!({
-                    "after": {
-                        "repository": repo_id,
-                        "ref_name": ref_name,
-                        "head_sha": null
-                    }
-                });
-                sqlx::query(
-                    "INSERT INTO shardline_reliability_events
-                     (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds)
-                     VALUES ('MetadataCommit', $1, $2, $3, $4)",
-                )
-                .bind(&operation_id)
-                .bind(sequence)
-                .bind(event_json)
-                .bind(shardline_protocol::unix_now_seconds_lossy() as i64)
-                .execute(&mut *tx)
-                .await?;
-            }
-            sqlx::query("DELETE FROM shardline_hub_file_entries WHERE commit_sha IN (SELECT sha FROM shardline_hub_revisions WHERE repo_id = $1)")
-                .bind(repo_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM shardline_hub_refs WHERE repo_id = $1")
-                .bind(repo_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM shardline_hub_revisions WHERE repo_id = $1")
-                .bind(repo_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM shardline_hub_repos WHERE repo_id = $1")
-                .bind(repo_id)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await
-        }
-        .await;
-        if let Err(e) = cleanup_result {
-            eprintln!("cleanup: failed to remove repository {repo_id}: {e}");
-        }
-        if let Err(e) = sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'MetadataCommit'
-               AND operation_id LIKE $1 || '%'",
-        )
-        .bind(format!("{}:{repo_id}", repo_id.len()))
-        .execute(store.pool())
-        .await
-        {
-            eprintln!("cleanup: failed to delete repository evidence for {repo_id}: {e}");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1705,7 +1819,6 @@ mod tests {
             return;
         };
         let store = make_store(pool);
-        cleanup_repo(&store, "pg-create-get").await;
 
         let repo = store
             .create_repo(HubRepoType::Model, "pg-create-get", false)
@@ -1739,8 +1852,6 @@ mod tests {
             before, after,
             "duplicate creation must not append ref evidence"
         );
-
-        cleanup_repo(&store, "pg-create-get").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1751,7 +1862,6 @@ mod tests {
         };
         let store = make_store(pool);
         let repo = "pg-create-race";
-        cleanup_repo(&store, repo).await;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut creators = Vec::new();
         for attempt in 0..8 {
@@ -1777,7 +1887,6 @@ mod tests {
             store.get_repo(repo).unwrap().unwrap().private,
             winner.unwrap()
         );
-        cleanup_repo(&store, repo).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1788,7 +1897,6 @@ mod tests {
         };
         let store = make_store(pool.clone());
         let repo_id = "pg-mixed-version-ref";
-        cleanup_repo(&store, repo_id).await;
         let original = store
             .create_repo(HubRepoType::Model, repo_id, false)
             .expect("create repo");
@@ -1810,7 +1918,6 @@ mod tests {
             store.get_repo(repo_id).expect("read after rejected write"),
             Some(original)
         );
-        cleanup_repo(&store, repo_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1821,7 +1928,6 @@ mod tests {
         };
         let store = make_store(pool.clone());
         let repo_id = "pg-list-search-tampered";
-        cleanup_repo(&store, repo_id).await;
 
         store
             .create_repo(HubRepoType::Model, repo_id, false)
@@ -1852,7 +1958,9 @@ mod tests {
         .execute(&pool)
         .await
         .expect("clean up tampered hub evidence");
-        cleanup_repo(&store, repo_id).await;
+        assert!(store.list_refs(repo_id).is_err());
+        assert!(store.list_repos().is_err());
+        assert!(store.search_repos(None, repo_id, 10).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1875,7 +1983,6 @@ mod tests {
             return;
         };
         let store = make_store(pool);
-        cleanup_repo(&store, "pg-rev-resolve").await;
 
         store
             .create_repo(HubRepoType::Model, "pg-rev-resolve", false)
@@ -1930,19 +2037,18 @@ mod tests {
 
         let sha = store.resolve_revision("pg-rev-resolve", "").unwrap();
         assert_eq!(sha.as_deref(), Some("rev2"));
-
-        cleanup_repo(&store, "pg-rev-resolve").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pg_delete_ref_preserves_commit_history_and_rejects_stale_delete() {
+        use crate::{HubRecoveryMode, HubRecoveryOutboxStore};
+
         let Some(pool) = connect_postgres().await else {
             eprintln!("skipping Postgres test: no DATABASE_URL");
             return;
         };
         let store = make_store(pool);
         let repo_id = "pg-delete-ref";
-        cleanup_repo(&store, repo_id).await;
 
         store
             .create_repo(HubRepoType::Model, repo_id, false)
@@ -1968,8 +2074,24 @@ mod tests {
         );
 
         store
+            .set_hub_recovery_mode(HubRecoveryMode::Shadow, Some("delete-test-deployment"))
+            .await
+            .unwrap();
+
+        store
             .delete_ref(repo_id, "refs/heads/feature", "feature-sha")
             .unwrap();
+        let item = store
+            .next_pending_hub_ref_event(repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.domain_sequence, 1);
+        assert_eq!(
+            item.event.before.refs[0].head_sha.as_deref(),
+            Some("feature-sha")
+        );
+        assert_eq!(item.event.after.refs[0].head_sha, None);
         assert_eq!(store.resolve_revision(repo_id, "feature").unwrap(), None);
         assert_eq!(
             store
@@ -1979,9 +2101,19 @@ mod tests {
             Some("feature-sha"),
             "deleting a ref must not remove the commit"
         );
+        assert!(store.delete_ref(repo_id, "feature", "feature-sha").is_err());
+        let last_sequence: i64 = sqlx::query_scalar(
+            "SELECT last_sequence FROM shardline_hub_recovery_sequences WHERE repo_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            last_sequence, 1,
+            "stale delete must not allocate a sequence"
+        );
         assert!(store.delete_ref(repo_id, "main", initial_sha).is_err());
-
-        cleanup_repo(&store, repo_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2045,14 +2177,6 @@ mod tests {
         assert!(!retrieved[0].is_lfs);
         assert_eq!(retrieved[1].path, "b.bin");
         assert!(retrieved[1].is_lfs);
-
-        if let Err(e) = sqlx::query("DELETE FROM shardline_hub_file_entries WHERE commit_sha = $1")
-            .bind("pg-commit-files")
-            .execute(store.pool())
-            .await
-        {
-            eprintln!("cleanup: failed to delete file entries for pg-commit-files: {e}");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2062,7 +2186,6 @@ mod tests {
             return;
         };
         let store = make_store(pool);
-        cleanup_repo(&store, "pg-concurrency").await;
 
         store
             .create_repo(HubRepoType::Model, "pg-concurrency", false)
@@ -2081,8 +2204,6 @@ mod tests {
             "stale",
         );
         assert!(result.is_err());
-
-        cleanup_repo(&store, "pg-concurrency").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2095,7 +2216,6 @@ mod tests {
         let second_store = make_store(pool.clone());
         let verifier = make_store(pool);
         let repo_id = "pg-concurrent-ref-cas";
-        cleanup_repo(&first_store, repo_id).await;
         first_store
             .create_repo(HubRepoType::Model, repo_id, false)
             .unwrap();
@@ -2125,7 +2245,6 @@ mod tests {
                 "second-sha"
             }
         );
-        cleanup_repo(&verifier, repo_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2138,7 +2257,6 @@ mod tests {
         let delete_store = make_store(pool.clone());
         let verifier = make_store(pool.clone());
         let repo_id = "pg-delete-push-race";
-        cleanup_repo(&push_store, repo_id).await;
         push_store
             .create_repo(HubRepoType::Model, repo_id, false)
             .unwrap();
@@ -2175,7 +2293,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dangling_files, 0);
-        cleanup_repo(&verifier, repo_id).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2185,7 +2302,6 @@ mod tests {
             return;
         };
         let store = make_store(pool);
-        cleanup_repo(&store, "pg-boxed").await;
 
         let boxed = BoxedHubStore::from_store(store);
 
@@ -2208,8 +2324,7 @@ mod tests {
         assert!(sha.is_some());
 
         // The initial empty-tree revision is shared by every new repository.
-        // Use a repository-specific revision for file entries so this test does
-        // not collide with cleanup performed by other Postgres tests.
+        // Give file entries their own revision to exercise revision publication.
         let initial_sha = sha.unwrap();
         let file_commit_sha = "pg-boxed-files";
         boxed
@@ -2243,7 +2358,6 @@ mod tests {
         };
         let store = make_store(pool.clone());
         let repo = "pg-strict-delete-lock";
-        cleanup_repo(&store, repo).await;
         store.create_repo(HubRepoType::Model, repo, true).unwrap();
         store
             .create_revision(repo, Some(EMPTY_HUB_REVISION), "old", "selected", "old")
@@ -2325,7 +2439,6 @@ mod tests {
                 .unwrap(),
             HubRefUpdateOutcome::Updated(_)
         ));
-        cleanup_repo(&store, repo).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pg_atomic_webhook_registration_handles_boundary_and_concurrency() {
@@ -2338,26 +2451,8 @@ mod tests {
             return;
         };
         let store = make_store(pool);
-        for repo in [
-            "bounded/case",
-            "bounded/Case",
-            "bounded/cap",
-            "bounded/duplicate",
-            "atomic-secret/target",
-        ] {
-            cleanup_repo(&store, repo).await;
-        }
         crate::hub::assert_atomic_webhook_registration(&store);
         crate::hub::assert_atomic_webhook_secret_upgrade(&store);
         eprintln!("PostgreSQL atomic webhook boundary and concurrency checks executed");
-        for repo in [
-            "bounded/case",
-            "bounded/Case",
-            "bounded/cap",
-            "bounded/duplicate",
-            "atomic-secret/target",
-        ] {
-            cleanup_repo(&store, repo).await;
-        }
     }
 }

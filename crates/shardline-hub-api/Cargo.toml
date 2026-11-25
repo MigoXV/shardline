@@ -10,13 +10,9 @@ readme = "README.md"
 description = "HuggingFace Hub API compatibility layer for Shardline."
 
 [dependencies]
-aes-gcm.workspace = true
-arrow-array.workspace = true
 arrow-json.workspace = true
-arrow-schema.workspace = true
 axum.workspace = true
 base64.workspace = true
-getrandom.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 chrono.workspace = true
@@ -24,18 +20,18 @@ flate2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 hex.workspace = true
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 sha1.workspace = true
 sha2.workspace = true
 shardline-index.workspace = true
-shardline-metrics.workspace = true
+shardline-metrics = { workspace = true, features = ["http"] }
 shardline-protocol.workspace = true
 shardline-protocol-adapters.workspace = true
 shardline-server-core.workspace = true
-shardline-storage.workspace = true
+shardline-storage = { workspace = true, features = ["s3"] }
 tempfile.workspace = true
 parquet.workspace = true
 thiserror.workspace = true
@@ -45,7 +41,9 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["rustls-tls"] }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 shardline-test-support = { workspace = true, features = ["docker"] }
 sqlx.workspace = true
 http-body-util = "0.1"

@@ -5,7 +5,10 @@ use axum::{
 use shardline_index::OciTagStore as _;
 use tower::ServiceExt;
 
-use super::test_helpers::{build_oci_postgres_test_cluster, build_oci_test_state, oci_test_router};
+use super::test_helpers::{
+    build_oci_postgres_test_cluster, build_oci_test_state, oci_test_router, send,
+    send_with_content_type, sha256_hex,
+};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const REPO: &str = "team/assets";
@@ -13,10 +16,9 @@ const TAG: &str = "latest";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_manifest_publication_fails_after_request_barrier_owner_loss() {
-    if std::env::var("DATABASE_URL").is_err() {
+    let Some(mut cluster) = build_oci_postgres_test_cluster().await else {
         return;
-    }
-    let mut cluster = build_oci_postgres_test_cluster().await.unwrap();
+    };
     let state = std::sync::Arc::get_mut(&mut cluster.node_a).unwrap();
     let backend = match &mut state.backend {
         crate::ServerBackend::Postgres(backend) => Some(backend),
@@ -96,12 +98,7 @@ async fn postgres_manifest_publication_fails_after_request_barrier_owner_loss() 
     )
     .await;
     assert_eq!(referrers.status(), StatusCode::OK);
-    let listing: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(referrers.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let listing = crate::test_support::json_body(referrers).await;
     assert_eq!(
         listing["manifests"].as_array().unwrap().len(),
         1,
@@ -113,7 +110,7 @@ async fn postgres_manifest_publication_fails_after_request_barrier_owner_loss() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_ordinary_gc_reclaims_row_scoped_abandoned_manifest_after_hold_release() {
     use shardline_index::{AsyncIndexStore as _, OciObjectStore as _};
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = shardline_test_support::postgres_fixture_url("DATABASE_URL") else {
         return;
     };
     let admin = sqlx::PgPool::connect(&url).await.unwrap();
@@ -129,28 +126,12 @@ async fn postgres_ordinary_gc_reclaims_row_scoped_abandoned_manifest_after_hold_
         .execute(&admin)
         .await
         .unwrap();
-    let mut scoped_url = url::Url::parse(&url).unwrap();
-    let old_options = scoped_url
-        .query_pairs()
-        .find(|(key, _)| key == "options")
-        .map_or_else(String::new, |(_, value)| value.into_owned());
-    let other_parameters: Vec<_> = scoped_url
-        .query_pairs()
-        .filter(|(key, _)| key != "options")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    scoped_url.set_query(None);
-    scoped_url
-        .query_pairs_mut()
-        .extend_pairs(other_parameters)
-        .append_pair("options", &format!("{old_options} -csearch_path={schema}"));
+    let scoped_url = crate::test_support::postgres_fixture::schema_url(&url, &schema);
     let url = scoped_url.as_str();
     let bootstrap = sqlx::PgPool::connect(url).await.unwrap();
     crate::apply_database_migrations(&bootstrap).await.unwrap();
     bootstrap.close().await;
-    let cluster = super::test_helpers::build_oci_postgres_test_cluster_for_url(url)
-        .await
-        .unwrap();
+    let cluster = super::test_helpers::build_oci_postgres_test_cluster_for_url(url).await;
     let backend = match &cluster.node_a.backend {
         crate::ServerBackend::Postgres(backend) => Some(backend),
         crate::ServerBackend::Local(_) => None,
@@ -345,10 +326,9 @@ async fn postgres_ordinary_gc_reclaims_row_scoped_abandoned_manifest_after_hold_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_interrupted_manifest_bytes_stay_hidden_until_publication() {
-    if std::env::var("DATABASE_URL").is_err() {
+    let Some(cluster) = build_oci_postgres_test_cluster().await else {
         return;
-    }
-    let cluster = build_oci_postgres_test_cluster().await.unwrap();
+    };
     let backend = match &cluster.node_a.backend {
         crate::ServerBackend::Postgres(backend) => Some(backend),
         crate::ServerBackend::Local(_) => None,
@@ -456,10 +436,9 @@ async fn postgres_interrupted_manifest_bytes_stay_hidden_until_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_manifest_dependency_pending_delete_returns_retryable_error() {
-    if std::env::var("DATABASE_URL").is_err() {
+    let Some(cluster) = build_oci_postgres_test_cluster().await else {
         return;
-    }
-    let cluster = build_oci_postgres_test_cluster().await.unwrap();
+    };
     let backend = match &cluster.node_a.backend {
         crate::ServerBackend::Postgres(backend) => Some(backend),
         crate::ServerBackend::Local(_) => None,
@@ -556,39 +535,6 @@ fn test_manifest_json(config_digest: &str, layer_digest: &str) -> String {
         ]
     })
     .to_string()
-}
-
-/// Computes the SHA-256 hex digest of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
-}
-
-// ── helpers ─────────────────────────────────────────────────────────
-
-async fn send(
-    app: &axum::Router,
-    method: Method,
-    uri: &str,
-    body: Body,
-) -> axum::http::Response<Body> {
-    send_with_content_type(app, method, uri, body, "application/octet-stream").await
-}
-
-async fn send_with_content_type(
-    app: &axum::Router,
-    method: Method,
-    uri: &str,
-    body: Body,
-    content_type: &str,
-) -> axum::http::Response<Body> {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(body)
-        .unwrap();
-    app.clone().oneshot(request).await.unwrap()
 }
 
 /// Uploads a blob directly to the registry via POST with `?digest=` query.
@@ -1029,10 +975,7 @@ async fn manifest_delete_cleans_up_tag() {
     let tags_uri = format!("/v2/{REPO}/tags/list");
     let response = send(&app, Method::GET, &tags_uri, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let body = crate::test_support::json_body(response).await;
     assert_eq!(body["tags"], serde_json::json!([]));
 }
 
@@ -1152,12 +1095,7 @@ async fn tags_list_empty_repository() {
             .unwrap(),
         "application/json"
     );
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let body = crate::test_support::json_body(response).await;
     assert_eq!(body["name"], REPO);
     assert_eq!(body["tags"], serde_json::json!([]));
 }
@@ -1172,67 +1110,58 @@ async fn tags_list_with_manifest() {
     let response = send(&app, Method::GET, &uri, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let body = crate::test_support::json_body(response).await;
     assert_eq!(body["name"], REPO);
     let tags = body["tags"].as_array().unwrap();
     assert!(tags.contains(&serde_json::json!(TAG)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tags_list_with_n_zero_returns_empty() {
+async fn tags_list_pagination_covers_zero_partial_and_complete_pages() {
     let ctx = build_oci_test_state().await;
     let app = oci_test_router(&ctx.state);
-    setup_manifest(&app, REPO, TAG).await;
-
-    let uri = format!("/v2/{REPO}/tags/list?n=0");
-    let response = send(&app, Method::GET, &uri, Body::empty()).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    // Must NOT have Link header when n=0
-    let has_link = response.headers().get(header::LINK).is_some();
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(!has_link);
-    let tags = body["tags"].as_array().unwrap();
-    assert!(tags.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tags_list_with_pagination() {
-    let ctx = build_oci_test_state().await;
-    let app = oci_test_router(&ctx.state);
-
-    // Upload manifests with different tags
-    for tag in ["alpha", "beta", "gamma"] {
+    for tag in ["gamma", "alpha", "beta"] {
         setup_manifest(&app, REPO, tag).await;
     }
 
-    // Request page of size 2
-    let uri = format!("/v2/{REPO}/tags/list?n=2");
-    let response = send(&app, Method::GET, &uri, Body::empty()).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    for (size, expected_tags, expected_link) in [
+        (0, serde_json::json!([]), None),
+        (
+            2,
+            serde_json::json!(["alpha", "beta"]),
+            Some(format!(
+                "</v2/{REPO}/tags/list?n=2&last=beta>; rel=\"next\""
+            )),
+        ),
+        (3, serde_json::json!(["alpha", "beta", "gamma"]), None),
+    ] {
+        let uri = format!("/v2/{REPO}/tags/list?n={size}");
+        let response = send(&app, Method::GET, &uri, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LINK)
+                .map(|link| link.to_str().unwrap()),
+            expected_link.as_deref(),
+            "n={size}"
+        );
+        let body = crate::test_support::json_body(response).await;
+        assert_eq!(body["name"], REPO);
+        assert_eq!(body["tags"], expected_tags, "n={size}");
+    }
 
-    // Should have a Link header for the next page
-    let link = response.headers().get(header::LINK).cloned();
-    let body: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
+    let response = send(
+        &app,
+        Method::GET,
+        &format!("/v2/{REPO}/tags/list?n=2&last=beta"),
+        Body::empty(),
     )
-    .unwrap();
-    let tags = body["tags"].as_array().unwrap();
-    assert_eq!(tags.len(), 2);
-    assert!(link.is_some(), "expected Link header for pagination");
-    let link_str = link.unwrap().to_str().unwrap().to_owned();
-    assert!(link_str.contains("rel=\"next\""));
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::LINK));
+    let body = crate::test_support::json_body(response).await;
+    assert_eq!(body["tags"], serde_json::json!(["gamma"]));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1834,19 +1763,9 @@ async fn manifest_integrity_and_rejection_local() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manifest_integrity_and_rejection_postgres() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Some(cluster) = build_oci_postgres_test_cluster().await else {
         return;
     };
-    let pool = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("configured PostgreSQL must connect");
-    crate::apply_database_migrations(&pool)
-        .await
-        .expect("apply migrations");
-    pool.close().await;
-    let cluster = build_oci_postgres_test_cluster()
-        .await
-        .expect("configured PostgreSQL cluster must initialize");
     let run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

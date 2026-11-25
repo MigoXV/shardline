@@ -81,15 +81,19 @@ mod config;
 mod database_migration;
 pub mod download_stream;
 mod error;
+mod external_jwt_claims;
 mod fsck;
 #[cfg(feature = "fuzzing")]
 mod fuzz;
 pub(crate) mod gc;
 mod gc_runtime;
+mod hub_checkpoint;
+mod hub_recovery_resources;
 mod hub_secret_upgrade;
 mod ingest_bench;
 mod jwks_provider;
 mod jwt_algorithm;
+mod jwt_keys;
 mod lifecycle_repair;
 mod local_backend;
 mod local_fs;
@@ -119,6 +123,7 @@ mod runtime_check;
 mod server_frontend;
 mod server_role;
 mod storage_migration;
+mod storage_stats;
 pub mod task_tracking;
 pub mod test_fixtures;
 pub mod test_invariant_error;
@@ -193,8 +198,10 @@ pub use fuzz::{
 };
 pub use gc::{
     DEFAULT_LOCAL_GC_RETENTION_SECONDS, LocalGcDiagnostics, LocalGcOptions, LocalGcReport,
+    MINIMUM_GC_RETENTION_SECONDS,
 };
 pub use gc_runtime::{run_gc, run_gc_diagnostics};
+pub use hub_checkpoint::create_hub_ref_state_checkpoint;
 pub use ingest_bench::ingest_without_storage_with_parallelism;
 pub use lifecycle_repair::{
     DEFAULT_WEBHOOK_DELIVERY_RETENTION_SECONDS, LifecycleRepairBoundary, LifecycleRepairOptions,
@@ -224,7 +231,7 @@ pub use server_frontend::{ServerFrontend, ServerFrontendParseError};
 pub use server_role::{ServerRole, ServerRoleParseError};
 pub(crate) use shardline_protocol_adapters::{
     LFS_CONTENT_TYPE, LfsBatchRequest, LfsBatchResponse, LfsObjectError, LfsObjectResponse,
-    LfsOperation, TransferAdapter, cas_headers,
+    LfsOperation, cas_headers,
 };
 pub(crate) use shardline_xet_adapter::ShardUploadResponse;
 pub use storage_migration::{

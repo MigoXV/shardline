@@ -550,8 +550,9 @@ const SHARDLINE_MIGRATIONS: [DatabaseMigration; 35] = [
 ];
 
 // These tables extend frontend capabilities without changing the released
-// storage schema. Their installation history must not prevent old restarts.
-const FRONTEND_MIGRATIONS: [DatabaseMigration; 8] = [
+// core ledger. Acceptance of predecessor frontend history is qualified
+// separately; this does not promise unrestricted old-binary restarts.
+const FRONTEND_MIGRATIONS: [DatabaseMigration; 11] = [
     DatabaseMigration {
         version: "20261021000000",
         name: "xet_file_identities",
@@ -599,6 +600,26 @@ const FRONTEND_MIGRATIONS: [DatabaseMigration; 8] = [
         name: "hub_creation_policy",
         up_sql: include_str!("../migrations/20261024000000_hub_creation_policy.up.sql"),
         down_sql: include_str!("../migrations/20261024000000_hub_creation_policy.down.sql"),
+    },
+    DatabaseMigration {
+        version: "20261115000000",
+        name: "deduplication_domains",
+        up_sql: include_str!("../migrations/20261115000000_deduplication_domains.up.sql"),
+        down_sql: include_str!("../migrations/20261115000000_deduplication_domains.down.sql"),
+    },
+    DatabaseMigration {
+        version: "20261117000000",
+        name: "record_membership_domain_once",
+        up_sql: include_str!("../migrations/20261117000000_record_membership_domain_once.up.sql"),
+        down_sql: include_str!(
+            "../migrations/20261117000000_record_membership_domain_once.down.sql"
+        ),
+    },
+    DatabaseMigration {
+        version: "20261124000000",
+        name: "hub_recovery_outbox",
+        up_sql: include_str!("../migrations/20261124000000_hub_recovery_outbox.up.sql"),
+        down_sql: include_str!("../migrations/20261124000000_hub_recovery_outbox.down.sql"),
     },
 ];
 
@@ -2970,7 +2991,7 @@ mod tests {
     #[test]
     fn bundled_migrations_have_expected_count() {
         assert_eq!(bundled_database_migrations().len(), 35);
-        assert_eq!(super::FRONTEND_MIGRATIONS.len(), 8);
+        assert_eq!(super::FRONTEND_MIGRATIONS.len(), 11);
     }
 
     #[test]

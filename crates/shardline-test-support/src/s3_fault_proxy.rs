@@ -21,6 +21,8 @@ pub enum S3ProxyFault {
     DelaySuccessfulPutResponse(Duration),
     /// Return one retryable `503 Service Unavailable` without contacting the provider.
     ServiceUnavailableOnce,
+    /// Return one `412 Precondition Failed` for an If-Match GET.
+    ConditionalRangePreconditionFailedOnce,
     /// Forward successful GET headers, pause, then forward the original body.
     DelaySuccessfulGetBody(Duration),
     /// Pause a successful GET body only when its request path has this suffix.
@@ -104,29 +106,37 @@ impl S3FaultProxy {
         let worker_injected = Arc::clone(&injected);
         let (stop, stopped) = mpsc::channel();
         let thread = thread::spawn(move || {
-            loop {
-                if stopped.try_recv().is_ok() {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((client, _address)) => {
-                        proxy_one_s3_request(
-                            client,
-                            &upstream,
-                            fault.clone(),
-                            &worker_armed,
-                            &worker_injected,
-                            &worker_requests,
-                            &worker_get_response_bytes,
-                        )
-                        .ok();
+            // A streamed response may wait for a client that needs another
+            // object first. Serve connections independently, and join them all
+            // before proxy shutdown completes.
+            let forward = |client| {
+                proxy_one_s3_request(
+                    client,
+                    &upstream,
+                    fault.clone(),
+                    &worker_armed,
+                    &worker_injected,
+                    &worker_requests,
+                    &worker_get_response_bytes,
+                )
+                .ok();
+            };
+            thread::scope(|scope| {
+                loop {
+                    if stopped.try_recv().is_ok() {
+                        break;
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
+                    match listener.accept() {
+                        Ok((client, _address)) => {
+                            scope.spawn(move || forward(client));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_error) => break,
                     }
-                    Err(_error) => break,
                 }
-            }
+            });
         });
         Ok(Self {
             endpoint,
@@ -252,6 +262,19 @@ fn proxy_one_s3_request(
         requests.head.fetch_add(1, Ordering::AcqRel);
     }
     let is_delete = request.starts_with(b"DELETE ");
+    let has_if_match = request
+        .windows(b"if-match:".len())
+        .any(|window| window.eq_ignore_ascii_case(b"if-match:"));
+    if is_get
+        && has_if_match
+        && matches!(fault, S3ProxyFault::ConditionalRangePreconditionFailedOnce)
+        && mark_injected(armed, injected)
+    {
+        client.write_all(
+            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
     if is_put
         && matches!(fault, S3ProxyFault::ServiceUnavailableOnce)
         && mark_injected(armed, injected)
@@ -325,6 +348,7 @@ fn proxy_one_s3_request(
         | S3ProxyFault::DropAcceptedDelete
         | S3ProxyFault::DelaySuccessfulPutResponse(_)
         | S3ProxyFault::ServiceUnavailableOnce
+        | S3ProxyFault::ConditionalRangePreconditionFailedOnce
         | S3ProxyFault::DelaySuccessfulGetBodyForPath { .. }
         | S3ProxyFault::ReplaceSuccessfulGetBody(_) => None,
     };

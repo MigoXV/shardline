@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain};
+use crate::operation::length_prefixed_operation_id;
+use crate::snapshot_event::{
+    SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain, verify_snapshot_chain_for,
+};
 use crate::snapshot_log::{SnapshotEvidenceLog, verify_and_append_snapshot_transition};
 use crate::{OperationIdentity, OperationKind, ReliabilityError};
 
@@ -45,19 +48,12 @@ impl WebhookDeliveryOperationId {
     /// Derives the canonical, unambiguous operation ID for one delivery.
     #[must_use]
     pub fn new(identity: &WebhookDeliveryIdentity) -> Self {
-        let fields = [
+        Self(length_prefixed_operation_id(&[
             identity.provider.as_str(),
             identity.owner.as_str(),
             identity.repo.as_str(),
             identity.delivery_id.as_str(),
-        ];
-        Self(
-            fields
-                .into_iter()
-                .map(|field| format!("{}:{field}", field.len()))
-                .collect::<Vec<_>>()
-                .join(""),
-        )
+        ]))
     }
 
     #[must_use]
@@ -217,12 +213,7 @@ pub fn verify_webhook_delivery_events(
     events: &[WebhookDeliveryLifecycleEvent],
     expected: &WebhookDeliverySnapshot,
 ) -> Result<(), ReliabilityError> {
-    verify_webhook_delivery_chain(events)?;
-    if events.last().is_some_and(|event| event.after == *expected) {
-        Ok(())
-    } else {
-        Err(ReliabilityError::StateMismatch)
-    }
+    verify_snapshot_chain_for(events, expected)
 }
 
 /// Reclaims a delivery whose failed application released its deduplication

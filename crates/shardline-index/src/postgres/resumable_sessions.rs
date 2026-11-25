@@ -1,3 +1,5 @@
+use crate::store::escape_like;
+
 use std::{collections::HashMap, num::NonZeroU64, time::Duration};
 
 use shardline_reliability::{
@@ -10,21 +12,30 @@ use super::{
     load_postgres_latest_evidence_heads, next_reliability_sequence, u64_to_i64,
 };
 use crate::{
-    CreateResumableSessionOutcome, PublishResumablePartOutcome, ResumablePartRange,
-    ResumableSession, ResumableSessionError, ResumableSessionGcInventory, ResumableSessionPart,
-    ResumableSessionProtocol, ResumableSessionState,
+    CreateResumableSessionOutcome, PublishResumablePartOutcome, ResumableCompletionFence,
+    ResumablePartRange, ResumableSession, ResumableSessionError, ResumableSessionGcInventory,
+    ResumableSessionPart, ResumableSessionProtocol, ResumableSessionState,
 };
 
 const SESSION_ACCOUNTING_LOCK_ID: i64 = 0x5348_5244_5345_5353;
 
 mod listing_snapshot;
 
-/// Escapes LIKE wildcards in user-supplied values to prevent pattern injection.
-fn escape_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+/// Locks a live completion claim until the caller commits or rolls back publication.
+pub(super) async fn lock_completion_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    fence: &ResumableCompletionFence,
+) -> Result<Option<(String, String)>, PostgresMetadataStoreError> {
+    Ok(sqlx::query_as(
+        "SELECT scope_namespace, target_key FROM shardline_resumable_sessions
+         WHERE session_id = $1 AND state = 'completing' AND fence_epoch = $2
+         AND expires_at > clock_timestamp()
+         FOR UPDATE",
+    )
+    .bind(fence.session_id())
+    .bind(u64_to_i64(fence.epoch().get())?)
+    .fetch_optional(&mut **transaction)
+    .await?)
 }
 
 fn session_from_row(
@@ -153,6 +164,22 @@ async fn verify_resumable_session_page(
     Ok(())
 }
 
+async fn verified_sessions_from_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    rows: &[sqlx::postgres::PgRow],
+) -> Result<Vec<ResumableSession>, PostgresMetadataStoreError> {
+    let sessions = rows
+        .iter()
+        .map(session_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let stored_digests = rows
+        .iter()
+        .map(|row| row.try_get("state_digest"))
+        .collect::<Result<Vec<Option<String>>, sqlx::Error>>()?;
+    verify_resumable_session_page(transaction, &sessions, &stored_digests).await?;
+    Ok(sessions)
+}
+
 pub(crate) async fn refresh_resumable_state_digest(
     transaction: &mut Transaction<'_, Postgres>,
     session_id: &str,
@@ -240,7 +267,7 @@ impl PostgresIndexStore {
         )
         .fetch_all(&mut *transaction)
         .await?;
-        let live_sessions = live_rows
+        let mut inventory = live_rows
             .iter()
             .map(|row| {
                 Ok::<_, PostgresMetadataStoreError>((
@@ -259,25 +286,15 @@ impl PostgresIndexStore {
         )
         .fetch_all(&mut *transaction)
         .await?;
-        let reclaimable_sessions = candidate_rows
-            .iter()
-            .map(|row| {
-                Ok::<_, PostgresMetadataStoreError>((
-                    session_from_row(row)?,
-                    row.try_get::<Option<String>, _>("state_digest")?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let inventory_sessions = live_sessions
-            .iter()
-            .chain(reclaimable_sessions.iter())
-            .map(|(session, _)| session.clone())
-            .collect::<Vec<_>>();
-        let inventory_digests = live_sessions
-            .iter()
-            .chain(reclaimable_sessions.iter())
-            .map(|(_, stored_digest)| stored_digest.clone())
-            .collect::<Vec<_>>();
+        let reclaimable_start = inventory.len();
+        for row in &candidate_rows {
+            inventory.push((
+                session_from_row(row)?,
+                row.try_get::<Option<String>, _>("state_digest")?,
+            ));
+        }
+        let (mut inventory_sessions, inventory_digests): (Vec<_>, Vec<_>) =
+            inventory.into_iter().unzip();
         verify_resumable_session_page(&mut transaction, &inventory_sessions, &inventory_digests)
             .await?;
         transaction.commit().await?;
@@ -290,10 +307,7 @@ impl PostgresIndexStore {
             .await?;
         Ok(ResumableSessionGcInventory::new(
             protected_staging_keys,
-            reclaimable_sessions
-                .into_iter()
-                .map(|(session, _)| session)
-                .collect(),
+            inventory_sessions.split_off(reclaimable_start),
         ))
     }
 
@@ -335,20 +349,8 @@ impl PostgresIndexStore {
             .bind(&candidate_ids)
             .fetch_all(&mut *validation_transaction)
             .await?;
-            let authoritative = rows
-                .iter()
-                .map(session_from_row)
-                .collect::<Result<Vec<_>, _>>()?;
-            let stored_digests = rows
-                .iter()
-                .map(|row| row.try_get("state_digest"))
-                .collect::<Result<Vec<Option<String>>, sqlx::Error>>()?;
-            verify_resumable_session_page(
-                &mut validation_transaction,
-                &authoritative,
-                &stored_digests,
-            )
-            .await?;
+            let authoritative =
+                verified_sessions_from_rows(&mut validation_transaction, &rows).await?;
             for candidate in candidates {
                 if let Some(current) = authoritative
                     .iter()
@@ -712,43 +714,13 @@ impl PostgresIndexStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *transaction)
             .await?;
-        let rows = sqlx::query(
-            "SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id = $2 ORDER BY sequence",
-        )
-        .bind("ResumableSession")
-        .bind(session_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        let mut event_json = Vec::with_capacity(rows.len());
-        let mut merkle_commits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let sequence: i64 = row.try_get("sequence")?;
-            if sequence < 0 {
-                return Err(PostgresMetadataStoreError::IntegerOutOfRange(
-                    "reliability sequence".into(),
-                ));
-            }
-            let value: serde_json::Value = row.try_get("event_json")?;
-            let event = serde_json::from_value::<StateTransitionEvent>(value.clone())?;
-            if u64_to_i64(event.sequence)? != sequence {
-                return Err(PostgresMetadataStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::Merkle(
-                        "resumable event sequence does not match its row".into(),
-                    ),
-                ));
-            }
-            events.push(event);
-            event_json.push(value);
-            merkle_commits.push(row.try_get("merkle_commit_json")?);
-        }
-        shardline_reliability::verify_persisted_event_merkle_chain(
-            shardline_reliability::OperationKind::ResumableSession,
-            &event_json,
-            &merkle_commits,
-        )?;
+        let events: Vec<StateTransitionEvent> =
+            super::index_store::load_postgres_reliability_events(
+                &mut transaction,
+                shardline_reliability::OperationKind::ResumableSession,
+                session_id,
+            )
+            .await?;
         let session = sqlx::query(
             "SELECT scope_namespace, target_key, state
              FROM shardline_resumable_sessions
@@ -1625,15 +1597,7 @@ impl PostgresIndexStore {
         .bind(limit)
         .fetch_all(&mut *transaction)
         .await?;
-        let sessions = rows
-            .iter()
-            .map(session_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let stored_digests = rows
-            .iter()
-            .map(|row| row.try_get("state_digest"))
-            .collect::<Result<Vec<Option<String>>, sqlx::Error>>()?;
-        verify_resumable_session_page(&mut transaction, &sessions, &stored_digests).await?;
+        let sessions = verified_sessions_from_rows(&mut transaction, &rows).await?;
         transaction.commit().await?;
         Ok(sessions)
     }
@@ -1711,15 +1675,7 @@ impl PostgresIndexStore {
         .bind(protocol.map(ResumableSessionProtocol::as_str))
         .fetch_all(&mut *transaction)
         .await?;
-        let sessions = rows
-            .iter()
-            .map(session_from_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let stored_digests = rows
-            .iter()
-            .map(|row| row.try_get("state_digest"))
-            .collect::<Result<Vec<Option<String>>, sqlx::Error>>()?;
-        verify_resumable_session_page(&mut transaction, &sessions, &stored_digests).await?;
+        let sessions = verified_sessions_from_rows(&mut transaction, &rows).await?;
         transaction.commit().await?;
         Ok(sessions)
     }
@@ -1800,72 +1756,19 @@ mod tests {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
     pub(super) async fn store() -> Option<PostgresIndexStore> {
-        let pool = super::super::connect_isolated_postgres().await?;
-        sqlx::raw_sql(include_str!(
-            "../../../../migrations/20260823000000_resumable_sessions.up.sql"
+        // The shared fixture copies the migrated tables and their triggers.
+        Some(PostgresIndexStore::new(
+            super::super::connect_isolated_postgres().await?,
         ))
-        .execute(&pool)
-        .await
-        .ok()?;
-        sqlx::raw_sql(include_str!(
-            "../../../../migrations/20260922000000_reliability_events.up.sql"
-        ))
-        .execute(&pool)
-        .await
-        .ok()?;
-        let has_state_digest: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'shardline_resumable_sessions'
-                   AND column_name = 'state_digest'
-             )",
-        )
-        .fetch_one(&pool)
-        .await
-        .ok()?;
-        if !has_state_digest {
-            sqlx::raw_sql(include_str!(
-                "../../../../migrations/20260924000000_resumable_state_digest.up.sql"
-            ))
-            .execute(&pool)
-            .await
-            .ok()?;
-        }
-        sqlx::raw_sql(include_str!(
-            "../../../../migrations/20261001000000_resumable_session_reliability_gate.up.sql"
-        ))
-        .execute(&pool)
-        .await
-        .ok()?;
-        Some(PostgresIndexStore::new(pool))
     }
 
-    /// Removes rows whose `session_id` begins with one of `prefixes` so tests
-    /// that assert exact result counts are idempotent across repeated runs.
-    async fn cleanup_session_prefixes(store: &PostgresIndexStore, prefixes: &[&str]) {
-        for prefix in prefixes {
-            let escaped = prefix
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            sqlx::query(
-                "DELETE FROM shardline_resumable_sessions
-                 WHERE session_id LIKE $1 || '%' ESCAPE '\\'",
-            )
-            .bind(escaped)
-            .execute(store.pool())
-            .await
-            .ok();
-            sqlx::query(
-                "DELETE FROM shardline_reliability_events
-                 WHERE operation_kind = $1 AND operation_id LIKE $2 || '%' ESCAPE '\\'",
-            )
-            .bind("ResumableSession")
-            .bind(prefix)
-            .execute(store.pool())
-            .await
-            .ok();
-        }
+    fn future_expiry() -> Duration {
+        Duration::from_secs(
+            u64::try_from(chrono::Utc::now().timestamp())
+                .unwrap()
+                .checked_add(3600)
+                .unwrap(),
+        )
     }
 
     pub(super) fn session(prefix: &str, expires_at: Duration) -> ResumableSession {
@@ -1885,8 +1788,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry =
-            Duration::from_secs(u64::try_from(chrono::Utc::now().timestamp()).unwrap() + 3600);
+        let expiry = future_expiry();
         let active = session("bound-active", expiry);
         let completing = session("bound-completing", expiry);
         let candidate = session("bound-create", expiry);
@@ -1989,9 +1891,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let first = session("bounded-first", expiry)
             .with_attributes_json(r#"{"bucket":"models"}"#.to_owned())
             .expect("valid attributes");
@@ -2056,9 +1956,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let original = session("reuse", expiry);
         assert!(store.create_resumable_session(&original).await.unwrap());
         assert!(
@@ -2111,9 +2009,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let session = session("reopen-failed-completion", expiry);
         assert!(store.create_resumable_session(&session).await.unwrap());
 
@@ -2183,9 +2079,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let session = session("read-evidence", expiry);
         assert!(store.create_resumable_session(&session).await.unwrap());
 
@@ -2203,6 +2097,12 @@ mod tests {
             store.resumable_session_by_id(session.session_id()).await,
             Err(PostgresMetadataStoreError::Reliability(_))
         ));
+        assert!(matches!(
+            store
+                .resumable_reliability_events(session.session_id())
+                .await,
+            Err(PostgresMetadataStoreError::Reliability(_))
+        ));
         sqlx::query("DELETE FROM shardline_resumable_sessions WHERE session_id = $1")
             .bind(session.session_id())
             .execute(store.pool())
@@ -2216,9 +2116,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let session = session("mixed-version-state", expiry);
         assert!(store.create_resumable_session(&session).await.unwrap());
 
@@ -2251,9 +2149,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let session = session("mixed-version-part", expiry);
         assert!(store.create_resumable_session(&session).await.unwrap());
         assert!(
@@ -2302,9 +2198,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         let session = session("parts", expiry);
         assert!(store.create_resumable_session(&session).await.unwrap());
 
@@ -2459,10 +2353,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
-        cleanup_session_prefixes(&store, &["gc-live-", "gc-terminal-"]).await;
+        let expiry = future_expiry();
         let live = session("gc-live", expiry);
         let terminal = session("gc-terminal", expiry);
         assert!(store.create_resumable_session(&live).await.unwrap());
@@ -2573,13 +2464,10 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         // Seed a deterministic set of active sessions whose ids sort in a known
         // order. The session() helper already prefixes ids with "keyset", so
         // query on that shared prefix.
-        cleanup_session_prefixes(&store, &["keyset-"]).await;
         let mut expected: Vec<String> = Vec::new();
         for _ in 0..5u32 {
             let s = session("keyset", expiry);
@@ -2632,10 +2520,7 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
-        cleanup_session_prefixes(&store, &["special-"]).await;
+        let expiry = future_expiry();
         // Insert an active session with a literal % and _ in its id.
         let special = ResumableSession::new(
             format!("special-a%b_1-{}", std::process::id()),
@@ -2704,11 +2589,8 @@ mod tests {
             eprintln!("skipping: no reachable DATABASE_URL");
             return;
         };
-        let expiry = Duration::from_secs(
-            u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 3600,
-        );
+        let expiry = future_expiry();
         // Seed interleaved active/completing/terminal ids under one prefix.
-        cleanup_session_prefixes(&store, &["inflight-"]).await;
         let mut seeded: Vec<(ResumableSession, ResumableSessionState)> = Vec::new();
         for i in 0..5u32 {
             let state = if i % 2 == 0 {

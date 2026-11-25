@@ -178,13 +178,13 @@ pub struct Contents {
 }
 
 impl Contents {
-    fn to_xml(&self, owner_id: Option<&str>) -> String {
+    fn to_xml(&self, owner_id: Option<&str>, url_encoding: bool) -> String {
         let owner = owner_id
             .map(|id| format!("    <Owner><ID>{}</ID></Owner>\n", xml_escape(id)))
             .unwrap_or_default();
         format!(
             "  <Contents>\n    <Key>{}</Key>\n    <Size>{}</Size>\n    <ETag>{}</ETag>\n    <LastModified>{}</LastModified>\n{owner}  </Contents>\n",
-            xml_escape(&self.key),
+            listing_xml_value(&self.key, url_encoding),
             self.size_bytes,
             etag_header(&self.etag),
             xml_escape(&self.last_modified_iso8601),
@@ -208,42 +208,40 @@ pub struct ListObjectsV2ResponseContext<'request> {
     pub owner_id: Option<&'request str>,
 }
 
-fn listing_wire_value(value: &str, url_encoding: bool) -> String {
-    if !url_encoding {
-        return value.to_owned();
+/// Encodes a listing field when the request selects S3's `encoding-type=url`.
+#[must_use]
+pub fn listing_wire_value(value: &str, url_encoding: bool) -> String {
+    if url_encoding {
+        crate::sigv4::encode(value)
+    } else {
+        value.to_owned()
     }
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(char::from(byte))
-            }
-            _ => {
-                encoded.push('%');
-                // Both nibble conversions are bounded to 0..16.
-                encoded.push(
-                    char::from_digit(u32::from(byte >> 4), 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-                encoded.push(
-                    char::from_digit(u32::from(byte & 15), 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-            }
-        }
-    }
-    encoded
 }
 
-fn encode_listing_rows(contents: &mut [Contents], prefixes: &mut [String]) {
-    for entry in contents {
-        entry.key = listing_wire_value(&entry.key, true);
+fn listing_xml_value(value: &str, url_encoding: bool) -> String {
+    if url_encoding {
+        xml_escape(&listing_wire_value(value, true))
+    } else {
+        xml_escape(value)
     }
-    for prefix in prefixes {
-        *prefix = listing_wire_value(prefix, true);
-    }
+}
+
+fn listing_rows_xml(
+    contents: &[Contents],
+    prefixes: &[String],
+    owner_id: Option<&str>,
+    url_encoding: bool,
+) -> String {
+    contents
+        .iter()
+        .map(|content| content.to_xml(owner_id, url_encoding))
+        .chain(prefixes.iter().map(|prefix| {
+            format!(
+                "  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>\n",
+                listing_xml_value(prefix, url_encoding)
+            )
+        }))
+        .collect()
 }
 
 fn append_listing_fields(xml: &mut String, fields: &str) {
@@ -270,11 +268,7 @@ impl ListBucketResult {
     /// encoding. Opaque continuation tokens retain their original values.
     #[must_use]
     pub fn to_xml_with_context(&self, context: ListObjectsV2ResponseContext<'_>) -> String {
-        let mut result = self.clone();
-        if context.url_encoding {
-            encode_listing_rows(&mut result.contents, &mut result.common_prefixes);
-        }
-        let mut xml = result.to_xml_with_owner(context.owner_id);
+        let mut xml = self.to_xml_with_owner(context.owner_id, context.url_encoding);
         let mut fields = format!(
             "  <Prefix>{}</Prefix>\n",
             xml_escape(&listing_wire_value(context.prefix, context.url_encoding))
@@ -306,25 +300,16 @@ impl ListBucketResult {
     /// Serializes the result to the S3 `ListBucketResult` XML envelope.
     #[must_use]
     pub fn to_xml(&self) -> String {
-        self.to_xml_with_owner(None)
+        self.to_xml_with_owner(None, false)
     }
 
-    fn to_xml_with_owner(&self, owner_id: Option<&str>) -> String {
-        let contents = self
-            .contents
-            .iter()
-            .map(|content| content.to_xml(owner_id))
-            .collect::<String>();
-        let common_prefixes = self
-            .common_prefixes
-            .iter()
-            .map(|prefix| {
-                format!(
-                    "  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>\n",
-                    xml_escape(prefix)
-                )
-            })
-            .collect::<String>();
+    fn to_xml_with_owner(&self, owner_id: Option<&str>, url_encoding: bool) -> String {
+        let rows = listing_rows_xml(
+            &self.contents,
+            &self.common_prefixes,
+            owner_id,
+            url_encoding,
+        );
         let continuation = self
             .next_continuation_token
             .as_ref()
@@ -336,7 +321,7 @@ impl ListBucketResult {
             })
             .unwrap_or_default();
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n{contents}{common_prefixes}  <IsTruncated>{}</IsTruncated>\n{continuation}</ListBucketResult>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n{rows}  <IsTruncated>{}</IsTruncated>\n{continuation}</ListBucketResult>\n",
             self.is_truncated,
         )
     }
@@ -370,60 +355,45 @@ impl ListBucketResultV1 {
     /// keys, prefix, delimiter and markers. Bucket names are unchanged.
     #[must_use]
     pub fn to_xml_with_url_encoding(&self, url_encoding: bool) -> String {
-        if !url_encoding {
-            return self.to_xml();
-        }
-        let mut result = self.clone();
-        encode_listing_rows(&mut result.contents, &mut result.common_prefixes);
-        result.prefix = listing_wire_value(&result.prefix, true);
-        result.marker = listing_wire_value(&result.marker, true);
-        result.delimiter = result
+        let rows = listing_rows_xml(&self.contents, &self.common_prefixes, None, url_encoding);
+        let delimiter = self
             .delimiter
-            .map(|value| listing_wire_value(&value, true));
-        result.next_marker = result
+            .as_ref()
+            .map(|delimiter| {
+                format!(
+                    "  <Delimiter>{}</Delimiter>\n",
+                    listing_xml_value(delimiter, url_encoding)
+                )
+            })
+            .unwrap_or_default();
+        let next_marker = self
             .next_marker
-            .map(|value| listing_wire_value(&value, true));
-        let mut xml = result.to_xml();
-        append_listing_fields(&mut xml, "  <EncodingType>url</EncodingType>\n");
+            .as_ref()
+            .map(|marker| {
+                format!(
+                    "  <NextMarker>{}</NextMarker>\n",
+                    listing_xml_value(marker, url_encoding)
+                )
+            })
+            .unwrap_or_default();
+        let mut xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <Marker>{}</Marker>\n  <MaxKeys>{}</MaxKeys>\n{delimiter}{rows}  <IsTruncated>{}</IsTruncated>\n{next_marker}</ListBucketResult>\n",
+            xml_escape(&self.name),
+            listing_xml_value(&self.prefix, url_encoding),
+            listing_xml_value(&self.marker, url_encoding),
+            self.max_keys,
+            self.is_truncated,
+        );
+        if url_encoding {
+            append_listing_fields(&mut xml, "  <EncodingType>url</EncodingType>\n");
+        }
         xml
     }
 
     /// Serializes the result to the S3 `ListBucketResult` (v1) XML envelope.
     #[must_use]
     pub fn to_xml(&self) -> String {
-        let contents = self
-            .contents
-            .iter()
-            .map(|content| content.to_xml(None))
-            .collect::<String>();
-        let common_prefixes = self
-            .common_prefixes
-            .iter()
-            .map(|prefix| {
-                format!(
-                    "  <CommonPrefixes>\n    <Prefix>{}</Prefix>\n  </CommonPrefixes>\n",
-                    xml_escape(prefix)
-                )
-            })
-            .collect::<String>();
-        let delimiter = self
-            .delimiter
-            .as_ref()
-            .map(|delimiter| format!("  <Delimiter>{}</Delimiter>\n", xml_escape(delimiter)))
-            .unwrap_or_default();
-        let next_marker = self
-            .next_marker
-            .as_ref()
-            .map(|marker| format!("  <NextMarker>{}</NextMarker>\n", xml_escape(marker)))
-            .unwrap_or_default();
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <Marker>{}</Marker>\n  <MaxKeys>{}</MaxKeys>\n{delimiter}{contents}{common_prefixes}  <IsTruncated>{}</IsTruncated>\n{next_marker}</ListBucketResult>\n",
-            xml_escape(&self.name),
-            xml_escape(&self.prefix),
-            xml_escape(&self.marker),
-            self.max_keys,
-            self.is_truncated,
-        )
+        self.to_xml_with_url_encoding(false)
     }
 }
 
@@ -496,7 +466,7 @@ impl CompleteMultipartUploadResult {
         self.to_xml_with_checksum(
             self.checksum_crc32
                 .as_deref()
-                .map(|value| ("ChecksumCRC32", value)),
+                .map(|value| ("ChecksumCRC32", value, "COMPOSITE")),
         )
     }
 
@@ -504,7 +474,7 @@ impl CompleteMultipartUploadResult {
     /// response type's field layout.
     #[must_use]
     pub fn to_crc32c_xml(&self, checksum_crc32c: &str) -> String {
-        self.to_xml_with_checksum(Some(("ChecksumCRC32C", checksum_crc32c)))
+        self.to_xml_with_checksum(Some(("ChecksumCRC32C", checksum_crc32c, "COMPOSITE")))
     }
 
     /// Serializes a negotiated multipart checksum using its S3 XML field and
@@ -534,25 +504,17 @@ impl CompleteMultipartUploadResult {
                 "Invalid negotiated multipart checksum",
             ));
         }
-        let checksum = format!(
-            "  <{checksum_field}>{}</{checksum_field}>\n  <ChecksumType>{}</ChecksumType>\n",
-            xml_escape(checksum_value),
-            xml_escape(checksum_type),
-        );
-        Ok(self.to_xml_with_checksum_xml(&checksum))
+        Ok(self.to_xml_with_checksum(Some((checksum_field, checksum_value, checksum_type))))
     }
 
-    fn to_xml_with_checksum(&self, checksum: Option<(&str, &str)>) -> String {
-        let checksum = checksum.map_or_else(String::new, |(field, value)| {
+    fn to_xml_with_checksum(&self, checksum: Option<(&str, &str, &str)>) -> String {
+        let checksum = checksum.map_or_else(String::new, |(field, value, checksum_type)| {
             format!(
-                "  <{field}>{}</{field}>\n  <ChecksumType>COMPOSITE</ChecksumType>\n",
-                xml_escape(value)
+                "  <{field}>{}</{field}>\n  <ChecksumType>{}</ChecksumType>\n",
+                xml_escape(value),
+                xml_escape(checksum_type),
             )
         });
-        self.to_xml_with_checksum_xml(&checksum)
-    }
-
-    fn to_xml_with_checksum_xml(&self, checksum: &str) -> String {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <ETag>{}</ETag>\n{}</CompleteMultipartUploadResult>\n",
             xml_escape(&self.bucket),
@@ -694,16 +656,15 @@ enum XmlEvent<'value> {
 /// It scans for `<`/`>` tags, classifies element names through
 /// [`CompleteXmlElement::parse`], and yields text between tags. Processing
 /// instructions (`<?…?>`) and comments (`<!…>`) are skipped as non-matching
-/// elements; self-closing tags yield an open event only. Malformed input is
-/// tolerated (any tag that never closes terminates the scan).
+/// elements; self-closing tags yield an open event only. Unterminated tags
+/// return an error.
 struct CompleteXmlScanner<'value> {
-    body: &'value str,
-    offset: usize,
+    remaining: &'value str,
 }
 
 impl<'value> CompleteXmlScanner<'value> {
     const fn new(body: &'value str) -> Self {
-        Self { body, offset: 0 }
+        Self { remaining: body }
     }
 
     /// Yields the next XML event.
@@ -713,43 +674,31 @@ impl<'value> CompleteXmlScanner<'value> {
     /// Returns [`crate::S3Error::invalid_part`] when the input contains an
     /// unterminated tag (no closing `>`).
     fn next_event(&mut self) -> Result<XmlEvent<'value>, crate::S3Error> {
-        let rest = self
-            .body
-            .get(self.offset..)
-            .ok_or_else(crate::S3Error::invalid_part)?;
+        let rest = self.remaining;
         let Some(next_tag) = rest.find('<') else {
-            let trailing = rest;
-            self.offset = self.body.len();
-            return if trailing.is_empty() {
+            self.remaining = "";
+            return if rest.is_empty() {
                 Ok(XmlEvent::End)
             } else {
-                Ok(XmlEvent::Text(trailing))
+                Ok(XmlEvent::Text(rest))
             };
         };
         if next_tag > 0 {
-            let text = rest
-                .get(..next_tag)
-                .ok_or_else(crate::S3Error::invalid_part)?;
-            self.offset = self.offset.saturating_add(next_tag);
+            // `find` returns a UTF-8 character boundary within `rest`.
+            let (text, remaining) = rest.split_at(next_tag);
+            self.remaining = remaining;
             return Ok(XmlEvent::Text(text));
         }
-        // At '<': read the tag through its closing '>'.
-        let tagged = self
-            .body
-            .get(self.offset..)
+        // At '<': consume the tag through its closing '>'.
+        let (tag, remaining) = rest
+            .split_once('>')
             .ok_or_else(crate::S3Error::invalid_part)?;
-        let Some(close) = tagged.find('>') else {
-            return Err(crate::S3Error::invalid_part());
-        };
-        let tag = tagged
-            .get(..=close)
-            .ok_or_else(crate::S3Error::invalid_part)?;
-        self.offset = self.offset.saturating_add(tag.len());
+        self.remaining = remaining;
         let is_closing = tag.as_bytes().get(1) == Some(&b'/');
         let name_start = if is_closing { 2 } else { 1 };
         let tag_after_name = tag.get(name_start..).unwrap_or("");
         let name_end = tag_after_name
-            .find(|ch: char| ch.is_whitespace() || ch == '>' || ch == '/')
+            .find(|ch: char| ch.is_whitespace() || ch == '/')
             .unwrap_or(tag_after_name.len());
         let name = tag_after_name.get(..name_end).unwrap_or("");
         if !is_closing && (name.starts_with('?') || name.starts_with('!')) {
@@ -772,9 +721,7 @@ impl<'value> CompleteXmlScanner<'value> {
 pub struct CompleteParts {
     part_numbers: BTreeSet<u32>,
     etags: BTreeMap<u32, Option<String>>,
-    checksums_crc32: BTreeMap<u32, Option<String>>,
-    checksums_crc32c: BTreeMap<u32, Option<String>>,
-    checksums: BTreeMap<(u32, String), Option<String>>,
+    checksums: BTreeMap<u32, (String, String)>,
 }
 
 impl CompleteParts {
@@ -793,25 +740,22 @@ impl CompleteParts {
     /// Returns the echoed CRC32 checksum for a part, if supplied.
     #[must_use]
     pub fn checksum_crc32(&self, part_number: u32) -> Option<&str> {
-        self.checksums_crc32
-            .get(&part_number)
-            .and_then(Option::as_deref)
+        self.checksum(part_number, "CRC32")
     }
 
     /// Returns the echoed CRC32C checksum for a part, if supplied.
     #[must_use]
     pub fn checksum_crc32c(&self, part_number: u32) -> Option<&str> {
-        self.checksums_crc32c
-            .get(&part_number)
-            .and_then(Option::as_deref)
+        self.checksum(part_number, "CRC32C")
     }
 
     /// Returns the echoed checksum for the named algorithm.
     #[must_use]
     pub fn checksum(&self, part_number: u32, algorithm: &str) -> Option<&str> {
         self.checksums
-            .get(&(part_number, algorithm.to_owned()))
-            .and_then(Option::as_deref)
+            .get(&part_number)
+            .filter(|(name, _value)| name == algorithm)
+            .map(|(_name, value)| value.as_str())
     }
 
     /// The number of distinct parts.
@@ -852,9 +796,7 @@ pub fn parse_complete_multipart_parts(body: &str) -> Result<CompleteParts, crate
     let mut root_closed = false;
     let mut number = None;
     let mut etag = None;
-    let mut checksum_crc32 = None;
-    let mut checksum_crc32c = None;
-    let mut checksums = BTreeMap::new();
+    let mut checksum = None;
     let mut field: Option<(CompleteXmlElement, String)> = None;
     loop {
         match scanner.next_event()? {
@@ -870,9 +812,7 @@ pub fn parse_complete_multipart_parts(body: &str) -> Result<CompleteParts, crate
                 in_part = true;
                 number = None;
                 etag = None;
-                checksum_crc32 = None;
-                checksum_crc32c = None;
-                checksums.clear();
+                checksum = None;
             }
             XmlEvent::Open(
                 element @ (CompleteXmlElement::PartNumber
@@ -885,7 +825,7 @@ pub fn parse_complete_multipart_parts(body: &str) -> Result<CompleteParts, crate
             ) if in_part && field.is_none() => {
                 if (element == CompleteXmlElement::PartNumber && number.is_some())
                     || (element == CompleteXmlElement::ETag && etag.is_some())
-                    || (element.checksum_details().is_some() && !checksums.is_empty())
+                    || (element.checksum_details().is_some() && checksum.is_some())
                 {
                     return Err(crate::S3Error::invalid_part());
                 }
@@ -933,12 +873,7 @@ pub fn parse_complete_multipart_parts(body: &str) -> Result<CompleteParts, crate
                     {
                         return Err(crate::S3Error::invalid_part());
                     }
-                    if algorithm == "CRC32" {
-                        checksum_crc32 = Some(value.clone());
-                    } else if algorithm == "CRC32C" {
-                        checksum_crc32c = Some(value.clone());
-                    }
-                    checksums.insert(algorithm.to_owned(), Some(value));
+                    checksum = Some((algorithm.to_owned(), value));
                 }
             }
             XmlEvent::Close(CompleteXmlElement::Part) if in_part && field.is_none() => {
@@ -948,12 +883,8 @@ pub fn parse_complete_multipart_parts(body: &str) -> Result<CompleteParts, crate
                 }
                 parts.part_numbers.insert(number);
                 parts.etags.insert(number, etag.take());
-                parts.checksums_crc32.insert(number, checksum_crc32.take());
-                parts
-                    .checksums_crc32c
-                    .insert(number, checksum_crc32c.take());
-                for (algorithm, value) in std::mem::take(&mut checksums) {
-                    parts.checksums.insert((number, algorithm), value);
+                if let Some(checksum) = checksum.take() {
+                    parts.checksums.insert(number, checksum);
                 }
                 in_part = false;
             }
@@ -1352,23 +1283,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_complete_multipart_parts_rejects_empty_or_malformed() {
-        assert!(super::parse_complete_multipart_parts("").is_err());
-        assert!(super::parse_complete_multipart_parts("<CompleteMultipartUpload/>").is_err());
-        assert!(
-            super::parse_complete_multipart_parts("<Part><PartNumber>0</PartNumber></Part>")
-                .is_err()
-        );
-        assert!(
-            super::parse_complete_multipart_parts("<Part><PartNumber>10001</PartNumber></Part>")
-                .is_err()
-        );
-        assert!(
-            super::parse_complete_multipart_parts(
-                "<Part><PartNumber>not-a-number</PartNumber></Part>"
-            )
-            .is_err()
-        );
+    fn parse_complete_multipart_parts_rejects_malformed_inputs() {
+        for body in [
+            "",
+            "<CompleteMultipartUpload/>",
+            "<Part><PartNumber>0</PartNumber></Part>",
+            "<Part><PartNumber>10001</PartNumber></Part>",
+            "<Part><PartNumber>not-a-number</PartNumber></Part>",
+            "<PartNumber>1",
+            "<Part><PartNumber>1</PartNumber></Part><Part><PartNumber>",
+            "<partnumber>1</partnumber>",
+            "<PartNumber>&lt;1&gt;</PartNumber>",
+            "<PartNumber>4294967296</PartNumber>",
+            "<PartNumber>10001</PartNumber>",
+        ] {
+            assert!(
+                super::parse_complete_multipart_parts(body).is_err(),
+                "{body:?}"
+            );
+        }
     }
 
     #[test]
@@ -1423,30 +1356,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_complete_multipart_parts_malformed_inputs() {
-        // Truly truncated (no closing tag for the number).
-        assert!(super::parse_complete_multipart_parts("<PartNumber>1").is_err());
-        // Truncated trailing XML must not silently discard requested parts.
-        assert!(
-            super::parse_complete_multipart_parts(
-                "<Part><PartNumber>1</PartNumber></Part><Part><PartNumber>"
-            )
-            .is_err()
-        );
-        // Wrong casing is not matched.
-        assert!(super::parse_complete_multipart_parts("<partnumber>1</partnumber>").is_err());
-        // Entity-encoded numbers do not parse as integers.
-        assert!(
-            super::parse_complete_multipart_parts("<PartNumber>&lt;1&gt;</PartNumber>").is_err()
-        );
-        // Oversized numbers (u32 overflow and above the protocol cap).
-        assert!(
-            super::parse_complete_multipart_parts("<PartNumber>4294967296</PartNumber>").is_err()
-        );
-        assert!(super::parse_complete_multipart_parts("<PartNumber>10001</PartNumber>").is_err());
-    }
-
-    #[test]
     fn parse_complete_multipart_parts_huge_list_and_duplicates() {
         // A large-but-valid list parses in order.
         let body = (1..=5000)
@@ -1486,9 +1395,18 @@ mod tests {
     #[test]
     fn completion_parts_parse_crc32c_and_reject_mixed_algorithms() {
         let body = "<Part><PartNumber>1</PartNumber><ETag>\"etag\"</ETag><ChecksumCRC32C>EjRWeA==</ChecksumCRC32C></Part>";
-        let parts = super::parse_complete_multipart_parts(body).unwrap();
+        let body = format!(
+            "{body}<Part><PartNumber>2</PartNumber><ChecksumCRC32>AAAAAA==</ChecksumCRC32></Part><Part><PartNumber>3</PartNumber></Part>"
+        );
+        let parts = super::parse_complete_multipart_parts(&body).unwrap();
         assert_eq!(parts.checksum_crc32c(1), Some("EjRWeA=="));
+        assert_eq!(parts.checksum(1, "CRC32C"), Some("EjRWeA=="));
         assert_eq!(parts.checksum_crc32(1), None);
+        assert_eq!(parts.checksum_crc32(2), Some("AAAAAA=="));
+        assert_eq!(parts.checksum_crc32c(2), None);
+        assert_eq!(parts.checksum(3, "CRC32"), None);
+        assert_eq!(parts.checksum(4, "CRC32C"), None);
+        assert_eq!(parts.checksum(1, "unknown"), None);
 
         let mixed = "<Part><PartNumber>1</PartNumber><ChecksumCRC32>AAAAAA==</ChecksumCRC32><ChecksumCRC32C>AAAAAA==</ChecksumCRC32C></Part>";
         assert!(super::parse_complete_multipart_parts(mixed).is_err());

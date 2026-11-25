@@ -13,6 +13,7 @@ use shardline_storage::S3ObjectStoreConfig;
 use tracing;
 
 use super::super::secrets::ensure_secret_size_within_limit;
+use super::HubRecoveryMode;
 use super::defaults::{
     CONFIG_SECRET_KEY_BYTES, DEFAULT_LFS_PATCH_MAX_ACTIVE_SESSIONS,
     DEFAULT_LFS_PATCH_MAX_SEEK_AHEAD_BYTES, DEFAULT_LFS_PATCH_TOTAL_MAX_BYTES,
@@ -57,7 +58,7 @@ pub const fn validate_chunk_size(chunk_size: NonZeroUsize) -> Result<(), ServerC
     if chunk_size.get() > MAX_TARGET_CHUNK_SIZE {
         return Err(ServerConfigError::ChunkSizeTooLarge);
     }
-    if !chunk_size.get().is_power_of_two() {
+    if !chunk_size.is_power_of_two() {
         return Err(ServerConfigError::ChunkSizeNotPowerOfTwo);
     }
     Ok(())
@@ -94,6 +95,28 @@ pub use shardline_server_core::DEFAULT_SHARD_METADATA_LIMITS;
 
 /// Bounded-parser limits for native Xet shard metadata.
 pub use shardline_server_core::ShardMetadataLimits;
+
+/// Validated Hub recovery signing and archive-store material. Secrets remain
+/// redacted and the separate S3 config is never substituted with payload storage.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HubRecoveryRuntimeConfig {
+    pub(crate) deployment_id: String,
+    pub(crate) key_id: String,
+    pub(crate) signing_key: SecretBytes,
+    pub(crate) archive_s3: S3ObjectStoreConfig,
+}
+
+impl std::fmt::Debug for HubRecoveryRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HubRecoveryRuntimeConfig")
+            .field("deployment_id", &self.deployment_id)
+            .field("key_id", &self.key_id)
+            .field("signing_key", &"<redacted>")
+            .field("archive_s3", &self.archive_s3)
+            .finish()
+    }
+}
 
 /// Validated bearer token for the read-only administration boundary.
 ///
@@ -150,9 +173,12 @@ pub struct ServerConfig {
     pub(crate) root_dir: PathBuf,
     pub(crate) object_storage_adapter: ObjectStorageAdapter,
     pub(crate) s3_object_store_config: Option<S3ObjectStoreConfig>,
+    pub(crate) hub_recovery_mode: Option<HubRecoveryMode>,
+    pub(crate) hub_recovery_runtime: Option<HubRecoveryRuntimeConfig>,
     pub(crate) s3_signing_identities: Vec<super::S3SigningIdentity>,
     pub(crate) max_request_body_bytes: NonZeroUsize,
     pub(crate) max_xorb_body_bytes: NonZeroUsize,
+    pub(crate) selective_serialized_xorb_ranges: bool,
     pub(crate) shard_metadata_limits: ShardMetadataLimits,
     pub(crate) chunk_size: NonZeroUsize,
     pub(crate) upload_max_in_flight_chunks: NonZeroUsize,
@@ -228,9 +254,12 @@ impl ServerConfig {
             root_dir,
             object_storage_adapter: ObjectStorageAdapter::Local,
             s3_object_store_config: None,
+            hub_recovery_mode: None,
+            hub_recovery_runtime: None,
             s3_signing_identities: Vec::new(),
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             max_xorb_body_bytes: super::DEFAULT_MAX_XORB_BODY_BYTES,
+            selective_serialized_xorb_ranges: false,
             shard_metadata_limits: DEFAULT_SHARD_METADATA_LIMITS,
             chunk_size,
             upload_max_in_flight_chunks: default_upload_max_in_flight_chunks(),
@@ -251,6 +280,9 @@ impl ServerConfig {
                 auth_oidc_jwks_host_allowlist: None,
                 auth_jwks_url: None,
                 auth_jwks_issuer: None,
+                auth_jwks_audience: None,
+                auth_jwt_repository_claim: None,
+                auth_jwt_scope_claim: None,
                 ed25519_private_key: None,
                 ed25519_public_key: None,
             },
@@ -344,6 +376,29 @@ impl ServerConfig {
         self.s3_object_store_config.as_ref()
     }
 
+    /// Returns explicitly configured Hub recovery mode. `None` means this
+    /// replica must preserve the database's existing mode.
+    #[must_use]
+    pub const fn hub_recovery_mode(&self) -> Option<HubRecoveryMode> {
+        self.hub_recovery_mode
+    }
+
+    /// Returns validated SHADOW signing and archive target configuration.
+    #[must_use]
+    pub(crate) const fn hub_recovery_runtime(&self) -> Option<&HubRecoveryRuntimeConfig> {
+        self.hub_recovery_runtime.as_ref()
+    }
+
+    pub(crate) fn with_hub_recovery(
+        mut self,
+        mode: HubRecoveryMode,
+        runtime: Option<HubRecoveryRuntimeConfig>,
+    ) -> Self {
+        self.hub_recovery_mode = Some(mode);
+        self.hub_recovery_runtime = runtime;
+        self
+    }
+
     /// Returns the maximum request body size accepted by body-buffering extractors.
     #[must_use]
     pub const fn max_request_body_bytes(&self) -> NonZeroUsize {
@@ -354,6 +409,13 @@ impl ServerConfig {
     #[must_use]
     pub const fn max_xorb_body_bytes(&self) -> NonZeroUsize {
         self.max_xorb_body_bytes
+    }
+
+    /// Whether native serialized-Xorb ranges may use authenticated selected-member reads.
+    /// Full-container verification remains the default.
+    #[must_use]
+    pub const fn selective_serialized_xorb_ranges(&self) -> bool {
+        self.selective_serialized_xorb_ranges
     }
 
     /// Returns the bounded-parser limits for native Xet shard metadata.
@@ -478,6 +540,13 @@ impl ServerConfig {
     #[must_use]
     pub const fn with_max_xorb_body_bytes(mut self, limit: NonZeroUsize) -> Self {
         self.max_xorb_body_bytes = limit;
+        self
+    }
+
+    /// Enables the opt-in selected-member native Xorb range path.
+    #[must_use]
+    pub const fn with_selective_serialized_xorb_ranges(mut self, enabled: bool) -> Self {
+        self.selective_serialized_xorb_ranges = enabled;
         self
     }
 
@@ -675,6 +744,24 @@ impl ServerConfig {
     #[must_use]
     pub fn auth_jwks_issuer(&self) -> Option<&str> {
         self.auth.auth_jwks_issuer.as_deref()
+    }
+
+    /// Returns the configured external JWT permission claim name.
+    #[must_use]
+    pub fn auth_jwt_scope_claim(&self) -> Option<&str> {
+        self.auth.auth_jwt_scope_claim.as_deref()
+    }
+
+    /// Returns the configured external JWT repository claim name.
+    #[must_use]
+    pub fn auth_jwt_repository_claim(&self) -> Option<&str> {
+        self.auth.auth_jwt_repository_claim.as_deref()
+    }
+
+    /// Returns the configured JWKS audience.
+    #[must_use]
+    pub fn auth_jwks_audience(&self) -> Option<&str> {
+        self.auth.auth_jwks_audience.as_deref()
     }
 
     /// Returns the optional token signing key.
@@ -1323,6 +1410,27 @@ impl ServerConfig {
     #[must_use]
     pub fn with_auth_jwks_issuer(mut self, issuer: String) -> Self {
         self.auth.auth_jwks_issuer = Some(issuer);
+        self
+    }
+
+    /// Configures the external JWT permission claim name.
+    #[must_use]
+    pub fn with_auth_jwt_scope_claim(mut self, value: String) -> Self {
+        self.auth.auth_jwt_scope_claim = Some(value);
+        self
+    }
+
+    /// Configures the external JWT repository claim name.
+    #[must_use]
+    pub fn with_auth_jwt_repository_claim(mut self, value: String) -> Self {
+        self.auth.auth_jwt_repository_claim = Some(value);
+        self
+    }
+
+    /// Configures the required audience for the JWKS provider.
+    #[must_use]
+    pub fn with_auth_jwks_audience(mut self, value: String) -> Self {
+        self.auth.auth_jwks_audience = Some(value);
         self
     }
 
