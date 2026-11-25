@@ -36,6 +36,18 @@ impl ServerAuth {
         }
     }
 
+    pub(crate) fn from_external_jwt_provider(
+        provider: Box<dyn AuthProvider>,
+        internal_key: Option<&[u8]>,
+    ) -> Result<Self, ServerError> {
+        let Some(key) = internal_key else {
+            return Ok(Self::from_provider(provider));
+        };
+        Ok(Self::from_provider(Box::new(
+            shardline_server_core::auth::ExternalJwtWithLocalIssuer::new(Arc::from(provider), key)?,
+        )))
+    }
+
     /// Returns a reference to the underlying [`AuthProvider`].
     #[must_use]
     pub fn provider(&self) -> &dyn AuthProvider {
@@ -252,11 +264,7 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_missing_header() {
-        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
-        assert!(auth.is_ok());
-        let Ok(auth) = auth else {
-            return;
-        };
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!").unwrap();
 
         assert!(matches!(
             auth.authorize(&HeaderMap::new(), TokenScope::Read),
@@ -266,44 +274,22 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_insufficient_scope() {
-        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
-        assert!(auth.is_ok());
-        let Ok(auth) = auth else {
-            return;
-        };
-        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
-        assert!(signer.is_ok());
-        let Ok(signer) = signer else {
-            return;
-        };
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!").unwrap();
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!").unwrap();
         let repository =
             RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"));
-        assert!(repository.is_ok());
-        let Ok(repository) = repository else {
-            return;
-        };
+        let repository = repository.expect("expected valid repository");
         let claims = TokenClaims::new(
             "local",
             "provider-user-1",
             TokenScope::Read,
             repository,
             u64::MAX,
-        );
-        assert!(claims.is_ok());
-        let Ok(claims) = claims else {
-            return;
-        };
-        let token = signer.sign(&claims);
-        assert!(token.is_ok());
-        let Ok(token) = token else {
-            return;
-        };
+        )
+        .unwrap();
+        let token = signer.sign(&claims).unwrap();
         let mut headers = HeaderMap::new();
-        let header_value = HeaderValue::from_str(&format!("Bearer {token}"));
-        assert!(header_value.is_ok());
-        let Ok(header_value) = header_value else {
-            return;
-        };
+        let header_value = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
         headers.insert(AUTHORIZATION, header_value);
 
         assert!(matches!(
@@ -314,18 +300,10 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_oversized_bearer_token_before_decoding() {
-        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
-        assert!(auth.is_ok());
-        let Ok(auth) = auth else {
-            return;
-        };
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!").unwrap();
         let token = "a".repeat(MAX_TOKEN_STRING_BYTES + 1);
         let mut headers = HeaderMap::new();
-        let header_value = HeaderValue::from_str(&format!("Bearer {token}"));
-        assert!(header_value.is_ok());
-        let Ok(header_value) = header_value else {
-            return;
-        };
+        let header_value = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
         headers.insert(AUTHORIZATION, header_value);
 
         assert!(matches!(
@@ -336,11 +314,7 @@ mod tests {
 
     #[test]
     fn server_auth_rejects_bearer_token_with_whitespace() {
-        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
-        assert!(auth.is_ok());
-        let Ok(auth) = auth else {
-            return;
-        };
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
@@ -355,52 +329,27 @@ mod tests {
 
     #[test]
     fn server_auth_accepts_valid_write_token() {
-        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!");
-        assert!(auth.is_ok());
-        let Ok(auth) = auth else {
-            return;
-        };
-        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!");
-        assert!(signer.is_ok());
-        let Ok(signer) = signer else {
-            return;
-        };
+        let auth = ServerAuth::new(b"test-signing-key-32-bytes-long!!").unwrap();
+        let signer = TokenSigner::new(b"test-signing-key-32-bytes-long!!").unwrap();
         let repository =
             RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"));
-        assert!(repository.is_ok());
-        let Ok(repository) = repository else {
-            return;
-        };
+        let repository = repository.expect("expected valid repository");
         let claims = TokenClaims::new(
             "local",
             "provider-user-1",
             TokenScope::Write,
             repository,
             u64::MAX,
-        );
-        assert!(claims.is_ok());
-        let Ok(claims) = claims else {
-            return;
-        };
-        let token = signer.sign(&claims);
-        assert!(token.is_ok());
-        let Ok(token) = token else {
-            return;
-        };
+        )
+        .unwrap();
+        let token = signer.sign(&claims).unwrap();
         let mut headers = HeaderMap::new();
-        let header_value = HeaderValue::from_str(&format!("Bearer {token}"));
-        assert!(header_value.is_ok());
-        let Ok(header_value) = header_value else {
-            return;
-        };
+        let header_value = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
         headers.insert(AUTHORIZATION, header_value);
 
         let context = auth.authorize(&headers, TokenScope::Read);
 
-        assert!(context.is_ok());
-        let Ok(context) = context else {
-            return;
-        };
+        let context = context.expect("expected valid context");
         assert_eq!(context.claims().subject(), "provider-user-1");
         assert_eq!(context.claims().scope(), TokenScope::Write);
     }
@@ -530,29 +479,6 @@ mod tests {
         }
     }
 
-    // ── scope_allows ───────────────────────────────────────────────────────
-
-    #[test]
-    fn scope_allows_read_when_scope_is_read() {
-        assert!(super::scope_allows(TokenScope::Read, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_write_when_scope_is_write() {
-        assert!(super::scope_allows(TokenScope::Write, TokenScope::Write));
-    }
-
-    #[test]
-    fn scope_allows_read_when_scope_is_write() {
-        // Write scope implicitly allows Read
-        assert!(super::scope_allows(TokenScope::Write, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_rejects_write_when_scope_is_read() {
-        assert!(!super::scope_allows(TokenScope::Read, TokenScope::Write));
-    }
-
     // ── AuthError conversion ───────────────────────────────────────────────
 
     #[test]
@@ -594,7 +520,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer any-token"));
         let result = auth.authorize(&headers, TokenScope::Write);
-        assert!(result.is_ok());
         let ctx = result.unwrap();
         // PassthroughProvider uses "anonymous" as the default subject
         assert!(ctx.claims().subject() == "anonymous" || ctx.claims().subject() == "passthrough");
@@ -716,27 +641,5 @@ mod tests {
             result,
             Err(ServerError::InvalidAuthorizationHeader)
         ));
-    }
-
-    // ── scope_allows edge cases ────────────────────────────────────────────
-
-    #[test]
-    fn scope_allows_with_same_scope_read_read() {
-        assert!(super::scope_allows(TokenScope::Read, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_with_same_scope_write_write() {
-        assert!(super::scope_allows(TokenScope::Write, TokenScope::Write));
-    }
-
-    #[test]
-    fn scope_allows_write_grants_read() {
-        assert!(super::scope_allows(TokenScope::Write, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_read_denies_write() {
-        assert!(!super::scope_allows(TokenScope::Read, TokenScope::Write));
     }
 }

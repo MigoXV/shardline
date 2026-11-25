@@ -24,7 +24,7 @@ use crate::{
     local_sqlite::helpers::{
         load_provider_evidence_batch, load_quarantine_evidence_batch, load_retention_evidence,
         load_retention_evidence_batch, load_webhook_evidence, load_webhook_evidence_batch,
-        persist_retention_evidence, persist_webhook_evidence, retention_snapshot, webhook_snapshot,
+        persist_appended_reliability_events, retention_snapshot, webhook_snapshot,
     },
     parse_xet_hash_hex,
     provider_evidence::snapshot_from_state,
@@ -311,36 +311,29 @@ impl<Entry: InventoryEntry> InventoryScan<Entry> {
             INVENTORY_BATCH_SIZE
         );
         let (batch, last_key) = {
-            let mut statement = self.connection.get()?.prepare(&sql)?;
+            let mut statement = self.connection.get()?.prepare_cached(&sql)?;
             let mut rows =
                 statement.query(rusqlite::params_from_iter(self.after.iter().flatten()))?;
             let mut batch = Vec::with_capacity(INVENTORY_BATCH_SIZE);
-            let mut last_key = None;
+            let mut last_key = Vec::with_capacity(Entry::KEYS.len());
             while let Some(row) = rows.next()? {
                 batch.push(Entry::from_row(row)?);
-                last_key = Some(
-                    Entry::KEYS
-                        .iter()
-                        .map(|key| row.get::<_, String>(*key))
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
+                last_key.clear();
+                for key in Entry::KEYS {
+                    last_key.push(row.get::<_, String>(*key)?);
+                }
             }
             (batch, last_key)
         };
-        if phase == 1 {
-            Entry::validate_snapshots(&batch)?;
+        match phase {
+            1 => Entry::validate_snapshots(&batch)?,
+            2 => Entry::verify_raw_heads(self.connection.get()?, &batch)?,
+            3 => Entry::verify_typed_heads(self.connection.get()?, &batch)?,
+            4 => Entry::verify_batch(self.connection.get()?, &batch)?,
+            _ => {}
         }
-        if phase == 2 {
-            Entry::verify_raw_heads(self.connection.get()?, &batch)?;
-        }
-        if phase == 3 {
-            Entry::verify_typed_heads(self.connection.get()?, &batch)?;
-        }
-        if phase == 4 {
-            Entry::verify_batch(self.connection.get()?, &batch)?;
-        }
-        if let Some(key) = last_key {
-            self.after = Some(key);
+        if !batch.is_empty() {
+            self.after = Some(last_key);
         }
         Ok(batch)
     }
@@ -441,11 +434,7 @@ impl InventoryEntry for QuarantineCandidate {
         connection: &rusqlite::Connection,
         batch: &[Self],
     ) -> Result<(), LocalIndexStoreError> {
-        let keys = batch
-            .iter()
-            .map(|entry| entry.object_key().as_str().to_owned())
-            .collect::<Vec<_>>();
-        let evidence = load_quarantine_evidence_batch(connection, &keys)?;
+        let evidence = load_quarantine_evidence_batch(connection, &Self::operation_ids(batch)?)?;
         for entry in batch {
             let snapshot =
                 super::helpers::quarantine_snapshot(entry, QuarantineLifecycleState::Active)?;
@@ -492,11 +481,7 @@ impl InventoryEntry for RetentionHold {
         connection: &rusqlite::Connection,
         batch: &[Self],
     ) -> Result<(), LocalIndexStoreError> {
-        let keys = batch
-            .iter()
-            .map(|entry| entry.object_key().as_str().to_owned())
-            .collect::<Vec<_>>();
-        let evidence = load_retention_evidence_batch(connection, &keys)?;
+        let evidence = load_retention_evidence_batch(connection, &Self::operation_ids(batch)?)?;
         for entry in batch {
             let snapshot = retention_snapshot(entry, RetentionHoldLifecycleState::Active)?;
             let stored = evidence.get(entry.object_key().as_str()).ok_or(
@@ -623,6 +608,26 @@ impl InventoryEntry for ProviderRepositoryState {
     }
 }
 
+fn upload_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UploadIntent> {
+    let state_text: String = row.get(4)?;
+    let state = UploadIntentState::parse(&state_text).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            4,
+            format!("invalid state: {state_text}"),
+            rusqlite::types::Type::Text,
+        )
+    })?;
+    Ok(UploadIntent::from_parts(
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get::<_, i64>(3)? as u64,
+        state,
+        Duration::from_secs(row.get::<_, i64>(5)? as u64),
+        Duration::from_secs(row.get::<_, i64>(6)? as u64),
+    ))
+}
+
 pub(super) fn load_verified_sqlite_intent(
     transaction: &Transaction<'_>,
     intent_id: &str,
@@ -633,31 +638,46 @@ pub(super) fn load_verified_sqlite_intent(
                 created_at_unix_seconds, updated_at_unix_seconds
          FROM shardline_upload_intents WHERE intent_id = ?1",
             [intent_id],
-            |row| {
-                let state_text: String = row.get(4)?;
-                let state = UploadIntentState::parse(&state_text).ok_or_else(|| {
-                    rusqlite::Error::InvalidColumnType(
-                        4,
-                        format!("invalid state: {state_text}"),
-                        rusqlite::types::Type::Text,
-                    )
-                })?;
-                Ok(UploadIntent::from_parts(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get::<_, i64>(3)? as u64,
-                    state,
-                    Duration::from_secs(row.get::<_, i64>(5)? as u64),
-                    Duration::from_secs(row.get::<_, i64>(6)? as u64),
-                ))
-            },
+            upload_intent_from_row,
         )
         .optional()?;
     if let Some(intent) = &intent {
         verify_sqlite_intent_evidence(transaction, intent)?;
     }
     Ok(intent)
+}
+
+fn verify_sqlite_intent_evidence_batch(
+    transaction: &Transaction<'_>,
+    intents: &[UploadIntent],
+) -> Result<(), LocalIndexStoreError> {
+    let operation_ids = intents
+        .iter()
+        .map(|intent| intent.intent_id().to_owned())
+        .collect::<Vec<_>>();
+    let heads = super::helpers::load_latest_verified_event_json_batch(
+        transaction,
+        shardline_reliability::OperationKind::Upload,
+        &operation_ids,
+    )?;
+    for intent in intents {
+        let event_json = heads
+            .get(intent.intent_id())
+            .ok_or(LocalIndexStoreError::Reliability(
+                shardline_reliability::ReliabilityError::OperationMismatch,
+            ))?;
+        let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
+        verify_upload_lifecycle_head(
+            &event,
+            event.operation.tenant.as_str(),
+            event.operation.repository.as_str(),
+            intent.intent_id(),
+            intent.object_key(),
+            intent.object_hash(),
+            intent.state(),
+        )?;
+    }
+    Ok(())
 }
 
 fn verify_sqlite_intent_evidence(
@@ -922,21 +942,7 @@ impl LifecycleStore for LocalIndexStore {
         let rows = statement.query_map([], super::helpers::quarantine_candidate_from_row)?;
         let candidates = collect_rows(rows)?;
         drop(statement);
-        let object_keys = candidates
-            .iter()
-            .map(|candidate| candidate.object_key().as_str().to_owned())
-            .collect::<Vec<_>>();
-        let evidence = load_quarantine_evidence_batch(&transaction, &object_keys)?;
-        for candidate in &candidates {
-            let snapshot =
-                super::helpers::quarantine_snapshot(candidate, QuarantineLifecycleState::Active)?;
-            let evidence = evidence.get(candidate.object_key().as_str()).ok_or(
-                LocalIndexStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                ),
-            )?;
-            verify_snapshot_evidence(evidence, &snapshot)?;
-        }
+        QuarantineCandidate::verify_batch(&transaction, &candidates)?;
         transaction.commit()?;
         Ok(candidates)
     }
@@ -1013,18 +1019,12 @@ impl LifecycleStore for LocalIndexStore {
         } else {
             verify_and_reactivate_quarantine(evidence, snapshot)?
         };
-        let event = evidence.events().last().ok_or_else(|| {
+        evidence.events().last().ok_or_else(|| {
             LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::EmptyField(
                 "quarantine evidence event",
             ))
         })?;
-        if evidence_was_empty {
-            for stored_event in evidence.events() {
-                super::helpers::persist_quarantine_evidence(&transaction, stored_event)?;
-            }
-        } else {
-            super::helpers::persist_quarantine_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1056,20 +1056,18 @@ impl LifecycleStore for LocalIndexStore {
                 super::helpers::load_quarantine_evidence(&transaction, object_key.as_str())?;
             let (evidence, evidence_was_empty) =
                 verify_and_append_snapshot_transition(evidence, active, released)?;
-            let event = evidence.events().last().ok_or_else(|| {
+            evidence.events().last().ok_or_else(|| {
                 LocalIndexStoreError::Reliability(
                     shardline_reliability::ReliabilityError::EmptyField(
                         "quarantine evidence event",
                     ),
                 )
             })?;
-            if evidence_was_empty {
-                for stored_event in evidence.events() {
-                    super::helpers::persist_quarantine_evidence(&transaction, stored_event)?;
-                }
-            } else {
-                super::helpers::persist_quarantine_evidence(&transaction, event)?;
-            }
+            persist_appended_reliability_events(
+                &transaction,
+                evidence.events(),
+                evidence_was_empty,
+            )?;
         }
         transaction.commit()?;
         Ok(changed > 0)
@@ -1122,18 +1120,12 @@ impl LifecycleStore for LocalIndexStore {
             transaction.commit()?;
             return Ok(false);
         }
-        let event = evidence.events().last().ok_or_else(|| {
+        evidence.events().last().ok_or_else(|| {
             LocalIndexStoreError::Reliability(shardline_reliability::ReliabilityError::EmptyField(
                 "quarantine evidence event",
             ))
         })?;
-        if evidence_was_empty {
-            for stored_event in evidence.events() {
-                super::helpers::persist_quarantine_evidence(&transaction, stored_event)?;
-            }
-        } else {
-            super::helpers::persist_quarantine_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -1176,20 +1168,7 @@ impl LifecycleStore for LocalIndexStore {
         let rows = statement.query_map([], super::helpers::retention_hold_from_row)?;
         let holds = collect_rows(rows)?;
         drop(statement);
-        let object_keys = holds
-            .iter()
-            .map(|hold| hold.object_key().as_str().to_owned())
-            .collect::<Vec<_>>();
-        let evidence = load_retention_evidence_batch(&transaction, &object_keys)?;
-        for hold in &holds {
-            let snapshot = retention_snapshot(hold, RetentionHoldLifecycleState::Active)?;
-            let evidence = evidence.get(hold.object_key().as_str()).ok_or(
-                LocalIndexStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                ),
-            )?;
-            verify_snapshot_evidence(evidence, &snapshot)?;
-        }
+        RetentionHold::verify_batch(&transaction, &holds)?;
         transaction.commit()?;
         Ok(holds)
     }
@@ -1256,13 +1235,7 @@ impl LifecycleStore for LocalIndexStore {
                 u64_to_i64(unix_now_seconds_lossy())?,
             ],
         )?;
-        if evidence_was_empty {
-            for event in evidence.events() {
-                persist_retention_evidence(&transaction, event)?;
-            }
-        } else if let Some(event) = evidence.events().last() {
-            persist_retention_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1289,13 +1262,11 @@ impl LifecycleStore for LocalIndexStore {
             let evidence = load_retention_evidence(&transaction, object_key.as_str())?;
             let (evidence, evidence_was_empty) =
                 verify_and_append_snapshot_transition(evidence, active, released)?;
-            if evidence_was_empty {
-                for event in evidence.events() {
-                    persist_retention_evidence(&transaction, event)?;
-                }
-            } else if let Some(event) = evidence.events().last() {
-                persist_retention_evidence(&transaction, event)?;
-            }
+            persist_appended_reliability_events(
+                &transaction,
+                evidence.events(),
+                evidence_was_empty,
+            )?;
         }
         transaction.commit()?;
         Ok(changed > 0)
@@ -1347,13 +1318,7 @@ impl LifecycleStore for LocalIndexStore {
             transaction.commit()?;
             return Ok(false);
         }
-        if evidence_was_empty {
-            for event in evidence.events() {
-                persist_retention_evidence(&transaction, event)?;
-            }
-        } else if let Some(event) = evidence.events().last() {
-            persist_retention_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -1409,13 +1374,7 @@ impl LifecycleStore for LocalIndexStore {
                 u64_to_i64(processed_at_unix_seconds)?,
             ],
         )?;
-        if evidence_was_empty {
-            for event in evidence.events() {
-                persist_webhook_evidence(&transaction, event)?;
-            }
-        } else if let Some(event) = evidence.events().last() {
-            persist_webhook_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -1435,17 +1394,7 @@ impl LifecycleStore for LocalIndexStore {
         let rows = statement.query_map([], super::helpers::webhook_delivery_from_row)?;
         let deliveries = collect_rows(rows)?;
         drop(statement);
-        let evidence = load_webhook_evidence_batch(&transaction, &deliveries)?;
-        for delivery in &deliveries {
-            let snapshot = webhook_snapshot(delivery, WebhookDeliveryLifecycleState::Processed)?;
-            let operation_id = snapshot.evidence_operation()?.operation_id;
-            let evidence = evidence
-                .get(&operation_id)
-                .ok_or(LocalIndexStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                ))?;
-            verify_snapshot_evidence(evidence, &snapshot)?;
-        }
+        WebhookDelivery::verify_batch(&transaction, &deliveries)?;
         transaction.commit()?;
         Ok(deliveries)
     }
@@ -1498,13 +1447,7 @@ impl LifecycleStore for LocalIndexStore {
                 delivery.delivery_id(),
             ],
         )?;
-        if evidence_was_empty {
-            for event in evidence.events() {
-                persist_webhook_evidence(&transaction, event)?;
-            }
-        } else if let Some(event) = evidence.events().last() {
-            persist_webhook_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(changed > 0)
     }
@@ -1559,13 +1502,7 @@ impl LifecycleStore for LocalIndexStore {
             transaction.commit()?;
             return Ok(false);
         }
-        if evidence_was_empty {
-            for event in evidence.events() {
-                persist_webhook_evidence(&transaction, event)?;
-            }
-        } else if let Some(event) = evidence.events().last() {
-            persist_webhook_evidence(&transaction, event)?;
-        }
+        persist_appended_reliability_events(&transaction, evidence.events(), evidence_was_empty)?;
         transaction.commit()?;
         Ok(true)
     }
@@ -1668,13 +1605,11 @@ impl LifecycleStore for LocalIndexStore {
                         delivery.delivery_id(),
                     ],
                 )?;
-                if evidence_was_empty {
-                    for event in evidence.events() {
-                        persist_webhook_evidence(&transaction, event)?;
-                    }
-                } else if let Some(event) = evidence.events().last() {
-                    persist_webhook_evidence(&transaction, event)?;
-                }
+                persist_appended_reliability_events(
+                    &transaction,
+                    evidence.events(),
+                    evidence_was_empty,
+                )?;
             }
         }
         transaction.commit()?;
@@ -1743,27 +1678,7 @@ impl LifecycleStore for LocalIndexStore {
             collect_rows(rows)?
         };
         let transaction = connection.transaction()?;
-        let snapshots = states
-            .iter()
-            .map(snapshot_from_state)
-            .collect::<Result<Vec<_>, _>>()?;
-        let evidence = load_provider_evidence_batch(&transaction, &snapshots)?;
-        for (_state, snapshot) in states.iter().zip(snapshots) {
-            let operation_id = super::helpers::provider_evidence_operation_id(&snapshot);
-            let stored = evidence
-                .get(&operation_id)
-                .ok_or(LocalIndexStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                ))?;
-            if stored.events().is_empty() {
-                verify_provider_lifecycle_events(
-                    ProviderEvidenceLog::baseline(snapshot.clone())?.events(),
-                    &snapshot,
-                )?;
-            } else {
-                stored.verify_for(&snapshot)?;
-            }
-        }
+        ProviderRepositoryState::verify_batch(&transaction, &states)?;
         transaction.commit()?;
         Ok(states)
     }
@@ -1837,14 +1752,13 @@ impl LifecycleStore for LocalIndexStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (provider, owner, repo)
              DO UPDATE SET
-                last_access_changed_at_unix_seconds = CASE
-                    WHEN excluded.last_access_changed_at_unix_seconds IS NULL
-                        THEN shardline_provider_repository_states.last_access_changed_at_unix_seconds
-                    WHEN shardline_provider_repository_states.last_access_changed_at_unix_seconds IS NULL
-                      OR excluded.last_access_changed_at_unix_seconds >= shardline_provider_repository_states.last_access_changed_at_unix_seconds
-                        THEN excluded.last_access_changed_at_unix_seconds
-                    ELSE shardline_provider_repository_states.last_access_changed_at_unix_seconds
-                END,
+                -- Scalar MAX returns NULL if either timestamp is NULL;
+                -- COALESCE preserves the available observation in that case.
+                last_access_changed_at_unix_seconds = COALESCE(
+                    MAX(shardline_provider_repository_states.last_access_changed_at_unix_seconds, excluded.last_access_changed_at_unix_seconds),
+                    shardline_provider_repository_states.last_access_changed_at_unix_seconds,
+                    excluded.last_access_changed_at_unix_seconds
+                ),
                 last_pushed_revision = CASE
                     WHEN excluded.last_revision_pushed_at_unix_seconds IS NOT NULL
                      AND (shardline_provider_repository_states.last_revision_pushed_at_unix_seconds IS NULL
@@ -1852,38 +1766,26 @@ impl LifecycleStore for LocalIndexStore {
                         THEN excluded.last_pushed_revision
                     ELSE shardline_provider_repository_states.last_pushed_revision
                 END,
-                last_revision_pushed_at_unix_seconds = CASE
-                    WHEN excluded.last_revision_pushed_at_unix_seconds IS NULL
-                        THEN shardline_provider_repository_states.last_revision_pushed_at_unix_seconds
-                    WHEN shardline_provider_repository_states.last_revision_pushed_at_unix_seconds IS NULL
-                      OR excluded.last_revision_pushed_at_unix_seconds >= shardline_provider_repository_states.last_revision_pushed_at_unix_seconds
-                        THEN excluded.last_revision_pushed_at_unix_seconds
-                    ELSE shardline_provider_repository_states.last_revision_pushed_at_unix_seconds
-                END,
-                last_cache_invalidated_at_unix_seconds = CASE
-                    WHEN excluded.last_cache_invalidated_at_unix_seconds IS NULL
-                        THEN shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds
-                    WHEN shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds IS NULL
-                      OR excluded.last_cache_invalidated_at_unix_seconds >= shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds
-                        THEN excluded.last_cache_invalidated_at_unix_seconds
-                    ELSE shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds
-                END,
-                last_authorization_rechecked_at_unix_seconds = CASE
-                    WHEN excluded.last_authorization_rechecked_at_unix_seconds IS NULL
-                        THEN shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds
-                    WHEN shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds IS NULL
-                      OR excluded.last_authorization_rechecked_at_unix_seconds >= shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds
-                        THEN excluded.last_authorization_rechecked_at_unix_seconds
-                    ELSE shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds
-                END,
-                last_drift_checked_at_unix_seconds = CASE
-                    WHEN excluded.last_drift_checked_at_unix_seconds IS NULL
-                        THEN shardline_provider_repository_states.last_drift_checked_at_unix_seconds
-                    WHEN shardline_provider_repository_states.last_drift_checked_at_unix_seconds IS NULL
-                      OR excluded.last_drift_checked_at_unix_seconds >= shardline_provider_repository_states.last_drift_checked_at_unix_seconds
-                        THEN excluded.last_drift_checked_at_unix_seconds
-                    ELSE shardline_provider_repository_states.last_drift_checked_at_unix_seconds
-                END,
+                last_revision_pushed_at_unix_seconds = COALESCE(
+                    MAX(shardline_provider_repository_states.last_revision_pushed_at_unix_seconds, excluded.last_revision_pushed_at_unix_seconds),
+                    shardline_provider_repository_states.last_revision_pushed_at_unix_seconds,
+                    excluded.last_revision_pushed_at_unix_seconds
+                ),
+                last_cache_invalidated_at_unix_seconds = COALESCE(
+                    MAX(shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds, excluded.last_cache_invalidated_at_unix_seconds),
+                    shardline_provider_repository_states.last_cache_invalidated_at_unix_seconds,
+                    excluded.last_cache_invalidated_at_unix_seconds
+                ),
+                last_authorization_rechecked_at_unix_seconds = COALESCE(
+                    MAX(shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds, excluded.last_authorization_rechecked_at_unix_seconds),
+                    shardline_provider_repository_states.last_authorization_rechecked_at_unix_seconds,
+                    excluded.last_authorization_rechecked_at_unix_seconds
+                ),
+                last_drift_checked_at_unix_seconds = COALESCE(
+                    MAX(shardline_provider_repository_states.last_drift_checked_at_unix_seconds, excluded.last_drift_checked_at_unix_seconds),
+                    shardline_provider_repository_states.last_drift_checked_at_unix_seconds,
+                    excluded.last_drift_checked_at_unix_seconds
+                ),
                 updated_at_unix_seconds = excluded.updated_at_unix_seconds",
             params![
                 state.provider().as_str(),
@@ -1940,7 +1842,7 @@ impl LifecycleStore for LocalIndexStore {
                 "provider evidence",
             ))
         })?;
-        super::helpers::persist_provider_evidence(&transaction, event)?;
+        super::helpers::persist_reliability_event(&transaction, event)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1978,7 +1880,7 @@ impl LifecycleStore for LocalIndexStore {
                 let baseline = ProviderEvidenceLog::baseline(snapshot.clone())?;
                 verify_provider_lifecycle_events(baseline.events(), &snapshot)?;
                 for event in baseline.events() {
-                    super::helpers::persist_provider_evidence(&transaction, event)?;
+                    super::helpers::persist_reliability_event(&transaction, event)?;
                 }
             } else {
                 verify_provider_lifecycle_events(evidence.events(), &snapshot)?;
@@ -2053,16 +1955,7 @@ impl UploadIntentStore for super::LocalIndexStore {
                             created_at_unix_seconds, updated_at_unix_seconds
                      FROM shardline_upload_intents WHERE intent_id = ?1",
                     rusqlite::params![intent.intent_id()],
-                    |row| {
-                        let state_text: String = row.get(4)?;
-                        let state = UploadIntentState::parse(&state_text).ok_or_else(|| {
-                            rusqlite::Error::InvalidColumnType(4, format!("invalid state: {state_text}"), rusqlite::types::Type::Text)
-                        })?;
-                        Ok(UploadIntent::from_parts(row.get(0)?, row.get(1)?, row.get(2)?,
-                            row.get::<_, i64>(3)? as u64, state,
-                            Duration::from_secs(row.get::<_, i64>(5)? as u64),
-                            Duration::from_secs(row.get::<_, i64>(6)? as u64)))
-                    },
+                    upload_intent_from_row,
                 )?;
                 if !durable_intent.has_same_identity(&intent) {
                     return Err(crate::UploadIntentConflictError::new(intent.intent_id()).into());
@@ -2187,6 +2080,14 @@ impl UploadIntentStore for super::LocalIndexStore {
         .map_err(|e| LocalIndexStoreError::Io(std::io::Error::other(e)))?
     }
 
+    fn is_upload_intents_table_missing(error: &Self::Error) -> bool {
+        matches!(error,
+            LocalIndexStoreError::Sqlite(rusqlite::Error::SqliteFailure(code, Some(message)))
+                if code.extended_code == rusqlite::ffi::SQLITE_ERROR
+                    && message == "no such table: shardline_upload_intents"
+        )
+    }
+
     async fn intents_by_state(
         &self,
         state: UploadIntentState,
@@ -2198,52 +2099,11 @@ impl UploadIntentStore for super::LocalIndexStore {
             let mut stmt = transaction.prepare(
                 "SELECT intent_id, object_key, object_hash, object_length, state, created_at_unix_seconds, updated_at_unix_seconds FROM shardline_upload_intents WHERE state = ?1 ORDER BY created_at_unix_seconds"
             )?;
-            let intents = stmt
-                .query_map(rusqlite::params![state.as_str()], |row| {
-                    let state_str: String = row.get(4)?;
-                    let s = UploadIntentState::parse(&state_str).ok_or_else(|| {
-                        rusqlite::Error::InvalidColumnType(4, format!("invalid state: {state_str}"), rusqlite::types::Type::Text)
-                    })?;
-                    Ok(UploadIntent::from_parts(
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get::<_, i64>(3)? as u64,
-                        s,
-                        Duration::from_secs(row.get::<_, i64>(5)? as u64),
-                        Duration::from_secs(row.get::<_, i64>(6)? as u64),
-                    ))
-                })
-                .map_err(LocalIndexStoreError::from)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(LocalIndexStoreError::from)?;
-            drop(stmt);
-            let operation_ids = intents
-                .iter()
-                .map(|intent| intent.intent_id().to_owned())
-                .collect::<Vec<_>>();
-            let heads = super::helpers::load_latest_verified_event_json_batch(
-                &transaction,
-                shardline_reliability::OperationKind::Upload,
-                &operation_ids,
+            let intents = collect_rows(
+                stmt.query_map(rusqlite::params![state.as_str()], upload_intent_from_row)?,
             )?;
-            for intent in &intents {
-                let event_json = heads.get(intent.intent_id()).ok_or(
-                    LocalIndexStoreError::Reliability(
-                        shardline_reliability::ReliabilityError::OperationMismatch,
-                    ),
-                )?;
-                let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
-                verify_upload_lifecycle_head(
-                    &event,
-                    event.operation.tenant.as_str(),
-                    event.operation.repository.as_str(),
-                    intent.intent_id(),
-                    intent.object_key(),
-                    intent.object_hash(),
-                    intent.state(),
-                )?;
-            }
+            drop(stmt);
+            verify_sqlite_intent_evidence_batch(&transaction, &intents)?;
             transaction.commit()?;
             Ok(intents)
         })
@@ -2268,52 +2128,11 @@ impl UploadIntentStore for super::LocalIndexStore {
             let mut stmt = transaction.prepare(
                 "SELECT intent_id, object_key, object_hash, object_length, state, created_at_unix_seconds, updated_at_unix_seconds FROM shardline_upload_intents WHERE state = ?1 AND created_at_unix_seconds < ?2 ORDER BY created_at_unix_seconds"
             )?;
-            let intents = stmt
-                .query_map(rusqlite::params![state.as_str(), cutoff], |row| {
-                    let state_str: String = row.get(4)?;
-                    let s = UploadIntentState::parse(&state_str).ok_or_else(|| {
-                        rusqlite::Error::InvalidColumnType(4, format!("invalid state: {state_str}"), rusqlite::types::Type::Text)
-                    })?;
-                    Ok(UploadIntent::from_parts(
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get::<_, i64>(3)? as u64,
-                        s,
-                        Duration::from_secs(row.get::<_, i64>(5)? as u64),
-                        Duration::from_secs(row.get::<_, i64>(6)? as u64),
-                    ))
-                })
-                .map_err(LocalIndexStoreError::from)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(LocalIndexStoreError::from)?;
-            drop(stmt);
-            let operation_ids = intents
-                .iter()
-                .map(|intent| intent.intent_id().to_owned())
-                .collect::<Vec<_>>();
-            let heads = super::helpers::load_latest_verified_event_json_batch(
-                &transaction,
-                shardline_reliability::OperationKind::Upload,
-                &operation_ids,
+            let intents = collect_rows(
+                stmt.query_map(rusqlite::params![state.as_str(), cutoff], upload_intent_from_row)?,
             )?;
-            for intent in &intents {
-                let event_json = heads.get(intent.intent_id()).ok_or(
-                    LocalIndexStoreError::Reliability(
-                        shardline_reliability::ReliabilityError::OperationMismatch,
-                    ),
-                )?;
-                let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
-                verify_upload_lifecycle_head(
-                    &event,
-                    event.operation.tenant.as_str(),
-                    event.operation.repository.as_str(),
-                    intent.intent_id(),
-                    intent.object_key(),
-                    intent.object_hash(),
-                    intent.state(),
-                )?;
-            }
+            drop(stmt);
+            verify_sqlite_intent_evidence_batch(&transaction, &intents)?;
             transaction.commit()?;
             Ok(intents)
         })
@@ -3300,7 +3119,7 @@ mod tests {
                 params![delivery.owner(),delivery.delivery_id(),u64_to_i64(observed_at).unwrap()],
             ).unwrap();
             for event in evidence.events() {
-                persist_webhook_evidence(&transaction, event).unwrap();
+                super::super::helpers::persist_reliability_event(&transaction, event).unwrap();
             }
             last = Some(delivery);
         }
@@ -3389,6 +3208,12 @@ mod tests {
             .evidence_operation()
             .unwrap();
         let connection = store.open_connection().unwrap();
+        assert_eq!(
+            load_webhook_evidence_batch(&connection, &[last.clone(), last.clone()])
+                .unwrap()
+                .len(),
+            1
+        );
         let original: String = connection.query_row("SELECT merkle_commit_json FROM shardline_reliability_events WHERE operation_kind='WebhookDelivery' AND operation_id=?1 AND sequence=2", [&operation.operation_id], |row| row.get(0)).unwrap();
         let baseline: String = connection.query_row("SELECT merkle_commit_json FROM shardline_reliability_events WHERE operation_kind='WebhookDelivery' AND operation_id=?1 AND sequence=0", [&operation.operation_id], |row| row.get(0)).unwrap();
         for sql in [
@@ -3421,6 +3246,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, i64::try_from(INVENTORY_BATCH_SIZE * 2 + 1).unwrap());
+        connection.execute("DELETE FROM shardline_reliability_events WHERE operation_kind='WebhookDelivery' AND operation_id=?1", [&operation.operation_id]).unwrap();
+        assert!(load_webhook_evidence_batch(&connection, &[last]).is_err());
     }
 
     #[test]
@@ -3510,7 +3337,11 @@ mod tests {
                 "legacy-provider",
             )
             .unwrap(),
-            Some(state)
+            Some(state.clone())
+        );
+        assert_eq!(
+            LifecycleStore::list_provider_repository_states(&store).unwrap(),
+            vec![state]
         );
     }
 
@@ -3545,6 +3376,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(LifecycleStore::list_provider_repository_states(&store).is_err());
     }
 
     #[test]
@@ -3697,62 +3529,26 @@ mod tests {
     // ── LifecycleStore: visit methods ──────────────────────────────────────
 
     #[test]
-    fn visit_quarantine_candidates_empty_store_does_not_call_visitor() {
-        let store = make_store();
-        let mut count = 0u32;
-        LifecycleStore::visit_quarantine_candidates(&store, |_| {
-            count += 1;
-            Ok::<(), LocalIndexStoreError>(())
-        })
-        .unwrap();
-        assert_eq!(count, 0);
-    }
+    fn empty_inventories_do_not_call_visitors() {
+        fn count_entries<Entry>(
+            count: &mut usize,
+        ) -> impl FnMut(Entry) -> Result<(), LocalIndexStoreError> + '_ {
+            move |_| {
+                *count += 1;
+                Ok(())
+            }
+        }
 
-    #[test]
-    fn visit_retention_holds_empty_store_does_not_call_visitor() {
         let store = make_store();
-        let mut count = 0u32;
-        LifecycleStore::visit_retention_holds(&store, |_| {
-            count += 1;
-            Ok::<(), LocalIndexStoreError>(())
-        })
-        .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn visit_webhook_deliveries_empty_store_does_not_call_visitor() {
-        let store = make_store();
-        let mut count = 0u32;
-        LifecycleStore::visit_webhook_deliveries(&store, |_| {
-            count += 1;
-            Ok::<(), LocalIndexStoreError>(())
-        })
-        .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn visit_provider_repository_states_empty_store_does_not_call_visitor() {
-        let store = make_store();
-        let mut count = 0u32;
-        LifecycleStore::visit_provider_repository_states(&store, |_| {
-            count += 1;
-            Ok::<(), LocalIndexStoreError>(())
-        })
-        .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn visit_dedupe_shard_mappings_empty_store_does_not_call_visitor() {
-        let store = make_store();
-        let mut count = 0u32;
-        DedupeStore::visit_dedupe_shard_mappings(&store, |_| {
-            count += 1;
-            Ok::<(), LocalIndexStoreError>(())
-        })
-        .unwrap();
+        let mut count = 0;
+        LifecycleStore::visit_quarantine_candidates(&store, count_entries(&mut count)).unwrap();
+        LifecycleStore::visit_retention_holds(&store, count_entries(&mut count)).unwrap();
+        LifecycleStore::visit_webhook_deliveries(&store, count_entries(&mut count)).unwrap();
+        LifecycleStore::visit_provider_repository_states(&store, count_entries(&mut count))
+            .unwrap();
+        DedupeStore::visit_dedupe_shard_mappings(&store, count_entries(&mut count)).unwrap();
+        ReconstructionStore::visit_reconstruction_file_ids(&store, count_entries(&mut count))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -4394,6 +4190,7 @@ mod tests {
             )
             .unwrap();
         assert!(LifecycleStore::quarantine_candidate(&store, candidate.object_key()).is_err());
+        assert!(LifecycleStore::list_quarantine_candidates(&store).is_err());
     }
 
     #[test]
@@ -4418,6 +4215,7 @@ mod tests {
             )
             .unwrap();
         assert!(LifecycleStore::retention_hold(&store, hold.object_key()).is_err());
+        assert!(LifecycleStore::list_retention_holds(&store).is_err());
     }
 
     #[test]

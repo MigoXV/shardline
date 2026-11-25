@@ -42,20 +42,14 @@ fn map_directory_path_error(error: DirectoryPathError) -> io::Error {
     }
 }
 
-use crate::config::effective_root;
-use shardline_server::ServerConfigError;
-use std::path::PathBuf;
-
 /// Resolves the server root directory, falling back to the effective root when
 /// no override is provided.
 ///
 /// # Errors
 ///
-/// Returns [`ServerConfigError`] when the root cannot be determined from the
+/// Returns [`shardline_server::ServerConfigError`] when the root cannot be determined from the
 /// environment or the provided override.
-pub fn resolve_root(root_override: Option<&Path>) -> Result<PathBuf, ServerConfigError> {
-    effective_root(root_override)
-}
+pub use crate::config::effective_root as resolve_root;
 
 #[cfg(test)]
 mod tests {
@@ -126,8 +120,7 @@ mod tests {
     fn resolve_root_with_temp_dir_succeeds() {
         let sandbox = tempfile::tempdir().unwrap();
         let result = resolve_root(Some(sandbox.path()));
-        assert!(result.is_ok());
         let root = result.unwrap();
-        assert!(root.is_absolute());
+        assert_eq!(root, sandbox.path());
     }
 }

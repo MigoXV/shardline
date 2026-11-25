@@ -122,34 +122,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn blob_path_rejects_invalid_digest() {
-        assert!(matches!(
-            parse_oci_path("team/assets/blobs/sha256:not-a-hex"),
-            Err(ServerError::InvalidDigest)
-        ));
-    }
-
-    // ── BlobUploads ─────────────────────────────────────────────────────
-
-    #[test]
-    fn blob_uploads_path_parses() {
-        let result = parse_oci_path("team/assets/blobs/uploads");
-        assert!(matches!(
-            result,
-            Ok(OciPath::BlobUploads { repository }) if repository == "team/assets"
-        ));
-    }
-
-    #[test]
-    fn blob_uploads_path_strips_trailing_slash() {
-        let result = parse_oci_path("team/assets/blobs/uploads/");
-        assert!(matches!(
-            result,
-            Ok(OciPath::BlobUploads { repository }) if repository == "team/assets"
-        ));
-    }
-
     // ── BlobUploadSession ───────────────────────────────────────────────
 
     #[test]
@@ -191,70 +163,6 @@ mod tests {
         ));
     }
 
-    // ── TagsList ────────────────────────────────────────────────────────
-
-    #[test]
-    fn tags_list_path_parses() {
-        let result = parse_oci_path("team/assets/tags/list");
-        assert!(matches!(
-            result,
-            Ok(OciPath::TagsList { repository }) if repository == "team/assets"
-        ));
-    }
-
-    #[test]
-    fn tags_list_path_strips_trailing_slash() {
-        let result = parse_oci_path("team/assets/tags/list/");
-        assert!(matches!(
-            result,
-            Ok(OciPath::TagsList { repository }) if repository == "team/assets"
-        ));
-    }
-
-    // ── Unknown / invalid paths ─────────────────────────────────────────
-
-    #[test]
-    fn unknown_path_returns_not_found() {
-        assert!(matches!(
-            parse_oci_path("team/assets/unknown"),
-            Err(ServerError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn empty_path_returns_not_found() {
-        assert!(matches!(parse_oci_path(""), Err(ServerError::NotFound)));
-    }
-
-    // ── Repository validation ───────────────────────────────────────────
-
-    #[test]
-    fn uppercase_repository_rejected() {
-        assert!(matches!(
-            parse_oci_path("Team/assets/tags/list"),
-            Err(ServerError::InvalidRepositoryName)
-        ));
-    }
-
-    #[test]
-    fn repository_with_spaces_rejected() {
-        assert!(matches!(
-            parse_oci_path("team/my assets/tags/list"),
-            Err(ServerError::InvalidRepositoryName)
-        ));
-    }
-
-    // ── Deeply nested repositories ──────────────────────────────────────
-
-    #[test]
-    fn deeply_nested_repository_parses() {
-        let result = parse_oci_path("a/b/c/d/tags/list");
-        assert!(matches!(
-            result,
-            Ok(OciPath::TagsList { repository }) if repository == "a/b/c/d"
-        ));
-    }
-
     // ── Path ordering (blobs/uploads must be checked before blobs) ──────
 
     #[test]
@@ -266,23 +174,6 @@ mod tests {
     // ── Additional edge cases ────────────────────────────────────────────
 
     #[test]
-    fn blob_path_with_trailing_slash_after_blobs_rejects() {
-        // Trimmed to "team/assets/blobs" — no "/blobs/" match (no trailing /),
-        // so it falls through to NotFound.
-        let path = "team/assets/blobs/";
-        let result = parse_oci_path(path);
-        assert!(matches!(result, Err(ServerError::NotFound)));
-    }
-
-    #[test]
-    fn blob_path_with_missing_sha256_prefix_rejects() {
-        // Digest that doesn't start with "sha256:" is invalid
-        let path = "team/assets/blobs/not-sha256-prefix";
-        let result = parse_oci_path(path);
-        assert!(matches!(result, Err(ServerError::InvalidDigest)));
-    }
-
-    #[test]
     fn path_with_too_many_segments_still_parses_if_matches_pattern() {
         // Deep nesting in the repository portion is fine (matches blob pattern)
         let path = format!("a/b/c/d/e/f/blobs/{VALID_DIGEST}");
@@ -291,19 +182,6 @@ mod tests {
             result,
             Ok(OciPath::Blob { repository, .. }) if repository == "a/b/c/d/e/f"
         ));
-    }
-
-    #[test]
-    fn manifest_without_reference_returns_not_found() {
-        // "/manifests" with nothing after (trailing slash trimmed)
-        let result = parse_oci_path("team/assets/manifests/");
-        assert!(matches!(result, Err(ServerError::NotFound)));
-    }
-
-    #[test]
-    fn manifest_reference_with_slash_is_rejected() {
-        let result = parse_oci_path("team/assets/manifests/v1/something");
-        assert!(matches!(result, Err(ServerError::NotFound)));
     }
 
     #[test]
@@ -340,56 +218,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tags_list_with_repository_having_hyphens_and_dots() {
-        // Repository names commonly contain hyphens and dots.
-        let result = parse_oci_path("my-team/my-repo.v2/tags/list");
-        assert!(matches!(
-            result,
-            Ok(OciPath::TagsList { repository }) if repository == "my-team/my-repo.v2"
-        ));
-    }
-
-    #[test]
-    fn repository_with_underscores_accepted() {
-        let result = parse_oci_path("team/my_repo/tags/list");
-        assert!(matches!(
-            result,
-            Ok(OciPath::TagsList { repository }) if repository == "team/my_repo"
-        ));
-    }
-
-    #[test]
-    fn repository_with_numbers_accepted() {
-        let result = parse_oci_path("team2/project3/blobs/uploads");
-        assert!(matches!(
-            result,
-            Ok(OciPath::BlobUploads { repository }) if repository == "team2/project3"
-        ));
-    }
-
-    #[test]
-    fn path_dot_segment_rejected() {
-        // Directories like "." or ".." are not valid in repository names
-        let result = parse_oci_path("team/./assets/tags/list");
-        assert!(matches!(result, Err(ServerError::InvalidRepositoryName)));
-    }
-
     // ── Null byte rejection ──────────────────────────────────────────────
-
-    #[test]
-    fn oci_repository_name_with_null_byte_rejected() {
-        let path = "team/asset\0s/tags/list";
-        let result = parse_oci_path(path);
-        assert!(matches!(result, Err(ServerError::InvalidRepositoryName)));
-    }
-
-    #[test]
-    fn oci_blob_path_with_null_byte_rejected() {
-        let path = "team/assets/blobs/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\0ef";
-        let result = parse_oci_path(path);
-        assert!(matches!(result, Err(ServerError::InvalidDigest)));
-    }
 
     #[test]
     fn oci_manifest_path_with_null_byte_in_reference() {
@@ -403,5 +232,83 @@ mod tests {
             result,
             Ok(OciPath::Manifest { reference, .. }) if reference == "v1\0tag"
         ));
+    }
+
+    #[test]
+    fn upload_initiation_paths_preserve_repository() {
+        for (path, expected) in [
+            ("team/assets/blobs/uploads", "team/assets"),
+            ("team/assets/blobs/uploads/", "team/assets"),
+            ("team2/project3/blobs/uploads", "team2/project3"),
+        ] {
+            assert!(
+                matches!(parse_oci_path(path), Ok(OciPath::BlobUploads { repository }) if repository == expected),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_listing_paths_preserve_repository() {
+        for (path, expected) in [
+            ("team/assets/tags/list", "team/assets"),
+            ("team/assets/tags/list/", "team/assets"),
+            ("a/b/c/d/tags/list", "a/b/c/d"),
+            ("my-team/my-repo.v2/tags/list", "my-team/my-repo.v2"),
+            ("team/my_repo/tags/list", "team/my_repo"),
+        ] {
+            assert!(
+                matches!(parse_oci_path(path), Ok(OciPath::TagsList { repository }) if repository == expected),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_return_not_found() {
+        for path in [
+            "team/assets/unknown",
+            "",
+            "team/assets/blobs/",
+            "team/assets/manifests/",
+            "team/assets/manifests/v1/something",
+        ] {
+            assert!(
+                matches!(parse_oci_path(path), Err(ServerError::NotFound)),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_return_invalid_repository_name() {
+        for path in [
+            "Team/assets/tags/list",
+            "team/my assets/tags/list",
+            "team/./assets/tags/list",
+            "team/asset\0s/tags/list",
+        ] {
+            assert!(
+                matches!(
+                    parse_oci_path(path),
+                    Err(ServerError::InvalidRepositoryName)
+                ),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_return_invalid_digest() {
+        for path in [
+            "team/assets/blobs/sha256:not-a-hex",
+            "team/assets/blobs/not-sha256-prefix",
+            "team/assets/blobs/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\0ef",
+        ] {
+            assert!(
+                matches!(parse_oci_path(path), Err(ServerError::InvalidDigest)),
+                "{path:?}"
+            );
+        }
     }
 }

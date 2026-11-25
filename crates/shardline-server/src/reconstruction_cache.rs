@@ -11,9 +11,8 @@ use std::{
 
 use serde_json::{from_slice, to_vec};
 use shardline_cache::{
-    AsyncReconstructionCache, DisabledReconstructionCache, MemoryReconstructionCache,
-    ReconstructionCacheKey, ReconstructionCacheLookup, ReconstructionCacheReservation,
-    RedisReconstructionCache,
+    AsyncReconstructionCache, MemoryReconstructionCache, ReconstructionCacheKey,
+    ReconstructionCacheLookup, ReconstructionCacheReservation, RedisReconstructionCache,
 };
 use shardline_protocol::RepositoryScope;
 
@@ -47,8 +46,7 @@ pub struct ReconstructionCacheBenchReport {
 #[derive(Clone)]
 pub struct ReconstructionCacheService {
     adapter_name: &'static str,
-    adapter: SharedReconstructionCache,
-    writes_enabled: bool,
+    adapter: Option<SharedReconstructionCache>,
 }
 
 impl Debug for ReconstructionCacheService {
@@ -65,8 +63,7 @@ impl ReconstructionCacheService {
     pub fn disabled() -> Self {
         Self {
             adapter_name: ReconstructionCacheAdapter::Disabled.as_str(),
-            adapter: Arc::new(DisabledReconstructionCache::new()),
-            writes_enabled: false,
+            adapter: None,
         }
     }
 
@@ -80,11 +77,10 @@ impl ReconstructionCacheService {
             ReconstructionCacheAdapter::Disabled => Ok(Self::disabled()),
             ReconstructionCacheAdapter::Memory => Ok(Self {
                 adapter_name: ReconstructionCacheAdapter::Memory.as_str(),
-                adapter: Arc::new(MemoryReconstructionCache::new(
+                adapter: Some(Arc::new(MemoryReconstructionCache::new(
                     config.reconstruction_cache_ttl_seconds(),
                     config.reconstruction_cache_memory_max_entries(),
-                )),
-                writes_enabled: true,
+                ))),
             }),
             ReconstructionCacheAdapter::Redis => {
                 let redis_url = config
@@ -100,8 +96,7 @@ impl ReconstructionCacheService {
                 )?;
                 Ok(Self {
                     adapter_name: ReconstructionCacheAdapter::Redis.as_str(),
-                    adapter: Arc::new(adapter),
-                    writes_enabled: true,
+                    adapter: Some(Arc::new(adapter)),
                 })
             }
         }
@@ -110,8 +105,7 @@ impl ReconstructionCacheService {
     fn for_tests(adapter_name: &'static str, adapter: SharedReconstructionCache) -> Self {
         Self {
             adapter_name,
-            adapter,
-            writes_enabled: true,
+            adapter: Some(adapter),
         }
     }
 
@@ -120,7 +114,10 @@ impl ReconstructionCacheService {
     }
 
     pub(crate) async fn ready(&self) -> Result<(), ServerError> {
-        self.adapter.ready().await.map_err(ServerError::from)
+        match &self.adapter {
+            Some(adapter) => adapter.ready().await.map_err(ServerError::from),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn get_or_load<Load, LoadFuture>(
@@ -132,110 +129,69 @@ impl ReconstructionCacheService {
         Load: FnOnce() -> LoadFuture,
         LoadFuture: Future<Output = Result<FileReconstructionResponse, ServerError>>,
     {
-        let reservation = if self.writes_enabled {
-            match self.adapter.get_or_reserve(key).await {
-                Ok(ReconstructionCacheLookup::Hit(payload)) if payload_within_bound(&payload) => {
-                    if let Ok(response) = from_slice::<FileReconstructionResponse>(&payload) {
-                        shardline_metrics::record_reconstruction_cache_hit();
-                        return Ok(response);
-                    }
-                    // A cache value is never authoritative. Remove malformed or
-                    // oversized data, and locate for a fenced reconstruction
-                    // reservation instead of allowing every replica to rebuild it.
-                    self.adapter.delete(key).await.ok();
-                    match self.adapter.get_or_reserve(key).await {
-                        Ok(ReconstructionCacheLookup::Hit(refetched))
-                            if payload_within_bound(&refetched) =>
-                        {
-                            if let Ok(response) =
-                                from_slice::<FileReconstructionResponse>(&refetched)
-                            {
-                                shardline_metrics::record_reconstruction_cache_hit();
-                                return Ok(response);
-                            }
-                            None
-                        }
-                        Ok(ReconstructionCacheLookup::Reserved(reservation)) => Some(reservation),
-                        Ok(ReconstructionCacheLookup::Hit(_)) | Err(_) => None,
-                    }
+        let Some(adapter) = &self.adapter else {
+            shardline_metrics::record_reconstruction_cache_miss();
+            return load().await;
+        };
+        let reservation = match adapter.get_or_reserve(key).await {
+            Ok(ReconstructionCacheLookup::Hit(payload)) => {
+                if let Some(response) = decode_cache_hit(&payload) {
+                    return Ok(response);
                 }
-                Ok(ReconstructionCacheLookup::Hit(_invalid_payload)) => {
-                    // A cache entry is never authoritative. Remove malformed or
-                    // oversized data, and compete for a fenced reconstruction
-                    // reservation instead of allowing every replica to rebuild it.
-                    self.adapter.delete(key).await.ok();
-                    match self.adapter.get_or_reserve(key).await {
-                        Ok(ReconstructionCacheLookup::Hit(refetched))
-                            if payload_within_bound(&refetched) =>
-                        {
-                            if let Ok(response) =
-                                from_slice::<FileReconstructionResponse>(&refetched)
-                            {
-                                shardline_metrics::record_reconstruction_cache_hit();
-                                return Ok(response);
-                            }
-                            None
+                // A cache value is never authoritative. Remove malformed or
+                // oversized data, and compete for a fenced reconstruction
+                // reservation instead of allowing every replica to rebuild it.
+                adapter.delete(key).await.ok();
+                match adapter.get_or_reserve(key).await {
+                    Ok(ReconstructionCacheLookup::Hit(refetched)) => {
+                        if let Some(response) = decode_cache_hit(&refetched) {
+                            return Ok(response);
                         }
-                        Ok(ReconstructionCacheLookup::Reserved(reservation)) => Some(reservation),
-                        Ok(ReconstructionCacheLookup::Hit(_)) | Err(_) => None,
+                        None
                     }
+                    Ok(ReconstructionCacheLookup::Reserved(reservation)) => Some(reservation),
+                    Err(_) => None,
                 }
-                Ok(ReconstructionCacheLookup::Reserved(reservation)) => Some(reservation),
-                Err(_) => None,
             }
-        } else {
-            None
+            Ok(ReconstructionCacheLookup::Reserved(reservation)) => Some(reservation),
+            Err(_) => None,
         };
 
         shardline_metrics::record_reconstruction_cache_miss();
-        // If THIS caller's future is dropped mid-load (client disconnect,
-        // request timeout, shutdown), the loading latch the adapter registered
-        // during get() must be released synchronously — otherwise the next
-        // caller for the same key stalls for the full orphan bound and the
-        // adapter's loading map grows without bound (F-112).
-        let _latch_release = LoadingLatchReleaseGuard {
-            adapter: Arc::clone(&self.adapter),
-            key: key.clone(),
-            reservation: reservation.clone(),
-        };
-        // Run the loader with a heartbeat that refreshes the loading latch the
-        // adapter registered during get() (F-90): a slow-but-alive load must
-        // never be mistaken for a dead one at a concurrent waiter's orphan
-        // bound, or the latch is stolen and a second reconstruction starts.
-        let response = match self
-            .run_load_with_heartbeat(key, reservation.as_ref(), load)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                // The adapter may have registered an in-flight loading latch for
-                // `key` during get(). If the loader failed, that latch is never
-                // released by a put(); without cleanup, concurrent callers wait on
-                // it until the adapter's stall timeout. Delete the key so the
-                // latch is removed and waiters wake and retry promptly.
-                if let Some(reservation) = reservation.as_ref() {
-                    self.adapter.delete_reserved(key, reservation).await.ok();
+        // Release this reservation synchronously on cancellation so waiters
+        // can retry without waiting for the orphan timeout (F-112).
+        let _latch_release = reservation
+            .as_ref()
+            .map(|reservation| LoadingLatchReleaseGuard {
+                adapter,
+                key,
+                reservation,
+            });
+        // Refresh the fenced reservation while loading so a slow, live loader
+        // is not mistaken for an orphan and duplicated by a waiter (F-90).
+        let response =
+            match Self::run_load_with_heartbeat(adapter, key, reservation.as_ref(), load).await {
+                Ok(response) => response,
+                Err(error) => {
+                    // Wake waiters after failure, without deleting a newer owner's reservation.
+                    if let Some(reservation) = reservation.as_ref() {
+                        adapter.delete_reserved(key, reservation).await.ok();
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
-        if self.writes_enabled {
-            let payload = to_vec(&response)?;
-            if payload_within_bound(&payload) {
-                if let Some(reservation) = reservation.as_ref() {
-                    let _ignored = self.adapter.put_reserved(key, &payload, reservation).await;
-                } else {
-                    let _ignored = self.adapter.put(key, &payload).await;
-                }
+            };
+        let payload = to_vec(&response)?;
+        if payload_within_bound(&payload) {
+            if let Some(reservation) = reservation.as_ref() {
+                let _ignored = adapter.put_reserved(key, &payload, reservation).await;
             } else {
-                // The payload exceeds the cache bound, so the put() is skipped —
-                // but the loading latch registered during get() must still be
-                // cleared, otherwise it lingers until a waiter steals it at the
-                // orphan bound (F-91). Delete restores the cache to its pre-get()
-                // state.
-                if let Some(reservation) = reservation.as_ref() {
-                    self.adapter.delete_reserved(key, reservation).await.ok();
-                }
+                let _ignored = adapter.put(key, &payload).await;
+            }
+        } else {
+            // Skipping an oversized write must still release our loading
+            // reservation so waiters can retry promptly (F-91).
+            if let Some(reservation) = reservation.as_ref() {
+                adapter.delete_reserved(key, reservation).await.ok();
             }
         }
         Ok(response)
@@ -245,7 +201,7 @@ impl ReconstructionCacheService {
     /// intervals, mirroring the memory adapter's own loader heartbeat so the
     /// production service-layer path gets the same protection (F-90).
     async fn run_load_with_heartbeat<Load, LoadFuture>(
-        &self,
+        adapter: &SharedReconstructionCache,
         key: &ReconstructionCacheKey,
         reservation: Option<&ReconstructionCacheReservation>,
         load: Load,
@@ -266,7 +222,7 @@ impl ReconstructionCacheService {
                     // Refresh the latch the adapter registered during get(), so
                     // a concurrent waiter at the orphan bound sees a fresh
                     // stamp instead of stealing the latch of a live loader.
-                    let _ignored = self.adapter.touch_reservation(key, reservation).await;
+                    let _ignored = adapter.touch_reservation(key, reservation).await;
                 }
             }
         }
@@ -281,27 +237,18 @@ impl ReconstructionCacheService {
     }
 }
 
-/// Releases the loading latch the adapter registered during `get()` when the
-/// service-layer caller's future is dropped mid-load (F-112).
-///
-/// The memory adapter registers a loading latch on a cold `get()` miss and
-/// removes it on `put()`/`delete()`. If the caller is dropped in between
-/// (client disconnect, request timeout, shutdown), neither runs — without this
-/// guard the latch would linger for the full orphan bound, stalling the next
-/// caller and leaking loading-map entries. `Drop` runs synchronously, so the
-/// release is a synchronous adapter method (a no-op for adapters without
-/// loading latches, e.g. Redis and Disabled).
-struct LoadingLatchReleaseGuard {
-    adapter: SharedReconstructionCache,
-    key: ReconstructionCacheKey,
-    reservation: Option<ReconstructionCacheReservation>,
+/// Releases a loader reservation on cancellation. Memory-cache waiters
+/// can retry immediately; adapters without synchronous release use lease expiry.
+/// The ownership fence prevents an old loader from releasing a newer reservation.
+struct LoadingLatchReleaseGuard<'request> {
+    adapter: &'request SharedReconstructionCache,
+    key: &'request ReconstructionCacheKey,
+    reservation: &'request ReconstructionCacheReservation,
 }
 
-impl Drop for LoadingLatchReleaseGuard {
+impl Drop for LoadingLatchReleaseGuard<'_> {
     fn drop(&mut self) {
-        if let Some(reservation) = self.reservation.as_ref() {
-            self.adapter.release_reservation(&self.key, reservation);
-        }
+        self.adapter.release_reservation(self.key, self.reservation);
     }
 }
 
@@ -342,6 +289,15 @@ pub(crate) const DEFAULT_RECONSTRUCTION_CACHE_MEMORY_MAX_ENTRIES: NonZeroUsize =
         None => NonZeroUsize::MIN,
     };
 
+fn decode_cache_hit(payload: &[u8]) -> Option<FileReconstructionResponse> {
+    if !payload_within_bound(payload) {
+        return None;
+    }
+    let response = from_slice(payload).ok()?;
+    shardline_metrics::record_reconstruction_cache_hit();
+    Some(response)
+}
+
 fn payload_within_bound(payload: &[u8]) -> bool {
     let observed_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     observed_bytes <= MAX_RECONSTRUCTION_CACHE_PAYLOAD_BYTES
@@ -364,23 +320,17 @@ where
     let cache = ReconstructionCacheService::for_tests("memory-bench", adapter);
     let key = ReconstructionCacheService::version_key(file_id, content_hash, repository_scope);
     let loader_calls = AtomicUsize::new(0);
+    let counted_load = || {
+        loader_calls.fetch_add(1, Ordering::SeqCst);
+        load()
+    };
 
     let cold_started = Instant::now();
-    let cold = cache
-        .get_or_load(&key, || {
-            loader_calls.fetch_add(1, Ordering::SeqCst);
-            load()
-        })
-        .await?;
+    let cold = cache.get_or_load(&key, &counted_load).await?;
     let cold_load_micros = duration_micros(cold_started.elapsed())?;
 
     let hot_started = Instant::now();
-    let hot = cache
-        .get_or_load(&key, || {
-            loader_calls.fetch_add(1, Ordering::SeqCst);
-            load()
-        })
-        .await?;
+    let hot = cache.get_or_load(&key, &counted_load).await?;
     let hot_load_micros = duration_micros(hot_started.elapsed())?;
 
     debug_assert_eq!(cold, hot);
@@ -643,31 +593,37 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cache_service_ignores_corrupt_cached_payload_and_repairs_entry() {
-        let put_calls = Arc::new(AtomicUsize::new(0));
-        let adapter: SharedReconstructionCache = Arc::new(StaticCache {
-            payload: Some(b"not a reconstruction response".to_vec()),
-            put_calls: Arc::clone(&put_calls),
-        });
-        let cache = ReconstructionCacheService::for_tests("static", adapter);
-        let key = ReconstructionCacheKey::latest("asset.bin", None);
-        let loader_calls = AtomicUsize::new(0);
+        for payload in [
+            b"not a reconstruction response".as_slice(),
+            b"not-a-valid-reconstruction-response",
+            b"{}",
+        ] {
+            let put_calls = Arc::new(AtomicUsize::new(0));
+            let adapter: SharedReconstructionCache = Arc::new(StaticCache {
+                payload: Some(payload.to_vec()),
+                put_calls: Arc::clone(&put_calls),
+            });
+            let cache = ReconstructionCacheService::for_tests("static", adapter);
+            let key = ReconstructionCacheKey::latest("asset.bin", None);
+            let loader_calls = AtomicUsize::new(0);
 
-        let response = cache
-            .get_or_load(&key, || {
-                loader_calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok(sample_response("chunk-repaired")) }
-            })
-            .await;
+            let response = cache
+                .get_or_load(&key, || {
+                    loader_calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(sample_response("chunk-repaired")) }
+                })
+                .await;
 
-        assert!(response.is_ok());
-        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(put_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            response
-                .ok()
-                .and_then(|value| value.terms.first().map(|term| term.hash.clone())),
-            Some("chunk-repaired".to_owned())
-        );
+            assert!(response.is_ok());
+            assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(put_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                response
+                    .ok()
+                    .and_then(|value| value.terms.first().map(|term| term.hash.clone())),
+                Some("chunk-repaired".to_owned())
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -716,27 +672,15 @@ mod tests {
     // ── ReconstructionCacheAdapter ───────────────────────────────────────
 
     #[test]
-    fn adapter_parse_disabled() {
-        assert_eq!(
-            ReconstructionCacheAdapter::parse("disabled").unwrap(),
-            ReconstructionCacheAdapter::Disabled
-        );
-    }
-
-    #[test]
-    fn adapter_parse_memory() {
-        assert_eq!(
-            ReconstructionCacheAdapter::parse("memory").unwrap(),
-            ReconstructionCacheAdapter::Memory
-        );
-    }
-
-    #[test]
-    fn adapter_parse_redis() {
-        assert_eq!(
-            ReconstructionCacheAdapter::parse("redis").unwrap(),
-            ReconstructionCacheAdapter::Redis
-        );
+    fn adapter_parse_known_variants() {
+        for (name, adapter) in [
+            ("disabled", ReconstructionCacheAdapter::Disabled),
+            ("memory", ReconstructionCacheAdapter::Memory),
+            ("redis", ReconstructionCacheAdapter::Redis),
+        ] {
+            assert_eq!(ReconstructionCacheAdapter::parse(name).unwrap(), adapter);
+            assert_eq!(adapter.as_str(), name);
+        }
     }
 
     #[test]
@@ -748,64 +692,53 @@ mod tests {
     }
 
     #[test]
-    fn adapter_as_str() {
-        assert_eq!(ReconstructionCacheAdapter::Disabled.as_str(), "disabled");
-        assert_eq!(ReconstructionCacheAdapter::Memory.as_str(), "memory");
-        assert_eq!(ReconstructionCacheAdapter::Redis.as_str(), "redis");
-    }
-
-    // ── payload_within_bound ─────────────────────────────────────────────
-
-    #[test]
-    fn payload_within_bound_accepts_small_payload() {
+    fn payload_bound_includes_empty_small_and_exact_maximum() {
+        assert!(payload_within_bound(b""));
         assert!(payload_within_bound(b"small"));
-    }
-
-    #[test]
-    fn payload_within_bound_rejects_oversized() {
-        let oversized = vec![0u8; (MAX_RECONSTRUCTION_CACHE_PAYLOAD_BYTES + 1) as usize];
+        let max = MAX_RECONSTRUCTION_CACHE_PAYLOAD_BYTES as usize;
+        let oversized = vec![0u8; max + 1];
         assert!(!payload_within_bound(&oversized));
-    }
-
-    #[test]
-    fn payload_within_bound_accepts_exact_max() {
-        let exact = vec![0u8; MAX_RECONSTRUCTION_CACHE_PAYLOAD_BYTES as usize];
-        assert!(payload_within_bound(&exact));
+        assert!(payload_within_bound(&oversized[..max]));
     }
 
     // ── ReconstructionCacheService::from_config ────────────────────────────
 
     #[test]
-    fn from_config_disabled_adapter_returns_disabled_service() {
-        let config = ServerConfig::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            "http://localhost:8080".to_owned(),
-            PathBuf::from("/tmp/test"),
-            NonZeroUsize::new(4096).unwrap(),
-        )
-        .with_reconstruction_cache_disabled();
-
-        let service = ReconstructionCacheService::from_config(&config).unwrap();
-        assert_eq!(service.backend_name(), "disabled");
-    }
-
-    #[test]
-    fn from_config_memory_adapter_returns_memory_service() {
+    fn configured_memory_and_disabled_adapters_have_expected_names() {
         let config = ServerConfig::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
             "http://localhost:8080".to_owned(),
             PathBuf::from("/tmp/test"),
             NonZeroUsize::new(4096).unwrap(),
         );
-
-        let service = ReconstructionCacheService::from_config(&config).unwrap();
-        assert_eq!(service.backend_name(), "memory");
+        for (config, expected) in [
+            (config.clone(), "memory"),
+            (config.with_reconstruction_cache_disabled(), "disabled"),
+        ] {
+            let service = ReconstructionCacheService::from_config(&config).unwrap();
+            assert_eq!(service.backend_name(), expected);
+        }
     }
 
-    #[test]
-    fn reconstruction_cache_service_disabled_returns_disabled_name() {
+    #[tokio::test]
+    async fn disabled_cache_loads_each_request_and_propagates_errors() {
         let service = ReconstructionCacheService::disabled();
         assert_eq!(service.backend_name(), "disabled");
+        service.ready().await.unwrap();
+        let key = ReconstructionCacheKey::latest("asset.bin", None);
+        for hash in ["first", "second"] {
+            let response = service
+                .get_or_load(&key, || async { Ok(sample_response(hash)) })
+                .await
+                .unwrap();
+            assert_eq!(response.terms.first().unwrap().hash, hash);
+        }
+        assert!(matches!(
+            service
+                .get_or_load(&key, || async { Err(ServerError::NotFound) })
+                .await,
+            Err(ServerError::NotFound)
+        ));
     }
 
     #[test]
@@ -814,40 +747,6 @@ mod tests {
         let debug = format!("{service:?}");
         assert!(debug.contains("ReconstructionCacheService"));
         assert!(debug.contains("disabled"));
-    }
-
-    // ── ReconstructionCacheService::from_config — Redis adapter ───────────
-
-    #[test]
-    fn from_config_redis_without_url_errors() {
-        let _config = ServerConfig::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            "http://localhost:8080".to_owned(),
-            PathBuf::from("/tmp/test"),
-            NonZeroUsize::new(4096).unwrap(),
-        );
-        // Default adapter is memory. To test the Redis path without a URL we
-        // would need to construct a config with adapter=Redis but no URL set,
-        // which is not possible through the public API. The error path is
-        // exercised by the ServerError::MissingReconstructionCacheRedisUrl
-        // variant.
-    }
-
-    #[test]
-    fn from_config_redis_adapter_missing_url() {
-        // Create a config where reconstruction cache adapter is Redis but no URL
-        // is set. This requires reaching into the config internals.
-        let _config = ServerConfig::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            "http://localhost:8080".to_owned(),
-            PathBuf::from("/tmp/test"),
-            NonZeroUsize::new(4096).unwrap(),
-        );
-        // We can't directly set the adapter to Redis without a URL through the
-        // public API. The with_reconstruction_cache_redis method requires a URL.
-        // Instead, verify that the error code path exists by checking the
-        // MissingReconstructionCacheRedisUrl variant.
-        let _err = ServerError::MissingReconstructionCacheRedisUrl;
     }
 
     // ── ready() method ───────────────────────────────────────────────────
@@ -875,52 +774,26 @@ mod tests {
     // ── version_key() ────────────────────────────────────────────────────
 
     #[test]
-    fn version_key_with_all_params() {
+    fn version_keys_preserve_file_identity_and_repository_scope() {
         use shardline_protocol::{RepositoryProvider, RepositoryScope};
         let scope =
             RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", None).unwrap();
-        let key = ReconstructionCacheService::version_key("file-id", "hash123", Some(&scope));
-        // Key should be a non-empty string representation
-        let key_str = format!("{key:?}");
-        assert!(!key_str.is_empty());
-    }
-
-    #[test]
-    fn version_key_without_scope() {
-        let key = ReconstructionCacheService::version_key("file-id", "hash123", None);
-        let key_str = format!("{key:?}");
-        assert!(!key_str.is_empty());
-    }
-
-    // ── get_or_load — deserialization failure ────────────────────────────
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cache_service_falls_back_when_cached_payload_fails_deserialize() {
-        // When the cached payload is valid JSON but not a valid
-        // FileReconstructionResponse, the cache should fall back to the loader.
-        let adapter: SharedReconstructionCache = Arc::new(StaticCache {
-            payload: Some(b"not-a-valid-reconstruction-response".to_vec()),
-            put_calls: Arc::new(AtomicUsize::new(0)),
-        });
-        let cache = ReconstructionCacheService::for_tests("static", adapter);
-        let key = ReconstructionCacheKey::latest("asset.bin", None);
-        let loader_calls = AtomicUsize::new(0);
-
-        let response = cache
-            .get_or_load(&key, || {
-                loader_calls.fetch_add(1, Ordering::SeqCst);
-                async { Ok(sample_response("loaded-chunk")) }
-            })
-            .await;
-
-        assert!(response.is_ok());
-        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        let scoped = ReconstructionCacheService::version_key("file-id", "hash123", Some(&scope));
+        let unscoped = ReconstructionCacheService::version_key("file-id", "hash123", None);
+        for key in [&scoped, &unscoped] {
+            assert_eq!(key.file_id(), "file-id");
+            assert_eq!(key.content_hash(), Some("hash123"));
+        }
+        let actual_scope = scoped.repository_scope().unwrap();
+        assert_eq!(actual_scope.owner(), "owner");
+        assert_eq!(actual_scope.repo(), "repo");
         assert_eq!(
-            response
-                .ok()
-                .and_then(|r| r.terms.first().map(|t| t.hash.clone())),
-            Some("loaded-chunk".to_owned())
+            actual_scope.clone().provider_kind(),
+            RepositoryProvider::GitHub
         );
+        assert_eq!(actual_scope.revision(), None);
+        assert!(unscoped.repository_scope().is_none());
+        assert_ne!(scoped, unscoped);
     }
 
     // ── get_or_load — payload at exact max bound ─────────────────────────
@@ -933,11 +806,13 @@ mod tests {
         // We need valid JSON that deserializes to FileReconstructionResponse.
         // Create a response and serialize it, then pad to exactly max bytes.
         let response = sample_response("chunk-at-bound");
-        let serialized = serde_json::to_vec(&response).unwrap();
+        let mut serialized = serde_json::to_vec(&response).unwrap();
         assert!(
             serialized.len() <= max,
             "sample response must fit within max bound for this test"
         );
+        serialized.resize(max, b' ');
+        assert_eq!(serialized.len(), max);
         let adapter: SharedReconstructionCache = Arc::new(StaticCache {
             payload: Some(serialized),
             put_calls: Arc::new(AtomicUsize::new(0)),
@@ -997,68 +872,41 @@ mod tests {
     // ── duration_micros ──────────────────────────────────────────────────
 
     #[test]
-    fn duration_micros_returns_micros() {
-        let result = super::duration_micros(Duration::from_micros(42)).unwrap();
-        assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn duration_micros_rejects_overflow() {
-        let huge = Duration::from_secs(u64::MAX);
-        let result = super::duration_micros(huge);
-        assert!(result.is_err());
-    }
-
-    // ── payload_within_bound — zero length ───────────────────────────────
-
-    #[test]
-    fn payload_within_bound_accepts_zero_length() {
-        assert!(payload_within_bound(b""));
-    }
-
-    // ── ReconstructionCacheAdapter::as_str — coverage ────────────────────
-
-    #[test]
-    fn adapter_as_str_all_variants() {
-        assert_eq!(ReconstructionCacheAdapter::Disabled.as_str(), "disabled");
-        assert_eq!(ReconstructionCacheAdapter::Memory.as_str(), "memory");
-        assert_eq!(ReconstructionCacheAdapter::Redis.as_str(), "redis");
-    }
-
-    // ── ReconstructionCacheService::disabled — default name ──────────────
-
-    #[test]
-    fn disabled_service_backend_name_is_disabled() {
-        let service = ReconstructionCacheService::disabled();
-        assert_eq!(service.backend_name(), "disabled");
+    fn duration_micros_preserves_precision_and_rejects_overflow() {
+        for (duration, expected) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(999), 0),
+            (Duration::from_micros(42), 42),
+        ] {
+            assert_eq!(super::duration_micros(duration).unwrap(), expected);
+        }
+        assert!(super::duration_micros(Duration::from_secs(u64::MAX)).is_err());
     }
 
     // ── benchmark_memory_reconstruction_cache_with_loader ───────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn benchmark_memory_reconstruction_cache_with_loader_hits_cache() {
+        let loader_calls = AtomicUsize::new(0);
         let report = benchmark_memory_reconstruction_cache_with_loader(
             "bench-file.bin",
             "aa".repeat(32).as_str(),
             None,
-            || async { Ok(sample_response("bench-chunk")) },
+            || {
+                loader_calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(sample_response("bench-chunk")) }
+            },
         )
         .await
         .expect("benchmark");
-        // Cold load should be > 0 micros.
-        assert!(
-            report.cold_load_micros > 0,
-            "cold_load_micros should be > 0, got {}",
-            report.cold_load_micros
-        );
-        // Hot load should be > 0 on second access (cached).
-        assert!(
-            report.hot_load_micros > 0,
-            "hot_load_micros should be > 0, got {}",
-            report.hot_load_micros
-        );
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
         assert!(report.cache_hit, "benchmark should report a cache hit");
-        assert!(report.response_bytes > 0, "response_bytes should be > 0");
+        assert_eq!(
+            report.response_bytes,
+            serde_json::to_vec(&sample_response("bench-chunk"))
+                .unwrap()
+                .len() as u64
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

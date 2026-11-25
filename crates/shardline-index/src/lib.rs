@@ -42,6 +42,7 @@
 //!     chunk_size: 1024,
 //!     storage_repr: StorageRepresentation::FixedChunkV1,
 //!     repository_scope: None,
+//!     deduplication_domain: None,
 //!     chunks: vec![FileChunkRecord {
 //!         hash,
 //!         offset: 0,
@@ -60,9 +61,11 @@
 mod store;
 
 mod dedupe;
+mod deduplication_domain;
 pub mod hub;
 mod hub_local_sqlite;
 mod hub_postgres;
+mod hub_recovery;
 mod ids;
 mod lfs_locks;
 mod lifecycle;
@@ -75,6 +78,10 @@ mod oci_tags;
 pub use oci_referrers::OciManifestSubject;
 mod postgres;
 mod provider;
+mod version_manifest;
+pub use version_manifest::{
+    FileVersionManifestV1, HubTreeVersionManifestV1, ManifestLocator, VersionManifestError,
+};
 mod provider_evidence;
 mod reconstruction;
 mod record;
@@ -94,6 +101,14 @@ mod xet_xorb;
 pub use xet_xorb::{MAX_XET_DESCRIPTOR_CHUNKS, XetXorbChunk, XetXorbDescriptor};
 
 pub use dedupe::DedupeShardMapping;
+pub use deduplication_domain::DeduplicationDomain;
+pub use hub_recovery::{
+    HubRecoveryArchiveObject, HubRecoveryError, HubRecoveryMode, HubRecoveryOutboxItem,
+    HubRecoveryOutboxStore, HubRefCheckpointSource, HubRefStateCheckpointArchiveObject,
+    HubRefStateCheckpointReadPin, MAX_PENDING_REPOSITORY_PAGE, archive_next_hub_ref_event,
+    put_hub_ref_archive_record, put_hub_ref_state_checkpoint, read_hub_ref_archive_record,
+    read_hub_ref_archive_record_with_previous, read_hub_ref_state_checkpoint,
+};
 pub use ids::{FileId, StoredObjectId, XorbId};
 pub use lifecycle::{
     ProviderRepositoryState, QuarantineCandidate, QuarantineCandidateError, RetentionHold,
@@ -134,6 +149,7 @@ pub use resumable_snapshot::resumable_state_digest;
 pub use s3_objects::{
     S3ObjectEntry, S3ObjectIndexStore, S3ObjectScanStart, S3PublishCondition, s3_prefix_successor,
 };
+pub use shardline_reliability::HubRefBatchManifestReferenceV1;
 pub use store::{
     AsyncIndexStore, DedupeStore, IndexStore, IndexStoreFuture, LifecycleStore,
     ReconstructionStore, Repository,

@@ -6,9 +6,8 @@ use shardline_protocol::ByteRange;
 use crate::{
     error::XetAdapterError,
     model::{
-        BatchReconstructionResponse, FileReconstructionResponse, FileReconstructionV2Response,
-        ReconstructionChunkRange, ReconstructionFetchInfo, ReconstructionMultiRangeFetch,
-        ReconstructionRangeDescriptor, ReconstructionTerm, ReconstructionUrlRange,
+        BatchReconstructionResponse, FileReconstructionResponse, ReconstructionChunkRange,
+        ReconstructionFetchInfo, ReconstructionTerm, ReconstructionUrlRange,
     },
 };
 
@@ -51,7 +50,7 @@ pub fn build_reconstruction_response(
     let mut first_term = true;
     let mut terms = Vec::with_capacity(record.chunks.len());
     let mut fetch_info = BTreeMap::new();
-    let mut dedup: HashSet<ReconstructionFetchInfo> = HashSet::new();
+    let mut dedup = HashSet::new();
     for chunk in &record.chunks {
         let Some(chunk_end_inclusive) = chunk
             .offset
@@ -84,6 +83,15 @@ pub fn build_reconstruction_response(
             .packed_end
             .checked_sub(1)
             .ok_or(XetAdapterError::Overflow)?;
+        if !dedup.insert((
+            chunk.hash.as_str(),
+            chunk.range_start,
+            chunk.range_end,
+            chunk.packed_start,
+            byte_end,
+        )) {
+            continue;
+        }
         let fetch_entry = ReconstructionFetchInfo {
             range: ReconstructionChunkRange {
                 start: chunk.range_start,
@@ -95,13 +103,10 @@ pub fn build_reconstruction_response(
                 end: byte_end,
             },
         };
-        let fetch_entries = fetch_info
+        fetch_info
             .entry(chunk.hash.clone())
-            .or_insert_with(Vec::new);
-        // Use a global dedup set to avoid O(n²) scans per hash group
-        if dedup.insert(fetch_entry.clone()) {
-            fetch_entries.push(fetch_entry);
-        }
+            .or_insert_with(Vec::new)
+            .push(fetch_entry);
     }
 
     // Clients share downloaded blocks by hash and starting chunk. Advertise
@@ -150,34 +155,7 @@ pub fn build_reconstruction_response_with_metrics(
     result
 }
 
-#[must_use]
-pub fn reconstruction_v2_from_v1(
-    response: FileReconstructionResponse,
-) -> FileReconstructionV2Response {
-    let xorbs = response
-        .fetch_info
-        .into_iter()
-        .map(|(hash, fetch_entries)| {
-            let entries = fetch_entries
-                .into_iter()
-                .map(|entry| ReconstructionMultiRangeFetch {
-                    url: entry.url,
-                    ranges: vec![ReconstructionRangeDescriptor {
-                        chunks: entry.range,
-                        bytes: entry.url_range,
-                    }],
-                })
-                .collect();
-            (hash, entries)
-        })
-        .collect();
-
-    FileReconstructionV2Response {
-        offset_into_first_range: response.offset_into_first_range,
-        terms: response.terms,
-        xorbs,
-    }
-}
+pub use shardline_protocol_adapters::xet::reconstruction_v2_from_v1;
 
 pub fn build_batch_reconstruction_response(
     responses: impl IntoIterator<Item = (String, FileReconstructionResponse)>,
@@ -232,6 +210,7 @@ mod tests {
             )
             .collect();
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "repeated".to_owned(),
             content_hash: "b".repeat(64),
             total_bytes: offset,
@@ -268,12 +247,10 @@ mod tests {
 
     #[test]
     fn response_contains_xet_terms_and_fetch_info() {
-        let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+        let scope =
+            RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", None).unwrap();
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 8,
@@ -304,10 +281,7 @@ mod tests {
 
         let response = build_reconstruction_response("http://127.0.0.1:8080", &record, None);
 
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
+        let response = response.expect("expected valid response");
         assert_eq!(response.offset_into_first_range, 0);
         assert_eq!(response.terms.len(), 2);
         assert_eq!(
@@ -338,6 +312,7 @@ mod tests {
     #[test]
     fn response_applies_requested_logical_range() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 12,
@@ -374,18 +349,11 @@ mod tests {
                 },
             ],
         };
-        let range = ByteRange::new(2, 9);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ByteRange::new(2, 9).unwrap();
 
         let response = build_reconstruction_response("http://127.0.0.1:8080", &record, Some(range));
 
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
+        let response = response.expect("expected valid response");
         assert_eq!(response.offset_into_first_range, 2);
         assert_eq!(response.terms.len(), 3);
     }
@@ -393,6 +361,7 @@ mod tests {
     #[test]
     fn response_rejects_requested_range_past_file_length() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 4,
@@ -409,11 +378,7 @@ mod tests {
                 packed_end: 4,
             }],
         };
-        let range = ByteRange::new(4, 4);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ByteRange::new(4, 4).unwrap();
 
         let response = build_reconstruction_response("http://127.0.0.1:8080", &record, Some(range));
 
@@ -424,33 +389,42 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_record_rejects_requested_range() {
-        let record = FileRecord {
-            file_id: "asset.bin".to_owned(),
-            content_hash: "deadbeef".repeat(8),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: Vec::new(),
-        };
-        let range = ByteRange::new(0, 0);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
-
-        let response = build_reconstruction_response("http://127.0.0.1:8080", &record, Some(range));
-
-        assert!(matches!(
-            response,
-            Err(XetAdapterError::RangeNotSatisfiable)
-        ));
+    fn empty_record_range_contract_is_shared_by_plain_and_metrics_builders() {
+        for file_id in ["asset.bin", "empty.bin"] {
+            let record = FileRecord {
+                deduplication_domain: None,
+                file_id: file_id.to_owned(),
+                content_hash: "deadbeef".repeat(8),
+                total_bytes: 0,
+                chunk_size: 0,
+                storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
+                repository_scope: None,
+                chunks: Vec::new(),
+            };
+            for build in [
+                build_reconstruction_response,
+                super::build_reconstruction_response_with_metrics,
+            ] {
+                let response = build("http://127.0.0.1:8080", &record, None).unwrap();
+                assert!(response.terms.is_empty());
+                assert!(response.fetch_info.is_empty());
+                assert_eq!(response.offset_into_first_range, 0);
+                assert!(matches!(
+                    build(
+                        "http://127.0.0.1:8080",
+                        &record,
+                        Some(ByteRange::new(0, 0).unwrap())
+                    ),
+                    Err(XetAdapterError::RangeNotSatisfiable)
+                ));
+            }
+        }
     }
 
     #[test]
     fn v2_conversion_preserves_terms_and_emits_range_descriptors() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "asset.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 8,
@@ -479,11 +453,7 @@ mod tests {
             ],
         };
 
-        let v1 = build_reconstruction_response("http://127.0.0.1:8080", &record, None);
-        assert!(v1.is_ok());
-        let Ok(v1) = v1 else {
-            return;
-        };
+        let v1 = build_reconstruction_response("http://127.0.0.1:8080", &record, None).unwrap();
         let v2 = reconstruction_v2_from_v1(v1);
 
         assert_eq!(v2.terms.len(), 2);
@@ -504,31 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_record_without_range_returns_empty_response() {
-        let record = FileRecord {
-            file_id: "empty.bin".to_owned(),
-            content_hash: "deadbeef".repeat(8),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: Vec::new(),
-        };
-
-        let response = build_reconstruction_response("http://127.0.0.1:8080", &record, None);
-
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
-        assert!(response.terms.is_empty());
-        assert!(response.fetch_info.is_empty());
-        assert_eq!(response.offset_into_first_range, 0);
-    }
-
-    #[test]
     fn response_with_metrics_delegates_to_build_reconstruction_response() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "metrics-test.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 4,
@@ -552,44 +500,52 @@ mod tests {
             None,
         );
 
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
+        let response = response.expect("expected valid response");
         assert_eq!(response.terms.len(), 1);
     }
 
     #[test]
-    fn response_rejects_invalid_reconstruction_plan() {
-        let record = FileRecord {
-            file_id: "bad.bin".to_owned(),
-            content_hash: "deadbeef".repeat(8),
-            total_bytes: 4,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
-                length: 4,
-                range_start: 1, // inverted range (start > end by default since range_end defaults to 1)
-                range_end: 0,
-                packed_start: 0,
-                packed_end: 4,
-            }],
-        };
+    fn plain_and_metrics_builders_reject_invalid_reconstruction_plans() {
+        use shardline_index::StorageRepresentation::{FixedChunkV1, WholeFileV1};
 
-        let response = build_reconstruction_response("http://127.0.0.1:8080", &record, None);
-
-        assert!(matches!(
-            response,
-            Err(XetAdapterError::FileRecordInvariant(_))
-        ));
+        for (file_id, chunk_size, storage_repr) in [
+            ("bad.bin", 0, WholeFileV1),
+            ("bad-metrics.bin", 4, FixedChunkV1),
+        ] {
+            let record = FileRecord {
+                deduplication_domain: None,
+                file_id: file_id.to_owned(),
+                content_hash: "deadbeef".repeat(8),
+                total_bytes: 4,
+                chunk_size,
+                storage_repr,
+                repository_scope: None,
+                chunks: vec![FileChunkRecord {
+                    hash: "a".repeat(64),
+                    offset: 0,
+                    length: 4,
+                    range_start: 1,
+                    range_end: 0,
+                    packed_start: 0,
+                    packed_end: 4,
+                }],
+            };
+            for build in [
+                build_reconstruction_response,
+                super::build_reconstruction_response_with_metrics,
+            ] {
+                assert!(matches!(
+                    build("http://127.0.0.1:8080", &record, None),
+                    Err(XetAdapterError::FileRecordInvariant(_))
+                ));
+            }
+        }
     }
 
     #[test]
     fn response_deduplicates_fetch_entries_for_same_hash() {
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "dedup.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 8,
@@ -621,10 +577,8 @@ mod tests {
 
         let response = build_reconstruction_response("http://127.0.0.1:8080", &record, None);
 
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
+        let response = response.expect("expected valid response");
+        assert_eq!(response.terms.len(), 2, "both logical terms must remain");
         // Both chunks reference the same hash and same range -> one fetch entry
         assert_eq!(
             response.fetch_info.get(&"a".repeat(64)).map(Vec::len),
@@ -634,44 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn response_with_metrics_propagates_validation_error() {
-        let record = FileRecord {
-            file_id: "bad-metrics.bin".to_owned(),
-            content_hash: "deadbeef".repeat(8),
-            total_bytes: 4,
-            chunk_size: 4,
-            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-            repository_scope: None,
-            chunks: vec![FileChunkRecord {
-                hash: "a".repeat(64),
-                offset: 0,
-                length: 4,
-                range_start: 1,
-                range_end: 0, // inverted => invariant error
-                packed_start: 0,
-                packed_end: 4,
-            }],
-        };
-
-        let response = super::build_reconstruction_response_with_metrics(
-            "http://127.0.0.1:8080",
-            &record,
-            None,
-        );
-
-        assert!(matches!(
-            response,
-            Err(XetAdapterError::FileRecordInvariant(_))
-        ));
-    }
-
-    #[test]
     fn response_skips_chunks_outside_requested_range() {
         // File with chunks at offsets 0-3 and 12-15, but range 4-11 covers
         // an empty space between them (the middle chunk is missing).
         // Actually, the range must be contiguous in FileRecord validation.
         // Instead, test a range that covers only some chunks.
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "partial.bin".to_owned(),
             content_hash: "deadbeef".repeat(8),
             total_bytes: 12,
@@ -709,18 +632,11 @@ mod tests {
             ],
         };
         // Range covering only the middle chunk (byte 4-7).
-        let range = ByteRange::new(4, 7);
-        assert!(range.is_ok());
-        let Ok(range) = range else {
-            return;
-        };
+        let range = ByteRange::new(4, 7).unwrap();
 
         let response = build_reconstruction_response("http://127.0.0.1:8080", &record, Some(range));
 
-        assert!(response.is_ok());
-        let Ok(response) = response else {
-            return;
-        };
+        let response = response.expect("expected valid response");
         assert_eq!(response.terms.len(), 1);
         assert_eq!(response.offset_into_first_range, 0);
         assert_eq!(
@@ -733,9 +649,10 @@ mod tests {
     fn batch_reconstruction_response_merges_fetch_info_across_files() {
         let first = build_batch_reconstruction_response([
             ("a".repeat(64), {
-                let response = build_reconstruction_response(
+                build_reconstruction_response(
                     "http://127.0.0.1:8080",
                     &FileRecord {
+                        deduplication_domain: None,
                         file_id: "asset-a".to_owned(),
                         content_hash: "a".repeat(64),
                         total_bytes: 4,
@@ -753,17 +670,14 @@ mod tests {
                         }],
                     },
                     None,
-                );
-                assert!(response.is_ok());
-                let Ok(response) = response else {
-                    return;
-                };
-                response
+                )
+                .unwrap()
             }),
             ("b".repeat(64), {
-                let response = build_reconstruction_response(
+                build_reconstruction_response(
                     "http://127.0.0.1:8080",
                     &FileRecord {
+                        deduplication_domain: None,
                         file_id: "asset-b".to_owned(),
                         content_hash: "b".repeat(64),
                         total_bytes: 4,
@@ -781,12 +695,8 @@ mod tests {
                         }],
                     },
                     None,
-                );
-                assert!(response.is_ok());
-                let Ok(response) = response else {
-                    return;
-                };
-                response
+                )
+                .unwrap()
             }),
         ]);
 

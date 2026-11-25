@@ -112,19 +112,14 @@ pub enum SdxConfigError {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct DefaultSection {
     /// Full `xet://` endpoint URL (overrides the other fields).
-    #[serde(default)]
     pub endpoint: Option<String>,
     /// Provider name, used when `endpoint` is absent or lacks a provider.
-    #[serde(default)]
     pub provider: Option<String>,
     /// Repository owner.
-    #[serde(default)]
     pub owner: Option<String>,
     /// Repository name.
-    #[serde(default)]
     pub repo: Option<String>,
     /// Revision / branch.
-    #[serde(default)]
     pub revision: Option<String>,
 }
 
@@ -132,13 +127,10 @@ pub struct DefaultSection {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct AuthSection {
     /// Opaque bearer token (priority 1 within the config).
-    #[serde(default)]
     pub token: Option<String>,
     /// Provider bootstrap API key (priority 2 within the config).
-    #[serde(default)]
     pub api_key: Option<String>,
     /// Path to a token file (priority 3 within the config).
-    #[serde(default)]
     pub token_file: Option<String>,
 }
 
@@ -184,26 +176,20 @@ impl SdxConfig {
         env: &dyn Fn(&str) -> Option<String>,
         home: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Option<SdxConfig>, SdxConfigError> {
-        let (resolved, explicit) = match path {
-            Some(path) => (path.to_path_buf(), true),
-            None => {
-                let env_path = env(SHARDLINE_CONFIG_ENV).filter(|value| !value.trim().is_empty());
-                match env_path {
-                    Some(env_path) => (PathBuf::from(env_path), false),
-                    None => {
-                        let base = home("HOME").map(PathBuf::from);
-                        match base {
-                            Some(base) => (
-                                base.join(".config")
-                                    .join("shardline")
-                                    .join(CONFIG_FILE_NAME),
-                                false,
-                            ),
-                            None => return Ok(None),
-                        }
-                    }
-                }
-            }
+        let explicit = path.is_some();
+        let resolved = if let Some(path) = path {
+            path.to_path_buf()
+        } else if let Some(env_path) =
+            env(SHARDLINE_CONFIG_ENV).filter(|value| !value.trim().is_empty())
+        {
+            PathBuf::from(env_path)
+        } else if let Some(base) = home("HOME") {
+            PathBuf::from(base)
+                .join(".config")
+                .join("shardline")
+                .join(CONFIG_FILE_NAME)
+        } else {
+            return Ok(None);
         };
         if explicit && !resolved.is_file() {
             return Err(SdxConfigError::InvalidPath(resolved.display().to_string()));
@@ -356,34 +342,14 @@ pub fn resolve_credential_from_config(
         return Ok(None);
     };
     let auth = &config.auth;
-    if let Some(token) = auth
-        .token
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(Some(Credential::Bearer(token.to_owned())));
-    }
-    if let Some(api_key) = auth
-        .api_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(Some(Credential::ProviderKey(api_key.to_owned())));
-    }
-    if let Some(path) = auth
-        .token_file
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        let contents = read_token_file(Path::new(path)).map_err(|source| {
-            CredentialResolutionError::TokenFile {
-                path: PathBuf::from(path),
-                source,
-            }
-        })?;
-        return Ok(Some(Credential::Bearer(contents)));
-    }
-    Ok(None)
+    // Config fields use the same priority, empty-value filtering, and bounded
+    // token-file loading as environment credentials.
+    resolve_credential_from_env(&|name| match name {
+        SHARDLINE_TOKEN_ENV => auth.token.clone(),
+        SHARDLINE_API_KEY_ENV => auth.api_key.clone(),
+        SHARDLINE_TOKEN_FILE_ENV => auth.token_file.clone(),
+        _ => None,
+    })
 }
 
 #[cfg(test)]
@@ -525,9 +491,7 @@ mod tests {
 
     // ── M6a: shardline.toml parsing ────────────────────────────────────────
 
-    use super::{
-        AuthSection, DefaultSection, SdxConfig, SdxConfigError, resolve_credential_from_config,
-    };
+    use super::{SdxConfig, SdxConfigError, resolve_credential_from_config};
 
     const VALID_TOML: &str = r#"
 [default]
@@ -710,19 +674,5 @@ whatever = true
         let config = SdxConfig::default();
         let credential = resolve_credential_from_config(Some(&config), &env_lookup(&env)).unwrap();
         assert!(credential.is_none());
-    }
-
-    #[test]
-    fn config_sections_are_comparable() {
-        let a = DefaultSection {
-            owner: Some("o".to_owned()),
-            ..Default::default()
-        };
-        assert_eq!(a, a.clone());
-        let auth = AuthSection {
-            token: Some("t".to_owned()),
-            ..Default::default()
-        };
-        assert_eq!(auth, auth.clone());
     }
 }

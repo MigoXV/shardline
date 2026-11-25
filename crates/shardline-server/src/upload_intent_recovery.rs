@@ -8,6 +8,8 @@ use shardline_protocol::RepositoryScope;
 use shardline_reliability::LifecycleEvent;
 
 use crate::upload_identity::SCOPE_PREFIX;
+mod reconcile;
+pub(crate) use reconcile::reconcile;
 pub(crate) mod startup;
 mod xorb_encoding;
 pub(crate) use xorb_encoding::native_xorb_has_equivalent_encoding;
@@ -64,11 +66,7 @@ pub(crate) fn file_record_has_expected_identity(
     record.repository_scope == scope
         && intent.object_key().strip_prefix("record/") == Some(record.file_id.as_str())
         && (intent.object_length() == 0 || intent.object_length() == record.total_bytes)
-        && intent.object_hash().len() == 64
-        && intent
-            .object_hash()
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && shardline_server_core::validate_content_hash(intent.object_hash()).is_ok()
 }
 
 /// Content verification is separate from startup's metadata identity checks.

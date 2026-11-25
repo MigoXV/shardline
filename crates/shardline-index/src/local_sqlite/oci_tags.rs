@@ -1,12 +1,10 @@
+use super::helpers::{persist_appended_reliability_events, run_blocking_store};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::{LocalIndexStore, LocalIndexStoreError, collect_rows};
 use crate::{
     OciTagEntry, OciTagStore,
-    local_sqlite::{
-        current_oci_tag_evidence, oci_tag_snapshot, persist_oci_tag_evidence,
-        verify_oci_tag_evidence,
-    },
+    local_sqlite::{current_oci_tag_evidence, oci_tag_snapshot, verify_oci_tag_evidence},
 };
 use shardline_reliability::{
     OciTagLifecycleEvent, OperationKind, SnapshotEvidence, verify_and_append_snapshot_transition,
@@ -44,14 +42,7 @@ pub(crate) fn record_tag_transition(
         current_oci_tag_evidence(transaction, scope_namespace, repository, tag, before)?;
     let evidence =
         verify_and_append_snapshot_transition(stored_evidence, before_snapshot, after_snapshot)?.0;
-    if evidence_was_missing {
-        for event in evidence.events() {
-            persist_oci_tag_evidence(transaction, event)?;
-        }
-    } else if let Some(event) = evidence.events().last() {
-        persist_oci_tag_evidence(transaction, event)?;
-    }
-    Ok(())
+    persist_appended_reliability_events(transaction, evidence.events(), evidence_was_missing)
 }
 
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OciTagEntry> {
@@ -84,44 +75,35 @@ fn verify_oci_tag_listing_evidence_chunk(
     if values.is_empty() {
         return Ok(());
     }
-    let mut operations = Vec::with_capacity(values.len());
-    for value in values {
-        let snapshot = oci_tag_snapshot(
-            &value.scope_namespace,
-            &value.repository,
-            &value.tag,
-            Some(value.digest_hex.clone()),
-        )?;
-        operations.push(snapshot.evidence_operation()?);
-    }
-    let operation_ids = operations
+    let snapshots = values
         .iter()
-        .map(|operation| operation.operation_id.clone())
-        .collect::<Vec<_>>();
+        .map(|value| {
+            oci_tag_snapshot(
+                &value.scope_namespace,
+                &value.repository,
+                &value.tag,
+                Some(value.digest_hex.clone()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation_ids = snapshots
+        .iter()
+        .map(|snapshot| Ok(snapshot.evidence_operation()?.operation_id))
+        .collect::<Result<Vec<_>, LocalIndexStoreError>>()?;
     let mut latest = super::helpers::load_latest_verified_event_json_batch(
         transaction,
         OperationKind::OciTag,
         &operation_ids,
     )?;
-    for (value, operation) in values.iter().zip(operations) {
-        let Some(event_json) = latest.remove(&operation.operation_id) else {
+    for (snapshot, operation_id) in snapshots.iter().zip(operation_ids) {
+        let Some(event_json) = latest.remove(&operation_id) else {
             return Err(LocalIndexStoreError::Reliability(
                 shardline_reliability::ReliabilityError::OperationMismatch,
             ));
         };
         let event: OciTagLifecycleEvent = serde_json::from_value(event_json)?;
-        let expected = oci_tag_snapshot(
-            &value.scope_namespace,
-            &value.repository,
-            &value.tag,
-            Some(value.digest_hex.clone()),
-        )?;
-        verify_snapshot_event(&event, &expected)?;
-        if event.operation != operation {
-            return Err(LocalIndexStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ));
-        }
+        // Event verification binds its operation identity to this exact snapshot.
+        verify_snapshot_event(&event, snapshot)?;
     }
     Ok(())
 }
@@ -133,7 +115,7 @@ impl OciTagStore for LocalIndexStore {
     async fn upsert_oci_tag(&self, entry: &OciTagEntry) -> Result<(), Self::Error> {
         let store = self.clone();
         let entry = entry.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection
@@ -170,13 +152,12 @@ impl OciTagStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
     }
 
     async fn insert_oci_tag_if_absent(&self, entry: &OciTagEntry) -> Result<bool, Self::Error> {
         let store = self.clone();
         let entry = entry.clone();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection.transaction()?;
@@ -219,7 +200,6 @@ impl OciTagStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
     }
 
     async fn oci_tag(
@@ -232,7 +212,7 @@ impl OciTagStore for LocalIndexStore {
         let scope_namespace = scope_namespace.to_owned();
         let repository = repository.to_owned();
         let tag = tag.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection.transaction()?;
@@ -249,7 +229,6 @@ impl OciTagStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
     }
 
     async fn list_oci_tags(
@@ -263,7 +242,7 @@ impl OciTagStore for LocalIndexStore {
         let scope_namespace = scope_namespace.to_owned();
         let repository = repository.to_owned();
         let cursor = cursor.map(ToOwned::to_owned);
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection.transaction()?;
@@ -299,7 +278,6 @@ impl OciTagStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
     }
 
     async fn list_oci_tags_by_digest(
@@ -312,7 +290,7 @@ impl OciTagStore for LocalIndexStore {
         let scope_namespace = scope_namespace.to_owned();
         let repository = repository.to_owned();
         let digest_hex = digest_hex.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection.transaction()?;
@@ -334,7 +312,6 @@ impl OciTagStore for LocalIndexStore {
             })
         })
         .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
     }
 
     async fn delete_oci_tag_if_digest(
@@ -349,7 +326,7 @@ impl OciTagStore for LocalIndexStore {
         let repository = repository.to_owned();
         let tag = tag.to_owned();
         let digest_hex = digest_hex.to_owned();
-        tokio::task::spawn_blocking(move || {
+        run_blocking_store(move || {
             super::helpers::retry_sqlite_busy(|| {
                 let mut connection = store.open_connection()?;
                 let transaction = connection.transaction()?;
@@ -371,9 +348,7 @@ impl OciTagStore for LocalIndexStore {
                 transaction.commit()?;
                 Ok(changed == 1)
             })
-        })
-        .await
-        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
+        }).await
     }
 }
 
@@ -684,7 +659,7 @@ mod tests {
                 "INSERT INTO shardline_oci_tags(scope_namespace,repository,tag,digest_hex) VALUES('chunk-fixture','team/assets',?1,?2)",
                 params![tag,digest]).unwrap();
             for event in evidence.events() {
-                persist_oci_tag_evidence(&transaction, event).unwrap();
+                super::super::helpers::persist_reliability_event(&transaction, event).unwrap();
             }
         }
         transaction.commit().unwrap();

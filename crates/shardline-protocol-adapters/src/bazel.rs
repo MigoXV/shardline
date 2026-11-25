@@ -44,8 +44,7 @@ pub fn bazel_cache_object_key(
 
 #[cfg(test)]
 mod tests {
-    use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenClaims, TokenScope};
-    use shardline_server_core::{AuthProvider, AuthorizedRepository, LocalHmacProvider};
+    use crate::tests::{test_capability, test_scope};
 
     use super::*;
 
@@ -53,106 +52,35 @@ mod tests {
         "a".repeat(64)
     }
 
-    fn test_scope() -> RepositoryScope {
-        RepositoryScope::new(RepositoryProvider::GitHub, "acme", "repo", None).unwrap()
-    }
-
-    /// Builds a capability carrying the given repository scope (or a
-    /// permissive anonymous capability when `None`), mirroring how the auth
-    /// layer mints capabilities: the claims are verified through a real
-    /// provider so the type-level seal is satisfied.
-    fn test_capability(scope: Option<RepositoryScope>) -> AuthorizedRepository {
-        scope.map_or_else(AuthorizedRepository::anonymous_full_access, |repo| {
-            let claims =
-                TokenClaims::new("local", "test", TokenScope::Write, repo, u64::MAX).unwrap();
-            let provider = LocalHmacProvider::new(b"test-signing-key-32-bytes-long!!").unwrap();
-            let token = provider.mint_token(&claims).unwrap();
-            let ctx = provider.verify_verified(&token).unwrap();
-            AuthorizedRepository::from_verified_context(ctx, TokenScope::Write).unwrap()
-        })
-    }
-
-    // --- BazelCacheKind ---
-
-    #[test]
-    fn bazel_cache_kind_ac_as_str() {
-        assert_eq!(BazelCacheKind::Ac.as_str(), "ac");
-    }
-
-    #[test]
-    fn bazel_cache_kind_cas_as_str() {
-        assert_eq!(BazelCacheKind::Cas.as_str(), "cas");
-    }
-
-    #[test]
-    fn bazel_cache_kind_variants_are_distinct() {
-        assert_ne!(BazelCacheKind::Ac, BazelCacheKind::Cas);
-    }
-
     // --- bazel_cache_object_key ---
 
     #[test]
-    fn bazel_cache_object_key_ac_valid_hash() {
+    fn bazel_cache_object_keys_cover_both_kinds_and_scopes() {
         let hash = valid_hash();
-        let key =
-            bazel_cache_object_key(BazelCacheKind::Ac, &hash, &test_capability(None)).unwrap();
-        assert!(key.as_str().contains("protocols/bazel/global/ac/"));
-        assert!(key.as_str().ends_with(&hash));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_cas_valid_hash() {
-        let hash = valid_hash();
-        let key =
-            bazel_cache_object_key(BazelCacheKind::Cas, &hash, &test_capability(None)).unwrap();
-        assert!(key.as_str().contains("protocols/bazel/global/cas/"));
-        assert!(key.as_str().ends_with(&hash));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_with_scope() {
-        let hash = valid_hash();
-        let scope = test_scope();
-        let key = bazel_cache_object_key(BazelCacheKind::Cas, &hash, &test_capability(Some(scope)))
-            .unwrap();
-        assert!(!key.as_str().contains("global"));
-        assert!(key.as_str().contains("protocols/bazel/"));
-        assert!(key.as_str().contains("/cas/"));
-        assert!(key.as_str().ends_with(&hash));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_ac_with_scope() {
-        let hash = valid_hash();
-        let scope = test_scope();
-        let key = bazel_cache_object_key(BazelCacheKind::Ac, &hash, &test_capability(Some(scope)))
-            .unwrap();
-        assert!(!key.as_str().contains("global"));
-        assert!(key.as_str().contains("/ac/"));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_invalid_hash_too_short() {
-        assert!(matches!(
-            bazel_cache_object_key(BazelCacheKind::Cas, "short", &test_capability(None)),
-            Err(ProtocolError::InvalidContentHash)
-        ));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_invalid_hash_uppercase() {
-        let uppercase = "A".repeat(64);
-        assert!(matches!(
-            bazel_cache_object_key(BazelCacheKind::Cas, &uppercase, &test_capability(None)),
-            Err(ProtocolError::InvalidContentHash)
-        ));
-    }
-
-    #[test]
-    fn bazel_cache_object_key_invalid_hash_empty() {
-        assert!(matches!(
-            bazel_cache_object_key(BazelCacheKind::Ac, "", &test_capability(None)),
-            Err(ProtocolError::InvalidContentHash)
-        ));
+        for (kind, segment) in [(BazelCacheKind::Ac, "ac"), (BazelCacheKind::Cas, "cas")] {
+            for scope in [None, Some(test_scope())] {
+                let scoped = scope.is_some();
+                let auth = test_capability(scope);
+                let key = bazel_cache_object_key(kind, &hash, &auth).unwrap();
+                assert_eq!(key, bazel_cache_object_key(kind, &hash, &auth).unwrap());
+                assert!(
+                    key.as_str().contains("protocols/bazel/"),
+                    "{kind:?}, {scoped}"
+                );
+                assert!(
+                    key.as_str().contains(&format!("/{segment}/")),
+                    "{kind:?}, {scoped}"
+                );
+                assert!(key.as_str().ends_with(&hash), "{kind:?}, {scoped}");
+                if scoped {
+                    assert!(!key.as_str().contains("global"), "{kind:?}");
+                } else {
+                    assert_eq!(
+                        key.as_str(),
+                        format!("protocols/bazel/global/{segment}/{hash}")
+                    );
+                }
+            }
+        }
     }
 }

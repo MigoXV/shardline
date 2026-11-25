@@ -109,17 +109,6 @@ impl BoundedObjectSink {
         })
     }
 
-    fn spill_to_temporary(&mut self) -> Result<(), IoError> {
-        let mut temporary = NamedTempFile::new()?;
-        temporary.write_all(&self.memory)?;
-        // The scratch file now owns these bytes. Release the allocation too:
-        // retaining capacity keeps the full memory budget charged throughout
-        // the remaining remote transfer even though it is no longer used.
-        self.memory = Vec::new();
-        self.temporary = Some(temporary);
-        Ok(())
-    }
-
     fn into_object(self) -> Result<MaterializedObject, IoError> {
         match self.temporary {
             Some(mut temporary) => {
@@ -157,12 +146,11 @@ impl Write for BoundedObjectSink {
             self.memory.extend_from_slice(buffer);
             return Ok(buffer.len());
         }
-        self.spill_to_temporary()?;
-        self.temporary
-            .as_mut()
-            .ok_or_else(|| IoError::other("bounded object spill was not created"))?
-            .as_file_mut()
-            .write(buffer)
+        let mut temporary = NamedTempFile::new()?;
+        temporary.write_all(&self.memory)?;
+        // Release the memory allocation once the scratch file owns its bytes.
+        self.memory = Vec::new();
+        self.temporary.insert(temporary).as_file_mut().write(buffer)
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
@@ -394,7 +382,7 @@ impl ServerObjectStore {
         object_key: &ObjectKey,
         length: u64,
     ) -> Result<NamedTempFile, ServerObjectStoreError> {
-        let mut output = NamedTempFile::new().map_err(ServerObjectStoreError::Io)?;
+        let mut output = NamedTempFile::new()?;
         if length == 0 {
             return Ok(output);
         }
@@ -406,8 +394,7 @@ impl ServerObjectStore {
                 if actual != length {
                     return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
                 }
-                std::io::copy(&mut input, output.as_file_mut())
-                    .map_err(ServerObjectStoreError::Io)?;
+                std::io::copy(&mut input, output.as_file_mut())?;
             }
             Self::S3(store) => {
                 let end = length
@@ -434,25 +421,19 @@ impl ServerObjectStore {
         &self,
         object_key: &ObjectKey,
     ) -> Result<Option<(NamedTempFile, u64)>, ServerObjectStoreError> {
-        let mut output = NamedTempFile::new().map_err(ServerObjectStoreError::Io)?;
+        let mut output = NamedTempFile::new()?;
         match self {
             Self::Local(store) => {
-                let Some(metadata) = ObjectStore::metadata(store, object_key)? else {
+                let Some((mut input, length)) = open_local_file_if_present(store, object_key)?
+                else {
                     return Ok(None);
                 };
-                let mut input = store.open_object_file(object_key)?;
-                let length = input.metadata()?.len();
-                if length != metadata.length() {
-                    return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
-                }
-                std::io::copy(&mut input, output.as_file_mut())
-                    .map_err(ServerObjectStoreError::Io)?;
+                std::io::copy(&mut input, output.as_file_mut())?;
                 Ok(Some((output, length)))
             }
-            Self::S3(store) => store
+            Self::S3(store) => Ok(store
                 .copy_object_to_file_if_present(object_key, output.as_file_mut())?
-                .map(|length| (output, length))
-                .map_or(Ok(None), |object| Ok(Some(object))),
+                .map(|length| (output, length))),
             Self::Blackhole => Ok(None),
         }
     }
@@ -496,14 +477,9 @@ impl ServerObjectStore {
         checkpoint()?;
         match self {
             Self::Local(store) => {
-                let Some(metadata) = ObjectStore::metadata(store, object_key)? else {
+                let Some((file, length)) = open_local_file_if_present(store, object_key)? else {
                     return Ok(None);
                 };
-                let file = store.open_object_file(object_key)?;
-                let length = file.metadata()?.len();
-                if length != metadata.length() {
-                    return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
-                }
                 checkpoint()?;
                 Ok(Some((MaterializedObject::Local(file), length)))
             }
@@ -518,10 +494,7 @@ impl ServerObjectStore {
                 let Some(length) = result? else {
                     return Ok(None);
                 };
-                Ok(Some((
-                    output.into_object().map_err(ServerObjectStoreError::Io)?,
-                    length,
-                )))
+                Ok(Some((output.into_object()?, length)))
             }
             Self::Blackhole => Ok(None),
         }
@@ -824,19 +797,15 @@ impl ServerObjectStore {
                         root.display()
                     ));
                 }
-                // Verify write access by checking we can stat the directory
-                std::fs::metadata(root)
-                    .map(|m| {
-                        if !m.permissions().readonly() {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "local storage root is read-only: {}",
-                                root.display()
-                            ))
-                        }
-                    })
-                    .map_err(|e| format!("local storage root inaccessible: {e}"))?
+                let metadata = std::fs::metadata(root)
+                    .map_err(|e| format!("local storage root inaccessible: {e}"))?;
+                if metadata.permissions().readonly() {
+                    return Err(format!(
+                        "local storage root is read-only: {}",
+                        root.display()
+                    ));
+                }
+                Ok(())
             }
             Self::S3(store) => {
                 // Attempt a lightweight list with an empty prefix to verify connectivity
@@ -877,14 +846,7 @@ impl ServerObjectStore {
             if actual_length != length {
                 return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
             }
-            let capacity = usize::try_from(length)?;
-            let mut output = Vec::with_capacity(capacity);
-            let mut limited = file.take(length);
-            Read::read_to_end(&mut limited, &mut output)?;
-            if output.len() != capacity {
-                return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
-            }
-            return Ok(output);
+            return read_file_bytes(file, length);
         }
 
         let end = length
@@ -909,30 +871,13 @@ impl ServerObjectStore {
     ) -> Result<Option<(Vec<u8>, u64)>, BoundedObjectReadError> {
         match self {
             Self::Local(store) => {
-                let Some(metadata) = ObjectStore::metadata(store, object_key)
-                    .map_err(ServerObjectStoreError::from)?
-                else {
+                let Some((file, length)) = open_local_file_if_present(store, object_key)? else {
                     return Ok(None);
                 };
-                let file = store
-                    .open_object_file(object_key)
-                    .map_err(ServerObjectStoreError::from)?;
-                let length = file.metadata().map_err(ServerObjectStoreError::from)?.len();
-                if length != metadata.length() {
-                    return Err(ServerObjectStoreError::StoredObjectLengthMismatch.into());
-                }
                 if length > maximum_length {
                     return Err(BoundedObjectReadError::ObjectTooLarge);
                 }
-                let capacity = usize::try_from(length).map_err(ServerObjectStoreError::from)?;
-                let mut output = Vec::with_capacity(capacity);
-                let mut limited = file.take(length);
-                Read::read_to_end(&mut limited, &mut output)
-                    .map_err(ServerObjectStoreError::from)?;
-                if output.len() != capacity {
-                    return Err(ServerObjectStoreError::StoredObjectLengthMismatch.into());
-                }
-                Ok(Some((output, length)))
+                Ok(Some((read_file_bytes(file, length)?, length)))
             }
             Self::S3(store) => store
                 .read_object_if_present(object_key, maximum_length)
@@ -947,6 +892,35 @@ impl ServerObjectStore {
             Self::Blackhole => Ok(None),
         }
     }
+}
+
+// Compare the opened inode's length with the stored metadata before use.
+fn open_local_file_if_present(
+    store: &LocalObjectStore,
+    object_key: &ObjectKey,
+) -> Result<Option<(std::fs::File, u64)>, ServerObjectStoreError> {
+    let Some(metadata) = ObjectStore::metadata(store, object_key)? else {
+        return Ok(None);
+    };
+    let file = store.open_object_file(object_key)?;
+    let length = file.metadata()?.len();
+    if length != metadata.length() {
+        return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
+    }
+    Ok(Some((file, length)))
+}
+
+// Callers establish the length and memory bound before reading. Recheck the
+// observed bytes because an open local file can be truncated after metadata.
+fn read_file_bytes(file: std::fs::File, length: u64) -> Result<Vec<u8>, ServerObjectStoreError> {
+    let capacity = usize::try_from(length)?;
+    let mut output = Vec::with_capacity(capacity);
+    let mut limited = file.take(length);
+    Read::read_to_end(&mut limited, &mut output)?;
+    if output.len() != capacity {
+        return Err(ServerObjectStoreError::StoredObjectLengthMismatch);
+    }
+    Ok(output)
 }
 
 /// Reads the full contents of an object from the store.
@@ -1043,7 +1017,7 @@ impl OpsRecordStore for LocalRecordStore {
         Option<shardline_index::XetXorbDescriptor>,
         <Self as RecordTraversal>::Error,
     > {
-        Box::pin(async move { self.xet_indexed_xorb_descriptor(xorb).await })
+        Box::pin(self.xet_indexed_xorb_descriptor(xorb))
     }
 
     fn supports_native_locations(&self) -> bool {
@@ -1054,10 +1028,7 @@ impl OpsRecordStore for LocalRecordStore {
         &'operation self,
         descriptor: &'operation shardline_index::XetXorbDescriptor,
     ) -> shardline_index::RecordStoreFuture<'operation, (), <Self as RecordTraversal>::Error> {
-        Box::pin(async move {
-            self.cache_xet_xorb_descriptors(std::slice::from_ref(descriptor))
-                .await
-        })
+        Box::pin(self.cache_xet_xorb_descriptors(std::slice::from_ref(descriptor)))
     }
 
     fn native_chunk_location<'operation>(
@@ -1069,7 +1040,7 @@ impl OpsRecordStore for LocalRecordStore {
         Option<shardline_index::XetXorbDescriptor>,
         <Self as RecordTraversal>::Error,
     > {
-        Box::pin(async move { self.xet_chunk_location(member, xorb).await })
+        Box::pin(self.xet_chunk_location(member, xorb))
     }
     fn locator_display(&self, locator: &<Self as RecordTraversal>::Locator) -> String {
         locator.record_key().to_owned()
@@ -1105,7 +1076,7 @@ impl OpsRecordStore for PostgresRecordStore {
         Option<shardline_index::XetXorbDescriptor>,
         <Self as RecordTraversal>::Error,
     > {
-        Box::pin(async move { self.xet_indexed_xorb_descriptor(xorb).await })
+        Box::pin(self.xet_indexed_xorb_descriptor(xorb))
     }
 
     fn supports_native_locations(&self) -> bool {
@@ -1116,10 +1087,7 @@ impl OpsRecordStore for PostgresRecordStore {
         &'operation self,
         descriptor: &'operation shardline_index::XetXorbDescriptor,
     ) -> shardline_index::RecordStoreFuture<'operation, (), <Self as RecordTraversal>::Error> {
-        Box::pin(async move {
-            self.cache_xet_xorb_descriptors(std::slice::from_ref(descriptor))
-                .await
-        })
+        Box::pin(self.cache_xet_xorb_descriptors(std::slice::from_ref(descriptor)))
     }
     fn native_chunk_location<'operation>(
         &'operation self,
@@ -1130,7 +1098,7 @@ impl OpsRecordStore for PostgresRecordStore {
         Option<shardline_index::XetXorbDescriptor>,
         <Self as RecordTraversal>::Error,
     > {
-        Box::pin(async move { self.xet_chunk_location(member, xorb).await })
+        Box::pin(self.xet_chunk_location(member, xorb))
     }
     fn locator_display(&self, locator: &<Self as RecordTraversal>::Locator) -> String {
         locator.record_key().to_owned()

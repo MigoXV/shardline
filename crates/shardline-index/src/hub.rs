@@ -1,5 +1,13 @@
 use shardline_protocol::SecretString;
+use shardline_reliability::HubRefBatchManifestReferenceV1;
 use std::sync::Arc;
+
+/// Type-erased failure returned by [`BoxedHubStore`].
+pub type HubStoreError = Box<dyn std::error::Error + Send + Sync>;
+
+fn erase_hub_store_error(error: impl std::fmt::Display) -> HubStoreError {
+    Box::new(std::io::Error::other(error.to_string()))
+}
 
 /// The complete revision listing exceeds its requested bound.
 /// Storage failures remain distinct so callers can safely choose a narrower
@@ -143,7 +151,8 @@ pub(crate) fn prefix_successor(prefix: &str) -> Option<String> {
 }
 
 /// A Hub revision record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HubRevision {
     pub repo_id: String,
     pub ref_name: String,
@@ -228,6 +237,28 @@ pub(crate) enum HubRefPublicationMode {
     UpdateOnly,
 }
 
+impl HubRefCreateOutcome {
+    pub(crate) fn into_update(self) -> HubRefUpdateOutcome {
+        match self {
+            Self::Created(revision) => HubRefUpdateOutcome::Updated(revision),
+            Self::AlreadyExists => HubRefUpdateOutcome::Conflict,
+            Self::Unsupported => HubRefUpdateOutcome::Unsupported,
+        }
+    }
+}
+
+impl HubRefPublicationMode {
+    /// Evaluate against the current head while holding the publication transaction.
+    pub(crate) fn conflicts_with(self, current: Option<&str>, parent: Option<&str>) -> bool {
+        match self {
+            Self::Upsert => false,
+            Self::CreateOnly => current.is_some(),
+            // A strict update must never recreate a deleted ref.
+            Self::UpdateOnly => parent.is_none() || current != parent,
+        }
+    }
+}
+
 /// One conditional change within an atomic repository ref transaction.
 #[derive(Debug, Clone)]
 pub struct HubRefChange {
@@ -267,6 +298,77 @@ pub(crate) fn valid_ref_batch(changes: &[HubRefChange]) -> bool {
                 && (change.new_sha.is_some()
                     || (change.expected_sha.is_some() && name != "main" && name != "HEAD"))
         })
+}
+
+pub(crate) struct PreparedHubRevisionBatch<'change> {
+    revisions_by_sha: std::collections::HashMap<&'change str, &'change HubRevision>,
+    first_change_by_sha: std::collections::HashMap<&'change str, &'change HubRefChange>,
+}
+
+impl<'change> PreparedHubRevisionBatch<'change> {
+    pub(crate) fn new(
+        repository_id: &str,
+        changes: &'change [HubRefChange],
+        revisions: &'change [HubRevision],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Option<Self> {
+        let mut first_change_by_sha = std::collections::HashMap::new();
+        for change in changes {
+            if change.expected_sha != change.new_sha
+                && let Some(sha) = change.new_sha.as_deref()
+            {
+                first_change_by_sha.entry(sha).or_insert(change);
+            }
+        }
+        let mut revisions_by_sha = std::collections::HashMap::new();
+        for revision in revisions {
+            if revision.repo_id != repository_id
+                || revision.sha.is_empty()
+                || revisions_by_sha
+                    .insert(revision.sha.as_str(), revision)
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        let manifest_shas = manifests
+            .iter()
+            .map(HubRefBatchManifestReferenceV1::revision_sha)
+            .collect::<std::collections::HashSet<_>>();
+        if manifest_shas.len() != manifests.len()
+            || revisions_by_sha.len() != first_change_by_sha.len()
+            || revisions_by_sha.len() != manifest_shas.len()
+            || revisions_by_sha
+                .keys()
+                .any(|sha| !first_change_by_sha.contains_key(sha) || !manifest_shas.contains(sha))
+        {
+            return None;
+        }
+        Some(Self {
+            revisions_by_sha,
+            first_change_by_sha,
+        })
+    }
+
+    pub(crate) fn revision(&self, sha: &str) -> Option<&'change HubRevision> {
+        self.revisions_by_sha.get(sha).copied()
+    }
+
+    pub(crate) fn first_change(&self, sha: &str) -> Option<&'change HubRefChange> {
+        self.first_change_by_sha.get(sha).copied()
+    }
+}
+
+pub(crate) fn prepared_revision_matches_first_change(
+    repository_id: &str,
+    change: &HubRefChange,
+    revision: &HubRevision,
+) -> bool {
+    revision.repo_id == repository_id
+        && revision.sha == change.new_sha.as_deref().unwrap_or_default()
+        && canonical_ref_name(&revision.ref_name) == canonical_ref_name(&change.ref_name)
+        && revision.parent_sha == change.expected_sha
+        && revision.message.as_deref().unwrap_or("") == change.message
 }
 
 /// A Hub file entry within a commit tree.
@@ -491,6 +593,47 @@ pub trait HubStore: Send + Sync {
         let _ = (repo_id, changes);
         Ok(HubRefBatchOutcome::Unsupported)
     }
+    /// Atomically commits ref changes and revision-bound manifest locators.
+    /// Nonempty locators fail closed unless the adapter persists them in its
+    /// publication transaction.
+    ///
+    /// # Errors
+    /// Returns an error on storage or integrity failure, rolling back all refs.
+    fn change_refs_atomically_with_manifests(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, Self::Error> {
+        if manifests.is_empty() {
+            self.change_refs_atomically(repo_id, changes)
+        } else {
+            Ok(HubRefBatchOutcome::Unsupported)
+        }
+    }
+    /// Atomically commits conditional ref changes, prepared revision metadata,
+    /// and revision-bound manifest locators in one transaction.
+    ///
+    /// `prepared_revisions` contains exactly one persisted metadata record for
+    /// each distinct newly referenced SHA. Existing revision metadata must
+    /// match exactly; first-time metadata must match the first corresponding
+    /// changed ref. This preserves timestamps prepared by protocol code.
+    ///
+    /// # Errors
+    /// Returns an error on storage, metadata mismatch, or integrity failure.
+    fn change_refs_atomically_with_prepared_revisions(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        prepared_revisions: &[HubRevision],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, Self::Error> {
+        if prepared_revisions.is_empty() && manifests.is_empty() {
+            self.change_refs_atomically_with_manifests(repo_id, changes, manifests)
+        } else {
+            Ok(HubRefBatchOutcome::Unsupported)
+        }
+    }
     /// Adapter-specific error type.
     type Error: std::fmt::Display + Send + Sync + 'static;
 
@@ -585,6 +728,22 @@ pub trait HubStore: Send + Sync {
     ) -> Result<HubRefUpdateOutcome, Self::Error> {
         let _ = revision;
         Ok(HubRefUpdateOutcome::Unsupported)
+    }
+    /// Publishes one prepared immutable revision and its archive locator in
+    /// the same ref/outbox transaction. Nonempty locators fail closed by default.
+    ///
+    /// # Errors
+    /// Returns an error on storage or immutable-metadata failure.
+    fn publish_prepared_revision_with_manifests(
+        &self,
+        revision: &HubRevision,
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefUpdateOutcome, Self::Error> {
+        if manifests.is_empty() {
+            self.publish_prepared_revision(revision)
+        } else {
+            Ok(HubRefUpdateOutcome::Unsupported)
+        }
     }
     /// Atomically updates an existing ref only when its current SHA equals `expected_sha`.
     ///
@@ -866,552 +1025,15 @@ pub trait HubStore: Send + Sync {
 type XetIdentityLookup = dyn Fn(
         &shardline_protocol::RepositoryScope,
         &str,
-    ) -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Option<crate::XetFileIdentity>, HubStoreError>
     + Send
     + Sync;
 
 /// Type-erased Hub metadata with an optional native-storage identity bridge.
+#[derive(Clone)]
 pub struct BoxedHubStore {
-    inner: Arc<dyn ErasedHubStore>,
+    inner: Arc<dyn HubStore<Error = HubStoreError>>,
     xet_identity_lookup: Option<Arc<XetIdentityLookup>>,
-}
-
-impl Clone for BoxedHubStore {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            xet_identity_lookup: self.xet_identity_lookup.clone(),
-        }
-    }
-}
-
-trait ErasedHubStore: Send + Sync {
-    fn create_repo_authorized(
-        &self,
-        repo_type: HubRepoType,
-        name: &str,
-        private: bool,
-        actor: Option<&HubCreationActor>,
-    ) -> Result<HubCreationOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    fn object_location(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        kind: HubObjectKind,
-        object_id: &str,
-    ) -> Result<Option<HubObjectLocation>, Box<dyn std::error::Error + Send + Sync>>;
-    fn remember_object_location(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        kind: HubObjectKind,
-        object_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-    fn lookup_xet_file_identity(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        sha256: &str,
-    ) -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>>;
-    fn supports_atomic_ref_updates(&self) -> bool;
-    fn change_refs_atomically(
-        &self,
-        repo_id: &str,
-        changes: &[HubRefChange],
-    ) -> Result<HubRefBatchOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    fn create_repo(
-        &self,
-        repo_type: HubRepoType,
-        name: &str,
-        private: bool,
-    ) -> Result<HubRepo, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn get_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<HubRepo>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn list_repos(&self) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn search_repos(
-        &self,
-        repo_type: Option<HubRepoType>,
-        name_prefix: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn search_repos_with_options(
-        &self,
-        repo_type: Option<HubRepoType>,
-        name_prefix: &str,
-        limit: usize,
-        options: &HubRepoSearchOptions,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn create_revision(
-        &self,
-        repo_id: &str,
-        parent_sha: Option<&str>,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRevision, Box<dyn std::error::Error + Send + Sync>>;
-    fn publish_prepared_revision(
-        &self,
-        revision: &HubRevision,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    fn update_revision_if_current(
-        &self,
-        repo_id: &str,
-        expected_sha: &str,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    fn create_revision_if_absent(
-        &self,
-        repo_id: &str,
-        parent_sha: Option<&str>,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRefCreateOutcome, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn list_refs(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>>;
-    fn list_refs_bounded(
-        &self,
-        repo_id: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn delete_ref(
-        &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected_sha: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn list_revisions(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>>;
-    fn get_revision(
-        &self,
-        repo_id: &str,
-        sha: &str,
-    ) -> Result<Option<HubRevision>, Box<dyn std::error::Error + Send + Sync>>;
-    fn list_revisions_bounded(
-        &self,
-        repo_id: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn resolve_revision(
-        &self,
-        repo_id: &str,
-        revision: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn store_files(
-        &self,
-        commit_sha: &str,
-        files: &[HubFileEntry],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn get_files(
-        &self,
-        commit_sha: &str,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>>;
-    fn get_files_bounded(
-        &self,
-        commit_sha: &str,
-        limit: usize,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn get_tree_page(
-        &self,
-        commit_sha: &str,
-        options: &HubTreePageOptions,
-    ) -> Result<HubTreePage, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn create_webhook_bounded(
-        &self,
-        repo_id: &str,
-        url: &str,
-        events: &[String],
-        secret: Option<&str>,
-        limit: usize,
-    ) -> Result<HubWebhookCreateOutcome, Box<dyn std::error::Error + Send + Sync>>;
-    fn create_webhook(
-        &self,
-        repo_id: &str,
-        url: &str,
-        events: &[String],
-        secret: Option<&str>,
-    ) -> Result<HubWebhook, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn list_webhooks(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn delete_repo(&self, repo_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn delete_webhook(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn update_webhook_secret(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-        secret: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    fn compare_and_swap_webhook_secret(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-        expected_secret: &str,
-        secret: Option<&str>,
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn webhooks_for_event(
-        &self,
-        repo_id: &str,
-        event: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-impl<T: HubStore> ErasedHubStore for T {
-    fn create_repo_authorized(
-        &self,
-        repo_type: HubRepoType,
-        name: &str,
-        private: bool,
-        actor: Option<&HubCreationActor>,
-    ) -> Result<HubCreationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_repo_authorized(self, repo_type, name, private, actor)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn object_location(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        kind: HubObjectKind,
-        object_id: &str,
-    ) -> Result<Option<HubObjectLocation>, Box<dyn std::error::Error + Send + Sync>> {
-        T::object_location(self, scope, kind, object_id)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn remember_object_location(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        kind: HubObjectKind,
-        object_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::remember_object_location(self, scope, kind, object_id)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn lookup_xet_file_identity(
-        &self,
-        scope: &shardline_protocol::RepositoryScope,
-        sha256: &str,
-    ) -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>> {
-        T::lookup_xet_file_identity(self, scope, sha256)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn supports_atomic_ref_updates(&self) -> bool {
-        T::supports_atomic_ref_updates(self)
-    }
-    fn change_refs_atomically(
-        &self,
-        repo_id: &str,
-        changes: &[HubRefChange],
-    ) -> Result<HubRefBatchOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::change_refs_atomically(self, repo_id, changes)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn get_revision(
-        &self,
-        repo_id: &str,
-        sha: &str,
-    ) -> Result<Option<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_revision(self, repo_id, sha)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-    fn create_repo(
-        &self,
-        repo_type: HubRepoType,
-        name: &str,
-        private: bool,
-    ) -> Result<HubRepo, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_repo(self, repo_type, name, private)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn get_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_repo(self, repo_id).map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn list_repos(&self) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_repos(self).map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn search_repos(
-        &self,
-        repo_type: Option<HubRepoType>,
-        name_prefix: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::search_repos(self, repo_type, name_prefix, limit)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn search_repos_with_options(
-        &self,
-        repo_type: Option<HubRepoType>,
-        name_prefix: &str,
-        limit: usize,
-        options: &HubRepoSearchOptions,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::search_repos_with_options(self, repo_type, name_prefix, limit, options)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn create_revision(
-        &self,
-        repo_id: &str,
-        parent_sha: Option<&str>,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRevision, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_revision(self, repo_id, parent_sha, new_sha, ref_name, message)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-    fn publish_prepared_revision(
-        &self,
-        revision: &HubRevision,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::publish_prepared_revision(self, revision)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-    fn update_revision_if_current(
-        &self,
-        repo_id: &str,
-        expected_sha: &str,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::update_revision_if_current(self, repo_id, expected_sha, new_sha, ref_name, message)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-    fn create_revision_if_absent(
-        &self,
-        repo_id: &str,
-        parent_sha: Option<&str>,
-        new_sha: &str,
-        ref_name: &str,
-        message: &str,
-    ) -> Result<HubRefCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_revision_if_absent(self, repo_id, parent_sha, new_sha, ref_name, message)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn list_refs_bounded(
-        &self,
-        repo_id: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_refs_bounded(self, repo_id, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub refs exceed the requested listing limit",
-                )) as _
-            })
-    }
-
-    fn list_refs(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_refs(self, repo_id).map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn delete_ref(
-        &self,
-        repo_id: &str,
-        ref_name: &str,
-        expected_sha: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_ref(self, repo_id, ref_name, expected_sha)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn list_revisions_bounded(
-        &self,
-        repo_id: &str,
-        limit: usize,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_revisions_bounded(self, repo_id, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| Box::new(HubRevisionListingOverflow) as _)
-    }
-
-    fn list_revisions(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_revisions(self, repo_id)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn resolve_revision(
-        &self,
-        repo_id: &str,
-        revision: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        T::resolve_revision(self, repo_id, revision)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn store_files(
-        &self,
-        commit_sha: &str,
-        files: &[HubFileEntry],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::store_files(self, commit_sha, files)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn get_files_bounded(
-        &self,
-        commit_sha: &str,
-        limit: usize,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_files_bounded(self, commit_sha, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub tree exceeds the requested listing limit",
-                )) as _
-            })
-    }
-
-    fn get_files(
-        &self,
-        commit_sha: &str,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_files(self, commit_sha)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn get_tree_page(
-        &self,
-        commit_sha: &str,
-        options: &HubTreePageOptions,
-    ) -> Result<HubTreePage, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_tree_page(self, commit_sha, options)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub tree exceeds the 100000-entry metadata read ceiling",
-                )) as _
-            })
-    }
-
-    fn create_webhook_bounded(
-        &self,
-        repo_id: &str,
-        url: &str,
-        events: &[String],
-        secret: Option<&str>,
-        limit: usize,
-    ) -> Result<HubWebhookCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_webhook_bounded(self, repo_id, url, events, secret, limit)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-    fn create_webhook(
-        &self,
-        repo_id: &str,
-        url: &str,
-        events: &[String],
-        secret: Option<&str>,
-    ) -> Result<HubWebhook, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_webhook(self, repo_id, url, events, secret)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn list_webhooks(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_webhooks(self, repo_id)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn delete_repo(&self, repo_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_repo(self, repo_id)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn delete_webhook(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_webhook(self, repo_id, webhook_id)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn update_webhook_secret(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-        secret: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::update_webhook_secret(self, repo_id, webhook_id, secret)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
-
-    fn compare_and_swap_webhook_secret(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-        expected_secret: &str,
-        secret: Option<&str>,
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
-        T::compare_and_swap_webhook_secret(self, repo_id, webhook_id, expected_secret, secret)
-            .map_err(|error| Box::new(std::io::Error::other(error.to_string())) as _)
-    }
-
-    fn webhooks_for_event(
-        &self,
-        repo_id: &str,
-        event: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
-        T::webhooks_for_event(self, repo_id, event)
-            .map_err(|e| Box::new(std::io::Error::other(e.to_string())) as _)
-    }
 }
 
 impl BoxedHubStore {
@@ -1424,7 +1046,7 @@ impl BoxedHubStore {
         name: &str,
         private: bool,
         actor: Option<&HubCreationActor>,
-    ) -> Result<HubCreationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubCreationOutcome, HubStoreError> {
         self.inner
             .create_repo_authorized(repo_type, name, private, actor)
     }
@@ -1436,7 +1058,7 @@ impl BoxedHubStore {
         scope: &shardline_protocol::RepositoryScope,
         kind: HubObjectKind,
         object_id: &str,
-    ) -> Result<Option<HubObjectLocation>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<HubObjectLocation>, HubStoreError> {
         self.inner.object_location(scope, kind, object_id)
     }
     /// Records the original physical namespace of an immutable object.
@@ -1447,7 +1069,7 @@ impl BoxedHubStore {
         scope: &shardline_protocol::RepositoryScope,
         kind: HubObjectKind,
         object_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), HubStoreError> {
         self.inner.remember_object_location(scope, kind, object_id)
     }
     /// Read a verified native Xet identity scoped to one repository.
@@ -1457,7 +1079,7 @@ impl BoxedHubStore {
         &self,
         scope: &shardline_protocol::RepositoryScope,
         sha256: &str,
-    ) -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<crate::XetFileIdentity>, HubStoreError> {
         self.xet_identity_lookup.as_ref().map_or_else(
             || self.inner.lookup_xet_file_identity(scope, sha256),
             |lookup| lookup(scope, sha256),
@@ -1472,8 +1094,7 @@ impl BoxedHubStore {
         F: Fn(
                 &shardline_protocol::RepositoryScope,
                 &str,
-            )
-                -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>>
+            ) -> Result<Option<crate::XetFileIdentity>, HubStoreError>
             + Send
             + Sync
             + 'static,
@@ -1494,8 +1115,39 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         changes: &[HubRefChange],
-    ) -> Result<HubRefBatchOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
         self.inner.change_refs_atomically(repo_id, changes)
+    }
+    /// Atomically applies conditional refs with their immutable manifest locators.
+    ///
+    /// # Errors
+    /// Returns an error on storage or integrity failure.
+    pub fn change_refs_atomically_with_manifests(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
+        self.inner
+            .change_refs_atomically_with_manifests(repo_id, changes, manifests)
+    }
+    /// Atomically publishes prepared revisions, refs, and manifest locators.
+    ///
+    /// # Errors
+    /// Returns an error on storage or prepared metadata mismatch.
+    pub fn change_refs_atomically_with_prepared_revisions(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        prepared_revisions: &[HubRevision],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
+        self.inner.change_refs_atomically_with_prepared_revisions(
+            repo_id,
+            changes,
+            prepared_revisions,
+            manifests,
+        )
     }
     /// Reads one immutable, repository-scoped revision without listing history.
     ///
@@ -1505,15 +1157,16 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         sha: &str,
-    ) -> Result<Option<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<HubRevision>, HubStoreError> {
         self.inner.get_revision(repo_id, sha)
     }
     /// Creates a new `BoxedHubStore` from any `HubStore` implementation.
-    pub fn new(
-        store: impl HubStore<Error = Box<dyn std::error::Error + Send + Sync>> + 'static,
-    ) -> Self {
+    pub fn new(store: impl HubStore<Error = HubStoreError> + 'static) -> Self {
         Self {
-            inner: Arc::new(store),
+            inner: Arc::new(ErasedAdapter {
+                store,
+                erase_error: erase_hub_store_error,
+            }),
             xet_identity_lookup: None,
         }
     }
@@ -1521,11 +1174,13 @@ impl BoxedHubStore {
     /// Creates a new `BoxedHubStore` from a value implementing `HubStore` with any error type.
     pub fn from_store<T: HubStore + 'static>(store: T) -> Self
     where
-        T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+        T::Error: Into<HubStoreError>,
     {
-        let erased: Arc<dyn ErasedHubStore> = Arc::new(ErasedAdapter(store));
         Self {
-            inner: erased,
+            inner: Arc::new(ErasedAdapter {
+                store,
+                erase_error: Into::into,
+            }),
             xet_identity_lookup: None,
         }
     }
@@ -1540,7 +1195,7 @@ impl BoxedHubStore {
         repo_type: HubRepoType,
         name: &str,
         private: bool,
-    ) -> Result<HubRepo, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRepo, HubStoreError> {
         self.inner.create_repo(repo_type, name, private)
     }
 
@@ -1549,10 +1204,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when the storage backend operation fails.
-    pub fn get_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_repo(&self, repo_id: &str) -> Result<Option<HubRepo>, HubStoreError> {
         self.inner.get_repo(repo_id)
     }
 
@@ -1561,7 +1213,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when the storage backend operation fails.
-    pub fn list_repos(&self) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_repos(&self) -> Result<Vec<HubRepo>, HubStoreError> {
         self.inner.list_repos()
     }
 
@@ -1575,7 +1227,7 @@ impl BoxedHubStore {
         repo_type: Option<HubRepoType>,
         name_prefix: &str,
         limit: usize,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<HubRepo>, HubStoreError> {
         self.inner.search_repos(repo_type, name_prefix, limit)
     }
 
@@ -1589,7 +1241,7 @@ impl BoxedHubStore {
         name_prefix: &str,
         limit: usize,
         options: &HubRepoSearchOptions,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<HubRepo>, HubStoreError> {
         self.inner
             .search_repos_with_options(repo_type, name_prefix, limit, options)
     }
@@ -1606,7 +1258,7 @@ impl BoxedHubStore {
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRevision, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRevision, HubStoreError> {
         self.inner
             .create_revision(repo_id, parent_sha, new_sha, ref_name, message)
     }
@@ -1618,8 +1270,20 @@ impl BoxedHubStore {
     pub fn publish_prepared_revision(
         &self,
         revision: &HubRevision,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
         self.inner.publish_prepared_revision(revision)
+    }
+    /// Publishes a prepared revision together with revision-bound archive locators.
+    ///
+    /// # Errors
+    /// Returns an error on storage or immutable-metadata failure.
+    pub fn publish_prepared_revision_with_manifests(
+        &self,
+        revision: &HubRevision,
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
+        self.inner
+            .publish_prepared_revision_with_manifests(revision, manifests)
     }
 
     /// Atomically updates an existing ref at exactly `expected_sha`.
@@ -1633,7 +1297,7 @@ impl BoxedHubStore {
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
         self.inner
             .update_revision_if_current(repo_id, expected_sha, new_sha, ref_name, message)
     }
@@ -1649,7 +1313,7 @@ impl BoxedHubStore {
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRefCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubRefCreateOutcome, HubStoreError> {
         self.inner
             .create_revision_if_absent(repo_id, parent_sha, new_sha, ref_name, message)
     }
@@ -1663,8 +1327,10 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         limit: usize,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_refs_bounded(repo_id, limit)
+    ) -> Result<Vec<HubRef>, HubStoreError> {
+        self.inner
+            .list_refs_bounded(repo_id, limit)?
+            .ok_or_else(|| erase_hub_store_error("Hub refs exceed the requested listing limit"))
     }
 
     /// Lists active branches and tags.
@@ -1672,10 +1338,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when metadata storage or reliability verification fails.
-    pub fn list_refs(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_refs(&self, repo_id: &str) -> Result<Vec<HubRef>, HubStoreError> {
         self.inner.list_refs(repo_id)
     }
 
@@ -1690,7 +1353,7 @@ impl BoxedHubStore {
         repo_id: &str,
         ref_name: &str,
         expected_sha: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), HubStoreError> {
         self.inner.delete_ref(repo_id, ref_name, expected_sha)
     }
 
@@ -1703,8 +1366,10 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         limit: usize,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_revisions_bounded(repo_id, limit)
+    ) -> Result<Vec<HubRevision>, HubStoreError> {
+        self.inner
+            .list_revisions_bounded(repo_id, limit)?
+            .ok_or_else(|| Box::new(HubRevisionListingOverflow) as _)
     }
 
     /// Lists all revisions.
@@ -1712,10 +1377,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when metadata storage or reliability verification fails.
-    pub fn list_revisions(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_revisions(&self, repo_id: &str) -> Result<Vec<HubRevision>, HubStoreError> {
         self.inner.list_revisions(repo_id)
     }
 
@@ -1728,7 +1390,7 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         revision: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<String>, HubStoreError> {
         self.inner.resolve_revision(repo_id, revision)
     }
 
@@ -1741,7 +1403,7 @@ impl BoxedHubStore {
         &self,
         commit_sha: &str,
         files: &[HubFileEntry],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), HubStoreError> {
         self.inner.store_files(commit_sha, files)
     }
 
@@ -1759,8 +1421,10 @@ impl BoxedHubStore {
         &self,
         commit_sha: &str,
         limit: usize,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_files_bounded(commit_sha, limit)
+    ) -> Result<Vec<HubFileEntry>, HubStoreError> {
+        self.inner
+            .get_files_bounded(commit_sha, limit)?
+            .ok_or_else(|| erase_hub_store_error("Hub tree exceeds the requested listing limit"))
     }
 
     /// Returns all entries for a tree within the adapter's supported ceiling.
@@ -1768,10 +1432,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error on overflow, recovery-required revisions or storage failure.
-    pub fn get_files(
-        &self,
-        commit_sha: &str,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn get_files(&self, commit_sha: &str) -> Result<Vec<HubFileEntry>, HubStoreError> {
         self.inner.get_files(commit_sha)
     }
 
@@ -1783,8 +1444,12 @@ impl BoxedHubStore {
         &self,
         commit_sha: &str,
         options: &HubTreePageOptions,
-    ) -> Result<HubTreePage, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.get_tree_page(commit_sha, options)
+    ) -> Result<HubTreePage, HubStoreError> {
+        self.inner
+            .get_tree_page(commit_sha, options)?
+            .ok_or_else(|| {
+                erase_hub_store_error("Hub tree exceeds the 100000-entry metadata read ceiling")
+            })
     }
 
     /// Atomically registers a nonduplicate webhook within `limit`.
@@ -1798,7 +1463,7 @@ impl BoxedHubStore {
         events: &[String],
         secret: Option<&str>,
         limit: usize,
-    ) -> Result<HubWebhookCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubWebhookCreateOutcome, HubStoreError> {
         self.inner
             .create_webhook_bounded(repo_id, url, events, secret, limit)
     }
@@ -1814,7 +1479,7 @@ impl BoxedHubStore {
         url: &str,
         events: &[String],
         secret: Option<&str>,
-    ) -> Result<HubWebhook, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HubWebhook, HubStoreError> {
         self.inner.create_webhook(repo_id, url, events, secret)
     }
 
@@ -1823,10 +1488,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when the storage backend operation fails.
-    pub fn list_webhooks(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn list_webhooks(&self, repo_id: &str) -> Result<Vec<HubWebhook>, HubStoreError> {
         self.inner.list_webhooks(repo_id)
     }
 
@@ -1835,10 +1497,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when the storage backend operation fails.
-    pub fn delete_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn delete_repo(&self, repo_id: &str) -> Result<(), HubStoreError> {
         self.inner.delete_repo(repo_id)
     }
 
@@ -1847,11 +1506,7 @@ impl BoxedHubStore {
     /// # Errors
     ///
     /// Returns an error when the storage backend operation fails.
-    pub fn delete_webhook(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn delete_webhook(&self, repo_id: &str, webhook_id: &str) -> Result<(), HubStoreError> {
         self.inner.delete_webhook(repo_id, webhook_id)
     }
 
@@ -1865,7 +1520,7 @@ impl BoxedHubStore {
         repo_id: &str,
         webhook_id: &str,
         secret: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), HubStoreError> {
         self.inner
             .update_webhook_secret(repo_id, webhook_id, secret)
     }
@@ -1880,7 +1535,7 @@ impl BoxedHubStore {
         webhook_id: &str,
         expected_secret: &str,
         secret: Option<&str>,
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<bool>, HubStoreError> {
         self.inner
             .compare_and_swap_webhook_secret(repo_id, webhook_id, expected_secret, secret)
     }
@@ -1894,85 +1549,106 @@ impl BoxedHubStore {
         &self,
         repo_id: &str,
         event: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<HubWebhook>, HubStoreError> {
         self.inner.webhooks_for_event(repo_id, event)
     }
 }
 
-/// Adapter to bridge any `HubStore` to `ErasedHubStore` via `Into<Box<dyn Error>>`.
-struct ErasedAdapter<T>(T);
+/// Retains the public store contract while adapting its error type.
+struct ErasedAdapter<T: HubStore> {
+    store: T,
+    erase_error: fn(T::Error) -> HubStoreError,
+}
 
-impl<T: HubStore> ErasedHubStore for ErasedAdapter<T>
-where
-    T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+impl<T: HubStore> HubStore for ErasedAdapter<T> {
+    type Error = HubStoreError;
+
     fn create_repo_authorized(
         &self,
         repo_type: HubRepoType,
         name: &str,
         private: bool,
         actor: Option<&HubCreationActor>,
-    ) -> Result<HubCreationOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_repo_authorized(&self.0, repo_type, name, private, actor).map_err(Into::into)
+    ) -> Result<HubCreationOutcome, HubStoreError> {
+        T::create_repo_authorized(&self.store, repo_type, name, private, actor)
+            .map_err(self.erase_error)
     }
     fn object_location(
         &self,
         scope: &shardline_protocol::RepositoryScope,
         kind: HubObjectKind,
         object_id: &str,
-    ) -> Result<Option<HubObjectLocation>, Box<dyn std::error::Error + Send + Sync>> {
-        T::object_location(&self.0, scope, kind, object_id).map_err(Into::into)
+    ) -> Result<Option<HubObjectLocation>, HubStoreError> {
+        T::object_location(&self.store, scope, kind, object_id).map_err(self.erase_error)
     }
     fn remember_object_location(
         &self,
         scope: &shardline_protocol::RepositoryScope,
         kind: HubObjectKind,
         object_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::remember_object_location(&self.0, scope, kind, object_id).map_err(Into::into)
+    ) -> Result<(), HubStoreError> {
+        T::remember_object_location(&self.store, scope, kind, object_id).map_err(self.erase_error)
     }
     fn lookup_xet_file_identity(
         &self,
         scope: &shardline_protocol::RepositoryScope,
         sha256: &str,
-    ) -> Result<Option<crate::XetFileIdentity>, Box<dyn std::error::Error + Send + Sync>> {
-        T::lookup_xet_file_identity(&self.0, scope, sha256).map_err(Into::into)
+    ) -> Result<Option<crate::XetFileIdentity>, HubStoreError> {
+        T::lookup_xet_file_identity(&self.store, scope, sha256).map_err(self.erase_error)
     }
     fn supports_atomic_ref_updates(&self) -> bool {
-        T::supports_atomic_ref_updates(&self.0)
+        T::supports_atomic_ref_updates(&self.store)
     }
     fn change_refs_atomically(
         &self,
         repo_id: &str,
         changes: &[HubRefChange],
-    ) -> Result<HubRefBatchOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::change_refs_atomically(&self.0, repo_id, changes).map_err(Into::into)
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
+        T::change_refs_atomically(&self.store, repo_id, changes).map_err(self.erase_error)
     }
-    fn get_revision(
+    fn change_refs_atomically_with_manifests(
         &self,
         repo_id: &str,
-        sha: &str,
-    ) -> Result<Option<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_revision(&self.0, repo_id, sha).map_err(Into::into)
+        changes: &[HubRefChange],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
+        T::change_refs_atomically_with_manifests(&self.store, repo_id, changes, manifests)
+            .map_err(self.erase_error)
+    }
+    fn change_refs_atomically_with_prepared_revisions(
+        &self,
+        repo_id: &str,
+        changes: &[HubRefChange],
+        prepared_revisions: &[HubRevision],
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefBatchOutcome, HubStoreError> {
+        T::change_refs_atomically_with_prepared_revisions(
+            &self.store,
+            repo_id,
+            changes,
+            prepared_revisions,
+            manifests,
+        )
+        .map_err(self.erase_error)
+    }
+    fn get_revision(&self, repo_id: &str, sha: &str) -> Result<Option<HubRevision>, HubStoreError> {
+        T::get_revision(&self.store, repo_id, sha).map_err(self.erase_error)
     }
     fn create_repo(
         &self,
         repo_type: HubRepoType,
         name: &str,
         private: bool,
-    ) -> Result<HubRepo, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_repo(&self.0, repo_type, name, private).map_err(Into::into)
+    ) -> Result<HubRepo, HubStoreError> {
+        T::create_repo(&self.store, repo_type, name, private).map_err(self.erase_error)
     }
 
-    fn get_repo(
-        &self,
-        repo_id: &str,
-    ) -> Result<Option<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_repo(&self.0, repo_id).map_err(Into::into)
+    fn get_repo(&self, repo_id: &str) -> Result<Option<HubRepo>, HubStoreError> {
+        T::get_repo(&self.store, repo_id).map_err(self.erase_error)
     }
 
-    fn list_repos(&self) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_repos(&self.0).map_err(Into::into)
+    fn list_repos(&self) -> Result<Vec<HubRepo>, HubStoreError> {
+        T::list_repos(&self.store).map_err(self.erase_error)
     }
 
     fn search_repos(
@@ -1980,8 +1656,8 @@ where
         repo_type: Option<HubRepoType>,
         name_prefix: &str,
         limit: usize,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::search_repos(&self.0, repo_type, name_prefix, limit).map_err(Into::into)
+    ) -> Result<Vec<HubRepo>, HubStoreError> {
+        T::search_repos(&self.store, repo_type, name_prefix, limit).map_err(self.erase_error)
     }
 
     fn search_repos_with_options(
@@ -1990,9 +1666,9 @@ where
         name_prefix: &str,
         limit: usize,
         options: &HubRepoSearchOptions,
-    ) -> Result<Vec<HubRepo>, Box<dyn std::error::Error + Send + Sync>> {
-        T::search_repos_with_options(&self.0, repo_type, name_prefix, limit, options)
-            .map_err(Into::into)
+    ) -> Result<Vec<HubRepo>, HubStoreError> {
+        T::search_repos_with_options(&self.store, repo_type, name_prefix, limit, options)
+            .map_err(self.erase_error)
     }
 
     fn create_revision(
@@ -2002,15 +1678,23 @@ where
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRevision, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_revision(&self.0, repo_id, parent_sha, new_sha, ref_name, message)
-            .map_err(Into::into)
+    ) -> Result<HubRevision, HubStoreError> {
+        T::create_revision(&self.store, repo_id, parent_sha, new_sha, ref_name, message)
+            .map_err(self.erase_error)
     }
     fn publish_prepared_revision(
         &self,
         revision: &HubRevision,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::publish_prepared_revision(&self.0, revision).map_err(Into::into)
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
+        T::publish_prepared_revision(&self.store, revision).map_err(self.erase_error)
+    }
+    fn publish_prepared_revision_with_manifests(
+        &self,
+        revision: &HubRevision,
+        manifests: &[HubRefBatchManifestReferenceV1],
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
+        T::publish_prepared_revision_with_manifests(&self.store, revision, manifests)
+            .map_err(self.erase_error)
     }
     fn update_revision_if_current(
         &self,
@@ -2019,9 +1703,16 @@ where
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRefUpdateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::update_revision_if_current(&self.0, repo_id, expected_sha, new_sha, ref_name, message)
-            .map_err(Into::into)
+    ) -> Result<HubRefUpdateOutcome, HubStoreError> {
+        T::update_revision_if_current(
+            &self.store,
+            repo_id,
+            expected_sha,
+            new_sha,
+            ref_name,
+            message,
+        )
+        .map_err(self.erase_error)
     }
     fn create_revision_if_absent(
         &self,
@@ -2030,33 +1721,21 @@ where
         new_sha: &str,
         ref_name: &str,
         message: &str,
-    ) -> Result<HubRefCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_revision_if_absent(&self.0, repo_id, parent_sha, new_sha, ref_name, message)
-            .map_err(Into::into)
+    ) -> Result<HubRefCreateOutcome, HubStoreError> {
+        T::create_revision_if_absent(&self.store, repo_id, parent_sha, new_sha, ref_name, message)
+            .map_err(self.erase_error)
     }
 
     fn list_refs_bounded(
         &self,
         repo_id: &str,
         limit: usize,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_refs_bounded(&self.0, repo_id, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub refs exceed the requested listing limit",
-                )) as _
-            })
+    ) -> Result<Option<Vec<HubRef>>, HubStoreError> {
+        T::list_refs_bounded(&self.store, repo_id, limit).map_err(erase_hub_store_error)
     }
 
-    fn list_refs(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_refs(&self.0, repo_id).map_err(Into::into)
+    fn list_refs(&self, repo_id: &str) -> Result<Vec<HubRef>, HubStoreError> {
+        T::list_refs(&self.store, repo_id).map_err(self.erase_error)
     }
 
     fn delete_ref(
@@ -2064,85 +1743,52 @@ where
         repo_id: &str,
         ref_name: &str,
         expected_sha: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_ref(&self.0, repo_id, ref_name, expected_sha).map_err(Into::into)
+    ) -> Result<(), HubStoreError> {
+        T::delete_ref(&self.store, repo_id, ref_name, expected_sha).map_err(self.erase_error)
     }
 
     fn list_revisions_bounded(
         &self,
         repo_id: &str,
         limit: usize,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_revisions_bounded(&self.0, repo_id, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| Box::new(HubRevisionListingOverflow) as _)
+    ) -> Result<Option<Vec<HubRevision>>, HubStoreError> {
+        T::list_revisions_bounded(&self.store, repo_id, limit).map_err(erase_hub_store_error)
     }
 
-    fn list_revisions(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubRevision>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_revisions(&self.0, repo_id).map_err(Into::into)
+    fn list_revisions(&self, repo_id: &str) -> Result<Vec<HubRevision>, HubStoreError> {
+        T::list_revisions(&self.store, repo_id).map_err(self.erase_error)
     }
 
     fn resolve_revision(
         &self,
         repo_id: &str,
         revision: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        T::resolve_revision(&self.0, repo_id, revision).map_err(Into::into)
+    ) -> Result<Option<String>, HubStoreError> {
+        T::resolve_revision(&self.store, repo_id, revision).map_err(self.erase_error)
     }
 
-    fn store_files(
-        &self,
-        commit_sha: &str,
-        files: &[HubFileEntry],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::store_files(&self.0, commit_sha, files).map_err(Into::into)
+    fn store_files(&self, commit_sha: &str, files: &[HubFileEntry]) -> Result<(), HubStoreError> {
+        T::store_files(&self.store, commit_sha, files).map_err(self.erase_error)
     }
 
     fn get_files_bounded(
         &self,
         commit_sha: &str,
         limit: usize,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_files_bounded(&self.0, commit_sha, limit)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub tree exceeds the requested listing limit",
-                )) as _
-            })
+    ) -> Result<Option<Vec<HubFileEntry>>, HubStoreError> {
+        T::get_files_bounded(&self.store, commit_sha, limit).map_err(erase_hub_store_error)
     }
 
-    fn get_files(
-        &self,
-        commit_sha: &str,
-    ) -> Result<Vec<HubFileEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_files(&self.0, commit_sha).map_err(Into::into)
+    fn get_files(&self, commit_sha: &str) -> Result<Vec<HubFileEntry>, HubStoreError> {
+        T::get_files(&self.store, commit_sha).map_err(self.erase_error)
     }
 
     fn get_tree_page(
         &self,
         commit_sha: &str,
         options: &HubTreePageOptions,
-    ) -> Result<HubTreePage, Box<dyn std::error::Error + Send + Sync>> {
-        T::get_tree_page(&self.0, commit_sha, options)
-            .map_err(|error| {
-                Box::new(std::io::Error::other(error.to_string()))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(
-                    "Hub tree exceeds the 100000-entry metadata read ceiling",
-                )) as _
-            })
+    ) -> Result<Option<HubTreePage>, HubStoreError> {
+        T::get_tree_page(&self.store, commit_sha, options).map_err(erase_hub_store_error)
     }
 
     fn create_webhook_bounded(
@@ -2152,8 +1798,9 @@ where
         events: &[String],
         secret: Option<&str>,
         limit: usize,
-    ) -> Result<HubWebhookCreateOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_webhook_bounded(&self.0, repo_id, url, events, secret, limit).map_err(Into::into)
+    ) -> Result<HubWebhookCreateOutcome, HubStoreError> {
+        T::create_webhook_bounded(&self.store, repo_id, url, events, secret, limit)
+            .map_err(self.erase_error)
     }
     fn create_webhook(
         &self,
@@ -2161,27 +1808,20 @@ where
         url: &str,
         events: &[String],
         secret: Option<&str>,
-    ) -> Result<HubWebhook, Box<dyn std::error::Error + Send + Sync>> {
-        T::create_webhook(&self.0, repo_id, url, events, secret).map_err(Into::into)
+    ) -> Result<HubWebhook, HubStoreError> {
+        T::create_webhook(&self.store, repo_id, url, events, secret).map_err(self.erase_error)
     }
 
-    fn list_webhooks(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
-        T::list_webhooks(&self.0, repo_id).map_err(Into::into)
+    fn list_webhooks(&self, repo_id: &str) -> Result<Vec<HubWebhook>, HubStoreError> {
+        T::list_webhooks(&self.store, repo_id).map_err(self.erase_error)
     }
 
-    fn delete_repo(&self, repo_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_repo(&self.0, repo_id).map_err(Into::into)
+    fn delete_repo(&self, repo_id: &str) -> Result<(), HubStoreError> {
+        T::delete_repo(&self.store, repo_id).map_err(self.erase_error)
     }
 
-    fn delete_webhook(
-        &self,
-        repo_id: &str,
-        webhook_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::delete_webhook(&self.0, repo_id, webhook_id).map_err(Into::into)
+    fn delete_webhook(&self, repo_id: &str, webhook_id: &str) -> Result<(), HubStoreError> {
+        T::delete_webhook(&self.store, repo_id, webhook_id).map_err(self.erase_error)
     }
 
     fn update_webhook_secret(
@@ -2189,8 +1829,8 @@ where
         repo_id: &str,
         webhook_id: &str,
         secret: Option<&str>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        T::update_webhook_secret(&self.0, repo_id, webhook_id, secret).map_err(Into::into)
+    ) -> Result<(), HubStoreError> {
+        T::update_webhook_secret(&self.store, repo_id, webhook_id, secret).map_err(self.erase_error)
     }
 
     fn compare_and_swap_webhook_secret(
@@ -2199,17 +1839,23 @@ where
         webhook_id: &str,
         expected_secret: &str,
         secret: Option<&str>,
-    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
-        T::compare_and_swap_webhook_secret(&self.0, repo_id, webhook_id, expected_secret, secret)
-            .map_err(Into::into)
+    ) -> Result<Option<bool>, HubStoreError> {
+        T::compare_and_swap_webhook_secret(
+            &self.store,
+            repo_id,
+            webhook_id,
+            expected_secret,
+            secret,
+        )
+        .map_err(self.erase_error)
     }
 
     fn webhooks_for_event(
         &self,
         repo_id: &str,
         event: &str,
-    ) -> Result<Vec<HubWebhook>, Box<dyn std::error::Error + Send + Sync>> {
-        T::webhooks_for_event(&self.0, repo_id, event).map_err(Into::into)
+    ) -> Result<Vec<HubWebhook>, HubStoreError> {
+        T::webhooks_for_event(&self.store, repo_id, event).map_err(self.erase_error)
     }
 }
 
@@ -2218,7 +1864,7 @@ where
 pub(crate) fn assert_atomic_webhook_secret_upgrade<S>(store: &S)
 where
     S: HubStore + Clone + 'static,
-    S::Error: std::fmt::Debug + Into<Box<dyn std::error::Error + Send + Sync>>,
+    S::Error: std::fmt::Debug + Into<HubStoreError>,
 {
     let repo = "atomic-secret/target";
     store.create_repo(HubRepoType::Model, repo, false).unwrap();
@@ -2325,12 +1971,15 @@ where
         .clone()
         .unwrap();
     assert_eq!(
-        ErasedHubStore::compare_and_swap_webhook_secret(
-            store,
+        ErasedAdapter {
+            store: store.clone(),
+            erase_error: erase_hub_store_error
+        }
+        .compare_and_swap_webhook_secret(
             repo,
             &hook.id,
             current.expose_secret(),
-            Some("boxed-blanket")
+            Some("boxed-display")
         )
         .unwrap(),
         Some(true)
@@ -2338,7 +1987,7 @@ where
     let adapter = BoxedHubStore::from_store(store.clone());
     assert_eq!(
         adapter
-            .compare_and_swap_webhook_secret(repo, &hook.id, "boxed-blanket", Some("boxed-adapter"))
+            .compare_and_swap_webhook_secret(repo, &hook.id, "boxed-display", Some("boxed-adapter"))
             .unwrap(),
         Some(true)
     );
@@ -2603,108 +2252,27 @@ mod tests {
         assert_ne!(sha1, sha2);
     }
 
-    // ---------------------------------------------------------------------------
-    // HubRepoType::as_str
-    // ---------------------------------------------------------------------------
-
     #[test]
-    fn hub_repo_type_as_str() {
-        assert_eq!(HubRepoType::Model.as_str(), "model");
-        assert_eq!(HubRepoType::Dataset.as_str(), "dataset");
-        assert_eq!(HubRepoType::Space.as_str(), "space");
-    }
-
-    // ---------------------------------------------------------------------------
-    // HubRepoType::parse_str
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn parse_str_valid_singular() {
-        assert_eq!(HubRepoType::parse_str("model"), Some(HubRepoType::Model));
-        assert_eq!(
-            HubRepoType::parse_str("dataset"),
-            Some(HubRepoType::Dataset)
-        );
-        assert_eq!(HubRepoType::parse_str("space"), Some(HubRepoType::Space));
+    fn hub_repo_type_names() {
+        for (kind, singular, plural) in [
+            (HubRepoType::Model, "model", "models"),
+            (HubRepoType::Dataset, "dataset", "datasets"),
+            (HubRepoType::Space, "space", "spaces"),
+        ] {
+            assert_eq!(kind.as_str(), singular);
+            for name in [singular, plural] {
+                assert_eq!(HubRepoType::parse_str(name), Some(kind), "{name}");
+                assert_eq!(HubRepoType::from_api_repo_type(name), Some(kind), "{name}");
+            }
+        }
     }
 
     #[test]
-    fn parse_str_valid_plural() {
-        assert_eq!(HubRepoType::parse_str("models"), Some(HubRepoType::Model));
-        assert_eq!(
-            HubRepoType::parse_str("datasets"),
-            Some(HubRepoType::Dataset)
-        );
-        assert_eq!(HubRepoType::parse_str("spaces"), Some(HubRepoType::Space));
-    }
-
-    #[test]
-    fn parse_str_invalid() {
-        assert_eq!(HubRepoType::parse_str("invalid"), None);
-        assert_eq!(HubRepoType::parse_str(""), None);
-        assert_eq!(HubRepoType::parse_str("unknown"), None);
-    }
-
-    // ---------------------------------------------------------------------------
-    // HubRepo fields
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn hub_repo_fields() {
-        let repo = HubRepo {
-            repo_id: "owner/name".to_owned(),
-            repo_type: HubRepoType::Model,
-            private: false,
-            default_branch: "main".to_owned(),
-            created_at_unix_seconds: 1000,
-            updated_at_unix_seconds: 2000,
-        };
-        assert_eq!(repo.repo_id, "owner/name");
-        assert_eq!(repo.repo_type, HubRepoType::Model);
-        assert!(!repo.private);
-        assert_eq!(repo.default_branch, "main");
-        assert_eq!(repo.created_at_unix_seconds, 1000);
-        assert_eq!(repo.updated_at_unix_seconds, 2000);
-    }
-
-    #[test]
-    fn hub_repo_private_flag() {
-        let public = HubRepo {
-            repo_id: "a/b".to_owned(),
-            repo_type: HubRepoType::Dataset,
-            private: false,
-            default_branch: String::new(),
-            created_at_unix_seconds: 0,
-            updated_at_unix_seconds: 0,
-        };
-        assert!(!public.private);
-
-        let private = HubRepo {
-            repo_id: "a/b".to_owned(),
-            repo_type: HubRepoType::Dataset,
-            private: true,
-            default_branch: String::new(),
-            created_at_unix_seconds: 0,
-            updated_at_unix_seconds: 0,
-        };
-        assert!(private.private);
-    }
-
-    // ---------------------------------------------------------------------------
-    // HubRepoType::from_api_repo_type
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn from_api_repo_type() {
-        assert_eq!(
-            HubRepoType::from_api_repo_type("model"),
-            Some(HubRepoType::Model)
-        );
-        assert_eq!(
-            HubRepoType::from_api_repo_type("dataset"),
-            Some(HubRepoType::Dataset)
-        );
-        assert_eq!(HubRepoType::from_api_repo_type("invalid"), None);
+    fn hub_repo_type_rejects_unknown_and_case_mismatched_names() {
+        for name in ["invalid", "", "unknown", "Model", "MODEL", "Spaces"] {
+            assert_eq!(HubRepoType::parse_str(name), None, "{name}");
+            assert_eq!(HubRepoType::from_api_repo_type(name), None, "{name}");
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -2712,37 +2280,18 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn canonical_ref_name_preserves_short_branch_name() {
-        assert_eq!(canonical_ref_name("main"), "main");
-        assert_eq!(canonical_ref_name("feature"), "feature");
-    }
-
-    #[test]
-    fn canonical_ref_name_strips_refs_heads_prefix() {
-        assert_eq!(canonical_ref_name("refs/heads/main"), "main");
-        assert_eq!(
-            canonical_ref_name("refs/heads/feature/branch"),
-            "feature/branch"
-        );
-    }
-
-    #[test]
-    fn canonical_ref_name_preserves_tag_refs() {
-        assert_eq!(canonical_ref_name("refs/tags/v1.0"), "refs/tags/v1.0");
-    }
-
-    #[test]
-    fn canonical_ref_name_handles_empty_after_strip() {
-        // "refs/heads/" with nothing after strips to "", but filter rejects it
-        assert_eq!(canonical_ref_name("refs/heads/"), "refs/heads/");
-    }
-
-    #[test]
-    fn canonical_ref_name_preserves_other_ref_prefixes() {
-        assert_eq!(
-            canonical_ref_name("refs/notes/commits"),
-            "refs/notes/commits"
-        );
+    fn canonical_ref_names() {
+        for (input, expected) in [
+            ("main", "main"),
+            ("feature", "feature"),
+            ("refs/heads/main", "main"),
+            ("refs/heads/feature/branch", "feature/branch"),
+            ("refs/tags/v1.0", "refs/tags/v1.0"),
+            ("refs/heads/", "refs/heads/"),
+            ("refs/notes/commits", "refs/notes/commits"),
+        ] {
+            assert_eq!(canonical_ref_name(input), expected, "{input}");
+        }
     }
 
     #[test]
@@ -2795,7 +2344,7 @@ mod tests {
     }
 
     impl HubStore for MemoryHubStore {
-        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Error = HubStoreError;
 
         fn create_repo(
             &self,
@@ -3431,11 +2980,9 @@ mod tests {
         }
     }
 
-    /// Exercises the blanket `impl<T: HubStore> ErasedHubStore for T` path
-    /// (used by `BoxedHubStore::new`) for every method at least once.
+    /// Exercises the display-error constructor's forwarding for every operation.
     #[test]
-    fn boxed_hub_store_blanket_impl_exercise() {
-        // Using `new` forces the blanket impl (not ErasedAdapter).
+    fn boxed_hub_store_new_forwards_all_operations() {
         let store = BoxedHubStore::new(MemoryHubStore::new());
 
         // create / get / list / search
@@ -3497,21 +3044,6 @@ mod tests {
         assert!(store.get_repo("blanket/repo").unwrap().is_none());
     }
 
-    // ── HubRepoType extra edge cases ───────────────────────────────────────
-
-    #[test]
-    fn parse_str_case_sensitive() {
-        assert_eq!(HubRepoType::parse_str("Model"), None);
-        assert_eq!(HubRepoType::parse_str("MODEL"), None);
-    }
-
-    #[test]
-    fn from_api_repo_type_unknown() {
-        assert_eq!(HubRepoType::from_api_repo_type("unknown"), None);
-        assert_eq!(HubRepoType::from_api_repo_type("Spaces"), None);
-        assert_eq!(HubRepoType::from_api_repo_type(""), None);
-    }
-
     // ── HubRepo::compute_commit_sha edge cases ─────────────────────────────
 
     #[test]
@@ -3552,53 +3084,6 @@ mod tests {
         assert_eq!(models.len(), 1);
     }
 
-    // ── HubRevision and HubFileEntry field access ──────────────────────────
-
-    #[test]
-    fn hub_revision_fields() {
-        let rev = HubRevision {
-            repo_id: "owner/repo".to_owned(),
-            ref_name: "main".to_owned(),
-            sha: "abc123".to_owned(),
-            parent_sha: Some("parent0".to_owned()),
-            message: Some("my commit".to_owned()),
-            created_at_unix_seconds: 1000,
-        };
-        assert_eq!(rev.sha, "abc123");
-        assert_eq!(rev.parent_sha.as_deref(), Some("parent0"));
-        assert_eq!(rev.message.as_deref(), Some("my commit"));
-    }
-
-    #[test]
-    fn hub_file_entry_fields() {
-        let entry = HubFileEntry {
-            path: "src/lib.rs".to_owned(),
-            size: 1024,
-            sha: "filehash".to_owned(),
-            is_lfs: true,
-        };
-        assert_eq!(entry.path, "src/lib.rs");
-        assert!(entry.is_lfs);
-        assert_eq!(entry.sha, "filehash");
-    }
-
-    #[test]
-    fn hub_webhook_fields() {
-        let wh = HubWebhook {
-            id: "wh-1".to_owned(),
-            repo_id: "repo".to_owned(),
-            url: "https://hook.example.com".to_owned(),
-            events: vec!["push".to_owned()],
-            secret: Some(SecretString::from_secret("s3kr3t")),
-            active: true,
-            created_at_unix_seconds: 500,
-        };
-        assert_eq!(
-            wh.secret.as_ref().map(SecretString::expose_secret),
-            Some("s3kr3t")
-        );
-        assert!(wh.active);
-    }
     #[test]
     fn atomic_create_override_is_forwarded_by_both_boxed_constructors() {
         for store in [
@@ -3616,7 +3101,7 @@ mod tests {
 
     struct OptimizedTreePageStore;
     impl HubStore for OptimizedTreePageStore {
-        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Error = HubStoreError;
         fn create_repo(
             &self,
             _repo_type: HubRepoType,
@@ -3626,7 +3111,11 @@ mod tests {
             Err(std::io::Error::other("unexpected non-page dispatch").into())
         }
         fn get_repo(&self, _repo_id: &str) -> Result<Option<HubRepo>, Self::Error> {
-            Err(std::io::Error::other("unexpected non-page dispatch").into())
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unexpected non-page dispatch",
+            )
+            .into())
         }
         fn list_repos(&self) -> Result<Vec<HubRepo>, Self::Error> {
             Err(std::io::Error::other("unexpected non-page dispatch").into())
@@ -3734,15 +3223,86 @@ mod tests {
         }
         fn get_tree_page(
             &self,
-            _commit_sha: &str,
+            commit_sha: &str,
             _options: &HubTreePageOptions,
         ) -> Result<Option<HubTreePage>, Self::Error> {
+            if commit_sha == "overflow" {
+                return Ok(None);
+            }
             Ok(Some(HubTreePage {
                 entries: vec![HubTreePageEntry::Directory {
                     path: "override".to_owned(),
                 }],
                 has_more: false,
             }))
+        }
+    }
+
+    #[test]
+    fn boxed_constructors_preserve_error_conversion_contracts() {
+        for (store, kind) in [
+            (
+                BoxedHubStore::new(OptimizedTreePageStore),
+                std::io::ErrorKind::Other,
+            ),
+            (
+                BoxedHubStore::from_store(OptimizedTreePageStore),
+                std::io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let error = store.get_repo("repo").unwrap_err();
+            assert_eq!(error.to_string(), "unexpected non-page dispatch");
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            // Bounded read failures remain errors, not overflow or empty listings.
+            assert_eq!(
+                store.list_refs_bounded("repo", 0).unwrap_err().to_string(),
+                "unexpected non-page dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn boxed_bounded_reads_preserve_overflow_and_complete_results() {
+        for store in [
+            BoxedHubStore::new(MemoryHubStore::new()),
+            BoxedHubStore::from_store(MemoryHubStore::new()),
+        ] {
+            store
+                .create_repo(HubRepoType::Model, "owner/repo", false)
+                .unwrap();
+            store
+                .create_revision("owner/repo", None, "sha", "main", "test")
+                .unwrap();
+            store
+                .store_files(
+                    "sha",
+                    &[HubFileEntry {
+                        path: "file".to_owned(),
+                        size: 1,
+                        sha: "digest".to_owned(),
+                        is_lfs: false,
+                    }],
+                )
+                .unwrap();
+            assert_eq!(store.list_refs_bounded("owner/repo", 1).unwrap().len(), 1);
+            assert_eq!(
+                store.list_revisions_bounded("owner/repo", 1).unwrap().len(),
+                1
+            );
+            assert_eq!(store.get_files_bounded("sha", 1).unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .list_refs_bounded("owner/repo", 0)
+                    .unwrap_err()
+                    .to_string(),
+                "Hub refs exceed the requested listing limit"
+            );
+            assert_eq!(
+                store.get_files_bounded("sha", 0).unwrap_err().to_string(),
+                "Hub tree exceeds the requested listing limit"
+            );
+            let error = store.list_revisions_bounded("owner/repo", 0).unwrap_err();
+            assert!(error.downcast_ref::<HubRevisionListingOverflow>().is_some());
         }
     }
 
@@ -3763,6 +3323,13 @@ mod tests {
                 vec![HubTreePageEntry::Directory {
                     path: "override".to_owned()
                 }]
+            );
+            assert_eq!(
+                store
+                    .get_tree_page("overflow", &options)
+                    .unwrap_err()
+                    .to_string(),
+                "Hub tree exceeds the 100000-entry metadata read ceiling"
             );
         }
     }

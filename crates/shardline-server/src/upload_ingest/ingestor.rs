@@ -10,10 +10,7 @@ use tracing::{debug, instrument, warn};
 
 use super::body_reader::ChunkBuffer;
 use super::cdc::CdcChunker;
-use super::chunk_store::{
-    SequencedStoredChunkOutcome, SequencedStoredChunkTaskOutcome,
-    put_if_absent_pooled_chunk_buffer, put_if_absent_with_verified_cache,
-};
+use super::chunk_store::{CompletedChunk, put_chunk_if_absent, put_if_absent_with_verified_cache};
 use super::durable_chunks::{DurableUploadChunks, ReadCache, SharedReadCache};
 use super::xorb_packer::{pack_owned_chunks_into_xorb, store_xorb};
 
@@ -42,11 +39,10 @@ pub(crate) struct FileUploadIngestor {
     pub(super) chunk_size: usize,
     pub(super) max_in_flight_chunks: usize,
     pub(super) pending: BytesMut,
-    pub(super) next_sequence: u64,
+    pub(super) submitted_chunks: u64,
     pub(super) next_offset: u64,
-    pub(super) completed_chunks: Vec<SequencedStoredChunkOutcome>,
-    pub(super) in_flight_chunks: JoinSet<Result<SequencedStoredChunkTaskOutcome, ServerError>>,
-    pub(super) reusable_pending_buffers: Vec<BytesMut>,
+    pub(super) completed_chunks: Vec<CompletedChunk>,
+    pub(super) in_flight_chunks: JoinSet<Result<CompletedChunk, ServerError>>,
     pub(super) inserted_chunks: u64,
     pub(super) reused_chunks: u64,
     pub(super) stored_bytes: u64,
@@ -58,6 +54,7 @@ pub(crate) struct FileUploadIngestor {
     local_packing: Option<super::packed_protocol::PackedProtocolUpload>,
     verified_chunks: SharedReadCache,
     packed_protocol: Option<super::packed_protocol::PackedProtocolUpload>,
+    reuse_domain: Option<shardline_index::DeduplicationDomain>,
 }
 
 impl FileUploadIngestor {
@@ -84,11 +81,10 @@ impl FileUploadIngestor {
             chunk_size,
             max_in_flight_chunks: max_in_flight_chunks.get(),
             pending: BytesMut::new(),
-            next_sequence: 0,
+            submitted_chunks: 0,
             next_offset: 0,
             completed_chunks: Vec::new(),
             in_flight_chunks: JoinSet::new(),
-            reusable_pending_buffers: Vec::new(),
             inserted_chunks: 0,
             reused_chunks: 0,
             stored_bytes: 0,
@@ -100,6 +96,7 @@ impl FileUploadIngestor {
             local_packing: None,
             verified_chunks: SharedReadCache::default(),
             packed_protocol: None,
+            reuse_domain: None,
         }
     }
 
@@ -114,6 +111,22 @@ impl FileUploadIngestor {
             self.packed_protocol = Some(super::packed_protocol::PackedProtocolUpload::new(
                 store.clone(),
                 pool.clone(),
+            ));
+        }
+        self
+    }
+
+    pub(crate) fn with_protocol_chunk_reuse(
+        mut self,
+        backend: crate::ServerBackend,
+        scope: Option<RepositoryScope>,
+    ) -> Self {
+        self.reuse_domain = Some(shardline_index::DeduplicationDomain::from_scope(
+            scope.as_ref(),
+        ));
+        if let Some(packed) = &mut self.packed_protocol {
+            packed.reuse = Some(super::protocol_reuse::ProtocolChunkReuse::new(
+                backend, scope,
             ));
         }
         self
@@ -143,24 +156,12 @@ impl FileUploadIngestor {
             sha256.update(bytes);
         }
 
-        // Accumulate incoming bytes
         self.pending.extend_from_slice(bytes);
-
-        // Loop to find and flush multiple chunks from pending
-        loop {
-            let boundary = {
-                if self.pending.len() < self.cdc_chunker.min_chunk() {
-                    None
-                } else {
-                    self.cdc_chunker.find_boundary(&self.pending)
-                }
-            };
-            match boundary {
-                Some(b) => {
-                    self.flush_pending_chunk_at(object_store, b).await?;
-                }
-                None => break,
-            }
+        while self.pending.len() >= self.cdc_chunker.min_chunk()
+            && let Some(boundary) = self.cdc_chunker.find_boundary(&self.pending)
+        {
+            let chunk = self.pending.split_to(boundary);
+            self.submit_chunk(object_store, chunk).await?;
         }
 
         Ok(())
@@ -176,7 +177,8 @@ impl FileUploadIngestor {
         expected_sha256: Option<&str>,
     ) -> Result<(FileRecord, UploadFileResponse), ServerError> {
         if !self.pending.is_empty() {
-            self.flush_pending_chunk(object_store).await?;
+            let chunk = mem::take(&mut self.pending);
+            self.submit_chunk(object_store, chunk).await?;
         }
         self.drain_all_completed_chunks().await?;
         if self.packed_protocol.is_none() {
@@ -204,7 +206,7 @@ impl FileUploadIngestor {
         // cannot be packed or stored.
         if let Some(packed) = self.packed_protocol.take() {
             let result = packed.finish().await?;
-            if result.records.len() != usize::try_from(self.next_sequence)? {
+            if result.records.len() != usize::try_from(self.submitted_chunks)? {
                 return Err(ServerError::Overflow);
             }
             let mut offset = 0;
@@ -254,6 +256,7 @@ impl FileUploadIngestor {
 
         let content_hash = content_hash(total_bytes, chunk_size, &self.records);
         let record = FileRecord {
+            deduplication_domain: self.reuse_domain,
             file_id: file_id.to_owned(),
             content_hash: content_hash.clone(),
             total_bytes,
@@ -289,25 +292,13 @@ impl FileUploadIngestor {
         Ok((record, response))
     }
 
-    async fn flush_pending_chunk(
+    async fn submit_chunk(
         &mut self,
         object_store: &ServerObjectStore,
+        chunk: BytesMut,
     ) -> Result<(), ServerError> {
-        self.submit_owned_chunk(object_store).await
-    }
-
-    /// Flush a chunk of exactly `boundary` bytes from the front of
-    /// `self.pending`.  The remaining bytes stay in `self.pending` for
-    /// the next chunk (used by CDC mode).
-    async fn flush_pending_chunk_at(
-        &mut self,
-        object_store: &ServerObjectStore,
-        boundary: usize,
-    ) -> Result<(), ServerError> {
-        let chunk = self.pending.split_to(boundary);
         self.pack_local_chunk(object_store, &chunk).await?;
-        let sequence = self.next_sequence;
-        self.next_sequence = checked_increment(self.next_sequence)?;
+        self.submitted_chunks = checked_increment(self.submitted_chunks)?;
         let offset = self.next_offset;
         let chunk_length = u64::try_from(chunk.len())?;
         self.next_offset = checked_add(self.next_offset, chunk_length)?;
@@ -317,16 +308,11 @@ impl FileUploadIngestor {
         }
         if matches!(object_store, ServerObjectStore::Blackhole) {
             let chunk = ChunkBuffer(chunk.freeze());
-            let (outcome, reusable_buffer) =
-                put_if_absent_pooled_chunk_buffer(object_store, chunk).await?;
+            let outcome = put_chunk_if_absent(object_store, chunk).await?;
             if outcome.inserted {
                 record_chunk_inserted(outcome.chunk_length);
             }
-            if let Some(reusable_buffer) = reusable_buffer {
-                self.recycle_pending_buffer(reusable_buffer);
-            }
-            self.completed_chunks.push(SequencedStoredChunkOutcome {
-                sequence,
+            self.completed_chunks.push(CompletedChunk {
                 offset,
                 stored: outcome,
             });
@@ -338,72 +324,15 @@ impl FileUploadIngestor {
         let verified_chunks = self.verified_chunks.clone();
         self.in_flight_chunks.spawn(async move {
             let chunk = ChunkBuffer(chunk.freeze());
-            let (outcome, reusable_buffer) =
+            let outcome =
                 put_if_absent_with_verified_cache(&object_store, chunk, Some(&verified_chunks))
                     .await?;
             if outcome.inserted {
                 record_chunk_inserted(outcome.chunk_length);
             }
-            Ok(SequencedStoredChunkTaskOutcome {
-                sequence,
+            Ok(CompletedChunk {
                 offset,
                 stored: outcome,
-                reusable_buffer,
-            })
-        });
-        Ok(())
-    }
-
-    async fn submit_owned_chunk(
-        &mut self,
-        object_store: &ServerObjectStore,
-    ) -> Result<(), ServerError> {
-        let replacement = self.take_pending_buffer();
-        let chunk = mem::replace(&mut self.pending, replacement);
-        self.pack_local_chunk(object_store, &chunk).await?;
-        let sequence = self.next_sequence;
-        self.next_sequence = checked_increment(self.next_sequence)?;
-        let offset = self.next_offset;
-        let chunk_length = u64::try_from(chunk.len())?;
-        self.next_offset = checked_add(self.next_offset, chunk_length)?;
-        if let Some(packed) = &mut self.packed_protocol {
-            packed.push(&chunk, offset).await?;
-            return Ok(());
-        }
-        if matches!(object_store, ServerObjectStore::Blackhole) {
-            let chunk = ChunkBuffer(chunk.freeze());
-            let (outcome, reusable_buffer) =
-                put_if_absent_pooled_chunk_buffer(object_store, chunk).await?;
-            if outcome.inserted {
-                record_chunk_inserted(outcome.chunk_length);
-            }
-            if let Some(reusable_buffer) = reusable_buffer {
-                self.recycle_pending_buffer(reusable_buffer);
-            }
-            self.completed_chunks.push(SequencedStoredChunkOutcome {
-                sequence,
-                offset,
-                stored: outcome,
-            });
-            return Ok(());
-        }
-
-        self.drain_completed_chunks_to_capacity().await?;
-        let object_store = object_store.clone();
-        let verified_chunks = self.verified_chunks.clone();
-        self.in_flight_chunks.spawn(async move {
-            let chunk = ChunkBuffer(chunk.freeze());
-            let (outcome, reusable_buffer) =
-                put_if_absent_with_verified_cache(&object_store, chunk, Some(&verified_chunks))
-                    .await?;
-            if outcome.inserted {
-                record_chunk_inserted(outcome.chunk_length);
-            }
-            Ok(SequencedStoredChunkTaskOutcome {
-                sequence,
-                offset,
-                stored: outcome,
-                reusable_buffer,
             })
         });
         Ok(())
@@ -431,32 +360,8 @@ impl FileUploadIngestor {
             warn!(error = %e, "chunk storage task panicked");
             ServerError::BlockingTask(e)
         })??;
-        if let Some(buffer) = outcome.reusable_buffer {
-            self.recycle_pending_buffer(buffer);
-        }
-        self.completed_chunks.push(SequencedStoredChunkOutcome {
-            sequence: outcome.sequence,
-            offset: outcome.offset,
-            stored: outcome.stored,
-        });
+        self.completed_chunks.push(outcome);
         Ok(())
-    }
-
-    fn take_pending_buffer(&mut self) -> BytesMut {
-        self.reusable_pending_buffers
-            .pop()
-            .unwrap_or_else(|| BytesMut::with_capacity(self.chunk_size))
-    }
-
-    fn recycle_pending_buffer(&mut self, mut buffer: BytesMut) {
-        if buffer.capacity() < self.chunk_size
-            || self.reusable_pending_buffers.len() >= self.max_in_flight_chunks
-        {
-            return;
-        }
-
-        buffer.clear();
-        self.reusable_pending_buffers.push(buffer);
     }
 
     async fn pack_local_chunk(
@@ -476,25 +381,18 @@ impl FileUploadIngestor {
         packed.push(chunk, self.next_offset).await
     }
 
-    /// `windows(2)` always yields slices of exactly two elements, so indexing
-    /// at 0 and 1 is infallible.
     fn record_completed_chunks(&mut self) -> Result<(), ServerError> {
-        let expected_chunks = usize::try_from(self.next_sequence)?;
+        let expected_chunks = usize::try_from(self.submitted_chunks)?;
         if self.completed_chunks.len() != expected_chunks {
             return Err(ServerError::Overflow);
         }
 
-        let already_sorted =
+        if !self
+            .completed_chunks
+            .is_sorted_by_key(|outcome| outcome.offset)
+        {
             self.completed_chunks
-                .windows(2)
-                .all(|w: &[SequencedStoredChunkOutcome]| {
-                    w.first()
-                        .zip(w.get(1))
-                        .is_some_and(|(a, b)| a.sequence <= b.sequence)
-                });
-        if !already_sorted {
-            self.completed_chunks
-                .sort_unstable_by_key(|outcome| outcome.sequence);
+                .sort_unstable_by_key(|outcome| outcome.offset);
         }
         let mut expected_offset = 0_u64;
         let completed_chunks = mem::take(&mut self.completed_chunks);
@@ -511,10 +409,7 @@ impl FileUploadIngestor {
         Ok(())
     }
 
-    fn record_chunk_outcome(
-        &mut self,
-        outcome: SequencedStoredChunkOutcome,
-    ) -> Result<(), ServerError> {
+    fn record_chunk_outcome(&mut self, outcome: CompletedChunk) -> Result<(), ServerError> {
         let super::chunk_store::StoredChunkOutcome {
             hash_hex,
             chunk_length,
@@ -593,15 +488,7 @@ async fn pack_and_store_xorb_from_durable_chunks(
     }
 
     if !batch.is_empty() {
-        let batch_to_store = take_xorb_batch(&mut batch);
-        store_xorb_batch(
-            object_store,
-            file_id,
-            batch_to_store,
-            records,
-            batch_record_start,
-        )
-        .await;
+        store_xorb_batch(object_store, file_id, batch, records, batch_record_start).await;
     }
     Ok(())
 }
@@ -699,11 +586,10 @@ mod tests {
         assert_eq!(ingestor.chunk_size, 128);
         assert_eq!(ingestor.max_in_flight_chunks, 128);
         assert!(ingestor.pending.is_empty());
-        assert_eq!(ingestor.next_sequence, 0);
+        assert_eq!(ingestor.submitted_chunks, 0);
         assert_eq!(ingestor.next_offset, 0);
         assert!(ingestor.completed_chunks.is_empty());
         assert!(ingestor.in_flight_chunks.is_empty());
-        assert!(ingestor.reusable_pending_buffers.is_empty());
         assert_eq!(ingestor.inserted_chunks, 0);
         assert_eq!(ingestor.reused_chunks, 0);
         assert_eq!(ingestor.stored_bytes, 0);
@@ -740,47 +626,6 @@ mod tests {
     }
 
     #[test]
-    fn ingestor_take_pending_buffer_returns_new_buffer_when_pool_empty() {
-        let mut ingestor = FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), false);
-        let buffer = ingestor.take_pending_buffer();
-        assert!(buffer.is_empty());
-        assert_eq!(buffer.capacity(), 128);
-    }
-
-    #[test]
-    fn ingestor_recycle_pending_buffer_ignores_undersized_buffer() {
-        let mut ingestor = FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), false);
-        let buffer = bytes::BytesMut::with_capacity(100);
-        ingestor.recycle_pending_buffer(buffer);
-        assert!(ingestor.reusable_pending_buffers.is_empty());
-    }
-
-    #[test]
-    fn ingestor_recycle_pending_buffer_accepts_chunk_sized_buffer() {
-        let mut ingestor = FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), false);
-        let mut buffer = bytes::BytesMut::with_capacity(2048);
-        buffer.extend_from_slice(b"some data");
-        ingestor.recycle_pending_buffer(buffer);
-        // Buffer should be cleared after recycling
-        assert!(ingestor.reusable_pending_buffers[0].is_empty());
-    }
-
-    #[test]
-    fn ingestor_recycle_pending_buffer_enforces_capacity_limit() {
-        let mut ingestor = FileUploadIngestor::new_with_parallelism(
-            NonZeroUsize::new(128).unwrap(),
-            false,
-            NonZeroUsize::new(2).unwrap(),
-            &crate::admission::ExecutionPools::default_sizes().hashing,
-        );
-        ingestor.recycle_pending_buffer(bytes::BytesMut::with_capacity(2048));
-        ingestor.recycle_pending_buffer(bytes::BytesMut::with_capacity(2048));
-        ingestor.recycle_pending_buffer(bytes::BytesMut::with_capacity(2048));
-        // Only 2 should be kept (equal to max_in_flight_chunks)
-        assert_eq!(ingestor.reusable_pending_buffers.len(), 2);
-    }
-
-    #[test]
     fn ingestor_allocates_pending_buffer_lazily() {
         let ingestor = FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), false);
 
@@ -789,21 +634,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_processes_aligned_request_frames_without_staging_copy() {
-        let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
-        let object_store = ServerObjectStore::local(storage.path().join("chunks"));
-        assert!(object_store.is_ok());
-        let Ok(object_store) = object_store else {
-            return;
-        };
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let storage = tempfile::tempdir().unwrap();
+        let object_store = ServerObjectStore::local(storage.path().join("chunks")).unwrap();
+        let chunk_size = NonZeroUsize::new(128).unwrap();
         let mut ingestor = FileUploadIngestor::new(chunk_size, false);
 
         let ingested = ingestor
@@ -814,13 +647,10 @@ mod tests {
             .await;
         assert!(ingested.is_ok());
 
-        let finished = ingestor
+        let (_record, response) = ingestor
             .finish(&object_store, "asset.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((_record, response)) = finished else {
-            return;
-        };
+            .await
+            .unwrap();
 
         // With CDC, chunk count depends on content-defined boundaries
         assert!(response.inserted_chunks > 0);
@@ -831,11 +661,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_blackhole_does_not_queue_completed_chunks_from_split_request_frames() {
         let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let chunk_size = NonZeroUsize::new(128).unwrap();
         let mut ingestor = FileUploadIngestor::new(chunk_size, false);
 
         let first = ingestor
@@ -853,13 +679,10 @@ mod tests {
         assert!(second.is_ok());
         assert_eq!(ingestor.in_flight_chunks.len(), 0);
 
-        let finished = ingestor
+        let (record, response) = ingestor
             .finish(&object_store, "asset.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, response)) = finished else {
-            return;
-        };
+            .await
+            .unwrap();
 
         assert_eq!(record.total_bytes, 72);
         assert!(response.inserted_chunks > 0);
@@ -869,11 +692,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_blackhole_does_not_queue_completed_aligned_request_frames() {
         let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let chunk_size = NonZeroUsize::new(128).unwrap();
         let mut ingestor = FileUploadIngestor::new(chunk_size, false);
 
         // Send data; with CDC, small data may stay pending until finish()
@@ -885,66 +704,19 @@ mod tests {
             .await;
         assert!(ingested.is_ok());
 
-        let finished = ingestor
+        let (_record, response) = ingestor
             .finish(&object_store, "aligned.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((_record, response)) = finished else {
-            return;
-        };
+            .await
+            .unwrap();
 
         assert!(response.inserted_chunks > 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_recycles_pooled_pending_buffers_after_upload_completion() {
-        let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
-        let mut ingestor = FileUploadIngestor::new(chunk_size, false);
-
-        let ingested = ingestor
-            .ingest_body_chunk(&object_store, &Bytes::from_static(b"ABC"))
-            .await;
-        assert!(ingested.is_ok());
-        let pooled_capacity = ingestor.pending.capacity();
-        assert!(pooled_capacity >= 4);
-
-        let second = ingestor
-            .ingest_body_chunk(
-                &object_store,
-                &Bytes::from_static(
-                    b"DEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                ),
-            )
-            .await;
-        assert!(second.is_ok());
-        // With CDC, pending buffer is reused after chunks are flushed
-        assert_eq!(ingestor.reusable_pending_buffers.len(), 0);
-        let recycled_buffer = ingestor.reusable_pending_buffers.first();
-        assert!(recycled_buffer.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_reuses_existing_chunks_for_aligned_request_frames() {
-        let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
-        let object_store = ServerObjectStore::local(storage.path().join("chunks"));
-        assert!(object_store.is_ok());
-        let Ok(object_store) = object_store else {
-            return;
-        };
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let storage = tempfile::tempdir().unwrap();
+        let object_store = ServerObjectStore::local(storage.path().join("chunks")).unwrap();
+        let chunk_size = NonZeroUsize::new(128).unwrap();
 
         // Use data large enough for CDC to find boundaries
         let test_data: Vec<u8> =
@@ -961,11 +733,10 @@ mod tests {
         let second_data = Bytes::from(test_data.clone());
         let second_ingested = second.ingest_body_chunk(&object_store, &second_data).await;
         assert!(second_ingested.is_ok());
-        let second_finished = second.finish(&object_store, "second.bin", None, None).await;
-        assert!(second_finished.is_ok());
-        let Ok((_record, response)) = second_finished else {
-            return;
-        };
+        let (_record, response) = second
+            .finish(&object_store, "second.bin", None, None)
+            .await
+            .unwrap();
 
         // CDC produces the same chunks for identical data → reused chunks
         assert_eq!(response.inserted_chunks, 0);
@@ -975,21 +746,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_preserves_tail_bytes_across_mixed_frame_sizes() {
-        let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
-        let object_store = ServerObjectStore::local(storage.path().join("chunks"));
-        assert!(object_store.is_ok());
-        let Ok(object_store) = object_store else {
-            return;
-        };
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let storage = tempfile::tempdir().unwrap();
+        let object_store = ServerObjectStore::local(storage.path().join("chunks")).unwrap();
+        let chunk_size = NonZeroUsize::new(128).unwrap();
         let mut ingestor = FileUploadIngestor::new(chunk_size, false);
 
         // With CDC, data smaller than min_chunk stays in pending until finish()
@@ -1007,13 +766,10 @@ mod tests {
         // With CDC, 62 bytes may stay pending if no boundary found
         // (target=128, min=16, max=256 — boundary depends on content hash)
 
-        let finished = ingestor
+        let (record, response) = ingestor
             .finish(&object_store, "asset.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, response)) = finished else {
-            return;
-        };
+            .await
+            .unwrap();
 
         assert!(response.inserted_chunks > 0);
         assert_eq!(record.total_bytes, 62);
@@ -1039,21 +795,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingestor_reports_hash_mismatch_when_expected_digest_differs() {
-        let storage = tempfile::tempdir();
-        assert!(storage.is_ok());
-        let Ok(storage) = storage else {
-            return;
-        };
-        let object_store = ServerObjectStore::local(storage.path().join("chunks"));
-        assert!(object_store.is_ok());
-        let Ok(object_store) = object_store else {
-            return;
-        };
-        let chunk_size = NonZeroUsize::new(128);
-        assert!(chunk_size.is_some());
-        let Some(chunk_size) = chunk_size else {
-            return;
-        };
+        let storage = tempfile::tempdir().unwrap();
+        let object_store = ServerObjectStore::local(storage.path().join("chunks")).unwrap();
+        let chunk_size = NonZeroUsize::new(128).unwrap();
         let mut ingestor = FileUploadIngestor::new(chunk_size, true);
 
         let ingested = ingestor
@@ -1072,38 +816,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_empty_upload_succeeds() {
-        // Empty file upload with no body chunks.
+    async fn blackhole_finalization_preserves_empty_and_sha256_accounting() {
         let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let ingestor = FileUploadIngestor::new(chunk_size, false);
-
-        let finished = ingestor
-            .finish(&object_store, "empty.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, response)) = finished else {
-            return;
-        };
-        assert_eq!(record.total_bytes, 0);
-        assert_eq!(response.inserted_chunks, 0);
-        assert_eq!(response.reused_chunks, 0);
-        assert!(record.chunks.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_empty_upload_with_sha256_and_expected_hash() {
-        // Empty file with SHA256 computed and matching expected hash.
-        let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let ingestor = FileUploadIngestor::new(chunk_size, true);
-
-        // SHA256 of empty string
-        let empty_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let finished = ingestor
-            .finish(&object_store, "empty-sha256.bin", None, Some(empty_sha256))
-            .await;
-        assert!(finished.is_ok());
+        for (body, expected) in [
+            (b"".as_slice(), None),
+            (
+                b"".as_slice(),
+                Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ),
+            (
+                b"abcd".as_slice(),
+                Some("88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589"),
+            ),
+        ] {
+            let mut ingestor =
+                FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), expected.is_some());
+            // Empty uploads reach EOF without any request frames.
+            if !body.is_empty() {
+                ingestor
+                    .ingest_body_chunk(&object_store, &Bytes::from_static(body))
+                    .await
+                    .unwrap();
+            }
+            let (record, response) = ingestor
+                .finish(&object_store, "verified.bin", None, expected)
+                .await
+                .unwrap();
+            let chunks = usize::from(!body.is_empty());
+            assert_eq!(record.total_bytes, body.len() as u64);
+            assert_eq!(response.total_bytes, record.total_bytes);
+            assert_eq!(response.stored_bytes, record.total_bytes);
+            assert_eq!(response.inserted_chunks, chunks as u64);
+            assert_eq!(response.reused_chunks, 0);
+            assert_eq!(record.chunks.len(), chunks);
+            assert_eq!(response.chunks.len(), chunks);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1121,220 +868,129 @@ mod tests {
             .unwrap();
         assert!(!ingestor.pending.is_empty());
 
-        let finished = ingestor
+        let (record, response) = ingestor
             .finish(&object_store, "single.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, response)) = finished else {
-            return;
-        };
+            .await
+            .unwrap();
         assert_eq!(record.total_bytes, 4);
         assert!(response.inserted_chunks >= 1);
         assert!(!response.chunks.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_multiple_in_flight_chunks_exceeds_parallelism() {
-        // Submit enough chunks to exceed max_in_flight_chunks, triggering
-        // drain_completed_chunks_to_capacity. Use blackhole so chunks complete
-        // synchronously without spawn_blocking.
-        let object_store = ServerObjectStore::blackhole();
-
-        // Set max_in_flight_chunks to 2, submit via one body frame.
-        let chunk_size = NonZeroUsize::new(128).unwrap();
+    async fn chunk_submission_drains_tasks_at_the_in_flight_limit() {
+        let storage = tempfile::tempdir().unwrap();
+        let object_store = ServerObjectStore::local(storage.path().join("chunks")).unwrap();
         let mut ingestor = FileUploadIngestor::new_with_parallelism(
-            chunk_size,
+            NonZeroUsize::new(128).unwrap(),
             false,
             NonZeroUsize::new(2).unwrap(),
             &crate::admission::ExecutionPools::default_sizes().hashing,
         );
+        for byte in 0..3 {
+            ingestor
+                .submit_chunk(&object_store, bytes::BytesMut::from(&[byte; 128][..]))
+                .await
+                .unwrap();
+            assert!(ingestor.in_flight_chunks.len() <= 2);
+        }
+        assert_eq!(ingestor.completed_chunks.len(), 1);
+        assert_eq!(ingestor.in_flight_chunks.len(), 2);
 
-        // With CDC (target=128, min=16, max=256), send enough data to produce
-        // multiple chunks. The data below is 320 bytes — enough for 2+ chunks.
-        let data: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            .iter()
-            .copied()
-            .cycle()
-            .take(320)
-            .collect();
-        ingestor
-            .ingest_body_chunk(&object_store, &Bytes::from(data))
-            .await
-            .unwrap();
-        // CDC may or may not have flushed all chunks depending on boundaries
-        assert!(!ingestor.completed_chunks.is_empty());
+        ingestor.drain_all_completed_chunks().await.unwrap();
+        ingestor.record_completed_chunks().unwrap();
+        assert_eq!(ingestor.records.len(), 3);
+        assert_eq!(ingestor.stored_bytes, 384);
+        assert!(ingestor.in_flight_chunks.is_empty());
+    }
 
-        let finished = ingestor
-            .finish(&object_store, "multi-chunk.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, _response)) = finished else {
-            return;
-        };
-        assert_eq!(record.total_bytes, 320);
-        assert!(!record.chunks.is_empty());
+    #[test]
+    fn completed_chunks_restore_order_and_reject_missing_or_discontinuous_results() {
+        use super::super::chunk_store::{CompletedChunk, StoredChunkOutcome};
+
+        for (order, submitted, valid) in [
+            (vec![], 0, true),
+            (vec![0, 1, 2], 3, true),
+            (vec![2, 0, 1], 3, true),
+            (vec![0, 0, 2], 3, false),
+            (vec![0, 2, 3], 3, false),
+            (vec![0, 1], 3, false),
+        ] {
+            let mut ingestor = FileUploadIngestor::new(NonZeroUsize::new(128).unwrap(), false);
+            ingestor.submitted_chunks = submitted;
+            ingestor.next_offset = ingestor.submitted_chunks * 4;
+            ingestor.completed_chunks = order
+                .into_iter()
+                .map(|index| CompletedChunk {
+                    offset: index * 4,
+                    stored: StoredChunkOutcome {
+                        hash_hex: index.to_string(),
+                        chunk_length: 4,
+                        compressed_length: 4,
+                        inserted: true,
+                    },
+                })
+                .collect();
+
+            let result = ingestor.record_completed_chunks();
+            if !valid {
+                assert!(matches!(result, Err(ServerError::Overflow)));
+                continue;
+            }
+            result.unwrap();
+
+            let actual: Vec<_> = ingestor
+                .records
+                .iter()
+                .map(|record| (record.hash.clone(), record.offset))
+                .collect();
+            let expected: Vec<_> = (0..ingestor.submitted_chunks)
+                .map(|index| (index.to_string(), index * 4))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(ingestor.stored_bytes, ingestor.next_offset);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_finish_with_blackhole_and_sha256_match() {
-        // Verify the SHA256 hash is computed correctly when expected matches.
-        // Use blackhole to avoid spawn_blocking complexity.
+    async fn blackhole_uploads_preserve_cdc_accounting_without_reporting_reuse() {
         let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let mut ingestor = FileUploadIngestor::new(chunk_size, true);
-
-        ingestor
-            .ingest_body_chunk(&object_store, &Bytes::from_static(b"abcd"))
-            .await
-            .unwrap();
-
-        // SHA256 of "abcd"
-        let expected = "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589";
-        let finished = ingestor
-            .finish(&object_store, "sha256-check.bin", None, Some(expected))
-            .await;
-        assert!(finished.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_recycles_pending_buffer_across_multiple_flushes() {
-        // When the pending buffer fills and is flushed multiple times,
-        // the pooled buffer should be recycled.
-        let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let mut ingestor = FileUploadIngestor::new(chunk_size, false);
-
-        // Send 3 bytes then 5 bytes → first fills pending (3 < 4), second completes it (3+1=4)
-        // Then 1 remains pending.
-        ingestor
-            .ingest_body_chunk(&object_store, &Bytes::from_static(b"abc"))
-            .await
-            .unwrap();
-        assert_eq!(ingestor.pending.len(), 3);
-        assert_eq!(ingestor.reusable_pending_buffers.len(), 0);
-
-        ingestor
-            .ingest_body_chunk(&object_store, &Bytes::from_static(b"defg"))
-            .await
-            .unwrap();
-        // After flush, the buffer should be recycled
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_record_completed_chunks_already_sorted() {
-        // Verify that already-sorted completed chunks don't need re-sorting.
-        let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let mut ingestor = FileUploadIngestor::new(chunk_size, false);
-
-        // Send data that reaches CDC boundaries
-        ingestor
-            .ingest_body_chunk(
-                &object_store,
-                &Bytes::from_static(
-                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                ),
-            )
-            .await
-            .unwrap();
-
-        // completed_chunks should already be in sequence order
-        let finished = ingestor
-            .finish(&object_store, "presorted.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((record, _response)) = finished else {
-            return;
-        };
-        assert!(!record.chunks.is_empty());
-        assert_eq!(record.total_bytes, 72);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_dedup_records_savings_metric_across_identical_uploads() {
-        // Verify the ingestor plumbing: the ingestor → chunk_store pipeline
-        // correctly processes identical content twice. The actual dedup metric
-        // emission is tested at the chunk_store level with a Local store
-        // (dedup_records_savings_metric_on_already_exists).
-        // Use blackhole so chunks complete synchronously.
-        let object_store = ServerObjectStore::blackhole();
-        let chunk_size = NonZeroUsize::new(128).unwrap();
-        let content = b"aaaabbbbccccdddd"; // 16 bytes → 4 chunks of 4
-
-        // First upload
-        let mut first = FileUploadIngestor::new(chunk_size, false);
-        first
-            .ingest_body_chunk(&object_store, &Bytes::from_static(content))
-            .await
-            .unwrap();
-        let first_finished = first.finish(&object_store, "first.bin", None, None).await;
-        assert!(first_finished.is_ok());
-        let Ok((_record, first_response)) = first_finished else {
-            return;
-        };
-        assert!(first_response.inserted_chunks >= 1);
-        assert_eq!(first_response.reused_chunks, 0);
-
-        // Second upload with same content
-        let mut second = FileUploadIngestor::new(chunk_size, false);
-        second
-            .ingest_body_chunk(&object_store, &Bytes::from_static(content))
-            .await
-            .unwrap();
-        let second_finished = second.finish(&object_store, "second.bin", None, None).await;
-        assert!(second_finished.is_ok());
-        let Ok((_record, second_response)) = second_finished else {
-            return;
-        };
-        // Blackhole always returns Inserted
-        assert!(second_response.inserted_chunks >= 1);
-        assert_eq!(second_response.reused_chunks, 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ingestor_cdc_produces_non_zero_chunks_with_blackhole() {
-        // Verify CDC produces chunks with non-zero length via Blackhole store.
-        let object_store = ServerObjectStore::blackhole();
-        let target_chunk_size = NonZeroUsize::new(128).unwrap();
-        let mut ingestor = FileUploadIngestor::new_with_parallelism(
-            target_chunk_size,
-            false,
-            NonZeroUsize::new(2).unwrap(),
-            &crate::admission::ExecutionPools::default_sizes().hashing,
-        );
-        // CDC chunker is created by default
-
-        // Send enough data to produce multiple CDC chunks
         let data: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
             .iter()
             .copied()
             .cycle()
             .take(5760)
             .collect();
-        let body = Bytes::from(data);
-        let ingested = ingestor.ingest_body_chunk(&object_store, &body).await;
-        assert!(ingested.is_ok());
-
-        let finished = ingestor
-            .finish(&object_store, "cdc-test.bin", None, None)
-            .await;
-        assert!(finished.is_ok());
-        let Ok((_record, response)) = finished else {
-            return;
-        };
-
-        // Should have produced at least one chunk
-        assert!(response.inserted_chunks > 0);
-        // Total bytes should match input
-        assert_eq!(response.stored_bytes, 5760);
-
-        // Each chunk should have non-zero length
-        for chunk in &response.chunks {
-            assert!(chunk.length > 0);
+        for body in [Bytes::from_static(b"aaaabbbbccccdddd"), Bytes::from(data)] {
+            // The blackhole always reports insertion, including repeat uploads.
+            for file_id in ["first.bin", "second.bin"] {
+                let mut ingestor = FileUploadIngestor::new_with_parallelism(
+                    NonZeroUsize::new(128).unwrap(),
+                    false,
+                    NonZeroUsize::new(2).unwrap(),
+                    &crate::admission::ExecutionPools::default_sizes().hashing,
+                );
+                ingestor
+                    .ingest_body_chunk(&object_store, &body)
+                    .await
+                    .unwrap();
+                let (_record, response) = ingestor
+                    .finish(&object_store, file_id, None, None)
+                    .await
+                    .unwrap();
+                assert!(response.inserted_chunks > 0);
+                assert_eq!(response.reused_chunks, 0);
+                assert_eq!(response.stored_bytes, body.len() as u64);
+                assert!(response.chunks.iter().all(|chunk| chunk.length > 0));
+                assert_eq!(
+                    response
+                        .chunks
+                        .iter()
+                        .map(|chunk| chunk.length)
+                        .sum::<u64>(),
+                    body.len() as u64,
+                );
+            }
         }
-
-        // The total of all chunk lengths should equal the input size
-        let total_chunk_bytes: u64 = response.chunks.iter().map(|c| c.length).sum();
-        assert_eq!(total_chunk_bytes, 5760);
     }
 }

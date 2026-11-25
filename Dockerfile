@@ -6,19 +6,27 @@ ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441
 
 FROM ${RUST_IMAGE} AS builder
 ARG RUST_VERSION
+ARG CARGO_REGISTRY_MIRROR=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 
 WORKDIR /workspace
 ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
-COPY . .
+COPY Cargo.toml Cargo.lock README.md ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY migrations/ migrations/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
     cargo build --locked --release -p shardline --bin shardline \
+        --config 'source.crates-io.replace-with="mirror"' \
+        --config "source.mirror.registry=\"${CARGO_REGISTRY_MIRROR}\"" \
     && cp /workspace/target/release/shardline /tmp/shardline
 
 FROM ${RUNTIME_IMAGE} AS runtime
+ARG DEBIAN_MIRROR=http://mirrors.bfsu.edu.cn
 
-RUN apt-get update \
+RUN sed -i "s|http://deb.debian.org/|${DEBIAN_MIRROR}/|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 shardline \

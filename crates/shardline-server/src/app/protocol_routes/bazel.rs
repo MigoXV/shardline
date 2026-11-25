@@ -2,119 +2,27 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{FromRequestParts, Path, State},
-    http::{HeaderMap, StatusCode, request::Parts},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use shardline_protocol::TokenScope;
-use shardline_server_core::AuthorizedRepository;
+
+use shardline_storage::ObjectKey;
 
 use crate::{
     BazelCacheKind, ServerError,
     admission::weights,
+    backend::ObjectReadSnapshot,
     bazel_cache_object_key,
     object_store::put_reader_if_absent_s3,
     upload_ingest::{RequestBodyReader, stage_bounded_body},
 };
 
-use super::{AppState, authorize, direct_object_response, direct_object_response_from_snapshot};
+use super::{AppState, direct_object_response, direct_object_response_from_snapshot};
 
-/// Runs the shared authorize chain and mints a typed [`AuthorizedRepository`]
-/// capability for Bazel requests.
-///
-/// Bazel URLs carry no repository segment, so the repository identity comes
-/// exclusively from the verified token claims (isolated via the token's
-/// `RepositoryScope` namespace). This reproduces today's chain in the same
-/// order: [`authorize`] (permissive `Ok(None)` when no auth provider is
-/// configured) → mint: verified context → `from_verified_context`,
-/// `None` → `anonymous_full_access()`.
-fn authorize_repository(
-    state: &AppState,
-    headers: &HeaderMap,
-    required_scope: TokenScope,
-) -> Result<AuthorizedRepository, ServerError> {
-    authorize(state, headers, required_scope)?.map_or_else(
-        || Ok(AuthorizedRepository::anonymous_full_access()),
-        |ctx| {
-            // The verified context (minted by the auth layer's
-            // `verify_verified`) flows straight into the capability seam;
-            // `from_verified_context` only re-applies the scope gate
-            // idempotently — no token is re-verified here.
-            AuthorizedRepository::from_verified_context(ctx, required_scope)
-                .map_err(ServerError::from)
-        },
-    )
-}
-
-/// Read-scoped Bazel authorization capability, extracted from the request.
-///
-/// Because Bazel URLs carry no repository path segment, the capability's
-/// namespace comes entirely from the verified token claims. The extractor
-/// reproduces today's authorize chain exactly: `authorize` (permissive
-/// `Ok(None)` when `state.auth` is `None`) → verified context → capability,
-/// or `anonymous_full_access()` for permissive mode.
-#[derive(Debug)]
-pub struct BazelRepository {
-    auth: AuthorizedRepository,
-}
-
-/// Write-scoped Bazel authorization capability, extracted from the request.
-#[derive(Debug)]
-pub struct BazelWriteRepository {
-    auth: AuthorizedRepository,
-}
-
-impl BazelRepository {
-    /// Read-scoped construction from request headers.
-    fn read(state: &AppState, headers: &HeaderMap) -> Result<Self, ServerError> {
-        Ok(Self {
-            auth: authorize_repository(state, headers, TokenScope::Read)?,
-        })
-    }
-
-    /// The typed, verified authorization capability.
-    pub(crate) const fn capability(&self) -> &AuthorizedRepository {
-        &self.auth
-    }
-}
-
-impl BazelWriteRepository {
-    /// Write-scoped construction from request headers.
-    fn write(state: &AppState, headers: &HeaderMap) -> Result<Self, ServerError> {
-        Ok(Self {
-            auth: authorize_repository(state, headers, TokenScope::Write)?,
-        })
-    }
-
-    /// The typed, verified authorization capability.
-    pub(crate) const fn capability(&self) -> &AuthorizedRepository {
-        &self.auth
-    }
-}
-
-impl FromRequestParts<Arc<AppState>> for BazelRepository {
-    type Rejection = ServerError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &Arc<AppState>,
-    ) -> Result<Self, Self::Rejection> {
-        // Borrow (do not consume) the headers: handlers extract `HeaderMap`
-        // separately for downstream processing.
-        Self::read(state, &parts.headers)
-    }
-}
-
-impl FromRequestParts<Arc<AppState>> for BazelWriteRepository {
-    type Rejection = ServerError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &Arc<AppState>,
-    ) -> Result<Self, Self::Rejection> {
-        Self::write(state, &parts.headers)
-    }
-}
+pub use super::repository::{
+    ReadRepository as BazelRepository, WriteRepository as BazelWriteRepository,
+};
 
 // ---------------------------------------------------------------------------
 // AC (Action Cache) handlers — /v1/bazel/cache/ac/{hash}
@@ -179,17 +87,7 @@ pub(crate) async fn bazel_head_ac(
 ) -> Result<Response, ServerError> {
     let object_key = bazel_cache_object_key(BazelCacheKind::Ac, &hash, repo.capability())?;
     let total_length = state.backend.object_length(&object_key).await?;
-    Ok((
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_LENGTH, total_length.to_string()),
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream".to_owned(),
-            ),
-        ],
-    )
-        .into_response())
+    Ok(super::helpers::object_head_response(total_length))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +129,12 @@ pub(crate) async fn bazel_put_cas(
     let body = RequestBodyReader::from_body(body, state.config.max_request_body_bytes())?;
     let _stored = state
         .backend
-        .put_sha256_addressed_object_stream_if_absent(&object_key, &hash, body)
+        .put_sha256_addressed_object_stream_if_absent(
+            &object_key,
+            &hash,
+            body,
+            repo.capability().namespace(),
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -245,17 +148,7 @@ pub(crate) async fn bazel_head_cas(
 ) -> Result<Response, ServerError> {
     let object_key = bazel_cache_object_key(BazelCacheKind::Cas, &hash, repo.capability())?;
     let total_length = state.backend.object_length(&object_key).await?;
-    Ok((
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_LENGTH, total_length.to_string()),
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream".to_owned(),
-            ),
-        ],
-    )
-        .into_response())
+    Ok(super::helpers::object_head_response(total_length))
 }
 
 // ---------------------------------------------------------------------------
@@ -273,55 +166,21 @@ pub(crate) async fn bazel_get(
     repo: BazelRepository,
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
-    // Try AC first, then CAS.
-    if let Ok(ac_key) = bazel_cache_object_key(BazelCacheKind::Ac, &hash, repo.capability())
-        && let Ok(snapshot) = state.backend.object_read_snapshot(&ac_key).await
-    {
-        return direct_object_response_from_snapshot(
-            &state,
-            &headers,
-            &ac_key,
-            "application/octet-stream",
-            None,
-            "bazel",
-            snapshot,
-        )
-        .await;
-    }
-
-    let cas_key = bazel_cache_object_key(BazelCacheKind::Cas, &hash, repo.capability())?;
-    direct_object_response(
+    let (key, snapshot) = flat_object_snapshot(&state, &hash, &repo).await?;
+    direct_object_response_from_snapshot(
         &state,
         &headers,
-        &cas_key,
+        &key,
         "application/octet-stream",
         None,
         "bazel",
+        snapshot,
     )
     .await
 }
 
-/// PUT /v1/bazel/{hash} — Upload blob to CAS.
-#[tracing::instrument(skip(state, _headers, body), fields(hash))]
-pub(crate) async fn bazel_put(
-    State(state): State<Arc<AppState>>,
-    Path(hash): Path<String>,
-    repo: BazelWriteRepository,
-    _headers: HeaderMap,
-    body: Body,
-) -> Result<impl IntoResponse, ServerError> {
-    let _admit = state
-        .admission
-        .try_acquire(weights::XORB_UPLOAD)
-        .ok_or(ServerError::WorkQueueSaturated)?;
-    let object_key = bazel_cache_object_key(BazelCacheKind::Cas, &hash, repo.capability())?;
-    let body = RequestBodyReader::from_body(body, state.config.max_request_body_bytes())?;
-    let _stored = state
-        .backend
-        .put_sha256_addressed_object_stream_if_absent(&object_key, &hash, body)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
+/// The flat upload route has the same CAS semantics as the explicit CAS route.
+pub(crate) use bazel_put_cas as bazel_put;
 
 /// HEAD /v1/bazel/{hash} — Check existence (tries AC first, falls back to CAS).
 #[tracing::instrument(skip(state, _headers), fields(hash))]
@@ -331,41 +190,30 @@ pub(crate) async fn bazel_head(
     repo: BazelRepository,
     _headers: HeaderMap,
 ) -> Result<Response, ServerError> {
-    // Try AC first, then CAS.
-    if let Ok(ac_key) = bazel_cache_object_key(BazelCacheKind::Ac, &hash, repo.capability())
-        && let Ok(total_length) = state.backend.object_length(&ac_key).await
-    {
-        return Ok((
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_LENGTH, total_length.to_string()),
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    "application/octet-stream".to_owned(),
-                ),
-            ],
-        )
-            .into_response());
-    }
+    let (_, snapshot) = flat_object_snapshot(&state, &hash, &repo).await?;
+    Ok(super::helpers::object_head_response(snapshot.total_length))
+}
 
-    let cas_key = bazel_cache_object_key(BazelCacheKind::Cas, &hash, repo.capability())?;
-    let total_length = state.backend.object_length(&cas_key).await?;
-    Ok((
-        StatusCode::OK,
-        [
-            (axum::http::header::CONTENT_LENGTH, total_length.to_string()),
-            (
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream".to_owned(),
-            ),
-        ],
-    )
-        .into_response())
+async fn flat_object_snapshot(
+    state: &AppState,
+    hash: &str,
+    repo: &BazelRepository,
+) -> Result<(ObjectKey, ObjectReadSnapshot), ServerError> {
+    let ac_key = bazel_cache_object_key(BazelCacheKind::Ac, hash, repo.capability())?;
+    match state.backend.object_read_snapshot(&ac_key).await {
+        Ok(snapshot) => Ok((ac_key, snapshot)),
+        Err(ServerError::NotFound) => {
+            let cas_key = bazel_cache_object_key(BazelCacheKind::Cas, hash, repo.capability())?;
+            let snapshot = state.backend.object_read_snapshot(&cas_key).await?;
+            Ok((cas_key, snapshot))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io, num::NonZeroUsize, path::Path, sync::Arc};
+    use std::{io, num::NonZeroUsize, sync::Arc};
 
     use axum::{
         Router,
@@ -375,14 +223,14 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use shardline_protocol_adapters::ProtocolError;
+    use shardline_server_core::AuthorizedRepository;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     use crate::{
-        BazelCacheKind, ProtocolMetrics, ReconstructionCacheService, ServerBackend, ServerConfig,
-        ServerFrontend, ServerRole, TransferLimiter, app::AppState, bazel_cache_object_key,
+        BazelCacheKind, ServerBackend, ServerConfig, ServerFrontend, TransferLimiter,
+        app::AppState, bazel_cache_object_key,
     };
-    use shardline_server_core::AuthorizedRepository;
     use shardline_server_core::protocol_support::protocol_object_file_id;
 
     use super::{
@@ -409,71 +257,45 @@ mod tests {
 
         let transfer_limiter = TransferLimiter::new(chunk_size, chunk_size);
 
-        let state = Arc::new(AppState {
-            config,
-            role: ServerRole::All,
-            backend,
-            auth: None,
-            provider_tokens: None,
-            reconstruction_cache: ReconstructionCacheService::disabled(),
-            transfer_limiter,
-            oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-            admission: crate::admission::WeightedAdmission::new(
-                std::num::NonZeroUsize::new(256).unwrap(),
-            ),
-            pools: crate::admission::ExecutionPools::default_sizes(),
-            protocol_metrics: ProtocolMetrics::default(),
-        });
+        let state = crate::test_support::protocol_state(config, backend, None, transfer_limiter);
 
         (state, tmp)
     }
 
-    async fn build_postgres_state(
-        database_url: &str,
-        root: &Path,
-        object_store: crate::object_store::ServerObjectStore,
-    ) -> Option<Arc<AppState>> {
-        let chunk_size = NonZeroUsize::new(65_536)?;
+    /// Builds a PostgreSQL fixture, optional only when no database is requested.
+    async fn build_bazel_postgres_test_state() -> Option<(Arc<AppState>, TempDir)> {
+        let database_url = shardline_test_support::postgres_fixture_url("DATABASE_URL")?;
+        let tmp = TempDir::new().expect("Bazel fixture directory");
+        let root = tmp.path();
+        let object_store = crate::object_store::ServerObjectStore::local(root.join("objects"))
+            .expect("Bazel fixture object store");
+        let chunk_size = NonZeroUsize::new(65_536).expect("nonzero chunk size");
         let config = ServerConfig::new(
-            "127.0.0.1:0".parse().ok()?,
+            "127.0.0.1:0".parse().expect("fixture address"),
             "http://127.0.0.1:0".to_owned(),
             root.to_path_buf(),
             chunk_size,
         )
         .with_server_frontends([ServerFrontend::BazelHttp])
-        .ok()?;
+        .expect("configured PostgreSQL Bazel fixture");
         let backend = crate::PostgresBackend::new_with_object_store(
             root.to_path_buf(),
             "http://127.0.0.1:0".to_owned(),
             chunk_size,
-            database_url,
+            &database_url,
             object_store,
         )
         .await
-        .ok()?;
-        Some(Arc::new(AppState {
+        .expect("configured PostgreSQL Bazel fixture");
+        crate::apply_database_migrations(&backend.gc_barrier_pool)
+            .await
+            .expect("migrate PostgreSQL Bazel fixture");
+        let state = crate::test_support::protocol_state(
             config,
-            role: ServerRole::All,
-            backend: ServerBackend::Postgres(backend),
-            auth: None,
-            provider_tokens: None,
-            reconstruction_cache: ReconstructionCacheService::disabled(),
-            transfer_limiter: TransferLimiter::new(chunk_size, chunk_size),
-            oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-            admission: crate::admission::WeightedAdmission::new(std::num::NonZeroUsize::new(256)?),
-            pools: crate::admission::ExecutionPools::default_sizes(),
-            protocol_metrics: ProtocolMetrics::default(),
-        }))
-    }
-
-    /// Builds a minimal [`AppState`] backed by a Postgres backend with a local
-    /// object store. Returns `None` outside the Postgres CI job.
-    async fn build_bazel_postgres_test_state() -> Option<(Arc<AppState>, TempDir)> {
-        let database_url = std::env::var("DATABASE_URL").ok()?;
-        let tmp = TempDir::new().ok()?;
-        let object_store =
-            crate::object_store::ServerObjectStore::local(tmp.path().join("objects")).ok()?;
-        let state = build_postgres_state(&database_url, tmp.path(), object_store).await?;
+            ServerBackend::Postgres(backend),
+            None,
+            TransferLimiter::new(chunk_size, chunk_size),
+        );
         Some((state, tmp))
     }
 
@@ -613,42 +435,25 @@ mod tests {
     // =========================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac_get_missing_returns_not_found() {
-        let (state, _tmp) = build_test_state().await;
-        let app = bazel_router(state);
-        let hash = test_hash();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v1/bazel/cache/ac/{hash}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac_head_missing_returns_not_found() {
-        let (state, _tmp) = build_test_state().await;
-        let app = bazel_router(state);
-        let hash = test_hash();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri(format!("/v1/bazel/cache/ac/{hash}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    async fn read_routes_return_not_found_for_missing_objects() {
+        for prefix in ["/v1/bazel/cache/ac", "/v1/bazel/cache/cas", "/v1/bazel"] {
+            for method in ["GET", "HEAD"] {
+                let (state, _tmp) = build_test_state().await;
+                let app = bazel_router(state);
+                let uri = format!("{prefix}/{}", test_hash());
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(&uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -825,25 +630,6 @@ mod tests {
     // =========================================================================
     // CAS (Content-Addressable Storage) integration tests
     // =========================================================================
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cas_get_missing_returns_not_found() {
-        let (state, _tmp) = build_test_state().await;
-        let app = bazel_router(state);
-        let hash = test_hash();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v1/bazel/cache/cas/{hash}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cas_put_and_get_happy_path() {
@@ -1059,46 +845,7 @@ mod tests {
     // =========================================================================
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flat_get_missing_returns_not_found() {
-        let (state, _tmp) = build_test_state().await;
-        let app = bazel_router(state);
-        let hash = test_hash();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/v1/bazel/{hash}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flat_head_missing_returns_not_found() {
-        let (state, _tmp) = build_test_state().await;
-        let app = bazel_router(state);
-        let hash = test_hash();
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri(format!("/v1/bazel/{hash}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flat_put_to_cas_and_get_from_flat() {
+    async fn flat_routes_fall_back_only_when_action_cache_is_missing() {
         let (state, _tmp) = build_test_state().await;
         let app = bazel_router(state.clone());
         let content = test_content();
@@ -1148,6 +895,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), content.as_slice());
+
+        let ac_key = bazel_cache_object_key(
+            BazelCacheKind::Ac,
+            &hash,
+            &AuthorizedRepository::anonymous_full_access(),
+        )
+        .unwrap();
+        let ac_path = state
+            .backend
+            .object_store()
+            .local_path_for_key(&ac_key)
+            .unwrap();
+        // A directory in place of an object is a storage failure, not a cache miss.
+        std::fs::create_dir_all(ac_path).unwrap();
+        for method in ["GET", "HEAD"] {
+            for (route, expected) in [
+                (format!("cache/cas/{hash}"), StatusCode::OK),
+                (
+                    format!("cache/ac/{hash}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                ),
+                (hash.clone(), StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(format!("/v1/bazel/{route}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{method} {route}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1228,54 +1012,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_hash_returns_error() {
-        assert!(matches!(
-            bazel_cache_object_key(
-                BazelCacheKind::Ac,
-                "short",
-                &AuthorizedRepository::anonymous_full_access()
-            ),
-            Err(ProtocolError::InvalidContentHash)
-        ));
-    }
-
-    #[test]
-    fn invalid_hash_not_hex_returns_error() {
-        assert!(matches!(
-            bazel_cache_object_key(
-                BazelCacheKind::Cas,
-                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-                &AuthorizedRepository::anonymous_full_access(),
-            ),
-            Err(ProtocolError::InvalidContentHash)
-        ));
-    }
-
-    // ------------------------------------------------------------------
-    // Edge cases
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn empty_hash_returns_error() {
-        assert!(matches!(
-            bazel_cache_object_key(
-                BazelCacheKind::Ac,
-                "",
-                &AuthorizedRepository::anonymous_full_access()
-            ),
-            Err(ProtocolError::InvalidContentHash)
-        ));
-    }
-
-    #[test]
-    fn uppercase_hex_returns_error() {
-        assert!(matches!(
-            bazel_cache_object_key(
-                BazelCacheKind::Ac,
-                &"A".repeat(64),
-                &AuthorizedRepository::anonymous_full_access()
-            ),
-            Err(ProtocolError::InvalidContentHash)
-        ));
+    fn cache_namespaces_reject_invalid_hashes() {
+        for kind in [BazelCacheKind::Ac, BazelCacheKind::Cas] {
+            for hash in ["short", "", &"z".repeat(64), &"A".repeat(64)] {
+                assert!(
+                    matches!(
+                        bazel_cache_object_key(
+                            kind,
+                            hash,
+                            &AuthorizedRepository::anonymous_full_access()
+                        ),
+                        Err(ProtocolError::InvalidContentHash)
+                    ),
+                    "accepted invalid hash {hash:?}"
+                );
+            }
+        }
     }
 }

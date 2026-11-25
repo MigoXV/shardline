@@ -10,21 +10,28 @@ use sha1::{Digest, Sha1};
 use std::io::Write;
 
 /// Pack file generation error.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PackError {
     /// Pack header, entry size, or trailing bytes are malformed.
+    #[error("invalid pack framing or object size")]
     InvalidPack,
     /// Pack SHA-1 trailer does not match its contents.
+    #[error("invalid pack checksum")]
     InvalidChecksum,
     /// Zlib compression failed.
-    Zlib(std::io::Error),
+    #[error("zlib compression failed: {0}")]
+    Zlib(#[source] std::io::Error),
     /// Too many objects to fit in the pack header (exceeds u32::MAX).
+    #[error("too many objects for pack file")]
     TooManyObjects,
     /// Variable-length integer shift exceeds 63 bits.
+    #[error("variable-length integer shift overflow")]
     ShiftOverflow,
     /// Delta data is malformed or references a missing base object.
+    #[error("invalid or missing delta base")]
     InvalidDelta,
     /// Total decompressed size across all objects exceeds the allowed limit.
+    #[error("total decompressed size exceeds allowed limit")]
     ExcessiveDecompressedSize,
 }
 
@@ -46,36 +53,6 @@ const MAX_DELTA_TARGET_SIZE: usize =
 /// (and reject shifts ≥ 64) so the shift never overflows and parsing always
 /// terminates.
 const MAX_DELTA_VARINT_BYTES: usize = 10;
-
-impl std::fmt::Display for PackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidPack => write!(f, "invalid pack framing or object size"),
-            Self::InvalidChecksum => write!(f, "invalid pack checksum"),
-            Self::Zlib(e) => write!(f, "zlib compression failed: {e}"),
-            Self::TooManyObjects => write!(f, "too many objects for pack file"),
-            Self::ShiftOverflow => write!(f, "variable-length integer shift overflow"),
-            Self::InvalidDelta => write!(f, "invalid or missing delta base"),
-            Self::ExcessiveDecompressedSize => {
-                write!(f, "total decompressed size exceeds allowed limit")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PackError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Zlib(e) => Some(e),
-            Self::InvalidPack
-            | Self::InvalidChecksum
-            | Self::TooManyObjects
-            | Self::ShiftOverflow
-            | Self::InvalidDelta
-            | Self::ExcessiveDecompressedSize => None,
-        }
-    }
-}
 
 /// Git object types used in pack encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,25 +167,22 @@ fn write_object(out: &mut Vec<u8>, obj: &GitObject) -> Result<(), PackError> {
 
     if size_remaining > 0 {
         byte |= 0x80; // continuation bit
-        out.push(byte);
+    }
+    out.push(byte);
 
-        while size_remaining > 0 {
-            let mut next_byte = (size_remaining & 0x7f) as u8;
-            size_remaining >>= 7;
-            if size_remaining > 0 {
-                next_byte |= 0x80;
-            }
-            out.push(next_byte);
+    while size_remaining > 0 {
+        let mut next_byte = (size_remaining & 0x7f) as u8;
+        size_remaining >>= 7;
+        if size_remaining > 0 {
+            next_byte |= 0x80;
         }
-    } else {
-        out.push(byte);
+        out.push(next_byte);
     }
 
     // Zlib-compress the object content
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(out, Compression::default());
     encoder.write_all(&obj.data).map_err(PackError::Zlib)?;
-    let compressed = encoder.finish().map_err(PackError::Zlib)?;
-    out.extend_from_slice(&compressed);
+    encoder.finish().map_err(PackError::Zlib)?;
     Ok(())
 }
 
@@ -299,15 +273,8 @@ pub(crate) fn apply_delta_with_limit(
     delta: &[u8],
     limit: usize,
 ) -> Result<Vec<u8>, PackError> {
-    let mut pos = 0;
-
-    // Parse source size (little-endian varint, 7 bits per byte)
-    let (source_size, after_source) = parse_delta_varint(delta, pos)?;
-    pos = after_source;
-
-    // Parse target size (varint)
-    let (target_size, after_target) = parse_delta_varint(delta, pos)?;
-    pos = after_target;
+    let (source_size, pos) = parse_delta_varint(delta, 0)?;
+    let (target_size, pos) = parse_delta_varint(delta, pos)?;
 
     if source_size != base.len() {
         return Err(PackError::InvalidDelta);
@@ -321,10 +288,8 @@ pub(crate) fn apply_delta_with_limit(
 
     let mut result = Vec::with_capacity(target_size);
 
-    while pos < delta.len() {
-        let cmd = delta.get(pos).copied().ok_or(PackError::InvalidDelta)?;
-        pos = pos.wrapping_add(1);
-
+    let mut instructions = delta.get(pos..).ok_or(PackError::InvalidDelta)?.iter();
+    while let Some(&cmd) = instructions.next() {
         if cmd & 0x80 != 0 {
             // Copy instruction: copy bytes from the base object.
             // Bits 0-3 indicate which offset bytes are present (LSB first).
@@ -334,21 +299,25 @@ pub(crate) fn apply_delta_with_limit(
 
             for i in 0u32..4 {
                 if cmd & (1 << i) != 0 {
-                    let offset_byte = delta.get(pos).copied().ok_or(PackError::InvalidDelta)?;
+                    let offset_byte = instructions
+                        .next()
+                        .copied()
+                        .ok_or(PackError::InvalidDelta)?;
                     copy_offset |= (offset_byte as usize)
                         .checked_shl(i.saturating_mul(8))
                         .ok_or(PackError::InvalidDelta)?;
-                    pos = pos.wrapping_add(1);
                 }
             }
 
             for i in 4u32..7 {
                 if cmd & (1 << i) != 0 {
-                    let size_byte = delta.get(pos).copied().ok_or(PackError::InvalidDelta)?;
+                    let size_byte = instructions
+                        .next()
+                        .copied()
+                        .ok_or(PackError::InvalidDelta)?;
                     copy_size |= (size_byte as usize)
                         .checked_shl(i.saturating_sub(4).saturating_mul(8))
                         .ok_or(PackError::InvalidDelta)?;
-                    pos = pos.wrapping_add(1);
                 }
             }
 
@@ -367,9 +336,9 @@ pub(crate) fn apply_delta_with_limit(
             let copy_end = copy_offset
                 .checked_add(copy_size)
                 .ok_or(PackError::InvalidDelta)?;
-            if copy_end > base.len() {
-                return Err(PackError::InvalidDelta);
-            }
+            let copied = base
+                .get(copy_offset..copy_end)
+                .ok_or(PackError::InvalidDelta)?;
 
             // Bound the running output size *before* extending the buffer. The
             // `with_capacity` cap alone is insufficient: repeated copies can
@@ -384,16 +353,14 @@ pub(crate) fn apply_delta_with_limit(
                 return Err(PackError::ExcessiveDecompressedSize);
             }
 
-            result.extend_from_slice(
-                base.get(copy_offset..copy_end)
-                    .ok_or(PackError::InvalidDelta)?,
-            );
+            result.extend_from_slice(copied);
         } else if cmd != 0 {
             // Insert instruction: copy cmd bytes from the delta stream.
             let insert_size = cmd as usize;
-            if pos.wrapping_add(insert_size) > delta.len() {
-                return Err(PackError::InvalidDelta);
-            }
+            let (inserted, rest) = instructions
+                .as_slice()
+                .split_at_checked(insert_size)
+                .ok_or(PackError::InvalidDelta)?;
             // Bound the running output size before extending the buffer, as
             // with copy instructions above.
             let projected = result
@@ -403,12 +370,8 @@ pub(crate) fn apply_delta_with_limit(
             if projected > target_size {
                 return Err(PackError::ExcessiveDecompressedSize);
             }
-            result.extend_from_slice(
-                delta
-                    .get(pos..pos.wrapping_add(insert_size))
-                    .ok_or(PackError::InvalidDelta)?,
-            );
-            pos = pos.wrapping_add(insert_size);
+            result.extend_from_slice(inserted);
+            instructions = rest.iter();
         } else {
             // cmd == 0 is not valid in the Git delta format.
             return Err(PackError::InvalidDelta);
@@ -427,26 +390,19 @@ pub(crate) fn apply_delta_with_limit(
 /// Encoding: little-endian, 7 bits of value per byte; MSB is the continuation flag.
 fn parse_delta_varint(data: &[u8], mut pos: usize) -> Result<(usize, usize), PackError> {
     let mut result: usize = 0;
-    let mut shift: u32 = 0;
-    let mut terminated = false;
-    for _ in 0..MAX_DELTA_VARINT_BYTES {
+    for shift in (0..usize::BITS).step_by(7).take(MAX_DELTA_VARINT_BYTES) {
         let byte = data.get(pos).copied().ok_or(PackError::InvalidDelta)?;
         pos = pos.wrapping_add(1);
         let value = usize::from(byte & 0x7f);
-        if shift >= usize::BITS || value > (usize::MAX >> shift) {
+        if value > (usize::MAX >> shift) {
             return Err(PackError::InvalidDelta);
         }
         result |= value << shift;
-        shift = shift.wrapping_add(7);
         if byte & 0x80 == 0 {
-            terminated = true;
-            break;
+            return Ok((result, pos));
         }
     }
-    if !terminated {
-        return Err(PackError::InvalidDelta);
-    }
-    Ok((result, pos))
+    Err(PackError::InvalidDelta)
 }
 
 /// Parses the negative offset from an OFS_DELTA entry in a pack file.
@@ -462,7 +418,7 @@ pub fn parse_ofs_delta_offset(data: &[u8], pos: &mut usize) -> Result<usize, Pac
     *pos = (*pos).wrapping_add(1);
     let mut offset = (byte & 0x7f) as usize;
     // The offset accumulator is bounds-checked with checked arithmetic; the
-    // iteration budget uses a saturating counter (wrapping is unreachable —
+    // iteration budget uses a bounded counter (wrapping is unreachable —
     // the loop exits after at most MAX_DELTA_VARINT_BYTES iterations).
     let mut iterations = 0usize;
     while byte & 0x80 != 0 {
@@ -687,172 +643,80 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- parse_ofs_delta_offset tests ---
-
     #[test]
-    fn parse_ofs_delta_offset_single_byte() {
-        // Single byte, MSB clear: offset = byte & 0x7f
-        let data = [0x05];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 5);
-        assert_eq!(pos, 1);
+    fn ofs_delta_offsets_preserve_values_and_consume_only_the_encoding() {
+        for (encoded, expected) in [
+            (&[0x05][..], 5),
+            (&[0x7f][..], 127),
+            (&[0x00][..], 0),
+            (&[0x82, 0x00][..], 384),
+            (&[0x81, 0x00][..], 256),
+            (&[0x81, 0x7f][..], 383),
+            (&[0x81, 0x81, 0x01][..], 33025),
+            (&[0x80, 0x01][..], 129),
+        ] {
+            for start in [0, 2] {
+                let mut data = vec![0xff; start];
+                data.extend_from_slice(encoded);
+                data.extend_from_slice(b"trailing pack data");
+                let mut pos = start;
+                assert_eq!(parse_ofs_delta_offset(&data, &mut pos).unwrap(), expected);
+                assert_eq!(pos, start.checked_add(encoded.len()).unwrap());
+            }
+        }
     }
 
     #[test]
-    fn parse_ofs_delta_offset_single_byte_max() {
-        // Single byte with max 7-bit value (MSB clear = no continuation)
-        let data = [0x7f];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 127);
-        assert_eq!(pos, 1);
+    fn ofs_delta_offsets_reject_incomplete_encodings_without_skipping_bytes() {
+        for (data, start, consumed) in [
+            (&[][..], 0, 0),
+            (&[0x80][..], 0, 1),
+            (&[0x05][..], 1, 1),
+            (&[0x05][..], usize::MAX, usize::MAX),
+        ] {
+            let mut pos = start;
+            assert!(matches!(
+                parse_ofs_delta_offset(data, &mut pos),
+                Err(PackError::InvalidDelta)
+            ));
+            assert_eq!(pos, consumed);
+        }
     }
 
     #[test]
-    fn parse_ofs_delta_offset_single_byte_zero() {
-        let data = [0x00];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 0);
-        assert_eq!(pos, 1);
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_two_bytes() {
-        // Two bytes: first has MSB set (continuation), second does not.
-        // Byte 0: 0x82 → low 7 bits = 2, continuation
-        // Byte 1: 0x00 → low 7 bits = 0, no continuation
-        // offset = ((2 + 1) << 7) | 0 = 384
-        let data = [0x82, 0x00];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 384);
-        assert_eq!(pos, 2);
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_two_bytes_small() {
-        // Two bytes encoding 128:
-        // Byte 0: 0x81 → low 7 bits = 1, continuation
-        // Byte 1: 0x00 → low 7 bits = 0, no continuation
-        // offset = ((1 + 1) << 7) | 0 = 256
-        let data = [0x81, 0x00];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 256);
-        assert_eq!(pos, 2);
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_two_bytes_with_payload() {
-        // Two bytes with payload in second byte:
-        // Byte 0: 0x81 → low 7 bits = 1, continuation
-        // Byte 1: 0x7f → low 7 bits = 127, no continuation
-        // offset = ((1 + 1) << 7) | 127 = 256 + 127 = 383
-        let data = [0x81, 0x7f];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 383);
-        assert_eq!(pos, 2);
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_three_bytes() {
-        // Three bytes:
-        // Byte 0: 0x81 → low 7 bits = 1, continuation
-        // Byte 1: 0x81 → low 7 bits = 1, continuation
-        // Byte 2: 0x01 → low 7 bits = 1, no continuation
-        // Step 1: offset = 1
-        // Step 2: offset = ((1+1) << 7) | 1 = 256 + 1 = 257
-        // Step 3: offset = ((257+1) << 7) | 1 = 258*128 + 1 = 33024 + 1 = 33025
-        let data = [0x81, 0x81, 0x01];
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        assert_eq!(offset, 33025);
-        assert_eq!(pos, 3);
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_trailing_continuation_is_error() {
-        // A byte with MSB set as the last byte means the parser expects
-        // another byte but there isn't one.
-        let data = [0x80];
-        let mut pos = 0;
-        let result = parse_ofs_delta_offset(&data, &mut pos);
-        assert!(
-            result.is_err(),
-            "trailing continuation byte should be an error"
-        );
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_empty_data() {
-        let data: [u8; 0] = [];
-        let mut pos = 0;
-        let result = parse_ofs_delta_offset(&data, &mut pos);
-        assert!(result.is_err(), "empty data should be an error");
-    }
-
-    #[test]
-    fn parse_ofs_delta_offset_pos_past_end() {
-        let data = [0x05];
-        let mut pos = 1; // already past end
-        let result = parse_ofs_delta_offset(&data, &mut pos);
-        assert!(result.is_err(), "pos past end should be an error");
-    }
-
-    // --- PackError Display tests ---
-
-    #[test]
-    fn pack_error_display_zlib() {
-        let io_err = std::io::Error::other("compression failed");
-        let err = PackError::Zlib(io_err);
-        let msg = err.to_string();
-        assert!(msg.contains("zlib compression failed"));
-        assert!(msg.contains("compression failed"));
-    }
-
-    #[test]
-    fn pack_error_display_too_many_objects() {
-        let err = PackError::TooManyObjects;
-        assert_eq!(err.to_string(), "too many objects for pack file");
-    }
-
-    #[test]
-    fn pack_error_display_shift_overflow() {
-        let err = PackError::ShiftOverflow;
-        assert_eq!(err.to_string(), "variable-length integer shift overflow");
-    }
-
-    #[test]
-    fn pack_error_display_invalid_delta() {
-        let err = PackError::InvalidDelta;
-        assert_eq!(err.to_string(), "invalid or missing delta base");
-    }
-
-    #[test]
-    fn pack_error_display_excessive_decompressed_size() {
-        let err = PackError::ExcessiveDecompressedSize;
+    fn pack_errors_preserve_messages_and_source_chains() {
+        for (error, expected) in [
+            (
+                PackError::InvalidPack,
+                "invalid pack framing or object size",
+            ),
+            (PackError::InvalidChecksum, "invalid pack checksum"),
+            (PackError::TooManyObjects, "too many objects for pack file"),
+            (
+                PackError::ShiftOverflow,
+                "variable-length integer shift overflow",
+            ),
+            (PackError::InvalidDelta, "invalid or missing delta base"),
+            (
+                PackError::ExcessiveDecompressedSize,
+                "total decompressed size exceeds allowed limit",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+            assert!(error.source().is_none());
+        }
+        let error = PackError::Zlib(std::io::Error::other("compression failed"));
         assert_eq!(
-            err.to_string(),
-            "total decompressed size exceeds allowed limit"
+            error.to_string(),
+            "zlib compression failed: compression failed"
         );
-    }
-
-    #[test]
-    fn pack_error_source_zlib_returns_inner() {
-        let io_err = std::io::Error::other("compress fail");
-        let err = PackError::Zlib(io_err);
-        assert!(err.source().is_some());
-    }
-
-    #[test]
-    fn pack_error_source_non_zlib_returns_none() {
-        assert!(PackError::TooManyObjects.source().is_none());
-        assert!(PackError::ShiftOverflow.source().is_none());
-        assert!(PackError::InvalidDelta.source().is_none());
-        assert!(PackError::ExcessiveDecompressedSize.source().is_none());
+        let source = error
+            .source()
+            .unwrap()
+            .downcast_ref::<std::io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), std::io::ErrorKind::Other);
+        assert_eq!(source.to_string(), "compression failed");
     }
 
     // --- ObjectType tests ---
@@ -886,43 +750,33 @@ mod tests {
         assert_eq!(obj.object_type, ObjectType::Blob);
     }
 
-    // --- parse_delta_varint tests ---
-
     #[test]
-    fn parse_delta_varint_single_byte_zero() {
-        assert_eq!(parse_delta_varint(&[0x00], 0).unwrap(), (0, 1));
+    fn delta_varints_preserve_values_and_stop_at_the_terminator() {
+        for (encoded, start, expected) in [
+            (&[0x00][..], 0, (0, 1)),
+            (&[0x7f][..], 0, (127, 1)),
+            (&[0x81, 0x0a][..], 0, (1281, 2)),
+            (&[0xff, 0x7f][..], 1, (127, 2)),
+            (&[0x01, 0xff][..], 0, (1, 1)),
+        ] {
+            assert_eq!(parse_delta_varint(encoded, start).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn parse_delta_varint_single_byte_max() {
-        assert_eq!(parse_delta_varint(&[0x7f], 0).unwrap(), (127, 1));
-    }
-
-    #[test]
-    fn parse_delta_varint_two_bytes() {
-        // Byte 0: 0x81 (MSB set, value=1)
-        // Byte 1: 0x0a (MSB clear, value=10)
-        // result = 1 | (10 << 7) = 1 + 1280 = 1281
-        assert_eq!(parse_delta_varint(&[0x81, 0x0a], 0).unwrap(), (1281, 2));
-    }
-
-    #[test]
-    fn parse_delta_varint_empty_data() {
-        let result = parse_delta_varint(&[], 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_delta_varint_truncated() {
-        // Continuation byte but no more data
-        let result = parse_delta_varint(&[0x80], 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_delta_varint_with_offset() {
-        let data = [0xff, 0x7f]; // skip first byte, parse from index 1
-        assert_eq!(parse_delta_varint(&data, 1).unwrap(), (127, 2));
+    fn delta_varints_reject_missing_truncated_and_unterminated_encodings() {
+        for (encoded, start) in [
+            (&[][..], 0),
+            (&[0x80][..], 0),
+            (&[0x00][..], 1),
+            (&[0x00][..], usize::MAX),
+            (&[0x80; MAX_DELTA_VARINT_BYTES][..], 0),
+        ] {
+            assert!(matches!(
+                parse_delta_varint(encoded, start),
+                Err(PackError::InvalidDelta)
+            ));
+        }
     }
 
     // --- Additional edge cases ---
@@ -1088,19 +942,6 @@ mod tests {
         assert!(content.starts_with(b"100644 readme.txt\x00"));
     }
 
-    #[test]
-    fn parse_ofs_delta_offset_shift_wrapping() {
-        // A single byte offset with MSB set should complete normally
-        // when followed by a byte with MSB clear.
-        let data = [0x80, 0x01]; // continuation then final byte
-        let mut pos = 0;
-        let offset = parse_ofs_delta_offset(&data, &mut pos).unwrap();
-        // Step 1: byte 0x80 → low 7 bits = 0, continuation
-        // Step 2: byte 0x01 → low 7 bits = 1, no continuation
-        // offset = ((0 + 1) << 7) | 1 = 128 + 1 = 129
-        assert_eq!(offset, 129);
-        assert_eq!(pos, 2);
-    }
     #[test]
     fn delta_varint_value_overflow_rejected() {
         let mut delta = vec![0x80; 9];

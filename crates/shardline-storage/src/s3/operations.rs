@@ -37,10 +37,14 @@ mod file_compare;
 mod file_upload;
 mod full_read;
 mod suffix;
+pub use suffix::S3RangeSnapshot;
 pub(super) mod temp_cleanup;
 
 #[cfg(test)]
 mod conditional_upload_tests;
+
+#[cfg(test)]
+mod runtime_tests;
 
 #[cfg(test)]
 mod temp_cleanup_tests;
@@ -292,28 +296,23 @@ impl S3ObjectStore {
         &self,
         key: &ObjectKey,
     ) -> Result<ObjectStorePath, S3ObjectStoreError> {
-        let location = self.key_prefix.as_ref().map_or_else(
-            || key.as_str().to_owned(),
-            |prefix| format!("{prefix}/{}", key.as_str()),
-        );
-        ObjectStorePath::parse(location).map_err(S3ObjectStoreError::Path)
+        self.storage_location(key.as_str())
     }
 
     pub(crate) fn location_for_prefix(
         &self,
         prefix: &ObjectPrefix,
     ) -> Result<ObjectStorePath, S3ObjectStoreError> {
-        let location = self.key_prefix.as_ref().map_or_else(
-            || prefix.as_str().to_owned(),
-            |key_prefix| {
-                if prefix.as_str().is_empty() {
-                    key_prefix.clone()
-                } else {
-                    format!("{key_prefix}/{}", prefix.as_str())
-                }
-            },
-        );
-        ObjectStorePath::parse(location).map_err(S3ObjectStoreError::Path)
+        self.storage_location(prefix.as_str())
+    }
+
+    fn storage_location(&self, relative: &str) -> Result<ObjectStorePath, S3ObjectStoreError> {
+        match (&self.key_prefix, relative.is_empty()) {
+            (Some(prefix), false) => ObjectStorePath::parse(format!("{prefix}/{relative}")),
+            (Some(prefix), true) => ObjectStorePath::parse(prefix),
+            (None, _) => ObjectStorePath::parse(relative),
+        }
+        .map_err(S3ObjectStoreError::Path)
     }
 
     /// Lists a bounded page of direct child objects under a flat namespace prefix.
@@ -347,11 +346,7 @@ impl S3ObjectStore {
                     break;
                 };
                 let item = self.metadata_from_external(&entry)?;
-                if !item.key().as_str().starts_with(prefix.as_str()) {
-                    continue;
-                }
-                let key_str = item.key().as_str();
-                let Some(remainder) = key_str.strip_prefix(prefix.as_str()) else {
+                let Some(remainder) = item.key().as_str().strip_prefix(prefix.as_str()) else {
                     continue;
                 };
                 if remainder.is_empty() || remainder.contains('/') {
@@ -455,23 +450,24 @@ impl S3ObjectStore {
     ) -> Result<(), S3ObjectStoreError> {
         let expected = range.len().ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
         self.block_on_result(async {
-            let mut stream = self.stream_range(key, range).await?;
-            let mut written = 0_u64;
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                let length = u64::try_from(bytes.len())
-                    .map_err(|_error| S3ObjectStoreError::RangeOutOfBounds)?;
-                written = written
-                    .checked_add(length)
-                    .filter(|total| *total <= expected)
-                    .ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
-                std::io::Write::write_all(output, &bytes)?;
-            }
-            if written != expected {
-                return Err(S3ObjectStoreError::RangeOutOfBounds);
-            }
-            Ok(())
+            let stream = self.stream_range(key, range).await?;
+            copy_stream_to_writer(stream, expected, output, || {
+                S3ObjectStoreError::RangeOutOfBounds
+            })
+            .await
+            .map(|_written| ())
         })
+    }
+
+    async fn get_if_present(
+        &self,
+        location: &ObjectStorePath,
+    ) -> Result<Option<GetResult>, S3ObjectStoreError> {
+        match self.inner.get(location).await {
+            Ok(result) => Ok(Some(result)),
+            Err(ExternalObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(S3ObjectStoreError::External(error)),
+        }
     }
 
     /// Copies a complete object into a file with one GET, returning `None` when
@@ -488,32 +484,7 @@ impl S3ObjectStore {
         key: &ObjectKey,
         output: &mut File,
     ) -> Result<Option<u64>, S3ObjectStoreError> {
-        let location = self.location_for_key(key)?;
-        self.block_on_result(async {
-            let result = match self.inner.get(&location).await {
-                Ok(result) => result,
-                Err(ExternalObjectStoreError::NotFound { .. }) => return Ok(None),
-                Err(error) => return Err(S3ObjectStoreError::External(error)),
-            };
-            let expected_length = result.meta.size;
-            let mut written = 0_u64;
-            let mut stream = stream_payload_for_range(result, 0..expected_length)?;
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                written = written
-                    .checked_add(
-                        u64::try_from(bytes.len())
-                            .map_err(|_error| S3ObjectStoreError::IntegrityLengthMismatch)?,
-                    )
-                    .filter(|length| *length <= expected_length)
-                    .ok_or(S3ObjectStoreError::IntegrityLengthMismatch)?;
-                std::io::Write::write_all(output, &bytes).map_err(S3ObjectStoreError::Io)?;
-            }
-            if written != expected_length {
-                return Err(S3ObjectStoreError::IntegrityLengthMismatch);
-            }
-            Ok(Some(written))
-        })
+        self.copy_object_to_writer_if_present(key, output)
     }
 
     /// Copies an object directly to a writer using one GET, without allocating
@@ -531,29 +502,14 @@ impl S3ObjectStore {
     ) -> Result<Option<u64>, S3ObjectStoreError> {
         let location = self.location_for_key(key)?;
         self.block_on_result(async {
-            let result = match self.inner.get(&location).await {
-                Ok(result) => result,
-                Err(ExternalObjectStoreError::NotFound { .. }) => return Ok(None),
-                Err(error) => return Err(S3ObjectStoreError::External(error)),
+            let Some(result) = self.get_if_present(&location).await? else {
+                return Ok(None);
             };
-            let expected_length = result.meta.size;
-            let mut written = 0_u64;
-            let mut stream = stream_payload_for_range(result, 0..expected_length)?;
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                written = written
-                    .checked_add(
-                        u64::try_from(bytes.len())
-                            .map_err(|_error| S3ObjectStoreError::IntegrityLengthMismatch)?,
-                    )
-                    .filter(|length| *length <= expected_length)
-                    .ok_or(S3ObjectStoreError::IntegrityLengthMismatch)?;
-                output.write_all(&bytes).map_err(S3ObjectStoreError::Io)?;
-            }
-            if written != expected_length {
-                return Err(S3ObjectStoreError::IntegrityLengthMismatch);
-            }
-            Ok(Some(expected_length))
+            copy_snapshot_to_writer(result, output, || {
+                S3ObjectStoreError::IntegrityLengthMismatch
+            })
+            .await
+            .map(Some)
         })
     }
 
@@ -572,12 +528,8 @@ impl S3ObjectStore {
     ) -> Result<Option<(Vec<u8>, u64)>, S3ObjectReadError> {
         let location = self.location_for_key(key)?;
         self.block_on_result(async {
-            let result = match self.inner.get(&location).await {
-                Ok(result) => result,
-                Err(ExternalObjectStoreError::NotFound { .. }) => return Ok(None),
-                Err(error) => {
-                    return Err(S3ObjectStoreError::External(error).into());
-                }
+            let Some(result) = self.get_if_present(&location).await? else {
+                return Ok(None);
             };
             let expected_length = result.meta.size;
             if expected_length > maximum_length {
@@ -586,21 +538,10 @@ impl S3ObjectStore {
             let capacity = usize::try_from(expected_length)
                 .map_err(|_error| S3ObjectReadError::ObjectTooLarge)?;
             let mut output = Vec::with_capacity(capacity);
-            let mut stream = stream_payload_for_range(result, 0..expected_length)?;
-            while let Some(bytes) = stream.next().await {
-                let bytes = bytes?;
-                let next_length = output
-                    .len()
-                    .checked_add(bytes.len())
-                    .ok_or(S3ObjectStoreError::IntegrityLengthMismatch)?;
-                if next_length > capacity {
-                    return Err(S3ObjectStoreError::IntegrityLengthMismatch.into());
-                }
-                output.extend_from_slice(&bytes);
-            }
-            if output.len() != capacity {
-                return Err(S3ObjectStoreError::IntegrityLengthMismatch.into());
-            }
+            copy_snapshot_to_writer(result, &mut output, || {
+                S3ObjectStoreError::IntegrityLengthMismatch
+            })
+            .await?;
             Ok(Some((output, expected_length)))
         })
     }
@@ -611,9 +552,9 @@ impl S3ObjectStore {
     ) -> Result<ObjectMetadata, S3ObjectStoreError> {
         let raw_key = metadata.location.as_ref();
         let key = if let Some(prefix) = &self.key_prefix {
-            let prefix = format!("{prefix}/");
             raw_key
-                .strip_prefix(&prefix)
+                .strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_prefix('/'))
                 .ok_or(S3ObjectStoreError::InvalidListedKey)?
         } else {
             raw_key
@@ -848,72 +789,65 @@ impl S3ObjectStore {
             return existing_copy_outcome(self, source, destination, source_len);
         }
 
-        let store = self.inner.clone();
-        let src = source_location.clone();
-        let dst = destination_location.clone();
-        let len = source_len;
-
         // Initialize before creating remote state so a local client-construction
         // failure cannot leave an unpublished multipart upload behind.
         let conditional_completion = self.conditional_completion_inner.get().await?;
-
-        let upload_id = store
-            .create_multipart(&dst)
-            .await
-            .map_err(S3ObjectStoreError::External)?;
-
-        let mut offset = 0_u64;
-        let mut part_idx = 0_usize;
-        let mut part_ids = Vec::new();
-
-        let result: Result<(), S3ObjectStoreError> = async {
-            while offset < len {
-                let chunk_end = offset.saturating_add(LARGE_COPY_CHUNK_BYTES).min(len);
-                let chunk = store
-                    .get_range(&src, offset..chunk_end)
-                    .await
-                    .map_err(S3ObjectStoreError::External)?;
-                let payload = PutPayload::from_bytes(chunk);
-                let part_id = store
-                    .put_part(&dst, &upload_id, part_idx, payload)
-                    .await
-                    .map_err(S3ObjectStoreError::External)?;
+        let upload_id = self.inner.create_multipart(destination_location).await?;
+        let result = async {
+            let mut offset = 0_u64;
+            let mut part_ids = Vec::new();
+            while offset < source_len {
+                let chunk_end = offset
+                    .saturating_add(LARGE_COPY_CHUNK_BYTES)
+                    .min(source_len);
+                let chunk = self
+                    .inner
+                    .get_range(source_location, offset..chunk_end)
+                    .await?;
+                let part_id = self
+                    .inner
+                    .put_part(
+                        destination_location,
+                        &upload_id,
+                        part_ids.len(),
+                        PutPayload::from_bytes(chunk),
+                    )
+                    .await?;
                 part_ids.push(part_id);
-                part_idx = part_idx.wrapping_add(1);
                 offset = chunk_end;
             }
-            Ok(())
+            // The provider must enforce absence atomically at publication.
+            // Another HEAD here cannot fence a competing node's later PUT.
+            // This client adds If-None-Match only to completion, retaining
+            // the dependency's signing, XML parsing and retries.
+            match conditional_completion
+                .complete_multipart(destination_location, &upload_id, part_ids)
+                .await
+            {
+                Ok(_) => Ok(PutOutcome::Inserted),
+                Err(
+                    ExternalObjectStoreError::AlreadyExists { .. }
+                    | ExternalObjectStoreError::Precondition { .. },
+                ) => Ok(PutOutcome::AlreadyExists),
+                Err(error) => Err(error),
+            }
         }
         .await;
 
+        // Abort before inspecting a competing destination. Transfer failures
+        // remain errors; only a completion conflict can become AlreadyExists.
+        if !matches!(&result, Ok(PutOutcome::Inserted)) {
+            self.inner
+                .abort_multipart(destination_location, &upload_id)
+                .await
+                .ok();
+        }
         match result {
-            Ok(()) => {
-                // The provider must enforce absence atomically at publication.
-                // Another HEAD here cannot fence a competing node's later PUT.
-                // This dedicated client adds If-None-Match only to completion,
-                // retaining the dependency's signing, XML parsing and retries.
-                match conditional_completion
-                    .complete_multipart(&dst, &upload_id, part_ids)
-                    .await
-                {
-                    Ok(_) => Ok(PutOutcome::Inserted),
-                    Err(
-                        ExternalObjectStoreError::AlreadyExists { .. }
-                        | ExternalObjectStoreError::Precondition { .. },
-                    ) => {
-                        store.abort_multipart(&dst, &upload_id).await.ok();
-                        existing_copy_outcome(self, source, destination, source_len)
-                    }
-                    Err(error) => {
-                        store.abort_multipart(&dst, &upload_id).await.ok();
-                        Err(S3ObjectStoreError::External(error))
-                    }
-                }
+            Ok(PutOutcome::AlreadyExists) => {
+                existing_copy_outcome(self, source, destination, source_len)
             }
-            Err(error) => {
-                store.abort_multipart(&dst, &upload_id).await.ok();
-                Err(error)
-            }
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(S3ObjectStoreError::External(error)),
         }
     }
 
@@ -1041,19 +975,7 @@ impl ObjectStore for S3ObjectStore {
             &location,
             GetOptions::new().with_range(Some(external_range.clone())),
         ))?;
-        if result.range != external_range {
-            return Err(S3ObjectStoreError::RangeOutOfBounds);
-        }
-        let bytes = self.block_on(async {
-            let mut acc = Vec::new();
-            let mut stream = result.into_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                acc.extend_from_slice(&chunk);
-            }
-            Ok::<_, ExternalObjectStoreError>(acc)
-        })?;
-        Ok(bytes)
+        self.block_on_result(read_range_payload(result, external_range))
     }
 
     fn contains(&self, key: &ObjectKey) -> Result<bool, Self::Error> {
@@ -1172,33 +1094,7 @@ impl AsyncObjectStore for S3ObjectStore {
             )
             .await
             .map_err(S3ObjectStoreError::External)?;
-        if result.range != external_range {
-            return Err(S3ObjectStoreError::RangeOutOfBounds);
-        }
-        let expected_length = external_range
-            .end
-            .checked_sub(external_range.start)
-            .ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
-        let mut acc = Vec::new();
-        let mut stream = result.into_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(S3ObjectStoreError::External)?;
-            let next_length = acc
-                .len()
-                .checked_add(chunk.len())
-                .and_then(|length| u64::try_from(length).ok())
-                .ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
-            if next_length > expected_length {
-                return Err(S3ObjectStoreError::RangeOutOfBounds);
-            }
-            acc.extend_from_slice(&chunk);
-        }
-        if u64::try_from(acc.len()).map_err(|_error| S3ObjectStoreError::RangeOutOfBounds)?
-            != expected_length
-        {
-            return Err(S3ObjectStoreError::RangeOutOfBounds);
-        }
-        Ok(acc)
+        read_range_payload(result, external_range).await
     }
 
     async fn read_suffix(
@@ -1274,15 +1170,64 @@ impl AsyncObjectStore for S3ObjectStore {
 }
 
 pub(crate) fn validated_external_range(range: ByteRange) -> Result<Range<u64>, S3ObjectStoreError> {
-    let Some(length) = range.len() else {
-        return Err(S3ObjectStoreError::RangeOutOfBounds);
-    };
     let end_exclusive = range
-        .start()
-        .checked_add(length)
+        .end_inclusive()
+        .checked_add(1)
         .ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
 
     Ok(range.start()..end_exclusive)
+}
+
+async fn read_range_payload(
+    result: GetResult,
+    expected_range: Range<u64>,
+) -> Result<Vec<u8>, S3ObjectStoreError> {
+    let expected_length = expected_range
+        .end
+        .checked_sub(expected_range.start)
+        .ok_or(S3ObjectStoreError::RangeOutOfBounds)?;
+    // A buffered result must fit in the platform's address space. Keep this
+    // check before the shared u64 stream budget and do not preallocate from
+    // an untrusted provider's declared length.
+    usize::try_from(expected_length).map_err(|_error| S3ObjectStoreError::RangeOutOfBounds)?;
+    let mut acc = Vec::new();
+    let stream = stream_payload_for_range(result, expected_range)?;
+    copy_stream_to_writer(stream, expected_length, &mut acc, || {
+        S3ObjectStoreError::RangeOutOfBounds
+    })
+    .await?;
+    Ok(acc)
+}
+
+async fn copy_snapshot_to_writer(
+    result: GetResult,
+    output: &mut impl Write,
+    length_error: fn() -> S3ObjectStoreError,
+) -> Result<u64, S3ObjectStoreError> {
+    let expected_length = result.meta.size;
+    let stream = stream_payload_for_range(result, 0..expected_length)?;
+    copy_stream_to_writer(stream, expected_length, output, length_error).await
+}
+
+async fn copy_stream_to_writer(
+    mut stream: S3ByteStream,
+    expected_length: u64,
+    output: &mut impl Write,
+    length_error: fn() -> S3ObjectStoreError,
+) -> Result<u64, S3ObjectStoreError> {
+    let mut written = 0_u64;
+    while let Some(bytes) = stream.next().await {
+        let bytes = bytes?;
+        written = written
+            .checked_add(u64::try_from(bytes.len()).map_err(|_error| length_error())?)
+            .filter(|length| *length <= expected_length)
+            .ok_or_else(length_error)?;
+        output.write_all(&bytes).map_err(S3ObjectStoreError::Io)?;
+    }
+    if written != expected_length {
+        return Err(length_error());
+    }
+    Ok(expected_length)
 }
 
 pub(crate) fn stream_payload_for_range(
@@ -1302,18 +1247,11 @@ pub(crate) fn verify_integrity(
     bytes: &[u8],
     integrity: &ObjectIntegrity,
 ) -> Result<(), S3ObjectStoreError> {
-    let body_length =
-        u64::try_from(bytes.len()).map_err(|_error| S3ObjectStoreError::IntegrityLengthMismatch)?;
-    if body_length != integrity.length() {
-        return Err(S3ObjectStoreError::IntegrityLengthMismatch);
-    }
-
-    let actual = chunk_hash(bytes);
-    if actual != integrity.hash() {
-        return Err(S3ObjectStoreError::IntegrityHashMismatch);
-    }
-
-    Ok(())
+    integrity.verify_bytes(
+        bytes,
+        S3ObjectStoreError::IntegrityLengthMismatch,
+        S3ObjectStoreError::IntegrityHashMismatch,
+    )
 }
 
 pub(crate) fn existing_object_outcome_from_file(
@@ -1326,12 +1264,8 @@ pub(crate) fn existing_object_outcome_from_file(
     let location = store.location_for_key(key)?;
     // Compare the complete response with the verified local file, retaining
     // the released single full-GET path even for providers without range support.
-    let result = match store.block_on(store.inner.get(&location)) {
-        Ok(result) => result,
-        Err(S3ObjectStoreError::External(ExternalObjectStoreError::NotFound { .. })) => {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let Some(result) = store.block_on_result(store.get_if_present(&location))? else {
+        return Ok(None);
     };
     file_compare::compare_existing_file(store, result, path, integrity).map(Some)
 }
@@ -1370,28 +1304,5 @@ pub(crate) fn verify_file_length(
     Ok(())
 }
 
-pub(crate) fn chunk_hash(bytes: &[u8]) -> ShardlineHash {
-    let digest = blake3::hash(bytes);
-    ShardlineHash::from_bytes(*digest.as_bytes())
-}
-
 #[cfg(test)]
-pub(crate) fn temporary_upload_location(key_prefix: &Option<String>) -> ObjectStorePath {
-    use super::types::TEMP_UPLOAD_COUNTER;
-    use std::{
-        sync::atomic::Ordering,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-    let counter = TEMP_UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let unix_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
-    let relative = format!(
-        "__tmp/shardline-stream-upload/{unix_nanos}-{}-{counter}",
-        std::process::id()
-    );
-    let path = key_prefix
-        .as_ref()
-        .map_or_else(|| relative.clone(), |prefix| format!("{prefix}/{relative}"));
-    ObjectStorePath::from(path)
-}
+pub(crate) use crate::object::chunk_hash;

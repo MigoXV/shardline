@@ -1,3 +1,4 @@
+use super::helpers::run_blocking_store;
 use std::time::Duration;
 
 use rusqlite::{OptionalExtension, params};
@@ -96,7 +97,7 @@ impl RecordScan {
                 format!(
                     "SELECT {columns} FROM shardline_record_membership m
                  JOIN shardline_file_records r ON r.record_key=m.record_key
-                 WHERE m.scope_key=?1 AND m.member_hash=?2 AND r.scope_key=?1
+                 WHERE m.scope_key=?1 AND m.member_hash=?2 AND COALESCE(json_extract(CASE WHEN json_valid(r.record) THEN r.record ELSE '{{}}' END, '$.deduplication_domain'), r.scope_key)=?1
                    AND m.record_key > ?3 ORDER BY m.record_key LIMIT {}",
                     super::index_store::INVENTORY_BATCH_SIZE,
                 ),
@@ -168,13 +169,10 @@ where
     VisitorError: Send,
 {
     let reservation = super::index_store::reserve_async_cursor().map_err(Into::into)?;
-    let scan = tokio::task::spawn_blocking(move || {
-        RecordScan::new(&store, kind, Some(reservation), repository)
-    })
-    .await
-    .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))
-    .map_err(Into::into)?
-    .map_err(Into::into)?;
+    let scan =
+        run_blocking_store(move || RecordScan::new(&store, kind, Some(reservation), repository))
+            .await
+            .map_err(Into::into)?;
     visit_scan(scan, visitor).await
 }
 
@@ -190,18 +188,15 @@ where
     for locators_only in [true, false] {
         scan.after = None;
         loop {
-            let (next, batch) =
-                tokio::task::spawn_blocking(move || match scan.next_batch(locators_only) {
-                    Ok(batch) => Ok((scan, batch)),
-                    Err(error) => {
-                        scan.abort();
-                        Err(error)
-                    }
-                })
-                .await
-                .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))
-                .map_err(Into::into)?
-                .map_err(Into::into)?;
+            let (next, batch) = run_blocking_store(move || match scan.next_batch(locators_only) {
+                Ok(batch) => Ok((scan, batch)),
+                Err(error) => {
+                    scan.abort();
+                    Err(error)
+                }
+            })
+            .await
+            .map_err(Into::into)?;
             scan = next;
             if batch.is_empty() {
                 break;
@@ -220,10 +215,8 @@ where
             }
         }
     }
-    tokio::task::spawn_blocking(move || scan.finish())
+    run_blocking_store(move || scan.finish())
         .await
-        .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))
-        .map_err(Into::into)?
         .map_err(Into::into)
 }
 
@@ -239,25 +232,27 @@ impl RecordTraversal for LocalRecordStore {
         after: Option<(String, i64)>,
     ) -> RecordStoreFuture<'_, Vec<(String, i64, String)>, Self::Error> {
         let store = self.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                if after.is_none() {
-                    // Released metadata can lack this optional derived index.
-                    // GC still scans authoritative records and verifies source
-                    // containers when standalone member copies are missing.
-                    let present: bool = connection.query_row(
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            if after.is_none() {
+                // Released metadata can lack this optional derived index.
+                // GC still scans authoritative records and verifies source
+                // containers when standalone member copies are missing.
+                let present: bool = connection.query_row(
                         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='shardline_xet_chunks')",
                         [], |row| row.get(0),
                     )?;
-                    if !present { return Ok(Vec::new()); }
+                if !present {
+                    return Ok(Vec::new());
                 }
-                let (hash, ordinal) = after.unwrap_or_else(|| (String::new(), -1));
-                let mut query = connection.prepare("SELECT xorb_hash,chunk_index,chunk_hash FROM shardline_xet_chunks WHERE (xorb_hash,chunk_index)>(?1,?2) ORDER BY xorb_hash,chunk_index LIMIT 256")?;
-                let rows = query.query_map(params![hash, ordinal], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-            }).await.map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
-        })
+            }
+            let (hash, ordinal) = after.unwrap_or_else(|| (String::new(), -1));
+            let mut query = connection.prepare("SELECT xorb_hash,chunk_index,chunk_hash FROM shardline_xet_chunks WHERE (xorb_hash,chunk_index)>(?1,?2) ORDER BY xorb_hash,chunk_index LIMIT 256")?;
+            let rows = query.query_map(params![hash, ordinal], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        }))
     }
 
     fn visit_repository_hash_records<'operation, Visitor, VisitorError>(
@@ -274,22 +269,38 @@ impl RecordTraversal for LocalRecordStore {
             + 'operation,
         VisitorError: Send + 'operation,
     {
+        Box::pin(async move {
+            let domain = crate::DeduplicationDomain::from_scope(Some(repository));
+            self.visit_deduplication_hash_records(&domain, hash_hex, visitor)
+                .await
+        })
+    }
+
+    fn visit_deduplication_hash_records<'operation, Visitor, VisitorError>(
+        &'operation self,
+        domain: &'operation crate::DeduplicationDomain,
+        hash_hex: &'operation str,
+        visitor: Visitor,
+    ) -> RecordStoreFuture<'operation, (), VisitorError>
+    where
+        Self: Sync,
+        Self::Error: Into<VisitorError> + 'operation,
+        Visitor: FnMut(crate::StoredRecord<Self::Locator>) -> Result<(), VisitorError>
+            + Send
+            + 'operation,
+        VisitorError: Send + 'operation,
+    {
         let store = self.clone();
-        let filter = (
-            crate::record_key::repository_scope_key(Some(repository)),
-            hash_hex.to_owned(),
-        );
+        let filter = (domain.as_str().to_owned(), hash_hex.to_owned());
         Box::pin(async move {
             let reservation = super::index_store::reserve_async_cursor().map_err(Into::into)?;
-            let scan = tokio::task::spawn_blocking(move || {
+            let scan = run_blocking_store(move || {
                 let mut scan =
                     RecordScan::new(&store, RecordKind::Latest, Some(reservation), None)?;
                 scan.hash_filter = Some(filter);
                 Ok::<_, LocalIndexStoreError>(scan)
             })
             .await
-            .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))
-            .map_err(Into::into)?
             .map_err(Into::into)?;
             visit_scan(scan, visitor).await
         })
@@ -315,11 +326,9 @@ impl RecordTraversal for LocalRecordStore {
         &self,
     ) -> RecordStoreFuture<'_, Vec<Self::Locator>, Self::Error> {
         let store = self.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.list_record_locators(RecordKind::Latest))
-                .await
-                .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            store.list_record_locators(RecordKind::Latest)
+        }))
     }
 
     fn visit_repository_latest_records<'operation, Visitor, VisitorError>(
@@ -348,13 +357,9 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, Vec<Self::Locator>, Self::Error> {
         let store = self.clone();
         let repository = repository.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                store.list_repository_record_locators(RecordKind::Latest, &repository)
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            store.list_repository_record_locators(RecordKind::Latest, &repository)
+        }))
     }
 
     fn visit_version_records<'operation, Visitor, VisitorError>(
@@ -377,11 +382,9 @@ impl RecordTraversal for LocalRecordStore {
         &self,
     ) -> RecordStoreFuture<'_, Vec<Self::Locator>, Self::Error> {
         let store = self.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || store.list_record_locators(RecordKind::Version))
-                .await
-                .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            store.list_record_locators(RecordKind::Version)
+        }))
     }
 
     fn visit_repository_version_records<'operation, Visitor, VisitorError>(
@@ -410,13 +413,9 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, Vec<Self::Locator>, Self::Error> {
         let store = self.clone();
         let repository = repository.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                store.list_repository_record_locators(RecordKind::Version, &repository)
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            store.list_repository_record_locators(RecordKind::Version, &repository)
+        }))
     }
 
     fn read_record_bytes<'operation>(
@@ -425,17 +424,11 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, Vec<u8>, Self::Error> {
         let store = self.clone();
         let locator = locator.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                store
-                    .read_record_bytes_raw(&locator)?
-                    .ok_or_else(record_not_found_error)
-            })
-            .await
-            .map_err(|e: tokio::task::JoinError| {
-                LocalIndexStoreError::BlockingTask(e.to_string())
-            })?
-        })
+        Box::pin(run_blocking_store(move || {
+            store
+                .read_record_bytes_raw(&locator)?
+                .ok_or_else(record_not_found_error)
+        }))
     }
 
     fn read_latest_record_bytes<'operation>(
@@ -444,14 +437,10 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, Option<Vec<u8>>, Self::Error> {
         let store = self.clone();
         let record = record.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let locator = store.latest_record_locator(&record);
-                store.read_record_bytes_raw(&locator)
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            let locator = store.latest_record_locator(&record);
+            store.read_record_bytes_raw(&locator)
+        }))
     }
 
     fn record_locator_exists<'operation>(
@@ -460,21 +449,17 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, bool, Self::Error> {
         let store = self.clone();
         let locator = locator.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                let exists = connection.query_row(
-                    "SELECT EXISTS(
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            let exists = connection.query_row(
+                "SELECT EXISTS(
                         SELECT 1 FROM shardline_file_records WHERE record_key = ?1
                      )",
-                    params![locator.record_key()],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                Ok(exists != 0)
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+                params![locator.record_key()],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(exists != 0)
+        }))
     }
 
     fn modified_since_epoch<'operation>(
@@ -483,24 +468,20 @@ impl RecordTraversal for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, Duration, Self::Error> {
         let store = self.clone();
         let locator = locator.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                let value = connection
-                    .query_row(
-                        "SELECT updated_at_unix_seconds
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            let value = connection
+                .query_row(
+                    "SELECT updated_at_unix_seconds
                          FROM shardline_file_records
                          WHERE record_key = ?1",
-                        params![locator.record_key()],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                    .ok_or_else(record_not_found_error)?;
-                Ok(Duration::from_secs(i64_to_u64(value)?))
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+                    params![locator.record_key()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .ok_or_else(record_not_found_error)?;
+            Ok(Duration::from_secs(i64_to_u64(value)?))
+        }))
     }
 
     fn latest_record_locator(&self, record: &FileRecord) -> Self::Locator {
@@ -523,21 +504,17 @@ impl RecordMutation for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, (), Self::Error> {
         let store = self.clone();
         let record = record.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                let locator = store.version_record_locator(&record);
-                super::helpers::upsert_file_record_row(
-                    &connection,
-                    &locator,
-                    &record,
-                    unix_now_seconds_lossy(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            let locator = store.version_record_locator(&record);
+            super::helpers::upsert_file_record_row(
+                &connection,
+                &locator,
+                &record,
+                unix_now_seconds_lossy(),
+            )?;
+            Ok(())
+        }))
     }
 
     fn write_latest_record<'operation>(
@@ -546,21 +523,17 @@ impl RecordMutation for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, (), Self::Error> {
         let store = self.clone();
         let record = record.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                let locator = store.latest_record_locator(&record);
-                super::helpers::upsert_file_record_row(
-                    &connection,
-                    &locator,
-                    &record,
-                    unix_now_seconds_lossy(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            let locator = store.latest_record_locator(&record);
+            super::helpers::upsert_file_record_row(
+                &connection,
+                &locator,
+                &record,
+                unix_now_seconds_lossy(),
+            )?;
+            Ok(())
+        }))
     }
 
     fn delete_record_locator<'operation>(
@@ -569,21 +542,17 @@ impl RecordMutation for LocalRecordStore {
     ) -> RecordStoreFuture<'operation, (), Self::Error> {
         let store = self.clone();
         let locator = locator.clone();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let connection = store.open_connection()?;
-                let deleted = connection.execute(
-                    "DELETE FROM shardline_file_records WHERE record_key = ?1",
-                    params![locator.record_key()],
-                )?;
-                if deleted == 0 {
-                    return Err(record_not_found_error());
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| LocalIndexStoreError::BlockingTask(e.to_string()))?
-        })
+        Box::pin(run_blocking_store(move || {
+            let connection = store.open_connection()?;
+            let deleted = connection.execute(
+                "DELETE FROM shardline_file_records WHERE record_key = ?1",
+                params![locator.record_key()],
+            )?;
+            if deleted == 0 {
+                return Err(record_not_found_error());
+            }
+            Ok(())
+        }))
     }
 
     fn prune_empty_latest_records(&self) -> RecordStoreFuture<'_, (), Self::Error> {
@@ -617,6 +586,7 @@ mod tests {
 
     fn sample_record() -> FileRecord {
         FileRecord {
+            deduplication_domain: None,
             file_id: "test.bin".to_owned(),
             content_hash: "a".repeat(64),
             total_bytes: 4,

@@ -100,7 +100,7 @@ impl MemoryReconstructionCache {
         Self {
             ttl: Duration::from_secs(ttl_seconds.get()),
             max_entries,
-            inner: Arc::new(RwLock::new(CacheInner::new())),
+            inner: Arc::new(RwLock::new(CacheInner::default())),
             loading: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -127,61 +127,47 @@ impl MemoryReconstructionCache {
         {
             let inner = self.inner.read().await;
             let now = Instant::now();
-            if let Some(entry) = inner.entries.get(key)
-                && entry.is_live(now, self.ttl)
-            {
-                return Ok(Some(entry.payload.as_ref().clone()));
+            if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                return Ok(Some(payload));
             }
         }
 
         // Try to become the exclusive loader for this key.
-        let (should_load, notify, last_seen_alive) = {
+        let (notify, last_seen_alive) = {
             let mut inner = self.inner.write().await;
             let now = Instant::now();
 
             // Re-check after acquiring the write lock.
-            if let Some(entry) = inner.entries.get(key)
-                && entry.is_live(now, self.ttl)
-            {
-                return Ok(Some(entry.payload.as_ref().clone()));
+            if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                return Ok(Some(payload));
             }
 
             // Check if someone else is already loading this key. The loading
             // map lives behind a synchronous mutex so the loader's Drop guard
             // can release a latch synchronously on caller cancellation
-            // (F-112). Use separate branches on contains_key() to avoid the
-            // clippy option_if_let_else lint.
+            // (F-112).
             let mut loading = self
                 .loading
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if loading.contains_key(key) {
-                // SAFETY: contains_key was just checked — get() returns Some.
-                // Use unwrap_or_else with a non-panicking default to avoid
-                // denied lints while satisfying the type system.
-                let dummy = LoadingEntry::new(Arc::new(Notify::new()));
-                let existing = loading.get(key).unwrap_or(&dummy);
-                (
-                    false,
-                    Arc::clone(&existing.notify),
-                    Arc::clone(&existing.last_seen_alive),
-                )
-            } else {
-                let new = LoadingEntry::new(Arc::new(Notify::new()));
-                let notify = Arc::clone(&new.notify);
-                let last_seen_alive = Arc::clone(&new.last_seen_alive);
-                loading.insert(key.clone(), new);
-                // Clean up any expired entry so the loader can store fresh data.
-                if let Some(entry) = inner.entries.get(key)
-                    && !entry.is_live(now, self.ttl)
-                {
-                    inner.remove(key);
+            match loading.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let existing = entry.get();
+                    (Arc::clone(&existing.notify), None)
                 }
-                (true, notify, last_seen_alive)
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let new = LoadingEntry::new(Arc::new(Notify::new()));
+                    let notify = Arc::clone(&new.notify);
+                    let last_seen_alive = Arc::clone(&new.last_seen_alive);
+                    slot.insert(new);
+                    // Clean up any expired entry so the loader can store fresh data.
+                    inner.remove(key);
+                    (notify, Some(last_seen_alive))
+                }
             }
         };
 
-        if should_load {
+        if let Some(last_seen_alive) = last_seen_alive {
             // F-112: if the caller's future is dropped mid-load (client
             // disconnect, request timeout, shutdown), the loading latch must
             // be released. The Drop guard removes it synchronously on
@@ -192,23 +178,15 @@ impl MemoryReconstructionCache {
             // the latch persists so concurrent callers still coalesce on this
             // one load (F-90).
             let _latch_guard = LoadingLatchGuard {
-                loading: Arc::clone(&self.loading),
-                key: key.clone(),
-                notify: Arc::clone(&notify),
+                loading: &self.loading,
+                key,
+                notify: &notify,
             };
-            let result = run_loader_with_heartbeat(last_seen_alive, loader).await;
-            match result {
-                Ok(payload) => {
-                    let reservation = ReconstructionCacheReservation::local(Arc::clone(&notify));
-                    self.put_reserved(key, &payload, &reservation).await?;
-                    Ok(Some(payload))
-                }
-                Err(e) => {
-                    // The guard above releases the loading latch and wakes
-                    // waiters on the way out.
-                    Err(e)
-                }
-            }
+            // On error, the guard releases the latch and wakes waiters.
+            let payload = run_loader_with_heartbeat(last_seen_alive, loader).await?;
+            let reservation = ReconstructionCacheReservation::local(Arc::clone(&notify));
+            self.put_reserved(key, &payload, &reservation).await?;
+            Ok(Some(payload))
         } else {
             // Someone else is loading — wait for them (bounded). `wait_for_loader`
             // re-enters for a second interval instead of stealing the latch while
@@ -258,10 +236,8 @@ impl MemoryReconstructionCache {
             {
                 let inner = self.inner.read().await;
                 let now = Instant::now();
-                if let Some(entry) = inner.entries.get(key)
-                    && entry.is_live(now, self.ttl)
-                {
-                    return Some(entry.payload.as_ref().clone());
+                if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                    return Some(payload);
                 }
                 if !self
                     .loading
@@ -287,10 +263,8 @@ impl MemoryReconstructionCache {
                     // wakeup).
                     let inner = self.inner.read().await;
                     let now = Instant::now();
-                    if let Some(entry) = inner.entries.get(key)
-                        && entry.is_live(now, self.ttl)
-                    {
-                        return Some(entry.payload.as_ref().clone());
+                    if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                        return Some(payload);
                     }
                     // Aliveness re-check: a running loader refreshes its stamp
                     // at intervals, so a fresh stamp means it is slow but alive.
@@ -329,20 +303,7 @@ impl MemoryReconstructionCache {
                     // its stamp fresh but never completes, F-100). Release the
                     // latch so later callers can retry promptly, and wake
                     // sibling waiters so they observe the release too.
-                    let released = {
-                        let mut loading = self
-                            .loading
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if loading.get(key).is_some_and(|entry| Arc::ptr_eq(&entry.notify, &notify)) {
-                            loading.remove(key).map(|entry| entry.notify)
-                        } else {
-                            None
-                        }
-                    };
-                    if let Some(released) = released {
-                        released.notify_waiters();
-                    }
+                    release_owned_loading(&self.loading, key, &notify);
                     return None;
                 }
             }
@@ -391,6 +352,30 @@ impl MemoryReconstructionCache {
     }
 }
 
+/// Releases only this loading generation, then wakes waiters after unlocking.
+fn release_owned_loading(
+    loading: &Mutex<HashMap<ReconstructionCacheKey, LoadingEntry>>,
+    key: &ReconstructionCacheKey,
+    owner: &Arc<Notify>,
+) {
+    let released = {
+        let mut loading = loading
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if loading
+            .get(key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.notify, owner))
+        {
+            loading.remove(key)
+        } else {
+            None
+        }
+    };
+    if let Some(released) = released {
+        released.notify.notify_waiters();
+    }
+}
+
 /// Runs a loader future while refreshing the loading latch's aliveness stamp
 /// at intervals. The waiter at the orphan bound re-checks the stamp: a fresh
 /// stamp proves the loader is slow but alive and the wait must be extended; a
@@ -431,30 +416,15 @@ where
 /// the guard's drop is a no-op once the latch is gone. The guard only ever
 /// removes the latch it registered — identified by its [`Notify`] — so a newer
 /// generation of loading for the same key is never torn down.
-struct LoadingLatchGuard {
-    loading: Arc<Mutex<HashMap<ReconstructionCacheKey, LoadingEntry>>>,
-    key: ReconstructionCacheKey,
-    notify: Arc<Notify>,
+struct LoadingLatchGuard<'load> {
+    loading: &'load Mutex<HashMap<ReconstructionCacheKey, LoadingEntry>>,
+    key: &'load ReconstructionCacheKey,
+    notify: &'load Arc<Notify>,
 }
 
-impl Drop for LoadingLatchGuard {
+impl Drop for LoadingLatchGuard<'_> {
     fn drop(&mut self) {
-        let mut loading = self
-            .loading
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(entry) = loading.get(&self.key) else {
-            // The latch was already released by put()/delete()/a waiter steal.
-            return;
-        };
-        if !Arc::ptr_eq(&entry.notify, &self.notify) {
-            // A newer loading generation holds the latch; leave it intact so
-            // its callers keep coalescing on it.
-            return;
-        }
-        loading.remove(&self.key);
-        drop(loading);
-        self.notify.notify_waiters();
+        release_owned_loading(self.loading, self.key, self.notify);
     }
 }
 
@@ -471,22 +441,14 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
             loop {
                 {
                     let inner = self.inner.read().await;
-                    if let Some(entry) = inner.entries.get(key)
-                        && entry.is_live(Instant::now(), self.ttl)
-                    {
-                        return Ok(ReconstructionCacheLookup::Hit(
-                            entry.payload.as_ref().clone(),
-                        ));
+                    if let Some(payload) = inner.live_payload(key, Instant::now(), self.ttl) {
+                        return Ok(ReconstructionCacheLookup::Hit(payload));
                     }
                 }
                 let notify = {
                     let mut inner = self.inner.write().await;
-                    if let Some(entry) = inner.entries.get(key)
-                        && entry.is_live(Instant::now(), self.ttl)
-                    {
-                        return Ok(ReconstructionCacheLookup::Hit(
-                            entry.payload.as_ref().clone(),
-                        ));
+                    if let Some(payload) = inner.live_payload(key, Instant::now(), self.ttl) {
+                        return Ok(ReconstructionCacheLookup::Hit(payload));
                     }
                     let mut loading = self
                         .loading
@@ -567,23 +529,7 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
         let Some(owner) = reservation.local_owner() else {
             return;
         };
-        let released = {
-            let mut loading = self
-                .loading
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if loading
-                .get(key)
-                .is_some_and(|entry| Arc::ptr_eq(&entry.notify, owner))
-            {
-                loading.remove(key)
-            } else {
-                None
-            }
-        };
-        if let Some(released) = released {
-            released.notify.notify_waiters();
-        }
+        release_owned_loading(&self.loading, key, owner);
     }
 
     fn get<'operation>(
@@ -595,10 +541,8 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
             // Fast path: serve a live cached entry without a write lock.
             {
                 let inner = self.inner.read().await;
-                if let Some(entry) = inner.entries.get(key)
-                    && entry.is_live(now, self.ttl)
-                {
-                    return Ok(Some(entry.payload.as_ref().clone()));
+                if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                    return Ok(Some(payload));
                 }
                 // No early return on a miss: a cold miss (or an expired entry)
                 // falls through to the write-lock path, which registers a
@@ -608,10 +552,8 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
 
             let mut inner = self.inner.write().await;
 
-            if let Some(entry) = inner.entries.get(key)
-                && entry.is_live(now, self.ttl)
-            {
-                return Ok(Some(entry.payload.as_ref().clone()));
+            if let Some(payload) = inner.live_payload(key, now, self.ttl) {
+                return Ok(Some(payload));
             }
 
             let existing_notify = {
@@ -646,13 +588,7 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(key.clone(), loading);
 
-            let should_remove = inner
-                .entries
-                .get(key)
-                .is_some_and(|entry| !entry.is_live(now, self.ttl));
-            if should_remove {
-                inner.remove(key);
-            }
+            inner.remove(key);
             Ok(None)
         })
     }
@@ -672,16 +608,7 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
                 self.max_entries.get(),
                 MAX_MEMORY_CACHE_BYTES,
             );
-            let released = {
-                let mut loading = self
-                    .loading
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                loading.remove(key)
-            };
-            if let Some(released) = released {
-                released.notify.notify_waiters();
-            }
+            self.release_loading(key);
             Ok(())
         })
     }
@@ -697,16 +624,7 @@ impl AsyncReconstructionCache for MemoryReconstructionCache {
             // explicitly gone, so waiting callers must wake and observe an
             // absence rather than block until the adapter's stall timeout. This
             // is what lets a failed loader's concurrency latch be cleaned up.
-            let released = {
-                let mut loading = self
-                    .loading
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                loading.remove(key)
-            };
-            if let Some(released) = released {
-                released.notify.notify_waiters();
-            }
+            self.release_loading(key);
             Ok(removed)
         })
     }

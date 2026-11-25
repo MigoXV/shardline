@@ -584,10 +584,7 @@ fn verify_lfs_merkle_journal_head(
                 .ok_or_else(|| invalid_evidence("LFS snapshot Merkle commitment is missing"))?,
         )
         .map_err(invalid_evidence)?;
-        if observed.schema_version > shardline_reliability::RELIABILITY_MERKLE_SCHEMA_VERSION
-            || observed.body != expected.body
-            || observed.event != expected.event
-        {
+        if !observed.matches_expected(&expected) {
             return Err(invalid_evidence(
                 "persisted Merkle commitment mismatch for LFS snapshot",
             ));
@@ -721,7 +718,7 @@ fn prepare_journal_append(
     journal_path: &Path,
     schema: &str,
 ) -> Result<(), ServerError> {
-    let Some(head) = journal_head(manifest_path, schema)? else {
+    let Some(manifest) = read_journal_manifest(manifest_path, schema)? else {
         if journal_path.exists() && fs::metadata(journal_path)?.len() != 0 {
             return Err(invalid_evidence(
                 "LFS journal is missing its committed head",
@@ -729,9 +726,26 @@ fn prepare_journal_append(
         }
         return Ok(());
     };
-    let manifest_bytes = fs::read(manifest_path).map_err(ServerError::from)?;
-    let manifest: JournalManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(invalid_evidence)?;
+    if let Some(expected_bytes) = manifest.bytes {
+        let actual_bytes = match fs::metadata(journal_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(invalid_evidence("LFS journal is missing its committed log"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if actual_bytes < expected_bytes {
+            return Err(invalid_evidence(
+                "LFS journal is shorter than its committed byte length",
+            ));
+        }
+        if actual_bytes > expected_bytes {
+            let file = fs::OpenOptions::new().write(true).open(journal_path)?;
+            file.set_len(expected_bytes)?;
+            file.sync_all()?;
+        }
+        return Ok(());
+    }
     let bytes = match fs::read(journal_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -739,28 +753,7 @@ fn prepare_journal_append(
         }
         Err(error) => return Err(error.into()),
     };
-    if let Some(expected_bytes) = manifest.bytes {
-        let actual_bytes = bytes.len() as u64;
-        if actual_bytes < expected_bytes {
-            return Err(invalid_evidence(
-                "LFS journal is shorter than its committed byte length",
-            ));
-        }
-        if actual_bytes > expected_bytes {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(journal_path)?;
-            let expected_bytes = usize::try_from(expected_bytes)
-                .map_err(|_error| invalid_evidence("LFS journal byte length overflow"))?;
-            let committed_prefix = bytes
-                .get(..expected_bytes)
-                .ok_or_else(|| invalid_evidence("LFS journal byte length exceeds its log"))?;
-            file.write_all(committed_prefix)?;
-            file.sync_all()?;
-        }
-        return Ok(());
-    }
+    let head = manifest.head;
     let mut records = 0_u64;
     let mut committed_bytes = 0_usize;
     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -779,29 +772,30 @@ fn prepare_journal_append(
             records = records
                 .checked_add(units)
                 .ok_or_else(|| invalid_evidence("LFS journal record count overflow"))?;
-            if records <= head {
-                committed_bytes = committed_bytes
-                    .checked_add(line.len())
-                    .ok_or_else(|| invalid_evidence("LFS journal byte count overflow"))?;
-            } else if records.saturating_sub(units) < head {
+            if records > head && records.saturating_sub(units) < head {
                 return Err(invalid_evidence(
                     "LFS journal head splits a persisted record",
                 ));
             }
+        }
+        if records <= head {
+            committed_bytes = committed_bytes
+                .checked_add(line.len())
+                .ok_or_else(|| invalid_evidence("LFS journal byte count overflow"))?;
         }
     }
     if records < head {
         return Err(invalid_evidence("LFS journal head exceeds its log"));
     }
     if records > head {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(journal_path)?;
+        let file = fs::OpenOptions::new().write(true).open(journal_path)?;
         let committed_prefix = bytes
             .get(..committed_bytes)
             .ok_or_else(|| invalid_evidence("LFS journal byte length exceeds its log"))?;
-        file.write_all(committed_prefix)?;
+        file.set_len(
+            u64::try_from(committed_prefix.len())
+                .map_err(|_error| invalid_evidence("LFS journal byte length overflow"))?,
+        )?;
         file.sync_all()?;
     }
     Ok(())
@@ -1697,40 +1691,61 @@ mod tests {
 
     #[test]
     fn uncommitted_lfs_journal_tail_is_ignored() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        record(
-            directory.path(),
-            OID,
-            SCOPE,
-            SESSION,
-            TARGET,
-            ResumableLifecycleState::Active,
-            ResumableLifecycleState::Active,
-        )
-        .expect("write evidence");
-        let journal = evidence_journal_path(directory.path(), OID);
-        let committed_record = fs::read_to_string(&journal).expect("journal");
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(&journal)
-            .expect("open journal");
-        file.write_all(committed_record.as_bytes())
-            .expect("append uncommitted tail");
-        let loaded = load(directory.path(), OID, SCOPE, SESSION, TARGET).expect("load evidence");
-        assert_eq!(loaded.events().len(), 2);
-        record(
-            directory.path(),
-            OID,
-            SCOPE,
-            SESSION,
-            TARGET,
-            ResumableLifecycleState::Active,
-            ResumableLifecycleState::Active,
-        )
-        .expect("append after uncommitted tail");
-        let advanced =
-            load(directory.path(), OID, SCOPE, SESSION, TARGET).expect("load advanced evidence");
-        assert_eq!(advanced.events().len(), 3);
+        for legacy in [false, true] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            record(
+                directory.path(),
+                OID,
+                SCOPE,
+                SESSION,
+                TARGET,
+                ResumableLifecycleState::Active,
+                ResumableLifecycleState::Active,
+            )
+            .expect("write evidence");
+            if legacy {
+                let path = evidence_path(directory.path(), OID);
+                let mut manifest: JournalManifest =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                manifest.bytes = None;
+                fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            }
+            let journal = evidence_journal_path(directory.path(), OID);
+            let mut committed_record = fs::read_to_string(&journal).expect("journal");
+            if legacy {
+                committed_record.insert(0, '\n');
+                fs::write(&journal, &committed_record).unwrap();
+            }
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&journal)
+                .expect("open journal");
+            file.write_all(committed_record.trim_start_matches('\n').as_bytes())
+                .expect("append uncommitted tail");
+            let loaded =
+                load(directory.path(), OID, SCOPE, SESSION, TARGET).expect("load evidence");
+            assert_eq!(loaded.events().len(), 2);
+            prepare_journal_append(
+                &evidence_path(directory.path(), OID),
+                &journal,
+                EVIDENCE_JOURNAL_SCHEMA,
+            )
+            .expect("trim uncommitted tail");
+            assert_eq!(fs::read_to_string(&journal).unwrap(), committed_record);
+            record(
+                directory.path(),
+                OID,
+                SCOPE,
+                SESSION,
+                TARGET,
+                ResumableLifecycleState::Active,
+                ResumableLifecycleState::Active,
+            )
+            .expect("append after uncommitted tail");
+            let advanced = load(directory.path(), OID, SCOPE, SESSION, TARGET)
+                .expect("load advanced evidence");
+            assert_eq!(advanced.events().len(), 3);
+        }
     }
 
     #[test]

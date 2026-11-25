@@ -9,6 +9,14 @@ use crate::{
     record::RecordStore,
 };
 
+/// Escapes LIKE wildcards in user-supplied values to prevent pattern injection.
+pub(crate) fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('_', "\\_")
+        .replace('%', "\\%")
+}
+
 macro_rules! visit_items {
     ($visit:ident, $list:ident, $item:ty) => {
         /// Visits every item of this type in the store.
@@ -981,4 +989,22 @@ pub trait Repository:
 impl<T> Repository for T where
     T: ReconstructionStore + DedupeStore + LifecycleStore + RecordStore + HubStore + Send + Sync
 {
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn like_literals_escape_backslashes_and_wildcards() {
+        for (input, expected) in [
+            ("hello", "hello"),
+            ("", ""),
+            ("abc123", "abc123"),
+            ("foo_bar", "foo\\_bar"),
+            ("foo%bar", "foo\\%bar"),
+            ("foo\\bar", "foo\\\\bar"),
+            ("a%b_c\\d", "a\\%b\\_c\\\\d"),
+        ] {
+            assert_eq!(super::escape_like(input), expected, "{input}");
+        }
+    }
 }

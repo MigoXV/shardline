@@ -26,7 +26,14 @@ impl S3ObjectStore {
     ) -> Result<(S3MultipartUploadWriter, ObjectKey), S3ObjectStoreError> {
         let seed = ObjectKey::parse("staging/resumable/stream")
             .map_err(|_error| S3ObjectStoreError::InvalidListedKey)?;
-        let temp_key = temp_key_for(&seed)?;
+        self.begin_temporary_upload(&seed).await
+    }
+
+    async fn begin_temporary_upload(
+        &self,
+        seed: &ObjectKey,
+    ) -> Result<(S3MultipartUploadWriter, ObjectKey), S3ObjectStoreError> {
+        let temp_key = temp_key_for(seed)?;
         let location = self.location_for_key(&temp_key)?;
         let upload = self
             .inner
@@ -55,16 +62,9 @@ impl S3ObjectStore {
         canonical_key: &ObjectKey,
     ) -> Result<PutOutcome, S3ObjectStoreError> {
         upload.finish().await?;
-        match self.copy_object_if_absent(temp_key, canonical_key) {
-            Ok(outcome) => {
-                self.delete_if_present(temp_key).ok();
-                Ok(outcome)
-            }
-            Err(error) => {
-                self.delete_if_present(temp_key).ok();
-                Err(error)
-            }
-        }
+        let result = self.copy_object_if_absent(temp_key, canonical_key);
+        self.delete_if_present(temp_key).ok();
+        result
     }
 
     /// Begins a direct multipart upload to a content-addressed destination key.
@@ -95,19 +95,8 @@ impl S3ObjectStore {
             return Ok(BeginMultipartUploadResult::AlreadyExists);
         }
 
-        let temp_key = temp_key_for(key)?;
-        let location = self.location_for_key(&temp_key)?;
-        let upload = self
-            .inner
-            .put_multipart(&location)
-            .await
-            .map_err(S3ObjectStoreError::External)?;
-        Ok(BeginMultipartUploadResult::Upload(
-            S3MultipartUploadWriter {
-                writer: WriteMultipart::new_with_chunk_size(upload, STREAM_UPLOAD_CHUNK_BYTES),
-            },
-            temp_key,
-        ))
+        let (writer, temp_key) = self.begin_temporary_upload(key).await?;
+        Ok(BeginMultipartUploadResult::Upload(writer, temp_key))
     }
 
     /// Finishes a content-addressed upload and atomically promotes the temp content
@@ -125,27 +114,16 @@ impl S3ObjectStore {
     ///
     /// # Errors
     ///
-    /// Returns [`S3ObjectStoreError`] when the multipart finalization, conditional
-    /// copy, or cleanup fails.
+    /// Returns [`S3ObjectStoreError`] when multipart finalization or conditional
+    /// copy fails. Temporary-object cleanup is best-effort.
     pub async fn finish_content_addressed_upload(
         &self,
         upload: S3MultipartUploadWriter,
         temp_key: &ObjectKey,
         canonical_key: &ObjectKey,
     ) -> Result<PutOutcome, S3ObjectStoreError> {
-        upload.finish().await?;
-
-        // Conditional copy — fails if canonical already exists.
-        match self.copy_object_if_absent(temp_key, canonical_key) {
-            Ok(outcome) => {
-                self.delete_if_present(temp_key).ok();
-                Ok(outcome)
-            }
-            Err(error) => {
-                self.delete_if_present(temp_key).ok();
-                Err(error)
-            }
-        }
+        self.finish_stream_upload(upload, temp_key, canonical_key)
+            .await
     }
 
     /// Starts a resumable multipart upload at a temporary S3 location.
@@ -204,17 +182,15 @@ impl S3ObjectStore {
         &self,
         key: &ObjectKey,
         upload_id: &str,
-        parts: Vec<(usize, String)>,
+        mut parts: Vec<(usize, String)>,
     ) -> Result<(), S3ObjectStoreError> {
-        let count = parts.len();
-        if count == 0 {
+        if parts.is_empty() {
             return Err(S3ObjectStoreError::InvalidUploadParts);
         }
 
-        // Validate consecutive 0..count numbering.
-        let mut indexed: Vec<(usize, String)> = parts;
-        indexed.sort_by_key(|(part_number, _etag)| *part_number);
-        for (expected, (part_number, _etag)) in indexed.iter().enumerate() {
+        // Equal part numbers are invalid, so stable ordering is unnecessary.
+        parts.sort_unstable_by_key(|(part_number, _etag)| *part_number);
+        for (expected, (part_number, _etag)) in parts.iter().enumerate() {
             if *part_number != expected {
                 return Err(S3ObjectStoreError::InvalidUploadParts);
             }
@@ -222,16 +198,15 @@ impl S3ObjectStore {
 
         let location = self.location_for_key(key)?;
         let multipart_id = upload_id.to_owned();
-        let part_ids = indexed
+        let part_ids = parts
             .into_iter()
             .map(|(_part_number, content_id)| PartId { content_id })
             .collect();
-        let _result = self
-            .inner
+        self.inner
             .complete_multipart(&location, &multipart_id, part_ids)
             .await
-            .map_err(S3ObjectStoreError::External)?;
-        Ok(())
+            .map(|_result| ())
+            .map_err(S3ObjectStoreError::External)
     }
 
     /// Aborts a resumable multipart upload and discards any uploaded parts.

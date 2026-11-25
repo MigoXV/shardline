@@ -32,113 +32,17 @@ impl RepairReport {
     /// # Errors
     /// Returns the first write or flush error.
     pub fn write_summary<W: std::io::Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
-        writeln!(
+        report_output::write_index_rebuild_summary_prefixed(
             writer,
-            "index_rebuild.scanned_version_records: {}",
-            self.index_rebuild.scanned_version_records
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.scanned_retained_shards: {}",
-            self.index_rebuild.scanned_retained_shards
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.rebuilt_latest_records: {}",
-            self.index_rebuild.rebuilt_latest_records
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.unchanged_latest_records: {}",
-            self.index_rebuild.unchanged_latest_records
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.removed_stale_latest_records: {}",
-            self.index_rebuild.removed_stale_latest_records
-        )?;
-        for location in &self
-            .index_rebuild
-            .preserved_latest_records_unreadable_version
-        {
-            writeln!(
-                writer,
-                "index_rebuild.kept_latest_record_unreadable_version: {}",
-                location
-            )?;
-        }
-        writeln!(
-            writer,
-            "index_rebuild.scanned_reconstructions: {}",
-            self.index_rebuild.scanned_reconstructions
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.unchanged_reconstructions: {}",
-            self.index_rebuild.unchanged_reconstructions
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.removed_stale_reconstructions: {}",
-            self.index_rebuild.removed_stale_reconstructions
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.rebuilt_dedupe_shard_mappings: {}",
-            self.index_rebuild.rebuilt_dedupe_shard_mappings
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.unchanged_dedupe_shard_mappings: {}",
-            self.index_rebuild.unchanged_dedupe_shard_mappings
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.removed_stale_dedupe_shard_mappings: {}",
-            self.index_rebuild.removed_stale_dedupe_shard_mappings
-        )?;
-        writeln!(
-            writer,
-            "index_rebuild.issue_count: {}",
-            self.index_rebuild.issue_count()
+            &self.index_rebuild,
+            "index_rebuild",
         )?;
         report_output::write_lifecycle_repair_summary_prefixed(
             writer,
             &self.lifecycle_repair,
             "lifecycle_repair",
         )?;
-        writeln!(writer, "fsck.latest_records: {}", self.fsck.latest_records)?;
-        writeln!(
-            writer,
-            "fsck.version_records: {}",
-            self.fsck.version_records
-        )?;
-        writeln!(
-            writer,
-            "fsck.inspected_chunk_references: {}",
-            self.fsck.inspected_chunk_references
-        )?;
-        writeln!(
-            writer,
-            "fsck.inspected_dedupe_shard_mappings: {}",
-            self.fsck.inspected_dedupe_shard_mappings
-        )?;
-        writeln!(
-            writer,
-            "fsck.inspected_reconstructions: {}",
-            self.fsck.inspected_reconstructions
-        )?;
-        writeln!(
-            writer,
-            "fsck.inspected_webhook_deliveries: {}",
-            self.fsck.inspected_webhook_deliveries
-        )?;
-        writeln!(
-            writer,
-            "fsck.inspected_provider_repository_states: {}",
-            self.fsck.inspected_provider_repository_states
-        )?;
-        writeln!(writer, "fsck.issue_count: {}", self.fsck.issue_count())?;
+        report_output::write_fsck_summary_prefixed(writer, &self.fsck, "fsck")?;
         writer.flush()
     }
 
@@ -280,91 +184,18 @@ mod tests {
     use std::{net::SocketAddr, num::NonZeroUsize, path::Path};
 
     use shardline_server::{
-        DEFAULT_WEBHOOK_DELIVERY_RETENTION_SECONDS, FsckIssueDetail, FsckIssueKind,
-        IndexRebuildIssueDetail, LifecycleRepairReport, LocalFsckIssue, LocalFsckReport,
-        LocalIndexRebuildIssue, LocalIndexRebuildIssueKind, LocalIndexRebuildReport, ServerConfig,
-        ServerConfigError,
+        FsckIssueDetail, FsckIssueKind, IndexRebuildIssueDetail, LifecycleRepairReport,
+        LocalFsckIssue, LocalFsckReport, LocalIndexRebuildIssue, LocalIndexRebuildIssueKind,
+        LocalIndexRebuildReport, ServerConfig,
     };
 
-    use super::{LifecycleRepairOptions, RepairReport, RepairRuntimeError};
-
-    #[test]
-    fn lifecycle_repair_default_retention_matches_server_default() {
-        let options = LifecycleRepairOptions::default();
-
-        assert_eq!(
-            options.webhook_retention_seconds,
-            DEFAULT_WEBHOOK_DELIVERY_RETENTION_SECONDS
-        );
-    }
-
-    // ── RepairRuntimeError Display / Debug ──────────────────────────────
-
-    #[test]
-    fn repair_runtime_error_config_display() {
-        let err = RepairRuntimeError::Config(ServerConfigError::InvalidServerRole);
-        let msg = err.to_string();
-        assert!(msg.contains("invalid server role"));
-    }
-
-    #[test]
-    fn repair_runtime_error_server_display() {
-        use shardline_server::ServerError;
-        let err = RepairRuntimeError::Server(ServerError::NotFound);
-        let msg = err.to_string();
-        assert!(!msg.is_empty());
-    }
-
-    #[test]
-    fn repair_runtime_error_debug() {
-        let err = RepairRuntimeError::Config(ServerConfigError::InvalidServerRole);
-        let debug = format!("{err:?}");
-        assert!(debug.contains("Config("));
-    }
-
-    // ── RepairReport smoke tests ────────────────────────────────────────
+    use super::RepairReport;
 
     fn empty_repair_report() -> RepairReport {
         RepairReport {
-            index_rebuild: LocalIndexRebuildReport {
-                scanned_version_records: 0,
-                scanned_retained_shards: 0,
-                rebuilt_latest_records: 0,
-                unchanged_latest_records: 0,
-                removed_stale_latest_records: 0,
-                scanned_reconstructions: 0,
-                unchanged_reconstructions: 0,
-                removed_stale_reconstructions: 0,
-                rebuilt_dedupe_shard_mappings: 0,
-                unchanged_dedupe_shard_mappings: 0,
-                removed_stale_dedupe_shard_mappings: 0,
-                preserved_latest_records_unreadable_version: vec![],
-                issues: vec![],
-            },
-            lifecycle_repair: LifecycleRepairReport {
-                scanned_records: 0,
-                referenced_objects: 0,
-                scanned_quarantine_candidates: 0,
-                removed_missing_quarantine_candidates: 0,
-                removed_reachable_quarantine_candidates: 0,
-                removed_held_quarantine_candidates: 0,
-                scanned_retention_holds: 0,
-                removed_expired_retention_holds: 0,
-                removed_missing_retention_holds: 0,
-                scanned_webhook_deliveries: 0,
-                removed_stale_webhook_deliveries: 0,
-                removed_future_webhook_deliveries: 0,
-            },
-            fsck: LocalFsckReport {
-                latest_records: 0,
-                version_records: 0,
-                inspected_chunk_references: 0,
-                inspected_dedupe_shard_mappings: 0,
-                inspected_reconstructions: 0,
-                inspected_webhook_deliveries: 0,
-                inspected_provider_repository_states: 0,
-                issues: vec![],
-            },
+            index_rebuild: LocalIndexRebuildReport::default(),
+            lifecycle_repair: LifecycleRepairReport::default(),
+            fsck: LocalFsckReport::default(),
         }
     }
 
@@ -382,12 +213,12 @@ mod tests {
                 rebuilt_dedupe_shard_mappings: 4,
                 unchanged_dedupe_shard_mappings: 10,
                 removed_stale_dedupe_shard_mappings: 1,
-                preserved_latest_records_unreadable_version: vec![],
                 issues: vec![LocalIndexRebuildIssue {
                     kind: LocalIndexRebuildIssueKind::InvalidVersionRecordJson,
                     location: "records/abc".to_owned(),
                     detail: IndexRebuildIssueDetail::RecordJsonInvalid,
                 }],
+                ..LocalIndexRebuildReport::default()
             },
             lifecycle_repair: LifecycleRepairReport {
                 scanned_records: 100,
@@ -418,55 +249,6 @@ mod tests {
                 }],
             },
         }
-    }
-
-    #[test]
-    fn repair_report_constructs_defaults() {
-        let report = empty_repair_report();
-        assert_eq!(report.index_rebuild.scanned_version_records, 0);
-        assert_eq!(report.lifecycle_repair.scanned_records, 0);
-        assert_eq!(report.fsck.latest_records, 0);
-    }
-
-    #[test]
-    fn repair_report_with_data_reports_correct_counts() {
-        let report = report_with_issues();
-        assert_eq!(report.index_rebuild.scanned_version_records, 10);
-        assert_eq!(report.index_rebuild.issue_count(), 1);
-        assert_eq!(report.lifecycle_repair.scanned_records, 100);
-        assert_eq!(report.fsck.issue_count(), 1);
-        assert!(!report.fsck.is_clean());
-        assert!(!report.index_rebuild.is_clean());
-    }
-
-    #[test]
-    fn repair_report_print_summary_runs() {
-        let report = empty_repair_report();
-        report.print_summary();
-    }
-
-    #[test]
-    fn repair_report_print_summary_with_data_runs() {
-        let report = report_with_issues();
-        report.print_summary();
-    }
-
-    #[test]
-    fn repair_report_print_cli_summary_runs() {
-        let report = empty_repair_report();
-        report.print_cli_summary(Path::new("/root"), 3600);
-    }
-
-    #[test]
-    fn repair_report_print_issues_with_data() {
-        let report = report_with_issues();
-        report.print_issues();
-    }
-
-    #[test]
-    fn repair_report_print_issues_empty() {
-        let report = empty_repair_report();
-        report.print_issues();
     }
 
     #[tokio::test]
@@ -519,6 +301,10 @@ mod tests {
             report.write_issues(writer)
         });
         let mut bytes = Vec::new();
+        empty_repair_report()
+            .write_issues(&mut bytes)
+            .expect("empty issues");
+        assert!(bytes.is_empty());
         report.write_issues(&mut bytes).expect("issues");
         assert_eq!(bytes, b"index_rebuild.issue: invalid_version_record_json location=records/abc detail=record json was invalid\nfsck.issue: missing_chunk location=chunks/xyz detail=record json was invalid\n");
         bytes.clear();

@@ -3,8 +3,29 @@ use crate::{ServerError, admission::BoundedPool};
 use std::{num::NonZeroUsize, sync::LazyLock};
 use tokio::sync::OwnedSemaphorePermit;
 
-static BUFFERED_UPLOADS: LazyLock<BoundedPool> =
-    LazyLock::new(|| BoundedPool::new(NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN)));
+const DEFAULT_BUFFERED_UPLOADS: usize = 2;
+const MAX_BUFFERED_UPLOADS: usize = 8;
+const BUFFERED_UPLOADS_ENV: &str = "SHARDLINE_BUFFERED_UPLOADS";
+
+fn buffered_upload_limit(value: Option<&str>) -> NonZeroUsize {
+    if let Some(value) = value {
+        if let Ok(slots) = value.parse::<NonZeroUsize>()
+            && slots.get() <= MAX_BUFFERED_UPLOADS
+        {
+            return slots;
+        }
+        tracing::warn!(
+            "invalid {BUFFERED_UPLOADS_ENV}; expected 1 through {MAX_BUFFERED_UPLOADS}, using {DEFAULT_BUFFERED_UPLOADS}"
+        );
+    }
+    NonZeroUsize::new(DEFAULT_BUFFERED_UPLOADS).unwrap_or(NonZeroUsize::MIN)
+}
+
+static BUFFERED_UPLOADS: LazyLock<BoundedPool> = LazyLock::new(|| {
+    BoundedPool::new(buffered_upload_limit(
+        std::env::var(BUFFERED_UPLOADS_ENV).ok().as_deref(),
+    ))
+});
 
 /// Acquire before consuming a body; retain through all users of its bytes.
 pub(super) async fn acquire() -> Result<OwnedSemaphorePermit, ServerError> {
@@ -23,6 +44,15 @@ pub(super) fn into_bytes(bytes: Vec<u8>, admission: impl Send + 'static) -> axum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_upload_limit_bounds_operator_overrides() {
+        assert_eq!(buffered_upload_limit(None).get(), 2);
+        assert_eq!(buffered_upload_limit(Some("6")).get(), 6);
+        for invalid in ["0", "9", "invalid"] {
+            assert_eq!(buffered_upload_limit(Some(invalid)).get(), 2);
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_packing_keeps_shared_admission_with_transport_payload() {

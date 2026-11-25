@@ -1,10 +1,37 @@
 //! Authorize an immutable Hub file before selecting its native storage scope.
 
-use shardline_protocol::RepositoryScope;
+use axum::body::Bytes;
+use shardline_protocol::{ByteRange, RepositoryScope};
 
 use crate::{ServerBackend, ServerError};
 
 impl ServerBackend {
+    pub(crate) async fn hub_repository_native_range(
+        &self,
+        identity: &shardline_index::XetFileIdentity,
+        range: ByteRange,
+    ) -> Result<Option<Bytes>, ServerError> {
+        let Self::Postgres(backend) = self else {
+            return Ok(None);
+        };
+        crate::validation::validate_content_hash(&identity.file_id)?;
+        let (sha, record) = backend
+            .record_store()
+            .repository_xet_file(&identity.repository_scope, &identity.file_id)
+            .await?
+            .ok_or(ServerError::NotFound)?;
+        if sha != identity.sha256 || record.total_bytes != identity.total_bytes {
+            return Err(ServerError::NotFound);
+        }
+        crate::download_stream::authenticated_range::native_file_range(
+            backend.object_store(),
+            &record,
+            range,
+            backend.stream_work_pool.clone(),
+        )
+        .await
+    }
+
     /// Select storage for an already authorized repository-wide Hub download.
     /// A missing revision grants the repository, not a literal revision-less
     /// storage namespace. Ref-limited credentials must keep their own checks.

@@ -23,9 +23,14 @@ enum Base {
     Sha([u8; 20]),
 }
 
+#[derive(Clone, Copy)]
+enum EntryKind {
+    Object(ObjectType),
+    Delta(Base),
+}
+
 struct Entry {
-    object_type: Option<ObjectType>,
-    base: Option<Base>,
+    kind: EntryKind,
     data: Vec<u8>,
 }
 
@@ -96,11 +101,11 @@ pub(super) fn parse_pack_data_with_budget(
             size |= value << shift;
             shift = shift.saturating_add(7);
         }
-        let (object_type, base) = match kind {
-            1 => (Some(ObjectType::Commit), None),
-            2 => (Some(ObjectType::Tree), None),
-            3 => (Some(ObjectType::Blob), None),
-            4 => (Some(ObjectType::Tag), None),
+        let kind = match kind {
+            1 => EntryKind::Object(ObjectType::Commit),
+            2 => EntryKind::Object(ObjectType::Tree),
+            3 => EntryKind::Object(ObjectType::Blob),
+            4 => EntryKind::Object(ObjectType::Tag),
             6 => {
                 let distance = parse_ofs_delta_offset(body, &mut pos)?;
                 if distance == 0 {
@@ -108,7 +113,7 @@ pub(super) fn parse_pack_data_with_budget(
                 }
                 let offset = start.checked_sub(distance).ok_or(PackError::InvalidDelta)?;
                 let base = *offsets.get(&offset).ok_or(PackError::InvalidDelta)?;
-                (None, Some(Base::Offset(base)))
+                EntryKind::Delta(Base::Offset(base))
             }
             7 => {
                 let end = pos.checked_add(20).ok_or(PackError::InvalidDelta)?;
@@ -118,7 +123,7 @@ pub(super) fn parse_pack_data_with_budget(
                     .try_into()
                     .map_err(|_error| PackError::InvalidDelta)?;
                 pos = end;
-                (None, Some(Base::Sha(sha)))
+                EntryKind::Delta(Base::Sha(sha))
             }
             _ => return Err(PackError::InvalidPack),
         };
@@ -139,8 +144,7 @@ pub(super) fn parse_pack_data_with_budget(
         pos = pos.checked_add(used).ok_or(PackError::InvalidPack)?;
         offsets.insert(start, index);
         entries.push(Entry {
-            object_type,
-            base,
+            kind,
             data: inflated,
         });
     }
@@ -154,47 +158,48 @@ pub(super) fn parse_pack_data_with_budget(
     let mut by_offset: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut by_sha: HashMap<[u8; 20], Vec<usize>> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        match entry.base {
-            None => ready.push_back(index),
-            Some(Base::Offset(base)) => by_offset.entry(base).or_default().push(index),
-            Some(Base::Sha(sha)) if bases.contains_key(&sha) => ready.push_back(index),
-            Some(Base::Sha(sha)) => by_sha.entry(sha).or_default().push(index),
+        match entry.kind {
+            EntryKind::Object(_) => ready.push_back(index),
+            EntryKind::Delta(Base::Offset(base)) => by_offset.entry(base).or_default().push(index),
+            EntryKind::Delta(Base::Sha(sha)) if bases.contains_key(&sha) => ready.push_back(index),
+            EntryKind::Delta(Base::Sha(sha)) => by_sha.entry(sha).or_default().push(index),
         }
     }
     let mut resolved: Vec<Option<GitObject>> = (0..count).map(|_| None).collect();
     let mut sha_index = HashMap::new();
     while let Some(index) = ready.pop_front() {
         let entry = entries.get_mut(index).ok_or(PackError::InvalidDelta)?;
-        let object = if let Some(base) = entry.base {
-            let base = match base {
-                Base::Offset(base_index) => resolved.get(base_index).and_then(Option::as_ref),
-                Base::Sha(sha) => sha_index
-                    .get(&sha)
-                    .and_then(|base_index| resolved.get(*base_index))
-                    .and_then(Option::as_ref)
-                    .or_else(|| bases.get(&sha).copied()),
+        let object = match entry.kind {
+            EntryKind::Delta(base) => {
+                let base = match base {
+                    Base::Offset(base_index) => resolved.get(base_index).and_then(Option::as_ref),
+                    Base::Sha(sha) => sha_index
+                        .get(&sha)
+                        .and_then(|base_index| resolved.get(*base_index))
+                        .and_then(Option::as_ref)
+                        .or_else(|| bases.get(&sha).copied()),
+                }
+                .ok_or(PackError::InvalidDelta)?;
+                let resolved_data = apply_delta_with_limit(
+                    &base.data,
+                    &entry.data,
+                    budget
+                        .checked_sub(total)
+                        .ok_or(PackError::ExcessiveDecompressedSize)?,
+                )?;
+                total = total
+                    .checked_add(resolved_data.len())
+                    .ok_or(PackError::ExcessiveDecompressedSize)?;
+                entry.data.clear();
+                GitObject {
+                    object_type: base.object_type,
+                    data: resolved_data,
+                }
             }
-            .ok_or(PackError::InvalidDelta)?;
-            let resolved_data = apply_delta_with_limit(
-                &base.data,
-                &entry.data,
-                budget
-                    .checked_sub(total)
-                    .ok_or(PackError::ExcessiveDecompressedSize)?,
-            )?;
-            total = total
-                .checked_add(resolved_data.len())
-                .ok_or(PackError::ExcessiveDecompressedSize)?;
-            entry.data.clear();
-            GitObject {
-                object_type: base.object_type,
-                data: resolved_data,
-            }
-        } else {
-            GitObject {
-                object_type: entry.object_type.ok_or(PackError::InvalidPack)?,
+            EntryKind::Object(object_type) => GitObject {
+                object_type,
                 data: std::mem::take(&mut entry.data),
-            }
+            },
         };
         let sha = object.sha1();
         *resolved.get_mut(index).ok_or(PackError::InvalidDelta)? = Some(object);
@@ -307,6 +312,140 @@ mod strict_tests {
     fn finish(mut pack: Vec<u8>) -> Vec<u8> {
         pack.extend_from_slice(&Sha1::digest(&pack));
         pack
+    }
+
+    #[test]
+    fn invalid_headers_are_rejected_before_object_decoding() {
+        for short in [&b""[..], b"PACK", b"NOTAPACKFILE"] {
+            assert!(matches!(
+                parse_pack_data(short),
+                Err(PackError::InvalidPack)
+            ));
+        }
+        let mut pack = generate_pack(&[]).unwrap();
+        pack[..4].copy_from_slice(b"NOPE");
+        assert!(matches!(
+            parse_pack_data(&pack),
+            Err(PackError::InvalidPack)
+        ));
+        for version in [0u32, 1, 4, u32::MAX] {
+            let mut pack = generate_pack(&[]).unwrap();
+            pack[4..8].copy_from_slice(&version.to_be_bytes());
+            resign(&mut pack);
+            assert!(matches!(
+                parse_pack_data(&pack),
+                Err(PackError::InvalidPack)
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_declared_objects_are_rejected_with_valid_checksum() {
+        let mut pack = generate_pack(&[create_blob_object(b"content")]).unwrap();
+        pack[8..12].copy_from_slice(&2u32.to_be_bytes());
+        resign(&mut pack);
+        assert!(matches!(
+            parse_pack_data(&pack),
+            Err(PackError::InvalidPack)
+        ));
+    }
+
+    #[test]
+    fn reserved_object_type_is_rejected_with_valid_checksum() {
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.push(0x50);
+        pack.extend_from_slice(&compress(b""));
+        assert!(matches!(
+            parse_pack_data(&finish(pack)),
+            Err(PackError::InvalidPack)
+        ));
+    }
+
+    #[test]
+    fn object_size_overflow_is_rejected_with_valid_checksum() {
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+        pack.push(0xbf);
+        pack.extend_from_slice(&[0x80; 10]);
+        assert!(matches!(
+            parse_pack_data(&finish(pack)),
+            Err(PackError::ShiftOverflow)
+        ));
+    }
+
+    #[test]
+    fn offset_delta_rejects_zero_missing_and_underflowing_bases() {
+        for distance in [0, 1, 2, 12, 13, 127] {
+            let mut pack = b"PACK\0\0\0\x02\0\0\0\x01".to_vec();
+            pack.extend_from_slice(&[0x63, distance]);
+            pack.extend_from_slice(&compress(&[0, 0, 0]));
+            assert!(matches!(
+                parse_pack_data(&finish(pack)),
+                Err(PackError::InvalidDelta)
+            ));
+        }
+    }
+
+    #[test]
+    fn non_delta_objects_preserve_order_type_bytes_and_identity() {
+        use crate::git::pack::{create_commit_object, create_tree_object};
+        let blob = create_blob_object(b"file content");
+        let tree = create_tree_object(&[(0o100644, "f.txt", &blob.sha1())]);
+        let commit = create_commit_object(&tree.sha1(), None, "Test <test@test.com>", "Initial");
+        let tag = GitObject {
+            object_type: ObjectType::Tag,
+            data: format!(
+                "object {}\ntype commit\ntag v1\n\nrelease\n",
+                hex::encode(commit.sha1())
+            )
+            .into_bytes(),
+        };
+        let expected = [
+            blob,
+            tree,
+            commit,
+            tag,
+            create_blob_object(b"hello world"),
+            create_blob_object(b""),
+        ];
+        let parsed = parse_pack_data(&generate_pack(&expected).unwrap()).unwrap();
+        assert_eq!(parsed.len(), expected.len());
+        for (actual, expected) in parsed.iter().zip(&expected) {
+            assert_eq!(actual.object_type, expected.object_type);
+            assert_eq!(actual.data, expected.data);
+            assert_eq!(actual.sha1(), expected.sha1());
+        }
+    }
+
+    #[test]
+    fn zlib_complete_streams_preserve_payload_and_consumption() {
+        for payload in [
+            &b""[..],
+            b"hello",
+            b"complete stream payload",
+            b"Hello, World! This is test data for zlib roundtrip.",
+        ] {
+            let compressed = compress(payload);
+            for trailing in [&b""[..], b"TRAILER"] {
+                let wire = [compressed.as_slice(), trailing].concat();
+                let (decoded, used) = decompress_zlib(&wire).unwrap();
+                assert_eq!(decoded, payload);
+                assert_eq!(used, compressed.len());
+            }
+        }
+    }
+
+    #[test]
+    fn zlib_rejects_garbage_and_every_truncated_prefix() {
+        for wire in [&b""[..], b"x", b"garbage data that is not valid zlib"] {
+            assert!(decompress_zlib(wire).is_err());
+        }
+        let complete = compress(b"hello world, this is a fairly long payload to truncate");
+        for length in 0..complete.len() {
+            assert!(
+                decompress_zlib(&complete[..length]).is_err(),
+                "accepted truncated stream of {length} bytes"
+            );
+        }
     }
 
     #[test]

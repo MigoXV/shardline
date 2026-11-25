@@ -2,7 +2,7 @@ use std::{
     fmt,
     future::Future,
     num::NonZeroU64,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
@@ -23,7 +23,7 @@ const REDIS_LOADING_POLL_INTERVAL: Duration = Duration::from_millis(25);
 ///
 /// Configure a root certificate for private certificate authorities. Configure
 /// a client certificate and key together when the Redis server requires mTLS.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RedisTlsConfig {
     root_cert: Option<SecretBytes>,
     client_cert: Option<SecretBytes>,
@@ -78,34 +78,13 @@ impl RedisTlsConfig {
     }
 }
 
-impl fmt::Debug for RedisTlsConfig {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RedisTlsConfig")
-            .field("root_cert", &self.root_cert)
-            .field("client_cert", &self.client_cert)
-            .field("client_key", &self.client_key)
-            .finish()
-    }
-}
-
 /// Redis-backed reconstruction cache adapter.
+#[derive(Clone)]
 pub struct RedisReconstructionCache {
     client: redis::Client,
     connection: Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
     ttl_seconds: NonZeroU64,
     operation_timeout: Duration,
-}
-
-impl Clone for RedisReconstructionCache {
-    fn clone(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            connection: Arc::clone(&self.connection),
-            ttl_seconds: self.ttl_seconds,
-            operation_timeout: self.operation_timeout,
-        }
-    }
 }
 
 impl fmt::Debug for RedisReconstructionCache {
@@ -234,23 +213,23 @@ impl RedisReconstructionCache {
             |scope| {
                 let revision = scope
                     .revision()
-                    .map_or_else(|| "head".to_owned(), encode_component);
+                    .map_or_else(|| "head".to_owned(), hex::encode);
                 format!(
                     "{}:{}:{}:{}",
                     scope.provider(),
-                    encode_component(scope.owner()),
-                    encode_component(scope.repo()),
+                    hex::encode(scope.owner()),
+                    hex::encode(scope.repo()),
                     revision
                 )
             },
         );
         let content = key
             .content_hash()
-            .map_or_else(|| "latest".to_owned(), encode_component);
+            .map_or_else(|| "latest".to_owned(), hex::encode);
 
         format!(
             "{RECONSTRUCTION_CACHE_PREFIX}:{scope}:{content}:{}",
-            encode_component(key.file_id())
+            hex::encode(key.file_id())
         )
     }
 
@@ -269,14 +248,17 @@ impl RedisReconstructionCache {
         loading_key: &str,
         token: &str,
     ) -> Result<bool, ReconstructionCacheError> {
-        let deleted: i64 = redis::Script::new(
-            "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+        static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+            redis::Script::new(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then \
              return redis.call('DEL', KEYS[1]) else return 0 end",
-        )
-        .key(loading_key)
-        .arg(token)
-        .invoke_async(connection)
-        .await?;
+            )
+        });
+        let deleted: i64 = SCRIPT
+            .key(loading_key)
+            .arg(token)
+            .invoke_async(connection)
+            .await?;
         Ok(deleted > 0)
     }
 }
@@ -327,46 +309,40 @@ impl AsyncReconstructionCache for RedisReconstructionCache {
             let deadline = Instant::now()
                 .checked_add(self.operation_timeout)
                 .ok_or(ReconstructionCacheError::Operation)?;
-            loop {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(ReconstructionCacheError::RedisTimeout);
-                }
-                let (state, payload) = tokio::time::timeout(remaining, async {
+            tokio::time::timeout_at(deadline.into(), async {
+                loop {
                     let mut connection = self.get_connection().await?;
                     let lease_millis = u64::try_from(REDIS_LOADING_LEASE.as_millis())?;
-                    let lookup: (i64, Option<Vec<u8>>) = redis::Script::new(
+                    static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+                        redis::Script::new(
                         "local value = redis.call('GET', KEYS[1]); \
                          if value then return {1, value} end; \
                          local acquired = redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ARGV[2]); \
                          if acquired then return {2, false} else return {0, false} end",
-                    )
+                        )
+                    });
+                    let (state, payload): (i64, Option<Vec<u8>>) = SCRIPT
                     .key(&redis_key)
                     .key(&loading_key)
                     .arg(&reservation_token)
                     .arg(lease_millis)
                     .invoke_async(&mut connection)
-                        .await?;
-                    Ok::<_, ReconstructionCacheError>(lookup)
-                })
-                .await
-                .map_err(|_elapsed| ReconstructionCacheError::RedisTimeout)??;
-                if state == 1
-                    && let Some(payload) = payload
-                {
-                    return Ok(ReconstructionCacheLookup::Hit(payload));
+                    .await?;
+                    if state == 1
+                        && let Some(payload) = payload
+                    {
+                        return Ok(ReconstructionCacheLookup::Hit(payload));
+                    }
+                    if state == 2 {
+                        return Ok(ReconstructionCacheLookup::Reserved(
+                            ReconstructionCacheReservation::distributed(reservation_token),
+                        ));
+                    }
+                    tokio::time::sleep(REDIS_LOADING_POLL_INTERVAL).await;
                 }
-                if state == 2 {
-                    return Ok(ReconstructionCacheLookup::Reserved(
-                        ReconstructionCacheReservation::distributed(reservation_token),
-                    ));
-                }
-                let remaining_before_sleep = deadline.saturating_duration_since(Instant::now());
-                if remaining_before_sleep.is_zero() {
-                    return Err(ReconstructionCacheError::RedisTimeout);
-                }
-                tokio::time::sleep(REDIS_LOADING_POLL_INTERVAL.min(remaining_before_sleep)).await;
-            }
+            })
+            .await
+            .map_err(|_elapsed| ReconstructionCacheError::RedisTimeout)?
         })
     }
 
@@ -404,19 +380,22 @@ impl AsyncReconstructionCache for RedisReconstructionCache {
             self.with_operation_timeout(async {
                 let mut connection = self.get_connection().await?;
                 let ttl_seconds = self.ttl_seconds.get();
-                let published: i64 = redis::Script::new(
-                    "if redis.call('GET', KEYS[2]) == ARGV[1] then \
+                static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+                    redis::Script::new(
+                        "if redis.call('GET', KEYS[2]) == ARGV[1] then \
                      redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); \
                      redis.call('DEL', KEYS[2]); return 1 else return 0 end",
-                )
-                .key(&redis_key)
-                .key(&loading_key)
-                .arg(token)
-                .arg(payload)
-                .arg(ttl_seconds)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(expiration_error)?;
+                    )
+                });
+                let published: i64 = SCRIPT
+                    .key(&redis_key)
+                    .key(&loading_key)
+                    .arg(token)
+                    .arg(payload)
+                    .arg(ttl_seconds)
+                    .invoke_async(&mut connection)
+                    .await
+                    .map_err(expiration_error)?;
                 if published == 0 {
                     return Err(ReconstructionCacheError::LostLoadingReservation);
                 }
@@ -453,16 +432,19 @@ impl AsyncReconstructionCache for RedisReconstructionCache {
             let loading_key = Self::loading_key(&redis_key);
             self.with_operation_timeout(async {
                 let mut connection = self.get_connection().await?;
-                let released: i64 = redis::Script::new(
-                    "if redis.call('GET', KEYS[2]) == ARGV[1] then \
+                static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+                    redis::Script::new(
+                        "if redis.call('GET', KEYS[2]) == ARGV[1] then \
                      local deleted = redis.call('DEL', KEYS[1]); \
                      redis.call('DEL', KEYS[2]); return deleted else return 0 end",
-                )
-                .key(&redis_key)
-                .key(&loading_key)
-                .arg(token)
-                .invoke_async(&mut connection)
-                .await?;
+                    )
+                });
+                let released: i64 = SCRIPT
+                    .key(&redis_key)
+                    .key(&loading_key)
+                    .arg(token)
+                    .invoke_async(&mut connection)
+                    .await?;
                 Ok(released > 0)
             })
             .await
@@ -482,15 +464,18 @@ impl AsyncReconstructionCache for RedisReconstructionCache {
             self.with_operation_timeout(async {
                 let mut connection = self.get_connection().await?;
                 let lease_millis = u64::try_from(REDIS_LOADING_LEASE.as_millis())?;
-                let refreshed: i64 = redis::Script::new(
-                    "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+                static SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+                    redis::Script::new(
+                        "if redis.call('GET', KEYS[1]) == ARGV[1] then \
                      return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end",
-                )
-                .key(loading_key)
-                .arg(token)
-                .arg(lease_millis)
-                .invoke_async(&mut connection)
-                .await?;
+                    )
+                });
+                let refreshed: i64 = SCRIPT
+                    .key(loading_key)
+                    .arg(token)
+                    .arg(lease_millis)
+                    .invoke_async(&mut connection)
+                    .await?;
                 Ok(refreshed > 0)
             })
             .await
@@ -505,25 +490,19 @@ impl AsyncReconstructionCache for RedisReconstructionCache {
         let Some(token) = reservation.owner_token().map(ToOwned::to_owned) else {
             return;
         };
-        let redis_key = Self::redis_key(key);
-        let loading_key = Self::loading_key(&redis_key);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let loading_key = Self::loading_key(&Self::redis_key(key));
         let cache = self.clone();
-        let operation_timeout = self.operation_timeout;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let release = async {
+        handle.spawn(async move {
+            let _ignored = cache
+                .with_operation_timeout(async {
                     let mut connection = cache.get_connection().await?;
-                    let _deleted = RedisReconstructionCache::compare_delete_loading(
-                        &mut connection,
-                        &loading_key,
-                        &token,
-                    )
-                    .await?;
-                    Ok::<(), ReconstructionCacheError>(())
-                };
-                let _ignored = tokio::time::timeout(operation_timeout, release).await;
-            });
-        }
+                    Self::compare_delete_loading(&mut connection, &loading_key, &token).await
+                })
+                .await;
+        });
     }
 }
 
@@ -556,11 +535,8 @@ fn expiration_error(error: redis::RedisError) -> ReconstructionCacheError {
     }
 }
 
-fn encode_component(value: &str) -> String {
-    hex::encode(value.as_bytes())
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::{env::var as env_var, error::Error as StdError, num::NonZeroU64, time::Duration};
 
@@ -643,9 +619,7 @@ mod tests {
     #[tokio::test]
     async fn redis_ownerless_reserved_mutations_do_not_fall_back_to_raw_commands() {
         let cache = RedisReconstructionCache::new("redis://127.0.0.1:9", NonZeroU64::MIN);
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
         let key = ReconstructionCacheKey::latest("ownerless", None);
         let token = crate::ReconstructionCacheReservation::default();
         assert!(matches!(
@@ -664,15 +638,9 @@ mod tests {
             return;
         };
         let cache = RedisReconstructionCache::new(&url, NonZeroU64::MIN);
-        assert!(cache.is_ok());
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
         let original = cache.get_connection().await;
-        assert!(original.is_ok());
-        let Ok(mut original) = original else {
-            return;
-        };
+        let mut original = original.unwrap();
         let original_id: u64 = redis::cmd("CLIENT")
             .arg("ID")
             .query_async(&mut original)
@@ -681,10 +649,7 @@ mod tests {
         assert_ne!(original_id, 0);
         for _ in 0..16 {
             let cloned = cache.clone().get_connection().await;
-            assert!(cloned.is_ok());
-            let Ok(mut cloned) = cloned else {
-                return;
-            };
+            let mut cloned = cloned.unwrap();
             let id: u64 = redis::cmd("CLIENT")
                 .arg("ID")
                 .query_async(&mut cloned)
@@ -700,15 +665,9 @@ mod tests {
             return;
         };
         let cache = RedisReconstructionCache::new(&url, NonZeroU64::MIN);
-        assert!(cache.is_ok());
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
         let original = cache.get_connection().await;
-        assert!(original.is_ok());
-        let Ok(mut original) = original else {
-            return;
-        };
+        let mut original = original.unwrap();
         let old_id: u64 = redis::cmd("CLIENT")
             .arg("ID")
             .query_async(&mut original)
@@ -717,15 +676,9 @@ mod tests {
         assert_ne!(old_id, 0);
         // Close only this test's managed connection, through a separate controller.
         let controller = redis::Client::open(url);
-        assert!(controller.is_ok());
-        let Ok(controller_client) = controller else {
-            return;
-        };
+        let controller_client = controller.unwrap();
         let connection = controller_client.get_multiplexed_async_connection().await;
-        assert!(connection.is_ok());
-        let Ok(mut controller_connection) = connection else {
-            return;
-        };
+        let mut controller_connection = connection.unwrap();
         let killed: u64 = redis::cmd("CLIENT")
             .arg("KILL")
             .arg("ID")
@@ -745,10 +698,7 @@ mod tests {
         .await;
         assert!(recovered.is_ok());
         let reconnected = cache.clone().get_connection().await;
-        assert!(reconnected.is_ok());
-        let Ok(mut reconnected) = reconnected else {
-            return;
-        };
+        let mut reconnected = reconnected.unwrap();
         let new_id: u64 = redis::cmd("CLIENT")
             .arg("ID")
             .query_async(&mut reconnected)
@@ -765,25 +715,12 @@ mod tests {
             "redis://:cache-secret@cache.example.test:6379/0",
             ttl_seconds,
         );
-        assert!(cache.is_ok());
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
 
         let rendered = format!("{cache:?}");
 
         assert!(!rendered.contains("cache-secret"));
         assert!(rendered.contains("***"));
-    }
-
-    #[test]
-    fn redis_cache_rejects_empty_url() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("", ttl_seconds);
-        assert!(matches!(
-            result,
-            Err(crate::ReconstructionCacheError::EmptyRedisUrl)
-        ));
     }
 
     #[test]
@@ -803,15 +740,9 @@ mod tests {
     #[tokio::test]
     async fn redis_cache_bounds_stalled_connection_operations() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await;
-        assert!(listener.is_ok());
-        let Ok(listener) = listener else {
-            return;
-        };
+        let listener = listener.unwrap();
         let address = listener.local_addr();
-        assert!(address.is_ok());
-        let Ok(address) = address else {
-            return;
-        };
+        let address = address.unwrap();
         let stalled_peer = tokio::spawn(async move {
             let accepted = listener.accept().await;
             if accepted.is_ok() {
@@ -824,10 +755,7 @@ mod tests {
             RedisTlsConfig::default(),
             Duration::from_millis(50),
         );
-        assert!(cache.is_ok());
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
 
         let result = cache.ready().await;
         stalled_peer.abort();
@@ -878,10 +806,7 @@ mod tests {
 
         let ttl_seconds = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
         let cache = RedisReconstructionCache::new(&redis_url, ttl_seconds);
-        assert!(cache.is_ok());
-        let Ok(cache) = cache else {
-            return;
-        };
+        let cache = cache.unwrap();
         let initial_flush = flush_matching_keys(&redis_url).await;
         assert!(initial_flush.is_ok());
         let key = ReconstructionCacheKey::latest("asset.bin", None);
@@ -923,286 +848,133 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── Repository scope key serialization ────────────────────────────────
-
     #[test]
-    fn redis_key_format_with_scope() {
-        let scope = RepositoryScope::new(
-            RepositoryProvider::GitHub,
-            "my-org",
-            "my-repo",
-            Some("main"),
-        );
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::latest("file.bin", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        // The provider ("github") is NOT hex-encoded (comes from provider_token directly).
-        // owner, repo, and revision ARE hex-encoded (via encode_component).
-        // file_id and content_hash ARE also hex-encoded.
-        let owner_hex = hex::encode("my-org");
-        let repo_hex = hex::encode("my-repo");
-        let revision_hex = hex::encode("main");
-        let file_hex = hex::encode("file.bin");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(&format!(":github:{owner_hex}:{repo_hex}:{revision_hex}:")));
-        assert!(redis_key.ends_with(&format!(":latest:{file_hex}")));
+    fn redis_key_serialization_preserves_scope_and_content_identity() {
+        let cases = [
+            (
+                Some((
+                    RepositoryProvider::GitHub,
+                    "my-org",
+                    "my-repo",
+                    Some("main"),
+                )),
+                "file.bin",
+                None,
+                "shardline:reconstruction:v1:github:6d792d6f7267:6d792d7265706f:6d61696e:latest:66696c652e62696e",
+            ),
+            (
+                None,
+                "file.bin",
+                None,
+                "shardline:reconstruction:v1:global:latest:66696c652e62696e",
+            ),
+            (
+                None,
+                "file.bin",
+                Some("abc123"),
+                "shardline:reconstruction:v1:global:616263313233:66696c652e62696e",
+            ),
+            (
+                Some((RepositoryProvider::GitLab, "group", "project", None)),
+                "doc.pdf",
+                None,
+                "shardline:reconstruction:v1:gitlab:67726f7570:70726f6a656374:head:latest:646f632e706466",
+            ),
+            (
+                Some((RepositoryProvider::Gitea, "gitea-org", "gitea-repo", None)),
+                "f1.bin",
+                Some("hash1"),
+                "shardline:reconstruction:v1:gitea:67697465612d6f7267:67697465612d7265706f:head:6861736831:66312e62696e",
+            ),
+            (
+                Some((RepositoryProvider::Codeberg, "user", "repo", Some("v2"))),
+                "data.bin",
+                None,
+                "shardline:reconstruction:v1:codeberg:75736572:7265706f:7632:latest:646174612e62696e",
+            ),
+            (
+                Some((RepositoryProvider::Generic, "ns", "repo-name", None)),
+                "generic.bin",
+                None,
+                "shardline:reconstruction:v1:generic:6e73:7265706f2d6e616d65:head:latest:67656e657269632e62696e",
+            ),
+            (
+                Some((
+                    RepositoryProvider::GitHub,
+                    "my-org/team",
+                    "asset.repo_v2",
+                    Some("feature/branch"),
+                )),
+                "my file (1).bin",
+                None,
+                "shardline:reconstruction:v1:github:6d792d6f72672f7465616d:61737365742e7265706f5f7632:666561747572652f6272616e6368:latest:6d792066696c65202831292e62696e",
+            ),
+            (None, "", None, "shardline:reconstruction:v1:global:latest:"),
+            (
+                None,
+                "f",
+                Some(""),
+                "shardline:reconstruction:v1:global::66",
+            ),
+        ];
+        for (scope, file_id, content_hash, expected) in cases {
+            let scope = scope.map(|(provider, owner, repo, revision)| {
+                RepositoryScope::new(provider, owner, repo, revision).unwrap()
+            });
+            let key = content_hash.map_or_else(
+                || ReconstructionCacheKey::latest(file_id, scope.as_ref()),
+                |hash| ReconstructionCacheKey::version(file_id, hash, scope.as_ref()),
+            );
+            assert_eq!(RedisReconstructionCache::redis_key(&key), expected);
+        }
     }
 
     #[test]
-    fn redis_key_format_without_scope() {
-        let key = ReconstructionCacheKey::latest("file.bin", None);
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(":global:"));
+    fn redis_url_validation_preserves_empty_and_parse_errors() {
+        for url in [
+            "",
+            "   ",
+            "\n",
+            "\t\t",
+            "localhost:6379",
+            "redis://localhost:abc",
+        ] {
+            let error = RedisReconstructionCache::new(url, NonZeroU64::MIN).unwrap_err();
+            if url.trim().is_empty() {
+                assert!(matches!(
+                    error,
+                    crate::ReconstructionCacheError::EmptyRedisUrl
+                ));
+            } else {
+                assert!(matches!(error, crate::ReconstructionCacheError::Redis(_)));
+            }
+        }
+        for url in [
+            "redis://127.0.0.1:6379",
+            "redis://localhost",
+            "redis+unix:///tmp/redis.sock",
+            "redis+unix:///run/redis.sock",
+        ] {
+            assert!(RedisReconstructionCache::new(url, NonZeroU64::MIN).is_ok());
+        }
     }
 
     #[test]
-    fn redis_key_format_with_content_hash() {
-        let key = ReconstructionCacheKey::version("file.bin", "abc123", None);
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let hash_hex = hex::encode("abc123");
-        let file_hex = hex::encode("file.bin");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.ends_with(&format!(":{hash_hex}:{file_hex}")));
-    }
-
-    #[test]
-    fn redis_key_format_with_scope_no_revision() {
-        let scope = RepositoryScope::new(RepositoryProvider::GitLab, "group", "project", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::latest("doc.pdf", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let owner_hex = hex::encode("group");
-        let repo_hex = hex::encode("project");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(&format!(":gitlab:{owner_hex}:{repo_hex}:")));
-        assert!(redis_key.contains(":head:"));
-    }
-
-    // ── Additional provider key formats ─────────────────────────────────
-
-    #[test]
-    fn redis_key_format_gitea_provider() {
-        let scope =
-            RepositoryScope::new(RepositoryProvider::Gitea, "gitea-org", "gitea-repo", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::version("f1.bin", "hash1", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let owner_hex = hex::encode("gitea-org");
-        let repo_hex = hex::encode("gitea-repo");
-        let hash_hex = hex::encode("hash1");
-        let file_hex = hex::encode("f1.bin");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(&format!(":gitea:{owner_hex}:{repo_hex}:head:")));
-        assert!(redis_key.ends_with(&format!(":{hash_hex}:{file_hex}")));
-    }
-
-    #[test]
-    fn redis_key_format_codeberg_provider() {
-        let scope = RepositoryScope::new(RepositoryProvider::Codeberg, "user", "repo", Some("v2"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::latest("data.bin", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let owner_hex = hex::encode("user");
-        let repo_hex = hex::encode("repo");
-        let rev_hex = hex::encode("v2");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(&format!(":codeberg:{owner_hex}:{repo_hex}:{rev_hex}:")));
-    }
-
-    #[test]
-    fn redis_key_format_generic_provider() {
-        let scope = RepositoryScope::new(RepositoryProvider::Generic, "ns", "repo-name", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::latest("generic.bin", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let owner_hex = hex::encode("ns");
-        let repo_hex = hex::encode("repo-name");
-        assert!(redis_key.starts_with("shardline:reconstruction:v1:"));
-        assert!(redis_key.contains(&format!(":generic:{owner_hex}:{repo_hex}:head:")));
-    }
-
-    // ── Edge cases ──────────────────────────────────────────────────────
-
-    #[test]
-    fn redis_key_format_special_characters_in_names() {
-        let scope = RepositoryScope::new(
-            RepositoryProvider::GitHub,
-            "my-org/team",
-            "asset.repo_v2",
-            Some("feature/branch"),
-        );
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let key = ReconstructionCacheKey::latest("my file (1).bin", Some(&scope));
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        let owner_hex = hex::encode("my-org/team");
-        let repo_hex = hex::encode("asset.repo_v2");
-        let rev_hex = hex::encode("feature/branch");
-        let file_hex = hex::encode("my file (1).bin");
-        assert!(redis_key.contains(&format!(":github:{owner_hex}:{repo_hex}:{rev_hex}:")));
-        assert!(redis_key.ends_with(&format!(":latest:{file_hex}")));
-    }
-
-    #[test]
-    fn redis_key_format_empty_file_id() {
-        let key = ReconstructionCacheKey::latest("", None);
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        assert!(redis_key.ends_with(":latest:"));
-    }
-
-    #[test]
-    fn redis_key_format_empty_content_hash() {
-        let key = ReconstructionCacheKey::version("f", "", None);
-        let redis_key = RedisReconstructionCache::redis_key(&key);
-        // Empty content hash is still hex-encoded as an empty string.
-        let hash_hex = hex::encode("");
-        assert!(redis_key.contains(&format!(":{hash_hex}:")));
-    }
-
-    // ── Redis URL validation ─────────────────────────────────────────────
-
-    #[test]
-    fn redis_cache_rejects_missing_scheme() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("localhost:6379", ttl_seconds);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn redis_cache_rejects_invalid_port() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("redis://localhost:abc", ttl_seconds);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn redis_cache_rejects_whitespace_only_url() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("   ", ttl_seconds);
-        assert!(matches!(
-            result,
-            Err(crate::ReconstructionCacheError::EmptyRedisUrl)
-        ));
-    }
-
-    #[test]
-    fn redis_cache_rejects_url_with_only_newline() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("\n", ttl_seconds);
-        assert!(matches!(
-            result,
-            Err(crate::ReconstructionCacheError::EmptyRedisUrl)
-        ));
-    }
-
-    #[test]
-    fn redis_cache_rejects_url_with_tabs() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("\t\t", ttl_seconds);
-        assert!(matches!(
-            result,
-            Err(crate::ReconstructionCacheError::EmptyRedisUrl)
-        ));
-    }
-
-    #[test]
-    fn redis_cache_accepts_valid_redis_url() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("redis://127.0.0.1:6379", ttl_seconds);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn redis_cache_accepts_unix_socket_url() {
-        let ttl_seconds = NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN);
-        let result = RedisReconstructionCache::new("redis+unix:///tmp/redis.sock", ttl_seconds);
-        assert!(result.is_ok());
-    }
-
-    // ── encode_component ───────────────────────────────────────────────────
-
-    #[test]
-    fn encode_component_hex_encodes_input() {
-        assert_eq!(super::encode_component("hello"), hex::encode("hello"));
-    }
-
-    #[test]
-    fn encode_component_handles_special_characters() {
-        assert_eq!(
-            super::encode_component("file name!"),
-            hex::encode("file name!")
-        );
-        assert_eq!(super::encode_component("a/b:c"), hex::encode("a/b:c"));
-    }
-
-    #[test]
-    fn encode_component_handles_unicode() {
-        assert_eq!(super::encode_component("héllo"), hex::encode("héllo"));
-    }
-
-    #[test]
-    fn encode_component_empty_string() {
-        assert_eq!(super::encode_component(""), hex::encode(""));
-    }
-
-    #[test]
-    fn encode_component_handles_control_characters_in_string() {
-        // encode_component takes &str so we can pass strings with escaped chars
-        assert_eq!(super::encode_component("a\tb"), hex::encode("a\tb"));
-        assert_eq!(
-            super::encode_component("line1\nline2"),
-            hex::encode("line1\nline2")
-        );
-    }
-
-    // ── Clone ────────────────────────────────────────────────────────────
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn redis_cache_clone_produces_independent_cache() {
-        let ttl = NonZeroU64::new(60).unwrap();
-        let cache = RedisReconstructionCache::new("redis://localhost", ttl).unwrap();
+    fn redis_cache_clones_share_connection_initialization_and_preserve_settings() {
+        let cache = RedisReconstructionCache::new_with_tls_and_timeout(
+            "redis://localhost",
+            NonZeroU64::new(60).unwrap(),
+            RedisTlsConfig::default(),
+            Duration::from_millis(250),
+        )
+        .unwrap();
         let cloned = cache.clone();
-        // Both should have the same client URL (redacted in Debug)
-        let debug_original = format!("{cache:?}");
-        let debug_cloned = format!("{cloned:?}");
-        assert_eq!(debug_original, debug_cloned);
-        // Verify ttl is preserved
+        assert!(std::sync::Arc::ptr_eq(
+            &cache.connection,
+            &cloned.connection
+        ));
         assert_eq!(cache.ttl_seconds, cloned.ttl_seconds);
-    }
-
-    // ── RedisReconstructionCache::new edge cases ─────────────────────────
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn redis_cache_new_with_redis_scheme() {
-        let ttl = NonZeroU64::new(60).unwrap();
-        assert!(RedisReconstructionCache::new("redis://localhost", ttl).is_ok());
-    }
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn redis_cache_new_with_unix_scheme() {
-        let ttl = NonZeroU64::new(60).unwrap();
-        assert!(RedisReconstructionCache::new("redis+unix:///run/redis.sock", ttl).is_ok());
+        assert_eq!(cache.operation_timeout, cloned.operation_timeout);
     }
 
     // ── More redis_key format edge cases ──────────────────────────────────

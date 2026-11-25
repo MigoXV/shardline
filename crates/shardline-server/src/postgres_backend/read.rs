@@ -1,31 +1,20 @@
 use std::time::Duration;
 
-use shardline_index::{
-    FileRecord, FileRecordStorageLayout, OciObjectKey, OciObjectStore, OciTagEntry, OciTagStore,
-    PostgresMetadataStoreError, RecordStore, RecordTraversal, S3ObjectEntry, S3ObjectIndexStore,
-};
-use shardline_protocol::{ByteRange, RepositoryScope, parse_http_byte_range};
+use shardline_index::{FileRecord, PostgresMetadataStoreError, RecordTraversal};
+use shardline_protocol::{ByteRange, RepositoryScope};
+use shardline_storage::{AsyncObjectStore, DeleteOutcome, ObjectKey};
 #[cfg(test)]
-use shardline_storage::ObjectStore;
-use shardline_storage::{AsyncObjectStore, DeleteOutcome, ObjectKey, ObjectMetadata, ObjectPrefix};
+use shardline_storage::{ObjectPrefix, ObjectStore};
 use sqlx::{PgPool, query_scalar};
-use tokio::task;
 
 use crate::{
     ServerError,
     chunk_store::chunk_object_key,
-    download_stream::{
-        ServerByteStream, VerifiedXorb, collect_file_record_bytes, file_record_byte_stream,
-        object_byte_range_stream, object_byte_stream, prepare_xorb_byte_range,
-    },
+    download_stream::{ServerByteStream, download_file_record_bytes, file_record_response_stream},
     error::IndexError,
-    object_store::{reconstruct_file_record_bytes, visit_object_prefix},
-    record_store::parse_stored_file_record_bytes,
-    validation::{ensure_directory, validate_content_hash, validate_identifier},
-    xet_adapter::{
-        FileReconstructionResponse, build_reconstruction_response, resolve_dedupe_shard_object,
-        xorb_object_key,
-    },
+    record_store::{parse_stored_file_record_bytes, repository_references_hash_in_scope},
+    validation::ensure_directory,
+    xet_adapter::{FileReconstructionResponse, build_reconstruction_response, xorb_object_key},
 };
 
 const REQUIRED_METADATA_TABLES: [&str; 6] = [
@@ -174,27 +163,13 @@ impl super::PostgresBackend {
         let record = self
             .read_record(file_id, content_hash, repository_scope)
             .await?;
-        let total_bytes = record.total_bytes;
-        crate::metrics::record_object_read_by_repr(record.storage_repr.as_str(), total_bytes);
-        let stream = if record.storage_layout() == FileRecordStorageLayout::ReferencedObjectTerms {
-            if range.is_some() {
-                return Err(ServerError::RangeNotSatisfiable);
-            }
-            crate::server_frontend::xet::referenced_file_record_byte_stream(
-                self.object_store(),
-                record,
-                self.stream_work_pool.clone(),
-            )?
-        } else {
-            file_record_byte_stream(
-                self.object_store(),
-                record,
-                range,
-                self.stream_work_pool.clone(),
-            )
-            .await?
-        };
-        Ok((stream, total_bytes))
+        file_record_response_stream(
+            self.object_store(),
+            record,
+            range,
+            self.stream_work_pool.clone(),
+        )
+        .await
     }
 
     /// Verifies that the local object store and required Postgres metadata tables are
@@ -258,25 +233,6 @@ impl super::PostgresBackend {
         )?)
     }
 
-    pub(crate) async fn reconstruction_http_range(
-        &self,
-        file_id: &str,
-        content_hash: Option<&str>,
-        range_header: &str,
-        repository_scope: Option<&RepositoryScope>,
-    ) -> Result<FileReconstructionResponse, ServerError> {
-        let record = self
-            .read_record(file_id, content_hash, repository_scope)
-            .await?;
-        let requested_range =
-            parse_http_byte_range(range_header, record.total_bytes).map_err(ServerError::from)?;
-        Ok(build_reconstruction_response(
-            self.public_base_url(),
-            &record,
-            Some(requested_range),
-        )?)
-    }
-
     /// Loads the logical byte length for a file version.
     ///
     /// # Errors
@@ -309,24 +265,13 @@ impl super::PostgresBackend {
         let record = self
             .read_record(file_id, content_hash, repository_scope)
             .await?;
-        let object_store = self.object_store();
-        let server_frontends = self.server_frontends.clone();
-
-        // ReferencedObjectTerms layout (shard/xorb-referenced) is handled
-        // by the raw reconstruct path; StoredChunks layout (ingestor/CDC)
-        // uses the streaming path for LZ4 decompression and xorb packing.
-        if matches!(
-            record.storage_layout(),
-            FileRecordStorageLayout::ReferencedObjectTerms
-        ) {
-            return task::spawn_blocking(move || {
-                reconstruct_file_record_bytes(&object_store, &server_frontends, &record)
-            })
-            .await
-            .map_err(ServerError::BlockingTask)?;
-        }
-
-        collect_file_record_bytes(object_store, record, self.stream_work_pool.clone()).await
+        download_file_record_bytes(
+            self.object_store(),
+            &self.server_frontends,
+            record,
+            &self.stream_work_pool,
+        )
+        .await
     }
 
     /// Reads a stored chunk by hash.
@@ -335,14 +280,7 @@ impl super::PostgresBackend {
     ///
     /// Returns [`ServerError`] when the hash is invalid or the chunk is missing.
     pub async fn read_chunk(&self, hash_hex: &str) -> Result<Vec<u8>, ServerError> {
-        let object_store = self.object_store();
-        let object_key = chunk_object_key(hash_hex)?;
-        match crate::object_store::read_small_object(object_store, object_key).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(ServerError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        crate::native_chunk_read::read_indexed_member(
+        crate::native_chunk_read::read_chunk(
             self.object_store(),
             hash_hex,
             &self.stream_work_pool,
@@ -362,48 +300,6 @@ impl super::PostgresBackend {
             return Err(ServerError::NotFound);
         };
         Ok(metadata.length())
-    }
-
-    pub(crate) async fn read_object(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ServerError> {
-        let object_store = self.object_store();
-        crate::object_store::read_small_object(object_store, object_key.clone()).await
-    }
-
-    pub(crate) async fn read_object_stream(
-        &self,
-        object_key: &ObjectKey,
-        total_length: u64,
-        range: Option<ByteRange>,
-    ) -> Result<ServerByteStream, ServerError> {
-        let object_store = self.object_store();
-        if let Some(range) = range {
-            return object_byte_range_stream(object_store, object_key.clone(), total_length, range)
-                .await;
-        }
-
-        object_byte_stream(object_store, object_key.clone(), total_length).await
-    }
-
-    pub(crate) fn visit_object_prefix<Visitor>(
-        &self,
-        prefix: &ObjectPrefix,
-        visitor: Visitor,
-    ) -> Result<(), ServerError>
-    where
-        Visitor: FnMut(ObjectMetadata) -> Result<(), ServerError>,
-    {
-        visit_object_prefix(&self.object_store(), prefix, visitor)
-    }
-
-    pub(crate) fn list_object_flat_namespace_page(
-        &self,
-        prefix: &ObjectPrefix,
-        start_after: Option<&ObjectKey>,
-        limit: usize,
-    ) -> Result<Vec<ObjectMetadata>, ServerError> {
-        Ok(self
-            .object_store()
-            .list_flat_namespace_page(prefix, start_after, limit)?)
     }
 
     pub(crate) async fn delete_object_if_present(
@@ -427,42 +323,6 @@ impl super::PostgresBackend {
         };
 
         Ok(metadata.length())
-    }
-
-    pub(crate) async fn read_dedupe_shard_stream(
-        &self,
-        hash_hex: &str,
-    ) -> Result<(ServerByteStream, u64), ServerError> {
-        let object_store = self.object_store();
-        let (object_key, total_length) =
-            resolve_dedupe_shard_object(&self.index_store, &object_store, hash_hex).await?;
-        let byte_stream = object_byte_stream(object_store, object_key, total_length).await?;
-
-        Ok((byte_stream, total_length))
-    }
-
-    /// Prepares a fully verified xorb for subsequent range authorization.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the hash is invalid, the xorb is missing, or the
-    /// stored length or content fails verification.
-    pub(crate) async fn prepare_xorb_range(
-        &self,
-        hash_hex: &str,
-        total_length: Option<u64>,
-    ) -> Result<VerifiedXorb, ServerError> {
-        let object_store = self.object_store();
-        let object_key = xorb_object_key(hash_hex)?;
-
-        prepare_xorb_byte_range(
-            &object_store,
-            &object_key,
-            hash_hex,
-            total_length,
-            self.stream_work_pool.clone(),
-        )
-        .await
     }
 
     /// Reads a stored chunk only when it is reachable from a concrete file version.
@@ -523,37 +383,18 @@ impl super::PostgresBackend {
         repository_references_hash_in_scope(&self.record_store, hash_hex, repository_scope).await
     }
 
-    fn file_record_locator(
-        &self,
-        file_id: &str,
-        content_hash: Option<&str>,
-        repository_scope: Option<&RepositoryScope>,
-    ) -> Result<shardline_index::PostgresRecordLocator, ServerError> {
-        validate_identifier(file_id)?;
-        let probe = FileRecord {
-            file_id: file_id.to_owned(),
-            content_hash: content_hash.unwrap_or_default().to_owned(),
-            total_bytes: 0,
-            chunk_size: 0,
-            storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
-            repository_scope: repository_scope.cloned(),
-            chunks: Vec::new(),
-        };
-        Ok(if let Some(content_hash) = content_hash {
-            validate_content_hash(content_hash)?;
-            self.record_store.version_record_locator(&probe)
-        } else {
-            self.record_store.latest_record_locator(&probe)
-        })
-    }
-
     pub(crate) async fn read_record(
         &self,
         file_id: &str,
         content_hash: Option<&str>,
         repository_scope: Option<&RepositoryScope>,
     ) -> Result<FileRecord, ServerError> {
-        let locator = self.file_record_locator(file_id, content_hash, repository_scope)?;
+        let locator = crate::record_store::file_record_locator(
+            &self.record_store,
+            file_id,
+            content_hash,
+            repository_scope,
+        )?;
         let bytes = RecordTraversal::read_record_bytes(&self.record_store, &locator)
             .await
             .map_err(map_record_store_error)?;
@@ -568,7 +409,12 @@ impl super::PostgresBackend {
         content_hash: Option<&str>,
         repository_scope: Option<&RepositoryScope>,
     ) -> Result<FileRecord, ServerError> {
-        let locator = self.file_record_locator(file_id, content_hash, repository_scope)?;
+        let locator = crate::record_store::file_record_locator(
+            &self.record_store,
+            file_id,
+            content_hash,
+            repository_scope,
+        )?;
         let bytes = if let Some(mut connection) =
             crate::maintenance_barrier::RequestSession::connection_for(
                 &self.request_session_identity,
@@ -603,192 +449,6 @@ impl super::PostgresBackend {
     ) -> Result<FileRecord, ServerError> {
         self.read_record(file_id, None, None).await
     }
-
-    pub(crate) async fn upsert_s3_object_with_multipart_count(
-        &self,
-        entry: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<(), ServerError> {
-        self.index_store
-            .upsert_s3_object_with_multipart_count(entry, part_count)
-            .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_with_multipart_count(
-        &self,
-        expected: Option<&S3ObjectEntry>,
-        replacement: &S3ObjectEntry,
-        part_count: u32,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .compare_and_swap_s3_object_with_multipart_count(expected, replacement, part_count)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn compare_and_swap_s3_object_metadata(
-        &self,
-        expected: &S3ObjectEntry,
-        replacement: &S3ObjectEntry,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .compare_and_swap_s3_object_metadata(expected, replacement)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Deletes one S3 object listing-index row, returning whether a row was removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index delete fails.
-    pub(crate) async fn delete_s3_object(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .delete_s3_object(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Scans S3 object listing rows for a scope namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index scan fails.
-    pub(crate) async fn scan_s3_objects(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_objects(scope_namespace, prefix, cursor, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn scan_s3_objects_from(
-        &self,
-        scope_namespace: &str,
-        prefix: &str,
-        start: Option<shardline_index::S3ObjectScanStart<'_>>,
-        limit: usize,
-    ) -> Result<Vec<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_objects_from(scope_namespace, prefix, start, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    /// Resolves exactly one S3 object listing row by its full raw key (no
-    /// prefix matching).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ServerError`] when the index lookup fails.
-    pub(crate) async fn scan_s3_object_exact(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<S3ObjectEntry>, ServerError> {
-        self.index_store
-            .scan_s3_object_exact(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn scan_s3_object_exact_with_multipart_count(
-        &self,
-        scope_namespace: &str,
-        object_key: &str,
-    ) -> Result<Option<(S3ObjectEntry, Option<u32>)>, ServerError> {
-        self.index_store
-            .scan_s3_object_exact_with_multipart_count(scope_namespace, object_key)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn insert_oci_tag_if_absent(
-        &self,
-        entry: &OciTagEntry,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .insert_oci_tag_if_absent(entry)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn oci_tag(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        tag: &str,
-    ) -> Result<Option<OciTagEntry>, ServerError> {
-        self.index_store
-            .oci_tag(scope_namespace, repository, tag)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn list_oci_tags(
-        &self,
-        scope_namespace: &str,
-        repository: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<OciTagEntry>, ServerError> {
-        self.index_store
-            .list_oci_tags(scope_namespace, repository, cursor, limit)
-            .await
-            .map_err(ServerError::from)
-    }
-
-    pub(crate) async fn oci_object_is_deleted(
-        &self,
-        key: &OciObjectKey,
-    ) -> Result<bool, ServerError> {
-        self.index_store
-            .oci_object_is_deleted(key)
-            .await
-            .map_err(ServerError::from)
-    }
-}
-
-pub(crate) async fn repository_references_hash_in_scope<RecordAdapter>(
-    record_store: &RecordAdapter,
-    hash_hex: &str,
-    repository_scope: &RepositoryScope,
-) -> Result<bool, ServerError>
-where
-    RecordAdapter: RecordStore + Sync,
-    RecordAdapter::Error: Send,
-    ServerError: From<RecordAdapter::Error>,
-{
-    crate::record_store::any_repository_hash_record(
-        record_store,
-        repository_scope,
-        hash_hex,
-        |bytes| stored_record_references_hash(bytes, hash_hex, repository_scope),
-    )
-    .await
-}
-
-fn stored_record_references_hash(
-    bytes: &[u8],
-    hash_hex: &str,
-    repository_scope: &RepositoryScope,
-) -> Result<bool, ServerError> {
-    let record = parse_stored_file_record_bytes(bytes)?;
-    if record.repository_scope.as_ref() != Some(repository_scope) {
-        return Ok(false);
-    }
-
-    Ok(record.chunks.iter().any(|chunk| chunk.hash == hash_hex))
 }
 
 pub(crate) fn connect_postgres_metadata_pool(
@@ -857,8 +517,7 @@ mod tests {
     use super::*;
     use crate::error::IndexError;
     use crate::object_store::ServerObjectStore;
-    use serde_json::to_vec;
-    use shardline_index::{FileChunkRecord, FileRecord, LocalRecordStore, RecordMutation};
+    use shardline_index::{FileRecord, LocalRecordStore, RecordMutation};
     use shardline_protocol::{RepositoryProvider, RepositoryScope};
     use shardline_storage::{ObjectBody, ObjectIntegrity};
     use tempfile::TempDir;
@@ -877,27 +536,6 @@ mod tests {
 
     fn make_hash(ch: char) -> String {
         std::iter::repeat_n(ch, 64).collect()
-    }
-
-    fn file_record_json_bytes(scope: &RepositoryScope, chunk_hash: &str) -> Vec<u8> {
-        let record = FileRecord {
-            file_id: "test/file.bin".into(),
-            content_hash: make_hash('f'),
-            total_bytes: 1024,
-            chunk_size: 256,
-            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-            repository_scope: Some(scope.clone()),
-            chunks: vec![FileChunkRecord {
-                hash: chunk_hash.to_owned(),
-                offset: 0,
-                length: 256,
-                range_start: 0,
-                range_end: 1,
-                packed_start: 0,
-                packed_end: 256,
-            }],
-        };
-        to_vec(&record).unwrap()
     }
 
     async fn make_backend() -> (super::super::PostgresBackend, TempDir) {
@@ -954,100 +592,6 @@ mod tests {
     // ===== Pure function tests =====
 
     #[test]
-    fn stored_record_references_hash_matching() {
-        let scope = test_scope();
-        let hash = make_hash('b');
-        let bytes = file_record_json_bytes(&scope, &hash);
-
-        assert!(stored_record_references_hash(&bytes, &hash, &scope).unwrap());
-    }
-
-    #[test]
-    fn stored_record_references_hash_different() {
-        let scope = test_scope();
-        let stored_hash = make_hash('b');
-        let queried_hash = make_hash('q');
-        let bytes = file_record_json_bytes(&scope, &stored_hash);
-
-        assert!(!stored_record_references_hash(&bytes, &queried_hash, &scope).unwrap());
-    }
-
-    #[test]
-    fn stored_record_references_hash_different_scope() {
-        let record_scope = test_scope();
-        let other_scope =
-            RepositoryScope::new(RepositoryProvider::GitHub, "other", "other-repo", None).unwrap();
-        let hash = make_hash('b');
-        let bytes = file_record_json_bytes(&record_scope, &hash);
-
-        assert!(!stored_record_references_hash(&bytes, &hash, &other_scope).unwrap());
-    }
-
-    #[test]
-    fn stored_record_references_hash_invalid_json() {
-        let scope = test_scope();
-        let bytes = b"!!! not valid json !!!";
-
-        assert!(stored_record_references_hash(bytes, &make_hash('a'), &scope).is_err());
-    }
-
-    #[test]
-    fn stored_record_references_hash_null_scope() {
-        // A record with `repository_scope: None` should never match any scope.
-        let scope = test_scope();
-        let hash = make_hash('b');
-        let bytes = {
-            let record = FileRecord {
-                file_id: "test/file.bin".into(),
-                content_hash: make_hash('f'),
-                total_bytes: 1024,
-                chunk_size: 256,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash.clone(),
-                    offset: 0,
-                    length: 256,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 256,
-                }],
-            };
-            to_vec(&record).unwrap()
-        };
-        assert!(!stored_record_references_hash(&bytes, &hash, &scope).unwrap());
-    }
-
-    #[test]
-    fn stored_record_references_hash_empty_chunks() {
-        let scope = test_scope();
-        let hash = make_hash('x');
-        let bytes = {
-            let record = FileRecord {
-                file_id: "test/file.bin".into(),
-                content_hash: make_hash('f'),
-                total_bytes: 0,
-                chunk_size: 0,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: Some(scope.clone()),
-                chunks: Vec::new(),
-            };
-            to_vec(&record).unwrap()
-        };
-        assert!(!stored_record_references_hash(&bytes, &hash, &scope).unwrap());
-    }
-
-    #[test]
-    fn stored_record_references_hash_hash_not_in_chunks() {
-        let scope = test_scope();
-        let stored_hash = make_hash('a');
-        let queried_hash = make_hash('z');
-        let bytes = file_record_json_bytes(&scope, &stored_hash);
-        assert!(!stored_record_references_hash(&bytes, &queried_hash, &scope).unwrap());
-    }
-
-    #[test]
     fn map_record_store_error_not_found() {
         let error = PostgresMetadataStoreError::RecordNotFound;
         let result = map_record_store_error(error);
@@ -1055,122 +599,72 @@ mod tests {
     }
 
     #[test]
-    fn map_record_store_error_sqlx() {
-        let error = PostgresMetadataStoreError::Sqlx(Box::new(sqlx::Error::PoolClosed));
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_json() {
-        let error =
-            PostgresMetadataStoreError::Json(serde_json::from_str::<()>("invalid").unwrap_err());
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_hash_parse() {
-        let error = PostgresMetadataStoreError::HashParse(
-            shardline_protocol::HashParseError::InvalidLength,
-        );
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_object_key() {
-        let error = PostgresMetadataStoreError::ObjectKey(shardline_storage::ObjectKeyError::Empty);
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_range() {
-        let error = PostgresMetadataStoreError::Range(shardline_protocol::RangeError::Inverted);
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_retention_hold() {
-        let error = PostgresMetadataStoreError::RetentionHold(
-            shardline_index::RetentionHoldError::EmptyReason,
-        );
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_quarantine_candidate() {
-        let error = PostgresMetadataStoreError::QuarantineCandidate(
-            shardline_index::QuarantineCandidateError::InvertedTimeline,
-        );
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_webhook_delivery() {
-        let error = PostgresMetadataStoreError::WebhookDelivery(
-            shardline_index::WebhookDeliveryError::EmptyRepositoryOwner,
-        );
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_integer_out_of_range() {
-        let error = PostgresMetadataStoreError::IntegerOutOfRange("test".to_owned());
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_invalid_record_kind() {
-        let error = PostgresMetadataStoreError::InvalidRecordKind;
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
-    }
-
-    #[test]
-    fn map_record_store_error_invalid_repo_type() {
-        let error = PostgresMetadataStoreError::InvalidRepoType("unknown".to_owned());
-        let result = map_record_store_error(error);
-        assert!(matches!(
-            result,
-            ServerError::Index(IndexError::PostgresMetadata(_))
-        ));
+    fn map_record_store_error_preserves_storage_failures() {
+        let cases = [
+            (
+                "sqlx",
+                PostgresMetadataStoreError::Sqlx(Box::new(sqlx::Error::PoolClosed)),
+            ),
+            (
+                "json",
+                PostgresMetadataStoreError::Json(
+                    serde_json::from_str::<()>("invalid").unwrap_err(),
+                ),
+            ),
+            (
+                "hash_parse",
+                PostgresMetadataStoreError::HashParse(
+                    shardline_protocol::HashParseError::InvalidLength,
+                ),
+            ),
+            (
+                "object_key",
+                PostgresMetadataStoreError::ObjectKey(shardline_storage::ObjectKeyError::Empty),
+            ),
+            (
+                "range",
+                PostgresMetadataStoreError::Range(shardline_protocol::RangeError::Inverted),
+            ),
+            (
+                "retention_hold",
+                PostgresMetadataStoreError::RetentionHold(
+                    shardline_index::RetentionHoldError::EmptyReason,
+                ),
+            ),
+            (
+                "quarantine_candidate",
+                PostgresMetadataStoreError::QuarantineCandidate(
+                    shardline_index::QuarantineCandidateError::InvertedTimeline,
+                ),
+            ),
+            (
+                "webhook_delivery",
+                PostgresMetadataStoreError::WebhookDelivery(
+                    shardline_index::WebhookDeliveryError::EmptyRepositoryOwner,
+                ),
+            ),
+            (
+                "integer_out_of_range",
+                PostgresMetadataStoreError::IntegerOutOfRange("test".to_owned()),
+            ),
+            (
+                "invalid_record_kind",
+                PostgresMetadataStoreError::InvalidRecordKind,
+            ),
+            (
+                "invalid_repo_type",
+                PostgresMetadataStoreError::InvalidRepoType("unknown".to_owned()),
+            ),
+        ];
+        for (name, error) in cases {
+            let expected = format!("{error:?}");
+            let result = map_record_store_error(error);
+            assert!(
+                matches!(&result, ServerError::Index(IndexError::PostgresMetadata(original))
+                    if format!("{original:?}") == expected),
+                "{name}: storage error was not preserved: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1185,11 +679,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_postgres_metadata_pool_very_small_connections_succeeds() {
-        // max_connections=1 should be accepted (lazy pool, no actual connect).
-        let result = connect_postgres_metadata_pool("postgres://localhost:5432/test", 1);
-        assert!(result.is_ok() || result.is_err());
-        // Drop the pool explicitly within the tokio context.
-        drop(result);
+        let pool = connect_postgres_metadata_pool("postgres://localhost:5432/test", 1).unwrap();
+        assert_eq!(pool.size(), 0, "lazy pool must not open a connection");
+        pool.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1304,7 +796,9 @@ mod tests {
         let key = ObjectKey::parse("test/read-obj").unwrap();
         let data = b"read object test content";
         store_object(&backend.object_store(), &key, data);
-        let read_data = backend.read_object(&key).await.expect("read_object");
+        let read_data = crate::object_store::read_small_object(backend.object_store(), key)
+            .await
+            .expect("read_object");
         assert_eq!(read_data, data);
     }
 
@@ -1312,7 +806,7 @@ mod tests {
     async fn read_object_not_found_for_missing_key() {
         let (backend, _root) = make_backend().await;
         let key = ObjectKey::parse("test/never-stored").unwrap();
-        let result = backend.read_object(&key).await;
+        let result = crate::object_store::read_small_object(backend.object_store(), key).await;
         assert!(matches!(result, Err(ServerError::NotFound)));
     }
 
@@ -1322,7 +816,9 @@ mod tests {
         let key = ObjectKey::parse("test/large-blob").unwrap();
         let data = vec![0x42u8; 131072]; // 128 KB
         store_object(&backend.object_store(), &key, &data);
-        let read_data = backend.read_object(&key).await.expect("read_object large");
+        let read_data = crate::object_store::read_small_object(backend.object_store(), key)
+            .await
+            .expect("read_object large");
         assert_eq!(read_data.len(), 131072);
         assert_eq!(read_data, data);
     }
@@ -1397,7 +893,7 @@ mod tests {
 
         let prefix = ObjectPrefix::parse("test/prefix").unwrap();
         let mut found: Vec<String> = Vec::new();
-        backend
+        crate::ServerBackend::Postgres(backend)
             .visit_object_prefix(&prefix, |meta| {
                 found.push(meta.key().as_str().to_owned());
                 Ok(())
@@ -1418,7 +914,7 @@ mod tests {
         let (backend, _root) = make_backend().await;
         let prefix = ObjectPrefix::parse("no/such/prefix").unwrap();
         let mut count = 0_u64;
-        backend
+        crate::ServerBackend::Postgres(backend)
             .visit_object_prefix(&prefix, |_| {
                 count += 1;
                 Ok(())
@@ -1432,7 +928,7 @@ mod tests {
         let (backend, _root) = make_backend().await;
         let prefix = ObjectPrefix::parse("test").unwrap();
         let mut count = 0_u64;
-        backend
+        crate::ServerBackend::Postgres(backend)
             .visit_object_prefix(&prefix, |_| {
                 count += 1;
                 Ok(())
@@ -1451,7 +947,7 @@ mod tests {
             store_object(&backend.object_store(), &key, b"page data");
         }
         let prefix = ObjectPrefix::parse("test/page").unwrap();
-        let page = backend
+        let page = crate::ServerBackend::Postgres(backend)
             .list_object_flat_namespace_page(&prefix, None, 4)
             .expect("list page");
         assert_eq!(page.len(), 4);
@@ -1467,7 +963,7 @@ mod tests {
         let prefix = ObjectPrefix::parse("test/page2").unwrap();
         // Request 2 items; the local store may or may not support start_after,
         // but should at least respect the limit.
-        let page = backend
+        let page = crate::ServerBackend::Postgres(backend)
             .list_object_flat_namespace_page(&prefix, None, 2)
             .expect("list with limit");
         assert!(!page.is_empty());
@@ -1483,7 +979,9 @@ mod tests {
         let key = ObjectKey::parse("test/special_chars/file-v1.0.bin").unwrap();
         let data = b"special key data";
         store_object(&backend.object_store(), &key, data);
-        let read_data = backend.read_object(&key).await.expect("read special key");
+        let read_data = crate::object_store::read_small_object(backend.object_store(), key)
+            .await
+            .expect("read special key");
         assert_eq!(read_data, data);
     }
 
@@ -1517,6 +1015,7 @@ mod tests {
 
     fn test_file_record(file_id: &str, content_hash: &str, scope: &RepositoryScope) -> FileRecord {
         FileRecord {
+            deduplication_domain: None,
             file_id: file_id.to_owned(),
             content_hash: content_hash.to_owned(),
             total_bytes: 1024,
@@ -1863,6 +1362,7 @@ mod tests {
         let (store, _storage) = local_record_store();
         let scope = test_scope();
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "test/empty-chunks.bin".into(),
             content_hash: make_hash('e'),
             total_bytes: 0,
@@ -1989,27 +1489,26 @@ mod tests {
     // ===== Invalid identifier / missing record errors =====
 
     #[tokio::test]
-    async fn reconstruction_rejects_invalid_file_id() {
+    async fn file_read_apis_reject_invalid_identifiers_before_database_access() {
         let (backend, _root) = make_backend().await;
-        // read_record() internally calls validate_identifier() which should reject "/".
-        let result = backend
-            .reconstruction("/absolute/path", None, None, None)
-            .await;
-        assert!(matches!(result, Err(ServerError::InvalidFileId)));
-    }
-
-    #[tokio::test]
-    async fn file_total_bytes_rejects_invalid_file_id() {
-        let (backend, _root) = make_backend().await;
-        let result = backend.file_total_bytes("../traverse", None, None).await;
-        assert!(matches!(result, Err(ServerError::InvalidFileId)));
-    }
-
-    #[tokio::test]
-    async fn download_file_rejects_invalid_file_id() {
-        let (backend, _root) = make_backend().await;
-        let result = backend.download_file("\0null", None, None).await;
-        assert!(matches!(result, Err(ServerError::InvalidFileId)));
+        for file_id in ["/absolute/path", "../traverse", "\0null"] {
+            for result in [
+                backend
+                    .reconstruction(file_id, None, None, None)
+                    .await
+                    .map(|_| ()),
+                backend
+                    .file_total_bytes(file_id, None, None)
+                    .await
+                    .map(|_| ()),
+                backend.download_file(file_id, None, None).await.map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(ServerError::InvalidFileId)),
+                    "{file_id:?}: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2041,8 +1540,8 @@ mod tests {
         let key = ObjectKey::parse("test/stream/no-range").unwrap();
         let data = b"stream data without range";
         store_object(&backend.object_store(), &key, data);
-        let result = backend
-            .read_object_stream(&key, data.len() as u64, None)
+        let result = crate::ServerBackend::Postgres(backend)
+            .direct_object_stream(&key, data.len() as u64, None)
             .await;
         assert!(result.is_ok());
     }
@@ -2054,8 +1553,8 @@ mod tests {
         let data = b"stream data with range spec";
         store_object(&backend.object_store(), &key, data);
         let range = ByteRange::new(0, data.len() as u64 - 1).unwrap();
-        let result = backend
-            .read_object_stream(&key, data.len() as u64, Some(range))
+        let result = crate::ServerBackend::Postgres(backend)
+            .direct_object_stream(&key, data.len() as u64, Some(range))
             .await;
         assert!(result.is_ok());
     }
@@ -2084,13 +1583,29 @@ mod tests {
     // ── reconstruction with content_hash (version locator branch) ──
 
     #[tokio::test]
-    async fn reconstruction_with_invalid_content_hash() {
+    async fn file_read_apis_reject_invalid_content_hashes_before_database_access() {
         let (backend, _root) = make_backend().await;
-        // An invalid content_hash should be caught before any PG call.
-        let result = backend
-            .reconstruction("test-file.bin", Some("not-a-valid-hash"), None, None)
-            .await;
-        assert!(matches!(result, Err(ServerError::InvalidContentHash)));
+        for hash in ["not-a-valid-hash", "bad", "invalid!"] {
+            for result in [
+                backend
+                    .reconstruction("test-file.bin", Some(hash), None, None)
+                    .await
+                    .map(|_| ()),
+                backend
+                    .file_total_bytes("test-file.bin", Some(hash), None)
+                    .await
+                    .map(|_| ()),
+                backend
+                    .download_file("test-file.bin", Some(hash), None)
+                    .await
+                    .map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(ServerError::InvalidContentHash)),
+                    "{hash}: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2110,15 +1625,6 @@ mod tests {
     // ── file_total_bytes with/without content_hash ──────────
 
     #[tokio::test]
-    async fn file_total_bytes_with_invalid_content_hash() {
-        let (backend, _root) = make_backend().await;
-        let result = backend
-            .file_total_bytes("test-file.bin", Some("bad"), None)
-            .await;
-        assert!(matches!(result, Err(ServerError::InvalidContentHash)));
-    }
-
-    #[tokio::test]
     async fn file_total_bytes_with_valid_params_fails_without_postgres() {
         let (backend, _root) = make_backend().await;
         let result = backend
@@ -2129,15 +1635,6 @@ mod tests {
     }
 
     // ── download_file ──────────────────────────────────────
-
-    #[tokio::test]
-    async fn download_file_with_invalid_content_hash() {
-        let (backend, _root) = make_backend().await;
-        let result = backend
-            .download_file("test-file.bin", Some("invalid!"), None)
-            .await;
-        assert!(matches!(result, Err(ServerError::InvalidContentHash)));
-    }
 
     #[tokio::test]
     async fn download_file_without_content_hash_fails_without_postgres() {

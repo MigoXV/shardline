@@ -22,8 +22,6 @@ use crate::error::XetHashParseError;
 
 /// Number of hexadecimal characters in a Xet CAS API hash string.
 const HASH_HEX_LENGTH: usize = 64;
-/// Bytes per group reversed by the Xet CAS API hexadecimal ordering.
-const XET_HASH_GROUP_BYTES: usize = 8;
 
 /// Parses the reordered lowercase hash text used by Xet API paths and persisted
 /// Xet metadata.
@@ -50,20 +48,8 @@ pub fn parse_xet_hash_hex(value: &str) -> Result<MerkleHash, XetHashParseError> 
         ));
     }
 
-    let decoded =
-        hex::decode(value).map_err(|e| XetHashParseError::InvalidCharacter(e.to_string()))?;
-    let reordered = decoded
-        .as_chunks::<XET_HASH_GROUP_BYTES>()
-        .0
-        .iter()
-        .flat_map(|chunk| chunk.iter().rev().copied())
-        .collect::<Vec<u8>>();
-    let bytes = <[u8; 32]>::try_from(reordered).map_err(|vec| {
-        let _ = vec;
-        XetHashParseError::InvalidLength
-    })?;
-
-    Ok(MerkleHash::from(bytes))
+    MerkleHash::from_hex(value)
+        .map_err(|error| XetHashParseError::InvalidCharacter(error.to_string()))
 }
 
 /// Returns the reordered lowercase hash text used by Xet API paths and persisted
@@ -75,15 +61,7 @@ pub fn parse_xet_hash_hex(value: &str) -> Result<MerkleHash, XetHashParseError> 
 /// `/v1/chunks/default/{hash}`.
 #[must_use]
 pub fn xet_hash_hex_string(hash: MerkleHash) -> String {
-    let bytes: [u8; 32] = hash.into();
-    let mut encoded = Vec::with_capacity(HASH_HEX_LENGTH);
-    for chunk in bytes.as_chunks::<XET_HASH_GROUP_BYTES>().0 {
-        for byte in chunk.iter().rev() {
-            append_lower_hex_byte(&mut encoded, *byte);
-        }
-    }
-
-    String::from_utf8(encoded).unwrap_or_default()
+    hash.hex()
 }
 
 /// Computes the BLAKE3 keyed chunk hash (`DATA_KEY`) for a chunk's raw bytes.
@@ -109,32 +87,6 @@ pub fn compute_term_verification_hash(chunks: &[MerkleHash]) -> MerkleHash {
     range_hash_from_chunks(chunks)
 }
 
-fn append_lower_hex_byte(output: &mut Vec<u8>, byte: u8) {
-    output.push(lower_hex_digit(byte >> 4));
-    output.push(lower_hex_digit(byte & 0x0f));
-}
-
-const fn lower_hex_digit(nibble: u8) -> u8 {
-    match nibble {
-        0 => b'0',
-        1 => b'1',
-        2 => b'2',
-        3 => b'3',
-        4 => b'4',
-        5 => b'5',
-        6 => b'6',
-        7 => b'7',
-        8 => b'8',
-        9 => b'9',
-        10 => b'a',
-        11 => b'b',
-        12 => b'c',
-        13 => b'd',
-        14 => b'e',
-        _ => b'f',
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use xet_core_structures::merklehash::MerkleHash;
@@ -144,66 +96,45 @@ mod tests {
     };
 
     #[test]
-    fn xet_hash_hex_uses_xet_byte_group_ordering() {
-        let hash = MerkleHash::from([
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31,
-        ]);
-
-        let xet_hex = xet_hash_hex_string(hash);
-
-        assert_eq!(
-            xet_hex,
-            "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918"
-        );
-        assert!(matches!(parse_xet_hash_hex(&xet_hex), Ok(h) if h == hash));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_short_string() {
-        assert!(matches!(
-            parse_xet_hash_hex("abc"),
-            Err(crate::error::XetHashParseError::InvalidLength)
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_long_string() {
-        assert!(matches!(
-            parse_xet_hash_hex(&"a".repeat(65)),
-            Err(crate::error::XetHashParseError::InvalidLength)
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_uppercase() {
-        let hex = "A".repeat(64);
-        assert!(matches!(
-            parse_xet_hash_hex(&hex),
-            Err(crate::error::XetHashParseError::InvalidCharacter(_))
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_non_hex_characters() {
-        let hex = format!("{}z{}", "a".repeat(32), "b".repeat(31));
-        assert!(matches!(
-            parse_xet_hash_hex(&hex),
-            Err(crate::error::XetHashParseError::InvalidCharacter(_))
-        ));
-    }
-
-    #[test]
-    fn parse_xet_hash_hex_rejects_empty_string() {
-        assert!(matches!(
-            parse_xet_hash_hex(""),
-            Err(crate::error::XetHashParseError::InvalidLength)
-        ));
+    fn parser_rejects_wrong_lengths_and_noncanonical_characters() {
+        for value in [String::new(), "abc".to_owned(), "a".repeat(65)] {
+            assert!(
+                matches!(
+                    parse_xet_hash_hex(&value),
+                    Err(crate::error::XetHashParseError::InvalidLength)
+                ),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "A".repeat(64),
+            format!("{}z{}", "a".repeat(32), "b".repeat(31)),
+        ] {
+            assert!(
+                matches!(
+                    parse_xet_hash_hex(&value),
+                    Err(crate::error::XetHashParseError::InvalidCharacter(_))
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
     fn xet_hash_vectors_round_trip_each_xet_byte_group_independently() {
         let cases = [
+            (
+                std::array::from_fn(|index| index as u8),
+                "07060504030201000f0e0d0c0b0a090817161514131211101f1e1d1c1b1a1918",
+            ),
+            // Upstream 1.5.2 `test_hash_hex_string_endianness` golden vector.
+            (
+                [
+                    22, 175, 58, 132, 4, 75, 131, 214, 190, 153, 138, 66, 226, 3, 153, 242, 204,
+                    86, 80, 234, 249, 153, 80, 99, 159, 80, 65, 138, 236, 231, 149, 78,
+                ],
+                "d6834b04843aaf16f29903e2428a99be635099f9ea5056cc4e95e7ec8a41509f",
+            ),
             (
                 [
                     0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
@@ -226,27 +157,9 @@ mod tests {
             let hash = MerkleHash::from(bytes);
 
             assert_eq!(xet_hash_hex_string(hash), xet_hex);
+            assert_eq!(hash.hex(), xet_hex);
             assert!(matches!(parse_xet_hash_hex(xet_hex), Ok(h) if h == hash));
         }
-    }
-
-    #[test]
-    fn xet_hex_matches_upstream_hex_endianness_vector() {
-        // Golden vector from xet-core-structures 1.5.2 `data_hash.rs`
-        // `test_hash_hex_string_endianness`. Upstream `DataHash::hex()` output
-        // is exactly the Xet CAS API ordering, so the raw bytes and the
-        // expected string must round-trip through sdx's formatter/parser and
-        // agree with the upstream `hex()` method.
-        let raw: [u8; 32] = [
-            22, 175, 58, 132, 4, 75, 131, 214, 190, 153, 138, 66, 226, 3, 153, 242, 204, 86, 80,
-            234, 249, 153, 80, 99, 159, 80, 65, 138, 236, 231, 149, 78,
-        ];
-        let expected = "d6834b04843aaf16f29903e2428a99be635099f9ea5056cc4e95e7ec8a41509f";
-
-        let hash = MerkleHash::from(raw);
-        assert_eq!(xet_hash_hex_string(hash), expected);
-        assert_eq!(hash.hex(), expected);
-        assert!(matches!(parse_xet_hash_hex(expected), Ok(h) if h == hash));
     }
 
     #[test]

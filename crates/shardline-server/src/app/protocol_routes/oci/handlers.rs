@@ -96,31 +96,25 @@ async fn oci_dispatch_parsed(
     };
     let outcome = async {
         match (method, repo.path()) {
-            (Method::GET, OciPath::Blob { digest_hex, .. }) => {
+            (method @ (Method::GET | Method::HEAD), OciPath::Blob { digest_hex, .. }) => {
                 ensure_oci_object_visible(
                     state,
                     &oci_blob_index_key(repo.repository(), digest_hex, repo.capability()),
                 )
                 .await?;
                 let object_key = oci_blob_key(repo.repository(), digest_hex, repo.capability())?;
-                metrics().protocol.record_oci_download();
-                direct_object_response(
-                    state,
-                    &headers,
-                    &object_key,
-                    "application/octet-stream",
-                    Some(format!("sha256:{digest_hex}")),
-                    "oci",
-                )
-                .await
-            }
-            (Method::HEAD, OciPath::Blob { digest_hex, .. }) => {
-                ensure_oci_object_visible(
-                    state,
-                    &oci_blob_index_key(repo.repository(), digest_hex, repo.capability()),
-                )
-                .await?;
-                let object_key = oci_blob_key(repo.repository(), digest_hex, repo.capability())?;
+                if method == Method::GET {
+                    metrics().protocol.record_oci_download();
+                    return direct_object_response(
+                        state,
+                        &headers,
+                        &object_key,
+                        "application/octet-stream",
+                        Some(format!("sha256:{digest_hex}")),
+                        "oci",
+                    )
+                    .await;
+                }
                 let total_length = state.backend.object_length(&object_key).await?;
                 Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -133,11 +127,8 @@ async fn oci_dispatch_parsed(
                         ServerError::Overflow
                     })?)
             }
-            (Method::GET, OciPath::Manifest { reference, .. }) => {
-                oci_get_manifest(state, &headers, &repo, reference, false).await
-            }
-            (Method::HEAD, OciPath::Manifest { reference, .. }) => {
-                oci_get_manifest(state, &headers, &repo, reference, true).await
+            (method @ (Method::GET | Method::HEAD), OciPath::Manifest { reference, .. }) => {
+                oci_get_manifest(state, &headers, &repo, reference, method == Method::HEAD).await
             }
             (Method::GET, OciPath::TagsList { .. }) => oci_tags_list(state, &uri, &repo).await,
             (Method::GET, OciPath::Referrers { digest_hex, .. }) => {
@@ -248,13 +239,7 @@ async fn oci_delete_blob(
         .delete_oci_object_locked(&mut repository_guard, &index_key)
         .await?;
     repository_guard.assert_current().await?;
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build delete blob response");
-            ServerError::Overflow
-        })
+    Ok(StatusCode::ACCEPTED.into_response())
 }
 
 /// Returns `true` if the JSON document (OCI manifest or index) contains a

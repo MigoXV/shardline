@@ -1,6 +1,7 @@
 mod admin_api;
 mod background_tasks;
 mod delta;
+mod hub_recovery_worker;
 mod hub_xet_download;
 pub use background_tasks::RouterBackgroundTasks;
 mod metadata_routes;
@@ -63,6 +64,7 @@ use crate::{
     config::{
         AuthProviderKind, DeploymentMode, ServerConfigError, env::bounded_pool_size_from_env,
     },
+    hub_recovery_resources::HubRecoveryResources,
     jwks_provider::JwksProvider,
     metrics::MetricsLayer,
     oidc_provider::OidcProvider,
@@ -85,7 +87,7 @@ use admin_api::{
 };
 #[cfg(feature = "fuzzing")]
 pub(crate) use admin_api::{parse_admin_cursor_for_fuzzing, parse_admin_query_for_fuzzing};
-use hub_xet_download::download_hub_xet_file;
+use hub_xet_download::{download_hub_xet_file, download_hub_xet_members};
 use metadata_routes::{
     create_revision, delete_path, delete_revision, list_revisions, register_path, tree_lookup,
 };
@@ -572,7 +574,7 @@ async fn router_with_housekeeping_guard(
     for frontend in state.config.server_frontends() {
         match frontend {
             ServerFrontend::Hub => {
-                hub_state = Some(build_hub_state(&state, task_tracker.clone(), background)?);
+                hub_state = Some(build_hub_state(&state, task_tracker.clone(), background).await?);
                 if role.serves_api() {
                     app = protocol_routes::register_hub_lock_routes(app, state.clone());
                 }
@@ -861,6 +863,10 @@ fn register_xet_routes(
                 get(delta::file_chunk_hashes),
             )
             .route("/v1/hub/xet-files/{sha256}", get(download_hub_xet_file))
+            .route(
+                "/v1/hub/xet-files/{sha256}/range",
+                get(download_hub_xet_members),
+            )
             .route("/v2/reconstructions/{file_id}", get(reconstruction_v2))
             .route("/shards", post(upload_shard))
             .route("/v2/shards", post(shard_progress::upload))
@@ -1091,7 +1097,7 @@ pub fn bounded_api_body_limit(configured_limit: NonZeroUsize, endpoint_limit: us
     configured_limit.get().min(endpoint_limit)
 }
 
-fn build_hub_state(
+async fn build_hub_state(
     app_state: &AppState,
     task_tracker: Arc<crate::task_tracking::EmbeddedTaskTracker>,
     background: &mut RouterBackgroundTasks,
@@ -1105,39 +1111,98 @@ fn build_hub_state(
     // Postgres Hub requests use their own pool on the configured database.
     // This is not the startup metadata pool or a maintenance ownership session.
     let root_dir = app_state.config.root_dir();
-    let store: shardline_index::hub::BoxedHubStore =
-        app_state.config.index_postgres_url().map_or_else(
-            || -> Result<shardline_index::hub::BoxedHubStore, ServerError> {
-                let hub_root = root_dir.join("hub");
-                if let Err(e) = fs::create_dir_all(&hub_root) {
-                    tracing::warn!("failed to create hub directory: {e}");
-                }
-                let sqlite_store = shardline_index::LocalIndexStore::new(hub_root.clone())
-                    .map_err(|e| ServerError::Io(Error::other(e)))?;
-                // Ensure hub-specific tables exist
-                if let Err(e) = shardline_index::hub::ensure_hub_tables(&hub_root) {
-                    tracing::warn!("failed to create hub tables: {e}");
-                }
-                let native_records =
-                    shardline_index::LocalRecordStore::open(root_dir.to_path_buf());
-                Ok(
-                    shardline_index::hub::BoxedHubStore::from_store(sqlite_store)
-                        .with_xet_identity_lookup(move |scope, sha256| {
-                            native_records
-                                .xet_file_identity(scope, sha256)
-                                .map_err(|error| Box::new(error) as _)
-                        }),
+    let (store, recovery_outbox): (
+        shardline_index::hub::BoxedHubStore,
+        Arc<dyn shardline_index::HubRecoveryOutboxStore>,
+    ) = match app_state.config.index_postgres_url() {
+        None => {
+            let hub_root = root_dir.join("hub");
+            if let Err(e) = fs::create_dir_all(&hub_root) {
+                tracing::warn!("failed to create hub directory: {e}");
+            }
+            let sqlite_store = shardline_index::LocalIndexStore::new(hub_root.clone())
+                .map_err(|e| ServerError::Io(Error::other(e)))?;
+            // Ensure hub-specific tables exist
+            if let Err(e) = shardline_index::hub::ensure_hub_tables(&hub_root) {
+                tracing::warn!("failed to create hub tables: {e}");
+            }
+            let native_records = shardline_index::LocalRecordStore::open(root_dir.to_path_buf());
+            let recovery_outbox: Arc<dyn shardline_index::HubRecoveryOutboxStore> =
+                Arc::new(sqlite_store.clone());
+            let store = shardline_index::hub::BoxedHubStore::from_store(sqlite_store)
+                .with_xet_identity_lookup(move |scope, sha256| {
+                    native_records
+                        .xet_file_identity(scope, sha256)
+                        .map_err(|error| Box::new(error) as _)
+                });
+            (store, recovery_outbox)
+        }
+        Some(pg_url) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(16)
+                .connect_lazy(pg_url)
+                .map_err(|e| ServerError::Io(Error::other(e)))?;
+            let pg_store = shardline_index::PostgresIndexStore::new(pool);
+            let recovery_outbox: Arc<dyn shardline_index::HubRecoveryOutboxStore> =
+                Arc::new(pg_store.clone());
+            (
+                shardline_index::hub::BoxedHubStore::from_store(pg_store),
+                recovery_outbox,
+            )
+        }
+    };
+
+    let recovery_archive = match app_state.config.hub_recovery_mode() {
+        Some(shardline_index::HubRecoveryMode::Off) => {
+            recovery_outbox
+                .set_hub_recovery_mode(shardline_index::HubRecoveryMode::Off, None)
+                .await
+                .map_err(hub_recovery_server_error)?;
+            None
+        }
+        Some(shardline_index::HubRecoveryMode::Shadow) => {
+            let runtime = app_state
+                .config
+                .hub_recovery_runtime()
+                .ok_or_else(|| hub_recovery_config_error("SHADOW runtime config is missing"))?;
+            let resources = HubRecoveryResources::from_config(runtime)?;
+
+            // Validate local resources before changing the durable mode. The
+            // outbox transition itself is transactional and checks deployment
+            // identity continuity before the worker is admitted.
+            recovery_outbox
+                .set_hub_recovery_mode(
+                    shardline_index::HubRecoveryMode::Shadow,
+                    Some(&runtime.deployment_id),
                 )
-            },
-            |pg_url| -> Result<shardline_index::hub::BoxedHubStore, ServerError> {
-                let pool = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(16)
-                    .connect_lazy(pg_url)
-                    .map_err(|e| ServerError::Io(Error::other(e)))?;
-                let pg_store = shardline_index::PostgresIndexStore::new(pool);
-                Ok(shardline_index::hub::BoxedHubStore::from_store(pg_store))
-            },
-        )?;
+                .await
+                .map_err(hub_recovery_server_error)?;
+            background.register(hub_recovery_worker::spawn(
+                recovery_outbox.clone(),
+                resources.archive.clone(),
+                resources.signing_key,
+                runtime.key_id.clone(),
+                background.stopped_flag(),
+            ));
+            Some(shardline_hub_api::routes::HubArchiveContext {
+                deployment_id: runtime.deployment_id.clone(),
+                resource_domain: "hub".to_owned(),
+                object_store: resources.archive,
+            })
+        }
+        None => {
+            let (mode, _deployment_id) = recovery_outbox
+                .hub_recovery_mode()
+                .await
+                .map_err(hub_recovery_server_error)?;
+            if mode == shardline_index::HubRecoveryMode::Shadow {
+                return Err(hub_recovery_config_error(
+                    "database Hub recovery mode is SHADOW but this replica has no recovery configuration",
+                ));
+            }
+            None
+        }
+    };
 
     // Build an HTTP client for outbound webhook delivery.
     let http_client = build_webhook_delivery_client();
@@ -1186,11 +1251,20 @@ fn build_hub_state(
     Ok(shardline_hub_api::routes::HubState {
         store,
         object_store: app_state.backend.object_store(),
+        recovery_archive,
         auth: hub_auth,
         http_client,
         webhook_secret_cipher,
         public_base_url: app_state.config.public_base_url().to_owned(),
     })
+}
+
+fn hub_recovery_config_error(message: &str) -> ServerError {
+    ServerError::Config(ServerConfigError::ConfigFileError(message.to_owned()))
+}
+
+fn hub_recovery_server_error(error: shardline_index::HubRecoveryError) -> ServerError {
+    ServerError::Io(Error::other(error))
 }
 
 fn endpoint_body_limit(
@@ -1242,6 +1316,20 @@ pub async fn acquire_chunk_transfer_permit(
     state.transfer_limiter.acquire_bytes(total_bytes).await
 }
 
+// Pin the intended service, rejecting absent/blank audiences before fetching keys.
+fn required_external_audience<'config>(
+    value: Option<&'config str>,
+    setting: &str,
+) -> Result<&'config str, ServerError> {
+    value
+        .filter(|audience| !audience.trim().is_empty())
+        .ok_or_else(|| {
+            ServerError::Config(ServerConfigError::ConfigFileError(format!(
+                "{setting} is required for external JWT authentication"
+            )))
+        })
+}
+
 async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>, ServerError> {
     match config.auth_provider() {
         AuthProviderKind::Local => {
@@ -1265,36 +1353,45 @@ async fn build_auth_provider(config: &ServerConfig) -> Result<Option<ServerAuth>
             let issuer = config
                 .auth_oidc_issuer()
                 .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
-            // Audience validation is mandatory: without a configured audience
-            // the verifier accepts ANY aud-bearing token minted by the issuer
-            // (including tokens for unrelated services at the same issuer),
-            // broadening token acceptance across service boundaries.
-            let audience = config.auth_oidc_audience().ok_or_else(|| {
-                ServerError::Config(ServerConfigError::ConfigFileError(
-                    "SHARDLINE_AUTH_OIDC_AUDIENCE is required when \
-                     SHARDLINE_AUTH_PROVIDER=oidc; without it any aud-bearing token \
-                     from the issuer is accepted"
-                        .into(),
-                ))
-            })?;
-            let provider = OidcProvider::new(
+            let audience = required_external_audience(
+                config.auth_oidc_audience(),
+                "SHARDLINE_AUTH_OIDC_AUDIENCE",
+            )?;
+            let mapping = crate::external_jwt_claims::ExternalJwtClaims::from_config(config)?;
+            let mut provider = OidcProvider::new(
                 issuer,
                 Some(audience.to_owned()),
                 config.auth_oidc_jwks_host_allowlist().unwrap_or(&[]),
             )
             .await
             .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
-            Ok(Some(ServerAuth::from_provider(Box::new(provider))))
+            provider.claim_mapping = mapping;
+            Ok(Some(ServerAuth::from_external_jwt_provider(
+                Box::new(provider),
+                config.token_signing_key(),
+            )?))
         }
         AuthProviderKind::Jwks => {
             let jwks_url = config
                 .auth_jwks_url()
                 .ok_or_else(|| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
             let issuer = config.auth_jwks_issuer().unwrap_or("jwks");
-            let provider = JwksProvider::new(jwks_url, issuer)
+            let audience = required_external_audience(
+                config.auth_jwks_audience(),
+                "SHARDLINE_AUTH_JWKS_AUDIENCE",
+            )?;
+            let mapping = crate::external_jwt_claims::ExternalJwtClaims::from_config(config)?;
+            let mut provider = JwksProvider::new(jwks_url, issuer)
                 .await
                 .map_err(|_e| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
-            Ok(Some(ServerAuth::from_provider(Box::new(provider))))
+            provider = provider
+                .with_audience(audience.to_owned())
+                .map_err(|_error| ServerError::Config(ServerConfigError::InvalidAuthProvider))?;
+            provider.claim_mapping = mapping;
+            Ok(Some(ServerAuth::from_external_jwt_provider(
+                Box::new(provider),
+                config.token_signing_key(),
+            )?))
         }
         AuthProviderKind::Ed25519 => {
             let provider = match (config.ed25519_private_key(), config.ed25519_public_key()) {
@@ -1448,3 +1545,6 @@ mod e2e_tests;
 
 #[cfg(test)]
 mod metadata_routes_tests;
+
+#[cfg(all(test, feature = "docker"))]
+mod hub_recovery_e2e;

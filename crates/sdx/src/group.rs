@@ -113,23 +113,11 @@ struct StreamRegistration {
 }
 
 impl StreamRegistration {
-    fn new(id: u64, stream: &DownloadStream) -> Arc<Self> {
+    fn new(id: u64, run_state: Arc<RunState>, start_signal: Option<Arc<Notify>>) -> Arc<Self> {
         Arc::new(Self {
             id,
-            run_state: stream.run_state(),
-            start_signal: stream.pending_start_signal(),
-            started: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            explicitly_cancelled: AtomicBool::new(false),
-            observed_failure: Mutex::new(None),
-        })
-    }
-
-    fn new_unordered(id: u64, stream: &UnorderedDownloadStream) -> Arc<Self> {
-        Arc::new(Self {
-            id,
-            run_state: stream.run_state(),
-            start_signal: stream.pending_start_signal(),
+            run_state,
+            start_signal,
             started: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             explicitly_cancelled: AtomicBool::new(false),
@@ -182,6 +170,36 @@ impl StreamRegistration {
         }
         XetTaskState::Queued
     }
+}
+
+fn active_registration_count<T>(active: &Mutex<HashMap<u64, Weak<T>>>) -> usize {
+    active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .filter(|registration| registration.strong_count() != 0)
+        .count()
+}
+
+/// Collect live registrations while holding the registry lock, then order by id.
+fn group_status<T>(
+    aborted: &AtomicBool,
+    active: &Mutex<HashMap<u64, Weak<T>>>,
+    state: impl Fn(&T, bool) -> XetTaskState,
+) -> Vec<(u64, XetTaskState)> {
+    let aborted = aborted.load(Ordering::Relaxed);
+    let active = active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut states = Vec::with_capacity(active.len());
+    for (id, weak) in active.iter() {
+        let Some(registration) = weak.upgrade() else {
+            continue;
+        };
+        states.push((*id, state(&registration, aborted)));
+    }
+    states.sort_by_key(|(id, _)| *id);
+    states
 }
 
 impl XetStreamGroupInner {
@@ -259,16 +277,17 @@ impl XetStreamGroup {
             .session
             .build_reconstructor(file_id, range)
             .await?;
-        reconstructor = reconstructor.with_cancellation_token(stream_token.clone());
+        reconstructor = reconstructor.with_cancellation_token(stream_token);
         let stream = reconstructor.reconstruct_to_stream();
-        let registration = StreamRegistration::new(id, &stream);
-        self.register(&registration);
-        Ok(GroupedDownloadStream::new(
-            stream,
+        let registration =
+            StreamRegistration::new(id, stream.run_state(), stream.pending_start_signal());
+        self.inner.register(&registration);
+        Ok(GroupedDownloadStream {
+            inner: stream,
             id,
             registration,
-            Arc::downgrade(&self.inner),
-        ))
+            group: Arc::downgrade(&self.inner),
+        })
     }
 
     /// Creates an unordered streaming download of `file_id` (optionally
@@ -292,16 +311,17 @@ impl XetStreamGroup {
             .session
             .build_reconstructor(file_id, range)
             .await?;
-        reconstructor = reconstructor.with_cancellation_token(stream_token.clone());
+        reconstructor = reconstructor.with_cancellation_token(stream_token);
         let stream = reconstructor.reconstruct_to_unordered_stream();
-        let registration = StreamRegistration::new_unordered(id, &stream);
-        self.register(&registration);
-        Ok(GroupedUnorderedDownloadStream::new(
-            stream,
+        let registration =
+            StreamRegistration::new(id, stream.run_state(), stream.pending_start_signal());
+        self.inner.register(&registration);
+        Ok(GroupedUnorderedDownloadStream {
+            inner: stream,
             id,
             registration,
-            Arc::downgrade(&self.inner),
-        ))
+            group: Arc::downgrade(&self.inner),
+        })
     }
 
     /// Aborts every active stream in this group and cancels the group's
@@ -330,40 +350,17 @@ impl XetStreamGroup {
     /// state)` pairs, ordered by stream id.
     #[must_use]
     pub fn status(&self) -> Vec<(u64, XetTaskState)> {
-        let aborted = self.inner.aborted.load(Ordering::Relaxed);
-        let active = self
-            .inner
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut states = Vec::with_capacity(active.len());
-        for (id, weak) in active.iter() {
-            let Some(registration) = weak.upgrade() else {
-                continue;
-            };
-            states.push((*id, registration.state(aborted)));
-        }
-        states.sort_by_key(|(id, _)| *id);
-        states
+        group_status(
+            &self.inner.aborted,
+            &self.inner.active,
+            StreamRegistration::state,
+        )
     }
 
     /// Number of live (not-yet-dropped) streams registered with this group.
     #[must_use]
     pub fn active_stream_count(&self) -> usize {
-        let active = self
-            .inner
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active
-            .values()
-            .filter(|weak| weak.upgrade().is_some())
-            .count()
-    }
-
-    /// Registers a stream; streams created after an abort start cancelled.
-    fn register(&self, registration: &Arc<StreamRegistration>) {
-        self.inner.register(registration);
+        active_registration_count(&self.inner.active)
     }
 }
 
@@ -380,20 +377,6 @@ pub struct GroupedDownloadStream {
 }
 
 impl GroupedDownloadStream {
-    const fn new(
-        inner: DownloadStream,
-        id: u64,
-        registration: Arc<StreamRegistration>,
-        group: Weak<XetStreamGroupInner>,
-    ) -> Self {
-        Self {
-            inner,
-            id,
-            registration,
-            group,
-        }
-    }
-
     /// Returns the unique stream id within its group.
     #[must_use]
     pub const fn task_id(&self) -> u64 {
@@ -479,20 +462,6 @@ pub struct GroupedUnorderedDownloadStream {
 }
 
 impl GroupedUnorderedDownloadStream {
-    const fn new(
-        inner: UnorderedDownloadStream,
-        id: u64,
-        registration: Arc<StreamRegistration>,
-        group: Weak<XetStreamGroupInner>,
-    ) -> Self {
-        Self {
-            inner,
-            id,
-            registration,
-            group,
-        }
-    }
-
     /// Returns the unique stream id within its group.
     #[must_use]
     pub const fn task_id(&self) -> u64 {
@@ -585,36 +554,29 @@ pub struct XetUploadCommit {
 struct XetUploadCommitInner {
     session: UploadSession,
     id: u64,
-    token: CancellationToken,
     aborted: AtomicBool,
-    active: Mutex<HashMap<u64, Weak<UploadRegistration>>>,
+    active: Mutex<HashMap<u64, Weak<UploadStreamHandle>>>,
     next_id: AtomicU64,
     #[cfg(test)]
     registration_gate: Option<Arc<std::sync::Barrier>>,
 }
 
-/// Per-upload bookkeeping shared between the group and the handle wrapper.
-struct UploadRegistration {
-    handle: UploadStreamHandle,
-}
-
-impl UploadRegistration {
-    fn state(&self, group_aborted: bool) -> XetTaskState {
-        let flags = self.handle.status_flags();
-        if group_aborted || flags.aborted {
-            return XetTaskState::Cancelled;
-        }
-        if let Some(message) = flags.error {
-            return XetTaskState::Failed(message);
-        }
-        if flags.finished {
-            return XetTaskState::Completed;
-        }
-        if flags.started {
-            return XetTaskState::InProgress;
-        }
-        XetTaskState::Queued
+/// Maps the shared upload handle's status into the group status vocabulary.
+fn upload_state(handle: &UploadStreamHandle, group_aborted: bool) -> XetTaskState {
+    let flags = handle.status_flags();
+    if group_aborted || flags.aborted {
+        return XetTaskState::Cancelled;
     }
+    if let Some(message) = flags.error {
+        return XetTaskState::Failed(message);
+    }
+    if flags.finished {
+        return XetTaskState::Completed;
+    }
+    if flags.started {
+        return XetTaskState::InProgress;
+    }
+    XetTaskState::Queued
 }
 
 impl XetUploadCommit {
@@ -629,7 +591,6 @@ impl XetUploadCommit {
             inner: Arc::new(XetUploadCommitInner {
                 session: upload_session,
                 id: NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed),
-                token: CancellationToken::new(),
                 aborted: AtomicBool::new(false),
                 active: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
@@ -680,17 +641,13 @@ impl XetUploadCommit {
                 "upload group aborted; cannot start new streams".to_owned(),
             ));
         }
-        let handle = self.inner.session.upload_stream_handle_with_id(id);
-        let registration = Arc::new(UploadRegistration {
-            handle: handle.clone(),
-        });
-        active.insert(id, Arc::downgrade(&registration));
-        Ok(GroupedUploadStream::new(
-            handle,
+        let handle = Arc::new(self.inner.session.upload_stream_handle_with_id(id));
+        active.insert(id, Arc::downgrade(&handle));
+        Ok(GroupedUploadStream {
             id,
-            registration,
-            Arc::downgrade(&self.inner),
-        ))
+            handle,
+            group: Arc::downgrade(&self.inner),
+        })
     }
 
     /// Finalizes the shared upload session: joins all xorb uploads, then
@@ -711,22 +668,20 @@ impl XetUploadCommit {
         self.inner.session.finalize().await
     }
 
-    /// Aborts every active upload in this group and cancels the group's
-    /// cancellation subtree.
+    /// Aborts every active upload and prevents new uploads in this group.
     ///
     /// Active [`GroupedUploadStream`] handles report [`XetTaskState::Cancelled`];
     /// handles created after the abort fail immediately.
     pub fn abort(&self) {
         self.inner.aborted.store(true, Ordering::Relaxed);
-        self.inner.token.cancel();
         let active = self
             .inner
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for weak in active.values() {
-            if let Some(registration) = weak.upgrade() {
-                registration.handle.abort();
+            if let Some(handle) = weak.upgrade() {
+                handle.abort();
             }
         }
     }
@@ -735,36 +690,14 @@ impl XetUploadCommit {
     /// pairs, ordered by upload id.
     #[must_use]
     pub fn status(&self) -> Vec<(u64, XetTaskState)> {
-        let aborted = self.inner.aborted.load(Ordering::Relaxed);
-        let active = self
-            .inner
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut states = Vec::with_capacity(active.len());
-        for (id, weak) in active.iter() {
-            let Some(registration) = weak.upgrade() else {
-                continue;
-            };
-            states.push((*id, registration.state(aborted)));
-        }
-        states.sort_by_key(|(id, _)| *id);
-        states
+        group_status(&self.inner.aborted, &self.inner.active, upload_state)
     }
 
     /// Number of live (not-yet-dropped) upload handles registered with this
     /// group.
     #[must_use]
     pub fn active_upload_count(&self) -> usize {
-        let active = self
-            .inner
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active
-            .values()
-            .filter(|weak| weak.upgrade().is_some())
-            .count()
+        active_registration_count(&self.inner.active)
     }
 }
 
@@ -786,27 +719,12 @@ impl XetUploadCommitInner {
 /// this upload, and [`task_id`](Self::task_id) identifies it in the group
 /// status probe.
 pub struct GroupedUploadStream {
-    handle: UploadStreamHandle,
     id: u64,
-    registration: Arc<UploadRegistration>,
+    handle: Arc<UploadStreamHandle>,
     group: Weak<XetUploadCommitInner>,
 }
 
 impl GroupedUploadStream {
-    const fn new(
-        handle: UploadStreamHandle,
-        id: u64,
-        registration: Arc<UploadRegistration>,
-        group: Weak<XetUploadCommitInner>,
-    ) -> Self {
-        Self {
-            handle,
-            id,
-            registration,
-            group,
-        }
-    }
-
     /// Returns the unique upload id within its group.
     #[must_use]
     pub const fn task_id(&self) -> u64 {
@@ -864,7 +782,7 @@ impl GroupedUploadStream {
             .group
             .upgrade()
             .is_some_and(|group| group.aborted.load(Ordering::Relaxed));
-        self.registration.state(aborted)
+        upload_state(&self.handle, aborted)
     }
 
     /// Cancels this upload only (the group and sibling uploads continue).
@@ -1624,55 +1542,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abort_mid_stream_stops_promptly() {
+    async fn abort_stops_running_and_queued_streams_promptly() {
         let server = MockServer::start().await;
         mocks(&server, Some(Duration::from_secs(30))).await;
         let group = client(&server).await.new_download_stream_group();
-
-        let mut stream = group.download_stream(FILE_ID, None).await.unwrap();
-        let id = stream.task_id();
-        // The xorb fetch is delayed, so next() blocks until the group aborts.
-        let abort = {
-            let group = group.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                group.abort();
-            })
-        };
-        let next = timeout(Duration::from_secs(5), stream.next())
-            .await
-            .expect("abort must stop the stream promptly")
-            .unwrap();
-        assert!(next.is_none());
-        abort.await.unwrap();
-        assert!(group.is_aborted());
-        assert!(group.status().contains(&(id, XetTaskState::Cancelled)));
-    }
-
-    #[tokio::test]
-    async fn abort_cancels_queued_streams_too() {
-        let server = MockServer::start().await;
-        mocks(&server, Some(Duration::from_secs(30))).await;
-        let group = client(&server).await.new_download_stream_group();
-
-        // A queued (never started) stream alongside a running one.
         let mut queued = group.download_stream(FILE_ID, None).await.unwrap();
         let queued_id = queued.task_id();
         let mut running = group.download_stream(FILE_ID, None).await.unwrap();
         let running_id = running.task_id();
 
-        group.abort();
+        // next() starts the running stream and blocks on the delayed fetch;
+        // its sibling stays queued until the group is aborted.
+        let abort = {
+            let group = group.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(group.status().contains(&(queued_id, XetTaskState::Queued)));
+                assert!(
+                    group
+                        .status()
+                        .contains(&(running_id, XetTaskState::InProgress))
+                );
+                group.abort();
+            })
+        };
         let next = timeout(Duration::from_secs(5), running.next())
             .await
-            .expect("abort must stop the running stream")
+            .expect("abort must stop the running stream promptly")
             .unwrap();
         assert!(next.is_none());
+        abort.await.unwrap();
         let next = timeout(Duration::from_secs(5), queued.next())
             .await
-            .expect("abort must stop the queued stream")
+            .expect("abort must stop the queued stream promptly")
             .unwrap();
         assert!(next.is_none());
-
+        assert!(group.is_aborted());
         let status = group.status();
         assert!(status.contains(&(queued_id, XetTaskState::Cancelled)));
         assert!(status.contains(&(running_id, XetTaskState::Cancelled)));
@@ -1737,15 +1642,5 @@ mod tests {
         // b is untouched and still completes.
         let out = drain(&mut b).await;
         assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn xet_task_state_is_comparable() {
-        assert_eq!(XetTaskState::Queued, XetTaskState::Queued);
-        assert_ne!(XetTaskState::Queued, XetTaskState::InProgress);
-        assert_ne!(
-            XetTaskState::Failed("x".to_owned()),
-            XetTaskState::Failed("y".to_owned())
-        );
     }
 }

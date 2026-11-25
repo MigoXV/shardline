@@ -10,7 +10,6 @@ readme = "README.md"
 description = "Garbage collection for Shardline chunk storage."
 
 [dependencies]
-async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 shardline-index.workspace = true
@@ -18,13 +17,13 @@ shardline-metrics.workspace = true
 shardline-oci-adapter.workspace = true
 shardline-protocol.workspace = true
 shardline-server-core.workspace = true
-shardline-storage.workspace = true
+shardline-storage = { workspace = true, features = ["s3"] }
 shardline-xet-adapter.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt"] }
 shardline-xet-core.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

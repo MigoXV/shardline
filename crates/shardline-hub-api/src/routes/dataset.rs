@@ -67,6 +67,31 @@ const MAX_DATASET_TEXT_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DATASET_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DATASET_TEXT_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
+async fn default_dataset_files(
+    state: &HubState,
+    name: &str,
+    auth: &AuthorizedRepository,
+) -> Result<Vec<HubFileEntry>, HubApiError> {
+    let entry = state
+        .store
+        .get_repo(name)?
+        .ok_or(HubApiError::RepoNotFound)?;
+    if entry.repo_type != HubRepoType::Dataset {
+        return Err(HubApiError::PathValidation(
+            "not a dataset repository".to_owned(),
+        ));
+    }
+    let commit_sha = state
+        .store
+        .resolve_revision(name, &entry.default_branch)?
+        .ok_or(HubApiError::RevisionNotFound)?;
+    crate::revision_access::authorize_read(state, name, "main", &commit_sha, auth).await?;
+    state
+        .store
+        .get_files(&commit_sha)
+        .map_err(|error| HubApiError::CasError(error.to_string()))
+}
+
 // ---- Dataset viewer endpoints ----
 
 /// Lists parquet/data files in a dataset repository.
@@ -77,36 +102,16 @@ pub(crate) async fn dataset_parquet(
 ) -> Result<Json<DatasetParquetResponse>, HubApiError> {
     shardline_metrics::record_hub_api_request("dataset_parquet", "GET", 200);
     let name = format!("{ns}/{repo_name}");
-    let entry = state
-        .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RepoNotFound)?;
-    if entry.repo_type != HubRepoType::Dataset {
-        return Err(HubApiError::PathValidation(
-            "not a dataset repository".to_owned(),
-        ));
-    }
-    let commit_sha = state
-        .store
-        .resolve_revision(&name, &entry.default_branch)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RevisionNotFound)?;
-    crate::revision_access::authorize_read(&state, &name, "main", &commit_sha, _repo.capability())
-        .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = default_dataset_files(&state, &name, _repo.capability()).await?;
     let parquet_files: Vec<DatasetParquetFile> = files
-        .iter()
+        .into_iter()
         .filter(|f| {
             f.path.ends_with(".parquet") || f.path.ends_with(".csv") || f.path.ends_with(".jsonl")
         })
         .map(|f| DatasetParquetFile {
-            path: f.path.clone(),
+            path: f.path,
             size: f.size,
-            sha: f.sha.clone(),
+            sha: f.sha,
         })
         .collect();
     Ok(Json(DatasetParquetResponse {
@@ -123,27 +128,7 @@ pub(crate) async fn dataset_first_rows(
 ) -> Result<Json<DatasetFirstRowsResponse>, HubApiError> {
     shardline_metrics::record_hub_api_request("dataset_first_rows", "GET", 200);
     let name = format!("{ns}/{repo_name}");
-    let entry = state
-        .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RepoNotFound)?;
-    if entry.repo_type != HubRepoType::Dataset {
-        return Err(HubApiError::PathValidation(
-            "not a dataset repository".to_owned(),
-        ));
-    }
-    let commit_sha = state
-        .store
-        .resolve_revision(&name, &entry.default_branch)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RevisionNotFound)?;
-    crate::revision_access::authorize_read(&state, &name, "main", &commit_sha, repo.capability())
-        .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = default_dataset_files(&state, &name, repo.capability()).await?;
     let data_file = match find_dataset_file(&files, &query.config, &query.split) {
         Some(f) => f,
         None => {
@@ -169,27 +154,7 @@ pub(crate) async fn dataset_viewer(
 ) -> Result<Json<DatasetViewerResponse>, HubApiError> {
     shardline_metrics::record_hub_api_request("dataset_viewer", "GET", 200);
     let name = format!("{ns}/{repo_name}");
-    let entry = state
-        .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RepoNotFound)?;
-    if entry.repo_type != HubRepoType::Dataset {
-        return Err(HubApiError::PathValidation(
-            "not a dataset repository".to_owned(),
-        ));
-    }
-    let commit_sha = state
-        .store
-        .resolve_revision(&name, &entry.default_branch)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-        .ok_or(HubApiError::RevisionNotFound)?;
-    crate::revision_access::authorize_read(&state, &name, "main", &commit_sha, repo.capability())
-        .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = default_dataset_files(&state, &name, repo.capability()).await?;
     let data_file = find_dataset_file(&files, &query.config, &split).ok_or_else(|| {
         HubApiError::PathValidation("no data file found for config/split".to_owned())
     })?;
@@ -232,8 +197,7 @@ pub(crate) async fn dataset_query(
     }
     let entry = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
     if entry.repo_type != HubRepoType::Dataset {
         return Err(HubApiError::PathValidation(
@@ -262,10 +226,7 @@ pub(crate) async fn dataset_query(
     {
         return Err(HubApiError::RevisionNotFound);
     }
-    let files = state
-        .store
-        .get_files(&revision)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = state.store.get_files(&revision)?;
     let file = find_dataset_file(&files, &request.config, &request.split).ok_or_else(|| {
         HubApiError::PathValidation("no data file found for config/split".to_owned())
     })?;
@@ -287,32 +248,26 @@ pub(crate) async fn dataset_query(
         .length();
     let object_store = state.object_store.clone();
     let mut selected_columns = request.columns.clone();
-    for predicate in &request.predicates {
-        if !selected_columns
-            .iter()
-            .any(|column| column == &predicate.column)
-        {
-            selected_columns.push(predicate.column.clone());
-        }
-    }
-    for aggregate in &request.aggregates {
-        if let Some(column) = &aggregate.column
-            && !selected_columns.iter().any(|selected| selected == column)
-        {
+    for column in request
+        .predicates
+        .iter()
+        .map(|predicate| &predicate.column)
+        .chain(
+            request
+                .aggregates
+                .iter()
+                .filter_map(|aggregate| aggregate.column.as_ref()),
+        )
+        .chain(request.order_by.iter().map(|order| &order.column))
+    {
+        if !selected_columns.contains(column) {
             selected_columns.push(column.clone());
         }
     }
-    for order in &request.order_by {
-        if !selected_columns
-            .iter()
-            .any(|selected| selected == &order.column)
-        {
-            selected_columns.push(order.column.clone());
-        }
-    }
-    let predicates = request.predicates.clone();
-    let aggregates = request.aggregates.clone();
-    let order_by = request.order_by.clone();
+    let has_aggregates = !request.aggregates.is_empty();
+    let predicates = request.predicates;
+    let aggregates = request.aggregates;
+    let order_by = request.order_by;
     let offset = request.offset as usize;
     let limit = request.limit as usize;
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -358,13 +313,13 @@ pub(crate) async fn dataset_query(
             return Err(failure.error);
         }
     };
-    let (output_columns, rows) = if request.aggregates.is_empty() && !request.columns.is_empty() {
+    let (output_columns, rows) = if !has_aggregates && !request.columns.is_empty() {
         let mut rows = rows;
         for row in &mut rows {
             row.columns
                 .retain(|column, _| request.columns.iter().any(|selected| selected == column));
         }
-        (request.columns.clone(), rows)
+        (request.columns, rows)
     } else {
         (output_columns, rows)
     };
@@ -401,103 +356,6 @@ pub(crate) fn find_dataset_file<'input>(
         }
     }
     None
-}
-
-/// Parses rows from inline file content (CSV or JSONL).
-#[cfg(test)]
-pub(crate) fn parse_rows_from_content(
-    content: &[u8],
-    path: &str,
-    offset: usize,
-    limit: usize,
-) -> Result<Vec<DatasetRow>, HubApiError> {
-    let text = std::str::from_utf8(content)
-        .map_err(|e| HubApiError::PathValidation(format!("invalid UTF-8: {e}")))?;
-    if path.ends_with(".jsonl") {
-        parse_jsonl_rows(text, offset, limit)
-    } else if path.ends_with(".csv") {
-        parse_csv_rows(text, offset, limit)
-    } else {
-        Err(HubApiError::PathValidation(format!(
-            "unsupported file format: {path}"
-        )))
-    }
-}
-
-/// Parses JSONL (newline-delimited JSON) rows.
-#[cfg(test)]
-pub(crate) fn parse_jsonl_rows(
-    text: &str,
-    offset: usize,
-    limit: usize,
-) -> Result<Vec<DatasetRow>, HubApiError> {
-    let mut rows = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if i < offset {
-            continue;
-        }
-        if rows.len() >= limit {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let line_number = i
-            .checked_add(1)
-            .ok_or_else(|| HubApiError::PathValidation("line number overflow".to_owned()))?;
-        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-            HubApiError::PathValidation(format!("invalid JSON at line {}: {e}", line_number))
-        })?;
-        let columns = value
-            .as_object()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        rows.push(DatasetRow { columns });
-    }
-    Ok(rows)
-}
-
-/// Parses CSV rows, handling quoted fields that may contain commas.
-#[cfg(test)]
-pub(crate) fn parse_csv_rows(
-    text: &str,
-    offset: usize,
-    limit: usize,
-) -> Result<Vec<DatasetRow>, HubApiError> {
-    let mut lines = text.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| HubApiError::PathValidation("empty CSV file".to_owned()))?;
-    let headers: Vec<String> = parse_csv_line(header_line)
-        .into_iter()
-        .map(|h| h.trim().trim_matches('"').to_owned())
-        .collect();
-    let mut rows = Vec::new();
-    for (i, line) in lines.enumerate() {
-        if i < offset {
-            continue;
-        }
-        if rows.len() >= limit {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let values: Vec<&str> = parse_csv_line(line);
-        let columns: std::collections::BTreeMap<String, serde_json::Value> = headers
-            .iter()
-            .zip(values.iter())
-            .map(|(h, v)| {
-                let json_val = serde_json::from_str(v)
-                    .unwrap_or_else(|_| serde_json::Value::String(v.trim_matches('"').to_owned()));
-                (h.clone(), json_val)
-            })
-            .collect();
-        rows.push(DatasetRow { columns });
-    }
-    Ok(rows)
 }
 
 fn read_dataset_rows(
@@ -551,7 +409,6 @@ struct RangeLineReader {
     key: ObjectKey,
     length: u64,
     position: u64,
-    scanned: u64,
     chunk: Vec<u8>,
     chunk_position: usize,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -569,7 +426,6 @@ impl RangeLineReader {
             key,
             length,
             position: 0,
-            scanned: 0,
             chunk: Vec::new(),
             chunk_position: 0,
             cancelled,
@@ -585,7 +441,7 @@ impl RangeLineReader {
         if self.position >= self.length {
             return Ok(false);
         }
-        if self.scanned >= MAX_DATASET_TEXT_SCAN_BYTES {
+        if self.position >= MAX_DATASET_TEXT_SCAN_BYTES {
             return Err(HubApiError::PathValidation(
                 "dataset text scan limit exceeded".to_owned(),
             ));
@@ -594,10 +450,7 @@ impl RangeLineReader {
             .position
             .saturating_add(super::object_io::OBJECT_STREAM_CHUNK_BYTES)
             .min(self.length)
-            .min(
-                self.position
-                    .saturating_add(MAX_DATASET_TEXT_SCAN_BYTES.saturating_sub(self.scanned)),
-            );
+            .min(MAX_DATASET_TEXT_SCAN_BYTES);
         let end = end_exclusive
             .checked_sub(1)
             .ok_or_else(|| HubApiError::PathValidation("dataset text range overflow".to_owned()))?;
@@ -612,14 +465,13 @@ impl RangeLineReader {
             usize::try_from(end_exclusive.saturating_sub(self.position)).map_err(|_error| {
                 HubApiError::PathValidation("dataset text range overflow".to_owned())
             })?;
-        if bytes.len() != expected || bytes.is_empty() {
+        if bytes.len() != expected {
             return Err(HubApiError::CasError(
                 shardline_server_core::ServerObjectStoreError::StoredObjectLengthMismatch
                     .to_string(),
             ));
         }
         self.position = end_exclusive;
-        self.scanned = self.scanned.saturating_add(bytes.len() as u64);
         self.chunk = bytes;
         self.chunk_position = 0;
         Ok(true)
@@ -643,30 +495,26 @@ impl RangeLineReader {
             let remaining = self.chunk.get(self.chunk_position..).ok_or_else(|| {
                 HubApiError::PathValidation("dataset text cursor out of bounds".to_owned())
             })?;
-            if let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
-                let end = self.chunk_position.saturating_add(newline);
-                let segment = self.chunk.get(self.chunk_position..end).ok_or_else(|| {
+            let newline = remaining.iter().position(|byte| *byte == b'\n');
+            let segment = remaining
+                .get(..newline.unwrap_or(remaining.len()))
+                .ok_or_else(|| {
                     HubApiError::PathValidation("dataset text cursor out of bounds".to_owned())
                 })?;
-                if line.len().saturating_add(segment.len()) > MAX_DATASET_LINE_BYTES {
-                    return Err(HubApiError::PathValidation(
-                        "dataset text line exceeds limit".to_owned(),
-                    ));
-                }
-                line.extend_from_slice(segment);
-                self.chunk_position = end.saturating_add(1);
+            if line.len().saturating_add(segment.len()) > MAX_DATASET_LINE_BYTES {
+                return Err(HubApiError::PathValidation(
+                    "dataset text line exceeds limit".to_owned(),
+                ));
+            }
+            line.extend_from_slice(segment);
+            self.chunk_position = self.chunk_position.saturating_add(segment.len());
+            if newline.is_some() {
+                self.chunk_position = self.chunk_position.saturating_add(1);
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
                 return Ok(Some(line));
             }
-            if line.len().saturating_add(remaining.len()) > MAX_DATASET_LINE_BYTES {
-                return Err(HubApiError::PathValidation(
-                    "dataset text line exceeds limit".to_owned(),
-                ));
-            }
-            line.extend_from_slice(remaining);
-            self.chunk_position = self.chunk.len();
         }
     }
 }
@@ -735,20 +583,15 @@ fn read_text_rows_streaming(
             let value: serde_json::Value = serde_json::from_str(line).map_err(|_error| {
                 HubApiError::PathValidation("invalid JSON in dataset text".to_owned())
             })?;
-            let mapped = value
-                .as_object()
-                .map(|object| {
-                    object
-                        .iter()
-                        .map(|(field, field_value)| (field.clone(), field_value.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mapped = if let serde_json::Value::Object(object) = value {
+                object.into_iter().collect()
+            } else {
+                Default::default()
+            };
             DatasetRow { columns: mapped }
         };
         if columns.is_empty() {
             columns = row.columns.keys().cloned().collect();
-            columns.sort();
         }
         rows.push(row);
         data_row = data_row.saturating_add(1);
@@ -840,12 +683,10 @@ pub(crate) fn parse_csv_line(line: &str) -> Vec<&str> {
             }
         } else {
             // Unquoted field — split on comma.
-            match current.find(',') {
-                Some(pos) => {
-                    fields.push(&current[..pos]);
-                    current = pos
-                        .checked_add(1)
-                        .map_or("", |n| current.get(n..).unwrap_or(""));
+            match current.split_once(',') {
+                Some((field, rest)) => {
+                    fields.push(field);
+                    current = rest;
                 }
                 None => {
                     fields.push(current);
@@ -862,10 +703,12 @@ pub(crate) fn parse_csv_line(line: &str) -> Vec<&str> {
 }
 
 #[cfg(test)]
-mod cancellation_tests {
-    use super::{QueryCancellationGuard, RangeLineReader};
+mod tests {
+    use super::{
+        DatasetRow, HubApiError, QueryCancellationGuard, RangeLineReader, read_text_rows_streaming,
+    };
     use shardline_server_core::ServerObjectStore;
-    use shardline_storage::ObjectKey;
+    use shardline_storage::{ObjectKey, ObjectStore};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -898,5 +741,210 @@ mod cancellation_tests {
             cancelled,
         );
         assert!(reader.next_line().is_err());
+    }
+    #[test]
+    fn text_reader_distinguishes_scan_limit_from_exact_eof() {
+        let mut reader = RangeLineReader::new(
+            &ServerObjectStore::Blackhole,
+            ObjectKey::parse("preview").unwrap(),
+            super::MAX_DATASET_TEXT_SCAN_BYTES + 1,
+            Arc::new(AtomicBool::new(false)),
+        );
+        reader.position = super::MAX_DATASET_TEXT_SCAN_BYTES;
+        assert!(matches!(
+            reader.next_line(),
+            Err(HubApiError::PathValidation(message)) if message == "dataset text scan limit exceeded"
+        ));
+        reader.length = reader.position;
+        assert!(reader.next_line().unwrap().is_none());
+    }
+
+    #[test]
+    fn text_reader_handles_crlf_split_across_storage_ranges_and_final_line() {
+        let mut content =
+            vec![b'a'; super::super::object_io::OBJECT_STREAM_CHUNK_BYTES as usize - 1];
+        content.extend_from_slice(b"\r\nlast");
+        let (_directory, store, key) = preview_store(&content);
+        let mut reader = RangeLineReader::new(
+            &store,
+            key,
+            content.len() as u64,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let first = reader.next_line().unwrap().unwrap();
+        assert_eq!(first, content[..content.len() - 6]);
+        assert_eq!(reader.next_line().unwrap().unwrap(), b"last");
+        assert!(reader.next_line().unwrap().is_none());
+    }
+
+    #[test]
+    fn text_reader_enforces_line_limit_across_multiple_storage_ranges() {
+        for length in [
+            super::MAX_DATASET_LINE_BYTES,
+            super::MAX_DATASET_LINE_BYTES + 1,
+        ] {
+            let mut content = vec![b'a'; length];
+            content.push(b'\n');
+            let (_directory, store, key) = preview_store(&content);
+            let mut reader = RangeLineReader::new(
+                &store,
+                key,
+                content.len() as u64,
+                Arc::new(AtomicBool::new(false)),
+            );
+            if length == super::MAX_DATASET_LINE_BYTES {
+                assert_eq!(reader.next_line().unwrap().unwrap(), content[..length]);
+                assert!(reader.next_line().unwrap().is_none());
+            } else {
+                assert!(matches!(
+                    reader.next_line(),
+                    Err(HubApiError::PathValidation(message)) if message == "dataset text line exceeds limit"
+                ));
+            }
+        }
+    }
+
+    fn preview_store(content: &[u8]) -> (tempfile::TempDir, ServerObjectStore, ObjectKey) {
+        use shardline_protocol::ShardlineHash;
+        use shardline_storage::{ObjectBody, ObjectIntegrity};
+        let directory = tempfile::tempdir().unwrap();
+        let store = ServerObjectStore::local(directory.path().to_path_buf()).unwrap();
+        let key = ObjectKey::parse("preview").unwrap();
+        let integrity = ObjectIntegrity::new(
+            ShardlineHash::from_bytes(*blake3::hash(content).as_bytes()),
+            content.len() as u64,
+        );
+        store
+            .put_if_absent(&key, ObjectBody::from_vec(content.to_vec()), &integrity)
+            .unwrap();
+        (directory, store, key)
+    }
+
+    fn read_preview(
+        content: &[u8],
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<DatasetRow>, HubApiError> {
+        let (_directory, store, key) = preview_store(content);
+        read_text_rows_streaming(
+            &store,
+            &key,
+            content.len() as u64,
+            path,
+            offset,
+            limit,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .map(|(_, rows)| rows)
+    }
+
+    #[test]
+    fn streaming_preview_rejects_invalid_utf8() {
+        assert!(read_preview(b"\xff\xfe\x00", "data.csv", 0, 10).is_err());
+    }
+
+    #[test]
+    fn text_preview_pagination_skips_blank_lines_for_both_formats() {
+        for (path, text) in [
+            ("data.csv", "n\n1\n\n2\n3\n \t\n4\n5"),
+            (
+                "data.jsonl",
+                "{\"n\":1}\n\n{\"n\":2}\n{\"n\":3}\n \t\n{\"n\":4}\n{\"n\":5}",
+            ),
+        ] {
+            for (offset, limit, expected) in [
+                (0, 10, &[1, 2, 3, 4, 5][..]),
+                (2, 2, &[3, 4][..]),
+                (0, 0, &[][..]),
+                (5, 10, &[][..]),
+            ] {
+                let rows = read_preview(text.as_bytes(), path, offset, limit).unwrap();
+                let values: Vec<_> = rows.iter().map(|row| row.columns["n"].clone()).collect();
+                assert_eq!(
+                    values,
+                    expected
+                        .iter()
+                        .map(|n| serde_json::json!(n))
+                        .collect::<Vec<_>>(),
+                    "{path}, offset={offset}, limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_preview_empty_inputs_preserve_format_contracts() {
+        assert!(read_preview(b"", "data.jsonl", 0, 10).unwrap().is_empty());
+        assert!(matches!(
+            read_preview(b"", "data.csv", 0, 10),
+            Err(HubApiError::PathValidation(message)) if message == "empty CSV file"
+        ));
+        assert!(
+            read_preview(b"a,b,c", "data.csv", 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_rows_simple() {
+        let text = "{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}";
+        let rows = read_preview(text.as_bytes(), "data.jsonl", 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].columns.get("a"), Some(&serde_json::json!(1)));
+        assert_eq!(rows[1].columns.get("b"), Some(&serde_json::json!(4)));
+    }
+
+    #[test]
+    fn jsonl_preview_preserves_nested_values_and_empty_non_object_rows() {
+        let content = br#"{"nested":{"items":[1,{"name":"value"}]}}
+[1,2]
+null
+42
+"#;
+        let rows = read_preview(content, "data.jsonl", 0, 10).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].columns.get("nested"),
+            Some(&serde_json::json!({"items": [1, {"name": "value"}]}))
+        );
+        assert!(rows[1..].iter().all(|row| row.columns.is_empty()));
+    }
+
+    #[test]
+    fn parse_jsonl_rows_invalid_json() {
+        let text = "{\"a\":1}\nnot_json\n{\"a\":2}";
+        let result = read_preview(text.as_bytes(), "data.jsonl", 0, 10);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_csv_rows
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_csv_rows_simple() {
+        let text = "name,age\nAlice,30\nBob,25";
+        let rows = read_preview(text.as_bytes(), "data.csv", 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].columns.get("name"),
+            Some(&serde_json::json!("Alice"))
+        );
+        assert_eq!(rows[1].columns.get("age"), Some(&serde_json::json!(25)));
+    }
+
+    #[test]
+    fn parse_csv_rows_quoted_fields() {
+        let text = r#"name,description
+Alice,"hello, world"
+Bob,"say ""hi"""#;
+        let rows = read_preview(text.as_bytes(), "data.csv", 0, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].columns.get("description"),
+            Some(&serde_json::json!("hello, world"))
+        );
     }
 }

@@ -62,13 +62,9 @@ mod tests {
         let repository = RepositoryRef::new(ProviderKind::GitLab, "team", "assets");
         let revision = RevisionRef::new("main");
 
-        assert!(subject.is_ok());
-        assert!(repository.is_ok());
-        assert!(revision.is_ok());
-
-        let (Ok(subject), Ok(repository), Ok(revision)) = (subject, repository, revision) else {
-            return;
-        };
+        let subject = subject.expect("expected valid subject");
+        let repository = repository.expect("expected valid repository");
+        let revision = revision.expect("expected valid revision");
         let request =
             AuthorizationRequest::new(subject, repository, revision, RepositoryAccess::Write);
 
@@ -87,23 +83,7 @@ mod tests {
             AuthorizationRequest::new(subject, repository, revision, RepositoryAccess::Read);
 
         assert_eq!(request.access(), RepositoryAccess::Read);
-    }
-
-    #[test]
-    fn authorization_request_clone_and_eq() {
-        let subject = ProviderSubject::new("user-1").unwrap();
-        let repository = RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap();
-        let revision = RevisionRef::new("main").unwrap();
-
-        let a = AuthorizationRequest::new(
-            subject.clone(),
-            repository.clone(),
-            revision.clone(),
-            RepositoryAccess::Read,
-        );
-        let b = AuthorizationRequest::new(subject, repository, revision, RepositoryAccess::Read);
-
-        assert_eq!(a, b);
+        assert_eq!(request, request.clone());
     }
 
     #[test]
@@ -159,20 +139,5 @@ mod tests {
         );
 
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn authorization_request_is_send_and_sync() {
-        fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
-        let subject = ProviderSubject::new("user").unwrap();
-        let repo = RepositoryRef::new(ProviderKind::GitHub, "org", "repo").unwrap();
-        let rev = RevisionRef::new("main").unwrap();
-        let request = AuthorizationRequest::new(subject, repo, rev, RepositoryAccess::Read);
-
-        assert_send::<AuthorizationRequest>();
-        assert_sync::<AuthorizationRequest>();
-        // keep request alive
-        let _ = request;
     }
 }

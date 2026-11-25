@@ -10,8 +10,7 @@ use crate::{S3ObjectEntry, S3ObjectIndexStore, S3ObjectScanStart, s3_prefix_succ
 use shardline_reliability::{
     OperationKind, ReliabilityMerkleCommit, S3ObjectEvidenceLog, S3ObjectLifecycleEvent,
     S3ObjectSnapshot, S3ObjectState, SnapshotEvidence,
-    build_reliability_merkle_commit_with_previous, persisted_event_sequence,
-    verify_and_append_snapshot_transition, verify_persisted_merkle_commit_with_previous,
+    build_reliability_merkle_commit_with_previous, verify_and_append_snapshot_transition,
     verify_snapshot_event, verify_snapshot_evidence,
 };
 
@@ -353,78 +352,24 @@ struct S3ObjectEvidenceHead {
 
 async fn load_s3_object_evidence_head(
     connection: &mut PgConnection,
-    scope_namespace: &str,
-    object_key: &str,
+    snapshot: &S3ObjectSnapshot,
 ) -> Result<S3ObjectEvidenceHead, PostgresMetadataStoreError> {
-    let operation = s3_object_snapshot(scope_namespace, object_key, None)?.evidence_operation()?;
-    let row = query(
-        "SELECT evidence.sequence, evidence.event_json,
-                evidence.merkle_commit_json AS evidence_merkle_json,
-                previous_evidence.merkle_commit_json AS previous_evidence_merkle_json
-         FROM LATERAL (
-             SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id = $2
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) AS evidence
-         LEFT JOIN LATERAL (
-             SELECT CASE WHEN EXISTS (
-                 SELECT 1
-                 FROM shardline_reliability_events AS missing
-                 WHERE missing.operation_kind = $1 AND missing.operation_id = $2
-                   AND missing.sequence < evidence.sequence
-                   AND missing.merkle_commit_json IS NULL
-             ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE (
-                 SELECT previous.merkle_commit_json
-                 FROM shardline_reliability_events AS previous
-                 WHERE previous.operation_kind = $1 AND previous.operation_id = $2
-                   AND previous.sequence < evidence.sequence
-                 ORDER BY previous.sequence DESC LIMIT 1
-             ) END AS merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id = $2
-               AND sequence < evidence.sequence
-             ORDER BY sequence DESC
-             LIMIT 1
-         ) AS previous_evidence ON TRUE",
+    let operation = snapshot.evidence_operation()?;
+    let Some(head) = super::index_store::load_postgres_latest_evidence_head(
+        connection,
+        OperationKind::S3Object,
+        &operation.operation_id,
     )
-    .bind(OperationKind::S3Object.as_str())
-    .bind(&operation.operation_id)
-    .fetch_optional(&mut *connection)
-    .await?;
-    let Some(row) = row else {
+    .await?
+    else {
         return Ok(S3ObjectEvidenceHead {
             evidence: S3ObjectEvidenceLog::default(),
             commitment: None,
         });
     };
-    let sequence = i64_to_u64(row.try_get("sequence")?)?;
-    let event_json: serde_json::Value = row.try_get("event_json")?;
-    let event_sequence = persisted_event_sequence(OperationKind::S3Object, event_json.clone())?;
-    if sequence != event_sequence {
-        return Err(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::Merkle(
-                "S3 evidence row sequence does not match its event".into(),
-            ),
-        ));
-    }
-    let event: S3ObjectLifecycleEvent = from_value(event_json.clone())?;
-    if event.operation.operation_id != operation.operation_id {
-        return Err(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ));
-    }
-    let commitment_json: Option<serde_json::Value> = row.try_get("evidence_merkle_json")?;
-    verify_persisted_merkle_commit_with_previous(
-        OperationKind::S3Object,
-        event_json,
-        commitment_json.clone(),
-        row.try_get("previous_evidence_merkle_json")?,
-    )?;
     Ok(S3ObjectEvidenceHead {
-        evidence: S3ObjectEvidenceLog::from_head(event)?,
-        commitment: commitment_json,
+        evidence: S3ObjectEvidenceLog::from_head(from_value(head.event_json)?)?,
+        commitment: head.merkle_commit_json,
     })
 }
 
@@ -447,7 +392,7 @@ async fn verify_s3_object_evidence(
     entry: &S3ObjectEntry,
 ) -> Result<(), PostgresMetadataStoreError> {
     let snapshot = s3_object_snapshot(scope_namespace, object_key, Some(entry))?;
-    let evidence = load_s3_object_evidence_head(connection, scope_namespace, object_key).await?;
+    let evidence = load_s3_object_evidence_head(connection, &snapshot).await?;
     verify_snapshot_evidence(&evidence.evidence, &snapshot)?;
     Ok(())
 }
@@ -472,33 +417,16 @@ async fn persist_s3_object_event(
     previous: Option<&ReliabilityMerkleCommit>,
 ) -> Result<ReliabilityMerkleCommit, PostgresMetadataStoreError> {
     event.verify_integrity()?;
-    let sequence = u64_to_i64(event.sequence)?;
+    u64_to_i64(event.sequence)?;
     let commitment = build_reliability_merkle_commit_with_previous(event, previous)?;
-    let result = query(
-        "INSERT INTO shardline_reliability_events
-            (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds,
-             merkle_commit_json)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (operation_kind, operation_id, sequence) DO UPDATE
-         SET merkle_commit_json = COALESCE(
-             shardline_reliability_events.merkle_commit_json,
-             EXCLUDED.merkle_commit_json
-         )
-         WHERE shardline_reliability_events.event_json = EXCLUDED.event_json",
+    super::index_store::insert_reliability_event_value(
+        connection,
+        &event.operation,
+        event.sequence,
+        to_value(event)?,
+        to_value(&commitment)?,
     )
-    .bind(event.operation.kind.as_str())
-    .bind(&event.operation.operation_id)
-    .bind(sequence)
-    .bind(to_value(event)?)
-    .bind(shardline_protocol::unix_now_seconds_lossy() as i64)
-    .bind(to_value(&commitment)?)
-    .execute(&mut *connection)
     .await?;
-    if result.rows_affected() == 0 {
-        return Err(PostgresMetadataStoreError::ReliabilityEventConflict(
-            event.operation.operation_id.clone(),
-        ));
-    }
     Ok(commitment)
 }
 
@@ -556,8 +484,7 @@ pub(super) async fn record_s3_object_transition(
     })?;
     let before_snapshot = s3_object_snapshot(&entry.scope_namespace, &entry.object_key, before)?;
     let after_snapshot = s3_object_snapshot(&entry.scope_namespace, &entry.object_key, after)?;
-    let stored =
-        load_s3_object_evidence_head(connection, &entry.scope_namespace, &entry.object_key).await?;
+    let stored = load_s3_object_evidence_head(connection, &before_snapshot).await?;
     // Reuse the verified persisted head from this transition's transaction.
     // Capture it before baseline repair, whose sequence-zero event is new.
     // Carry its verified commitment into each append, then chain any newly
@@ -857,9 +784,7 @@ mod tests {
     use super::*;
     use sqlx::query_scalar;
 
-    async fn connect_postgres() -> Option<sqlx::PgPool> {
-        super::super::connect_isolated_postgres().await
-    }
+    use super::super::connect_isolated_postgres as connect_postgres;
 
     fn entry(scope_namespace: &str, object_key: &str, file_id: &str) -> S3ObjectEntry {
         S3ObjectEntry {
@@ -910,62 +835,6 @@ mod tests {
             store.s3_multipart_part_count(&stored).await.unwrap(),
             Some(3)
         );
-        cleanup(&pool, &scope).await;
-    }
-
-    async fn cleanup(pool: &sqlx::PgPool, scope_namespace: &str) {
-        // The production delete gate intentionally rejects raw row cleanup.
-        // Seed a valid terminal deletion boundary for each fixture row so the
-        // test cleanup exercises the same deferred-trigger contract as a real
-        // adapter mutation, including after evidence-tampering tests.
-        sqlx::query(
-            "WITH fixture_rows AS (
-                 SELECT o.scope_namespace, o.object_key,
-                        COALESCE(MAX(e.sequence), -1) + 1 AS next_sequence
-                 FROM shardline_s3_objects AS o
-                 LEFT JOIN shardline_reliability_events AS e
-                   ON e.operation_kind = 'S3Object'
-                  AND e.operation_id = octet_length(o.scope_namespace)::text || ':' || o.scope_namespace
-                      || octet_length(o.object_key)::text || ':' || o.object_key
-                 WHERE o.scope_namespace = $1
-                 GROUP BY o.scope_namespace, o.object_key
-             )
-             INSERT INTO shardline_reliability_events
-                 (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds)
-             SELECT 'S3Object',
-                    octet_length(scope_namespace)::text || ':' || scope_namespace
-                        || octet_length(object_key)::text || ':' || object_key,
-                    next_sequence,
-                    jsonb_build_object(
-                        'after', jsonb_build_object(
-                            'entry', NULL,
-                            'object_key', object_key,
-                            'scope_namespace', scope_namespace
-                        )
-                    ),
-                    EXTRACT(EPOCH FROM now())::bigint
-             FROM fixture_rows
-             ON CONFLICT (operation_kind, operation_id, sequence) DO NOTHING",
-        )
-        .bind(scope_namespace)
-        .execute(pool)
-        .await
-        .expect("seed deletion evidence");
-        sqlx::query("DELETE FROM shardline_s3_objects WHERE scope_namespace = $1")
-            .bind(scope_namespace)
-            .execute(pool)
-            .await
-            .expect("cleanup s3 object rows");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = $1
-               AND operation_id LIKE $2 || '%'",
-        )
-        .bind(OperationKind::S3Object.as_str())
-        .bind(format!("{}:{scope_namespace}", scope_namespace.len()))
-        .execute(pool)
-        .await
-        .expect("cleanup s3 object evidence");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -975,7 +844,6 @@ mod tests {
             return;
         };
         let scope = "pg-s3-cas";
-        cleanup(&pool, scope).await;
         let first_store = PostgresIndexStore::new(pool.clone());
         let second_store = PostgresIndexStore::new(pool.clone());
         let first = entry(scope, "model.bin", "first");
@@ -1012,7 +880,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated, if third_won { third } else { fourth });
-        cleanup(&pool, scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1022,7 +889,6 @@ mod tests {
             return;
         };
         let scope = format!("s3-concurrent-upsert-{}", std::process::id());
-        cleanup(&pool, &scope).await;
         let first_store = PostgresIndexStore::new(pool.clone());
         let second_store = PostgresIndexStore::new(pool.clone());
         let first = entry(&scope, "model.bin", "first");
@@ -1040,7 +906,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stored == first || stored == second);
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1065,8 +930,6 @@ mod tests {
             .expect("scan");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], overwrite);
-
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1154,7 +1017,6 @@ mod tests {
                 .unwrap(),
             Some(newer)
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1186,8 +1048,6 @@ mod tests {
                 .expect("scan")
                 .is_empty()
         );
-
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1277,7 +1137,6 @@ mod tests {
                 .expect("verified read"),
             Some(first)
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1346,7 +1205,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1379,7 +1237,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1438,7 +1295,6 @@ mod tests {
             file_id, "file-b",
             "failed append must roll back publication"
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1492,7 +1348,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1540,7 +1395,6 @@ mod tests {
         .await
         .expect("count evidence");
         assert_eq!(count, 0);
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1603,8 +1457,6 @@ mod tests {
             .await
             .expect("scan");
         assert_eq!(more.len(), 2);
-
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1643,7 +1495,6 @@ mod tests {
                 .expect("read after rejected write"),
             Some(original)
         );
-        cleanup(&pool, &scope).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1680,8 +1531,6 @@ mod tests {
             .expect("scan");
         let keys: Vec<&str> = rows.iter().map(|row| row.object_key.as_str()).collect();
         assert_eq!(keys, vec!["a/b", "a/b/c"]);
-
-        cleanup(&pool, &scope).await;
     }
 
     /// Round-trips the bundled `s3_object_index` migration inside a rolled-back
@@ -1791,6 +1640,5 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        cleanup(&pool, &scope).await;
     }
 }

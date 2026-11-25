@@ -6,16 +6,13 @@
     clippy::vec_init_then_push
 )]
 
-use super::pack_parse::decompress_zlib;
 use super::receive_pack::{build_report_response, find_lfs_blob, parse_receive_pack_request};
 use super::ref_advertisement::{
-    GitRef, authorize_read, authorize_write, collect_refs, is_valid_refname, resolve_repo_id,
+    GitRef, authorize_read_with_context, authorize_write_with_context, collect_refs,
+    is_valid_refname, resolve_repo_id,
 };
 use super::tree_walk::parse_lfs_pointer_field;
-use super::upload_pack::{
-    build_git_tree_objects, build_gitattributes_blob, build_inline_blob, build_lfs_pointer_blob,
-    parse_haves, parse_wants,
-};
+use super::upload_pack::{build_lfs_pointer_blob, parse_object_ids};
 use super::*;
 use crate::git::pack::{GitObject, ObjectType, apply_delta};
 use crate::git::pktline;
@@ -25,21 +22,24 @@ use axum::response::Response;
 use shardline_index::hub::HubFileEntry;
 
 #[test]
-fn parse_wants_from_request() {
-    let lines = vec![
-        b"want 8ab686eafeb1f44702738c8b0f24f2567c36da6d side-band-64k\n".to_vec(),
-        b"want 0000000000000000000000000000000000000000\n".to_vec(),
-    ];
-    let wants = parse_wants(&lines);
-    assert_eq!(wants.len(), 2);
-    assert_eq!(wants[0], "8ab686eafeb1f44702738c8b0f24f2567c36da6d");
-}
-
-#[test]
-fn parse_haves_from_request() {
-    let lines = vec![b"have 0000000000000000000000000000000000000000\n".to_vec()];
-    let haves = parse_haves(&lines);
-    assert_eq!(haves.len(), 1);
+fn negotiation_object_ids_keep_order_and_ignore_other_or_malformed_lines() {
+    let first = "8ab686eafeb1f44702738c8b0f24f2567c36da6d";
+    let second = "0000000000000000000000000000000000000000";
+    for (prefix, other) in [("want ", "have "), ("have ", "want ")] {
+        let lines = vec![
+            format!("{prefix}{first} side-band-64k\n").into_bytes(),
+            format!("{other}{first}\n").into_bytes(),
+            format!("  {prefix}{second}\n").into_bytes(),
+            prefix.as_bytes().to_vec(),
+            vec![0xff],
+            b"done\n".to_vec(),
+        ];
+        assert_eq!(
+            parse_object_ids(&lines, prefix),
+            [first, second],
+            "{prefix}"
+        );
+    }
 }
 
 #[test]
@@ -93,14 +93,9 @@ fn find_lfs_blob_non_canonical_pointer_finds_content() {
         b"version https://git-lfs.github.com/spec/v1\r\noid sha256:<oid>\r\nsize <n>\r\n",
     );
     let objects = vec![content_obj, noncanonical_pointer];
-    let mut sha_to_obj: std::collections::HashMap<[u8; 20], &GitObject> =
-        std::collections::HashMap::new();
-    for obj in &objects {
-        sha_to_obj.insert(obj.sha1(), obj);
-    }
     let content_by_sha256 = build_content_index(&objects);
 
-    let found = find_lfs_blob(&file, &sha_to_obj, &content_by_sha256);
+    let found = find_lfs_blob(&file, &content_by_sha256);
     assert!(
         found.is_some(),
         "non-canonical pointer must still find the content blob"
@@ -113,7 +108,7 @@ fn find_lfs_blob_non_canonical_pointer_finds_content() {
 }
 
 #[test]
-fn find_lfs_blob_canonical_pointer_matches_by_sha1() {
+fn find_lfs_blob_canonical_pointer_resolves_payload() {
     use sha2::Digest;
     let content = b"canonical content";
     let oid = hex::encode(sha2::Sha256::digest(content));
@@ -127,13 +122,8 @@ fn find_lfs_blob_canonical_pointer_matches_by_sha1() {
     let pointer = build_lfs_pointer_blob(&file.sha, file.size);
     let content_obj = crate::git::pack::create_blob_object(content);
     let objects = vec![pointer, content_obj];
-    let mut sha_to_obj: std::collections::HashMap<[u8; 20], &GitObject> =
-        std::collections::HashMap::new();
-    for obj in &objects {
-        sha_to_obj.insert(obj.sha1(), obj);
-    }
     let content_by_sha256 = build_content_index(&objects);
-    let found = find_lfs_blob(&file, &sha_to_obj, &content_by_sha256);
+    let found = find_lfs_blob(&file, &content_by_sha256);
     // LFS resolution must return the content, never the pointer bytes.
     assert_eq!(found.unwrap().data, content);
 }
@@ -153,129 +143,38 @@ fn find_lfs_blob_none_when_no_matching_object() {
     // content object with the matching sha256 is present.
     let unrelated = crate::git::pack::create_blob_object(b"unrelated");
     let objects = vec![unrelated];
-    let mut sha_to_obj: std::collections::HashMap<[u8; 20], &GitObject> =
-        std::collections::HashMap::new();
-    for obj in &objects {
-        sha_to_obj.insert(obj.sha1(), obj);
-    }
     let content_by_sha256 = build_content_index(&objects);
     assert!(
-        find_lfs_blob(&file, &sha_to_obj, &content_by_sha256).is_none(),
+        find_lfs_blob(&file, &content_by_sha256).is_none(),
         "no matching object should yield None (the push is then failed)"
     );
 }
 
 #[test]
-fn inline_blob_deterministic() {
-    let file = HubFileEntry {
-        path: "test.txt".to_owned(),
-        size: 11,
-        sha: "aabbccdd".to_owned(),
-        is_lfs: false,
-    };
-    let b1 = build_inline_blob(&file);
-    let b2 = build_inline_blob(&file);
-    assert_eq!(b1.sha1(), b2.sha1());
-}
-
-#[test]
-fn tree_from_empty_files() {
-    let tree = build_git_tree_objects(&[]);
-    assert_eq!(tree.0.object_type, ObjectType::Tree);
-}
-
-#[test]
-fn tree_from_single_file() {
-    let files = vec![HubFileEntry {
-        path: "README.md".to_owned(),
-        size: 13,
-        sha: "deadbeef".to_owned(),
-        is_lfs: false,
-    }];
-    let (tree, sub_trees) = build_git_tree_objects(&files);
-    let tree_sha = tree.sha1();
-    assert_ne!(tree_sha, [0u8; 20]);
-    assert!(sub_trees.is_empty());
-}
-
-#[test]
-fn tree_from_nested_files() {
-    let files = vec![
-        HubFileEntry {
-            path: "src/main.rs".to_owned(),
-            size: 100,
-            sha: "aaaa".to_owned(),
-            is_lfs: false,
-        },
-        HubFileEntry {
-            path: "Cargo.toml".to_owned(),
-            size: 200,
-            sha: "bbbb".to_owned(),
-            is_lfs: false,
-        },
-    ];
-    let (tree, sub_trees) = build_git_tree_objects(&files);
-    let tree_sha = tree.sha1();
-    assert_ne!(tree_sha, [0u8; 20]);
-    // src/ should produce a sub-tree
-    assert_eq!(sub_trees.len(), 1);
-}
-
-#[test]
-fn gitattributes_blob_generated_for_lfs_files() {
-    let files = vec![
-        HubFileEntry {
-            path: "model.bin".to_owned(),
-            size: 1024,
-            sha: "oid1".to_owned(),
-            is_lfs: true,
-        },
-        HubFileEntry {
-            path: "README.md".to_owned(),
-            size: 100,
-            sha: "oid2".to_owned(),
-            is_lfs: false,
-        },
-    ];
-    let blob = build_gitattributes_blob(&files);
-    assert!(blob.is_some());
-    let content = String::from_utf8(blob.unwrap().data).unwrap();
-    assert!(content.contains("model.bin filter=lfs"));
-    assert!(!content.contains("README.md"));
-}
-
-#[test]
-fn gitattributes_blob_none_when_no_lfs() {
-    let files = vec![HubFileEntry {
-        path: "README.md".to_owned(),
-        size: 100,
-        sha: "oid2".to_owned(),
-        is_lfs: false,
-    }];
-    assert!(build_gitattributes_blob(&files).is_none());
-}
-
-// --- is_valid_refname tests ---
-
-#[test]
-fn is_valid_refname_valid() {
-    assert!(is_valid_refname("refs/heads/main"));
-    assert!(is_valid_refname("refs/tags/v1.0"));
-    assert!(is_valid_refname("refs/heads/feature/foo"));
-    assert!(is_valid_refname("refs/heads/feature/foo/bar"));
-    assert!(is_valid_refname("refs/pull/42/head"));
-    assert!(is_valid_refname("refs/heads/foo./bar"));
-    assert!(is_valid_refname("refs/heads/@"));
-}
-
-#[test]
-fn is_valid_refname_empty() {
-    assert!(!is_valid_refname(""));
-}
-
-#[test]
-fn is_valid_refname_rejects_git_reserved_spellings() {
+fn is_valid_refname_accepts_git_reference_names() {
     for reference in [
+        "refs/heads/main",
+        "refs/tags/v1.0",
+        "refs/heads/feature/foo",
+        "refs/heads/feature/foo/bar",
+        "refs/pull/42/head",
+        "refs/heads/foo./bar",
+        "refs/heads/@",
+    ] {
+        assert!(
+            is_valid_refname(reference),
+            "rejected valid Git ref: {reference:?}"
+        );
+    }
+}
+
+#[test]
+fn is_valid_refname_rejects_reserved_paths_and_characters() {
+    for reference in [
+        "",
+        "heads/main",
+        "tags/v1.0",
+        "main",
         "refs/heads/a..b",
         "refs/heads/.hidden",
         "refs/heads/a.lock",
@@ -290,34 +189,26 @@ fn is_valid_refname_rejects_git_reserved_spellings() {
         "refs/heads/a*b",
         "refs/heads/a[b",
         "refs/heads/a\\b",
+        "refs/heads/../secret",
+        "refs/heads/feature/..",
+        "refs/heads/../../etc/passwd",
+        "refs/heads/a/../../../x",
+        "refs/heads/my branch",
+        "refs/heads/feature ",
+        " refs/heads/feature",
     ] {
         assert!(
             !is_valid_refname(reference),
-            "invalid Git ref accepted: {reference}"
+            "accepted invalid Git ref: {reference:?}"
         );
     }
-}
-
-#[test]
-fn is_valid_refname_no_refs_prefix() {
-    assert!(!is_valid_refname("heads/main"));
-    assert!(!is_valid_refname("tags/v1.0"));
-    assert!(!is_valid_refname("main"));
-}
-
-#[test]
-fn is_valid_refname_control_chars() {
-    assert!(!is_valid_refname("refs/heads/main\n"));
-    assert!(!is_valid_refname("refs/heads/main\t"));
-    assert!(!is_valid_refname("refs/heads/main\x00"));
-    assert!(!is_valid_refname("refs/heads/main\x7f"));
-}
-
-#[test]
-fn is_valid_refname_dotdot() {
-    assert!(!is_valid_refname("refs/heads/../secret"));
-    assert!(!is_valid_refname("refs/heads/feature/.."));
-    assert!(!is_valid_refname("refs/heads/../../etc/passwd"));
+    for control in (0u8..=31).chain([127]) {
+        let reference = format!("refs/heads/main{}", char::from(control));
+        assert!(
+            !is_valid_refname(&reference),
+            "accepted control byte {control}"
+        );
+    }
 }
 
 // --- parse_commit_object tests ---
@@ -559,23 +450,6 @@ fn walk_git_tree_exceeds_max_depth() {
     );
 }
 
-// --- is_valid_refname edge cases ---
-
-#[test]
-fn is_valid_refname_with_spaces() {
-    assert!(!is_valid_refname("refs/heads/my branch"));
-    assert!(!is_valid_refname("refs/heads/feature "));
-    assert!(!is_valid_refname(" refs/heads/feature"));
-}
-
-#[test]
-fn is_valid_refname_with_dotdot() {
-    assert!(!is_valid_refname("refs/heads/../secret"));
-    assert!(!is_valid_refname("refs/heads/feature/.."));
-    assert!(!is_valid_refname("refs/heads/../../etc/passwd"));
-    assert!(!is_valid_refname("refs/heads/a/../../../x"));
-}
-
 // --- collect_refs dedup/HEAD logic tests ---
 
 /// Helper to create a temporary HubState backed by SQLite.
@@ -585,49 +459,14 @@ pub(super) fn make_hub_state() -> (tempfile::TempDir, HubState) {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
-    let db_path = root.join("metadata.sqlite3");
-    let conn = rusqlite::Connection::open(&db_path).expect("open sqlite");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS shardline_hub_repos (
-            repo_id TEXT PRIMARY KEY, repo_type TEXT NOT NULL, private INTEGER NOT NULL DEFAULT 0,
-            default_branch TEXT NOT NULL, created_at_unix_seconds INTEGER NOT NULL,
-            updated_at_unix_seconds INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_revisions (
-            repo_id TEXT NOT NULL, ref_name TEXT NOT NULL, sha TEXT NOT NULL,
-            parent_sha TEXT, message TEXT, created_at_unix_seconds INTEGER NOT NULL,
-            PRIMARY KEY (repo_id, sha)
-        );
-        CREATE INDEX IF NOT EXISTS shardline_hub_revisions_repo_ref_idx
-            ON shardline_hub_revisions (repo_id, ref_name);
-        CREATE TABLE IF NOT EXISTS shardline_hub_refs (
-            repo_id TEXT NOT NULL, ref_name TEXT NOT NULL, sha TEXT NOT NULL,
-            PRIMARY KEY (repo_id, ref_name)
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_file_entries (
-            commit_sha TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
-            sha TEXT NOT NULL, is_lfs INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (commit_sha, path)
-        );
-        CREATE TABLE IF NOT EXISTS shardline_hub_webhooks (
-            id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
-            url TEXT NOT NULL, events TEXT NOT NULL DEFAULT 'push', secret TEXT,
-            active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-            created_at_unix_seconds INTEGER NOT NULL,
-            FOREIGN KEY (repo_id) REFERENCES shardline_hub_repos(repo_id) ON DELETE CASCADE
-        );",
-    )
-    .expect("create schema");
-    drop(conn);
-    shardline_index::hub::ensure_hub_tables(&root).expect("create reliability evidence table");
-
-    let store = LocalIndexStore::open(root);
+    let store = LocalIndexStore::new(root).expect("initialize SQLite store");
     let boxed = BoxedHubStore::from_store(store);
     let object_store = shardline_server_core::ServerObjectStore::local(tmp.path().join("lfs"))
         .expect("local object store");
     let state = HubState {
         store: boxed,
         object_store,
+        recovery_archive: None,
         auth: None,
         http_client: None,
         webhook_secret_cipher: None,
@@ -637,7 +476,7 @@ pub(super) fn make_hub_state() -> (tempfile::TempDir, HubState) {
 }
 
 #[tokio::test]
-async fn collect_refs_dedup_identical_shas() {
+async fn collect_refs_preserve_sorted_names_and_commit_identities() {
     let (_tmp, state) = make_hub_state();
     use shardline_index::hub::HubRepoType;
 
@@ -647,9 +486,6 @@ async fn collect_refs_dedup_identical_shas() {
         .unwrap();
     let initial_sha = "4b825dc642cb6eb9a060e54bf899d69f8f5ce8e3";
 
-    // Insert two revisions with different SHAs but pointing to the same
-    // final SHA via a chain. The key dedup test: same ref_name ("main")
-    // should only appear once.
     state
         .store
         .create_revision("org/dedup", Some(initial_sha), "sha_a", "main", "first")
@@ -672,26 +508,17 @@ async fn collect_refs_dedup_identical_shas() {
 
     let refs = collect_refs(&state, "org/dedup").await.unwrap();
 
-    // Each unique (name, sha) pair should only appear once.
-    let mut seen = std::collections::HashSet::new();
-    for r in &refs {
-        let key = (&r.name, &r.sha1);
-        assert!(
-            seen.insert(key),
-            "duplicate ref entry: {key:?} in refs: {refs:?}"
-        );
-    }
-
-    // Verify all expected ref names are present.
-    let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
-    assert!(names.contains(&"HEAD"), "should contain HEAD: {refs:?}");
-    assert!(
-        names.contains(&"refs/heads/main"),
-        "should contain main: {refs:?}"
-    );
-    assert!(
-        names.contains(&"refs/heads/dev"),
-        "should contain dev: {refs:?}"
+    let advertised: Vec<_> = refs
+        .iter()
+        .map(|r| (r.name.as_str(), r.sha1.as_str()))
+        .collect();
+    assert_eq!(
+        advertised,
+        [
+            ("HEAD", "sha_head"),
+            ("refs/heads/dev", "sha_b"),
+            ("refs/heads/main", "sha_a"),
+        ]
     );
 }
 
@@ -855,72 +682,60 @@ async fn collect_refs_nonexistent_repo_returns_empty() {
 
 // --- build_report_response tests ---
 
-fn body_string(response: Response) -> String {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
-    })
+async fn body_string(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
 }
 
-#[test]
-fn build_report_response_unpack_ok_and_ok_refs() {
-    let results = vec![
-        ("refs/heads/main".to_owned(), true, None),
-        ("refs/heads/dev".to_owned(), true, None),
-    ];
-    let response = build_report_response(&results, true, false).unwrap();
-    let body = body_string(response);
-    assert!(body.contains("unpack ok"));
-    assert!(body.contains("ok refs/heads/main"));
-    assert!(body.contains("ok refs/heads/dev"));
-}
-
-#[test]
-fn build_report_response_unpack_failed_and_ng_refs() {
-    let results = vec![(
-        "refs/heads/main".to_owned(),
-        false,
-        Some("unpack failed".to_owned()),
-    )];
-    let response = build_report_response(&results, false, false).unwrap();
-    let body = body_string(response);
-    assert!(body.contains("unpack failed"));
-    assert!(body.contains("ng refs/heads/main"));
-    assert!(body.contains("unpack failed"));
-}
-
-#[test]
-fn build_report_response_ng_with_default_message() {
-    let results = vec![("refs/heads/bad".to_owned(), false, None)];
-    let response = build_report_response(&results, false, false).unwrap();
-    let body = body_string(response);
-    assert!(body.contains("ng refs/heads/bad failed"));
-}
-
-#[test]
-fn build_report_response_ends_with_flush() {
-    let results: Vec<(String, bool, Option<String>)> = vec![];
-    let response = build_report_response(&results, true, false).unwrap();
-    let body = body_string(response);
-    assert!(
-        body.ends_with("0000"),
-        "response should end with flush packet"
-    );
+#[tokio::test]
+async fn receive_status_preserves_exact_packet_framing_and_messages() {
+    for (results, unpack_ok, expected) in [
+        (vec![], true, "000eunpack ok\n0000"),
+        (
+            vec![
+                ("refs/heads/main".into(), true, None),
+                ("refs/heads/dev".into(), true, None),
+            ],
+            true,
+            "000eunpack ok\n0017ok refs/heads/main\n0016ok refs/heads/dev\n0000",
+        ),
+        (
+            vec![(
+                "refs/heads/main".into(),
+                false,
+                Some("unpack failed".into()),
+            )],
+            false,
+            "0012unpack failed\n0025ng refs/heads/main unpack failed\n0000",
+        ),
+        (
+            vec![("refs/heads/bad".into(), false, None)],
+            false,
+            "0012unpack failed\n001dng refs/heads/bad failed\n0000",
+        ),
+    ] {
+        let response = build_report_response(&results, unpack_ok, false).unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/x-git-receive-pack-result"
+        );
+        assert_eq!(body_string(response).await, expected);
+    }
 }
 
 // --- parse_receive_pack_request tests ---
 
-#[test]
-fn receive_sideband_preserves_status_across_frame_boundaries() {
+#[tokio::test]
+async fn receive_sideband_preserves_status_across_frame_boundaries() {
     let results: Vec<_> = (0..4000)
         .map(|index| (format!("refs/heads/branch-{index}"), index % 2 == 0, None))
         .collect();
     for unpack_ok in [true, false] {
-        let plain = body_string(build_report_response(&results, unpack_ok, false).unwrap());
-        let framed = body_string(build_report_response(&results, unpack_ok, true).unwrap());
+        let plain = body_string(build_report_response(&results, unpack_ok, false).unwrap()).await;
+        let framed = body_string(build_report_response(&results, unpack_ok, true).unwrap()).await;
         assert!(framed.ends_with("0000"));
         let packets = pktline::decode_lines(framed.as_bytes());
         assert!(
@@ -1015,234 +830,45 @@ fn parse_lfs_pointer_field_extra_whitespace() {
     assert!(oid.is_some());
 }
 
-// --- parse_pack_data tests ---
-
 #[test]
-fn parse_pack_data_empty_input() {
-    assert!(parse_pack_data(b"").is_err());
-}
+fn authorization_requires_credentials_only_when_configured() {
+    use shardline_protocol::TokenClaims;
+    use shardline_server_core::{AuthError, AuthProvider};
 
-#[test]
-fn parse_pack_data_too_short() {
-    assert!(parse_pack_data(b"PACK").is_err());
-}
-
-#[test]
-fn parse_pack_data_no_pack_magic() {
-    assert!(parse_pack_data(b"NOTAPACKFILE").is_err());
-}
-
-#[test]
-fn parse_pack_data_unsupported_version() {
-    let mut data = b"PACK".to_vec();
-    data.extend_from_slice(&3u32.to_be_bytes()); // version 3 (unsupported)
-    data.extend_from_slice(&0u32.to_be_bytes());
-    assert!(parse_pack_data(&data).is_err());
-}
-
-// --- parse_pack_data truncated pack (F-deep-2.5) ---
-
-#[test]
-fn parse_pack_data_truncated_claims_more_objects_errors() {
-    // A header claiming more objects than the stream actually contains must
-    // error instead of returning a partial object list.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"blob content").unwrap();
-    let compressed = enc.finish().unwrap();
-
-    let mut pack = b"PACK".to_vec();
-    pack.extend_from_slice(&2u32.to_be_bytes()); // version 2
-    pack.extend_from_slice(&2u32.to_be_bytes()); // claims 2 objects
-    // Only 1 object is actually present in the stream.
-    pack.push((3 << 4) | (compressed.len() as u8 & 0x0f)); // blob, size low nibble
-    pack.extend_from_slice(&compressed);
-
-    let result = parse_pack_data(&pack);
-    assert!(
-        result.is_err(),
-        "truncated pack must error instead of returning partial objects, got {result:?}"
-    );
-}
-
-// --- authorize_read / authorize_write tests (no auth configured) ---
-
-#[test]
-fn authorize_read_without_auth_is_permissive() {
-    let (_tmp, state) = make_hub_state();
-    let headers = axum::http::HeaderMap::new();
-    assert!(authorize_read(&state, &headers).is_ok());
-}
-
-#[test]
-fn authorize_write_without_auth_is_permissive() {
-    let (_tmp, state) = make_hub_state();
-    let headers = axum::http::HeaderMap::new();
-    assert!(authorize_write(&state, &headers).is_ok());
-}
-
-// --- decompress_zlib tests ---
-
-#[test]
-fn decompress_zlib_empty_input() {
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(b"").unwrap();
-    let compressed = encoder.finish().unwrap();
-    let (decompressed, _bytes_used) = decompress_zlib(&compressed).unwrap();
-    assert!(decompressed.is_empty());
-}
-
-#[test]
-fn decompress_zlib_short_input_returns_empty() {
-    // Truncated zlib stream
-    let result = decompress_zlib(b"x");
-    assert!(result.is_err() || result.unwrap().0.is_empty());
-}
-
-// --- parse_pack_data round-trip ---
-
-#[test]
-fn parse_pack_data_roundtrip_blob() {
-    // Generate a pack with one blob, then parse it back
-    let blob = crate::git::pack::create_blob_object(b"hello world");
-    let pack = crate::git::pack::generate_pack(&[blob]).unwrap();
-    let objects = parse_pack_data(&pack).unwrap();
-    assert_eq!(objects.len(), 1);
-    assert_eq!(objects[0].object_type, ObjectType::Blob);
-    assert_eq!(objects[0].data, b"hello world");
-}
-
-#[test]
-fn parse_pack_data_roundtrip_commit_and_tree() {
-    // Build a tree and commit, generate pack, parse it back
-    let blob = crate::git::pack::create_blob_object(b"file content");
-    let blob_sha = blob.sha1();
-    let tree_entries = vec![(0o100644, "f.txt", &blob_sha)];
-    let tree = crate::git::pack::create_tree_object(&tree_entries);
-    let tree_sha = tree.sha1();
-    let commit =
-        crate::git::pack::create_commit_object(&tree_sha, None, "Test <test@test.com>", "Initial");
-    let pack = crate::git::pack::generate_pack(&[blob, tree, commit]).unwrap();
-    let objects = parse_pack_data(&pack).unwrap();
-    assert_eq!(objects.len(), 3);
-    let blob_count = objects
-        .iter()
-        .filter(|o| o.object_type == ObjectType::Blob)
-        .count();
-    let tree_count = objects
-        .iter()
-        .filter(|o| o.object_type == ObjectType::Tree)
-        .count();
-    let commit_count = objects
-        .iter()
-        .filter(|o| o.object_type == ObjectType::Commit)
-        .count();
-    assert_eq!(blob_count, 1);
-    assert_eq!(tree_count, 1);
-    assert_eq!(commit_count, 1);
-}
-
-#[test]
-fn parse_pack_data_unknown_object_type_breaks() {
-    // A pack with an object of type 5 (reserved, not 1..4 or 6..7) cannot be
-    // parsed, and since the header claims an object that is never produced,
-    // the truncated/malformed pack must error instead of returning a partial
-    // (empty) object list.
-    let mut data = b"PACK".to_vec();
-    data.extend_from_slice(&2u32.to_be_bytes()); // version 2
-    data.extend_from_slice(&1u32.to_be_bytes()); // 1 object
-    // Object header byte: type=5, size=0, no continuation
-    // type 5 = (5 << 4) | 0 = 0x50
-    data.push(0x50);
-    // No compressed data follows, parser will break on zlib decompression
-    let result = parse_pack_data(&data);
-    assert!(
-        result.is_err(),
-        "pack claiming an object that cannot be parsed must error, got {result:?}"
-    );
-}
-
-#[test]
-fn parse_pack_data_with_ref_delta_stops_gracefully() {
-    // A pack with a REF_DELTA object (type 7) but no base object in the index
-    // should produce an error since the base SHA won't be found.
-    // We need at least a valid compressed stream after the REF_DELTA header.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"delta data").unwrap();
-    let compressed = enc.finish().unwrap();
-
-    let mut data = b"PACK".to_vec();
-    data.extend_from_slice(&2u32.to_be_bytes());
-    data.extend_from_slice(&1u32.to_be_bytes()); // 1 object
-    // Object header: type=7, size=0, no continuation
-    // type 7 = (7 << 4) | 0 = 0x70
-    data.push(0x70);
-    // REF_DELTA needs 20 bytes of base SHA
-    data.extend_from_slice(&[0u8; 20]);
-    // Valid zlib data
-    data.extend_from_slice(&compressed);
-    let result = parse_pack_data(&data);
-    assert!(
-        result.is_err(),
-        "expected error for REF_DELTA with missing base"
-    );
-}
-
-#[test]
-fn parse_pack_data_shift_overflow_detected() {
-    // Create a pack with a varint size that keeps shifting past 63 bits
-    let mut data = b"PACK".to_vec();
-    data.extend_from_slice(&2u32.to_be_bytes());
-    data.extend_from_slice(&1u32.to_be_bytes()); // 1 object
-    // Object header byte: type=3 (blob), size continues in following bytes
-    // Start with continuation bit set, size low nibble = 0
-    data.push(0x80 | (3 << 4) | 0x0f); // type=3, continuation, low 4 bits=0x0f
-    // Add more continuation bytes to keep shifting
-    for _ in 0..10 {
-        data.push(0x80); // continuation, 7 bits of zero
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct UnexpectedAuth(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl AuthProvider for UnexpectedAuth {
+        fn verify_token(&self, _token: &str) -> Result<TokenClaims, AuthError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(AuthError::InvalidToken)
+        }
+        fn mint_token(&self, _claims: &TokenClaims) -> Result<String, AuthError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(AuthError::InvalidToken)
+        }
     }
-    // Try to parse - should detect shift >= 64
-    let result = parse_pack_data(&data);
-    assert!(result.is_err());
-}
 
-// --- decompress_zlib with real data ---
-
-#[test]
-fn decompress_zlib_roundtrip() {
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let original = b"Hello, World! This is test data for zlib roundtrip.";
-    let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(original).unwrap();
-    let compressed = encoder.finish().unwrap();
-    let (decompressed, bytes_used) = decompress_zlib(&compressed).unwrap();
-    assert_eq!(decompressed, original);
-    assert_eq!(bytes_used, compressed.len());
-}
-
-#[test]
-fn decompress_zlib_trailing_bytes_still_decompresses() {
-    // decompress_zlib should consume only the bytes it needs, leaving
-    // trailing data unconsumed. It returns the number of bytes consumed.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(b"hello").unwrap();
-    let compressed = encoder.finish().unwrap();
-
-    // Append trailing data
-    let mut with_trailing = compressed.clone();
-    with_trailing.extend_from_slice(b"TRAILER");
-
-    let (decompressed, bytes_used) = decompress_zlib(&with_trailing).unwrap();
-    assert_eq!(decompressed, b"hello");
-    assert_eq!(bytes_used, compressed.len());
+    let (_tmp, mut state) = make_hub_state();
+    let headers = axum::http::HeaderMap::new();
+    for configured in [false, true] {
+        if configured {
+            state.auth = Some(crate::auth::HubAuth::new(Box::new(UnexpectedAuth(
+                calls.clone(),
+            ))));
+        }
+        for authorize in [authorize_read_with_context, authorize_write_with_context] {
+            let result = authorize(&state, &headers);
+            if configured {
+                assert!(matches!(
+                    result,
+                    Err(crate::error::HubApiError::Unauthorized)
+                ));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 // --- parse_commit_object edge cases ---
@@ -1339,40 +965,6 @@ fn walk_git_tree_wrong_object_type_errors() {
     );
 }
 
-// --- build_gitattributes_blob with multiple LFS files ---
-
-#[test]
-fn build_gitattributes_blob_multiple_lfs_files() {
-    let files = vec![
-        HubFileEntry {
-            path: "z.bin".to_owned(),
-            size: 200,
-            sha: "oid_z".to_owned(),
-            is_lfs: true,
-        },
-        HubFileEntry {
-            path: "a.bin".to_owned(),
-            size: 100,
-            sha: "oid_a".to_owned(),
-            is_lfs: true,
-        },
-        HubFileEntry {
-            path: "m.bin".to_owned(),
-            size: 300,
-            sha: "oid_m".to_owned(),
-            is_lfs: true,
-        },
-    ];
-    let blob = build_gitattributes_blob(&files);
-    assert!(blob.is_some());
-    let content = String::from_utf8(blob.unwrap().data).unwrap();
-    // Should be sorted: a.bin, m.bin, z.bin
-    let lines: Vec<&str> = content.lines().collect();
-    assert!(lines[0].starts_with("a.bin"));
-    assert!(lines[1].starts_with("m.bin"));
-    assert!(lines[2].starts_with("z.bin"));
-}
-
 // --- parse_lfs_pointer_field edge cases ---
 
 #[test]
@@ -1411,38 +1003,6 @@ fn parse_receive_pack_request_rejects_non_utf8_before_pack() {
     body.extend_from_slice(&[0, 0, 0, 2]);
     body.extend_from_slice(&[0, 0, 0, 0]);
     assert!(parse_receive_pack_request(&body).is_err());
-}
-
-// --- authorize with auth configured (error paths) ---
-
-#[test]
-fn authorize_read_with_auth_rejects_missing_token() {
-    use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenClaims, TokenScope as TS};
-    use shardline_server_core::{AuthError, AuthProvider};
-
-    let repo = RepositoryScope::new(RepositoryProvider::GitHub, "o", "r", None).unwrap();
-    let _claims = TokenClaims::new("iss", "sub", TS::Read, repo, u64::MAX).unwrap();
-    struct MockAuth;
-    impl AuthProvider for MockAuth {
-        fn verify_token(&self, _token: &str) -> Result<TokenClaims, AuthError> {
-            Err(AuthError::InvalidToken)
-        }
-        fn mint_token(&self, _claims: &TokenClaims) -> Result<String, AuthError> {
-            Err(AuthError::ProviderError("nope".into()))
-        }
-    }
-    let (_tmp, hub_state) = make_hub_state();
-    let state = HubState {
-        store: hub_state.store,
-        object_store: hub_state.object_store,
-        auth: Some(crate::auth::HubAuth::new(Box::new(MockAuth))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
-    let headers = axum::http::HeaderMap::new();
-    let result = authorize_read(&state, &headers);
-    assert!(result.is_err());
 }
 
 // --- info_refs with nonexistent repo ---
@@ -1564,87 +1124,6 @@ fn parse_pack_data_ofs_delta_two_objects() {
     );
 }
 
-// --- authorize_write with auth configured ---
-
-#[test]
-fn authorize_write_with_auth_rejects_missing_token() {
-    use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenClaims, TokenScope as TS};
-    use shardline_server_core::{AuthError, AuthProvider};
-
-    let repo = RepositoryScope::new(RepositoryProvider::GitHub, "o", "r", None).unwrap();
-    let _claims = TokenClaims::new("iss", "sub", TS::Read, repo, u64::MAX).unwrap();
-    struct MockAuth;
-    impl AuthProvider for MockAuth {
-        fn verify_token(&self, _token: &str) -> Result<TokenClaims, AuthError> {
-            Err(AuthError::InvalidToken)
-        }
-        fn mint_token(&self, _claims: &TokenClaims) -> Result<String, AuthError> {
-            Err(AuthError::ProviderError("nope".into()))
-        }
-    }
-    let (_tmp, hub_state) = make_hub_state();
-    let state = HubState {
-        store: hub_state.store,
-        object_store: hub_state.object_store,
-        auth: Some(crate::auth::HubAuth::new(Box::new(MockAuth))),
-        http_client: None,
-        webhook_secret_cipher: None,
-        public_base_url: "http://127.0.0.1:8080".to_owned(),
-    };
-    let headers = axum::http::HeaderMap::new();
-    let result = authorize_write(&state, &headers);
-    assert!(result.is_err());
-}
-
-// --- build_gitattributes_blob with nested LFS path ---
-
-#[test]
-fn gitattributes_blob_handles_nested_lfs_paths() {
-    let files = vec![
-        HubFileEntry {
-            path: "data/nested/model.bin".to_owned(),
-            size: 1024,
-            sha: "oid_nested".to_owned(),
-            is_lfs: true,
-        },
-        HubFileEntry {
-            path: "data/nested/readme.md".to_owned(),
-            size: 100,
-            sha: "oid_rn".to_owned(),
-            is_lfs: false,
-        },
-    ];
-    let blob = build_gitattributes_blob(&files);
-    assert!(blob.is_some());
-    let content = String::from_utf8(blob.unwrap().data).unwrap();
-    assert!(content.contains("data/nested/model.bin filter=lfs"));
-}
-
-// --- build_git_tree_objects with nested directories ---
-
-#[test]
-fn tree_from_nested_lfs_files_creates_sub_trees() {
-    let files = vec![
-        HubFileEntry {
-            path: "models/a/big.bin".to_owned(),
-            size: 2_000_000,
-            sha: "lfs_oid_ab".to_owned(),
-            is_lfs: true,
-        },
-        HubFileEntry {
-            path: "models/b/big.bin".to_owned(),
-            size: 2_000_000,
-            sha: "lfs_oid_bb".to_owned(),
-            is_lfs: true,
-        },
-    ];
-    let (root, sub_trees) = build_git_tree_objects(&files);
-    // Root tree + 3 sub-trees (models/, models/a/, models/b/)
-    assert!(!sub_trees.is_empty(), "expected sub-trees for nested dirs");
-    let root_sha = root.sha1();
-    assert_ne!(root_sha, [0u8; 20]);
-}
-
 // --- parse_receive_pack_request with valid commands ---
 
 #[test]
@@ -1683,130 +1162,6 @@ async fn upload_pack_rejects_unowned_want() {
         matches!(result, Err(crate::error::HubApiError::BadRequest(_))),
         "unowned wants must be rejected: {result:?}"
     );
-}
-
-// --- decompress_zlib error on garbage input ---
-
-#[test]
-fn decompress_zlib_garbage_returns_error() {
-    let result = decompress_zlib(b"garbage data that is not valid zlib");
-    assert!(result.is_err());
-}
-
-#[test]
-fn decompress_zlib_empty_input_is_truncated() {
-    // Empty input never reaches `StreamEnd`, so it is a truncated zlib stream
-    // and must be rejected (it would otherwise return partial bytes as a valid
-    // object).
-    let result = decompress_zlib(b"");
-    assert!(
-        result.is_err(),
-        "empty zlib input should be treated as truncated: {result:?}"
-    );
-}
-
-// --- decompress_zlib truncation (F-deep-2.4) ---
-
-#[test]
-fn decompress_zlib_truncated_stream_errors() {
-    // A valid zlib stream that is cut short must error instead of returning
-    // partial decompressed bytes as a complete object.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"hello world, this is a fairly long payload to truncate")
-        .unwrap();
-    let full = enc.finish().unwrap();
-    assert!(full.len() > 4, "compressed payload should be non-trivial");
-
-    // Truncate several bytes off the end so the stream cannot reach StreamEnd.
-    let truncated = &full[..full.len() - 4];
-    let result = decompress_zlib(truncated);
-    assert!(
-        result.is_err(),
-        "truncated zlib stream must error, got {result:?}"
-    );
-}
-
-#[test]
-fn decompress_zlib_full_stream_ok() {
-    // A complete zlib stream still decompresses successfully.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    let payload = b"complete stream payload";
-    enc.write_all(payload).unwrap();
-    let full = enc.finish().unwrap();
-    let (decompressed, _used) = decompress_zlib(&full).unwrap();
-    assert_eq!(decompressed, payload);
-}
-
-// --- parse_pack_data with invalid offset ---
-
-#[test]
-fn parse_pack_data_ofs_delta_bad_offset() {
-    // A pack with a single OFS_DELTA object (no base) should error.
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"delta data").unwrap();
-    let compressed = enc.finish().unwrap();
-
-    let mut pack = b"PACK".to_vec();
-    pack.extend_from_slice(&2u32.to_be_bytes());
-    pack.extend_from_slice(&1u32.to_be_bytes()); // 1 object
-    // OFS_DELTA (type=6), size <= 0x0f
-    pack.push((6 << 4) | compressed.len() as u8);
-    // OFS_DELTA offset: 2 (no base object at offset 2)
-    pack.push(0x02);
-    pack.extend_from_slice(&compressed);
-
-    let result = parse_pack_data(&pack);
-    assert!(result.is_err());
-}
-
-// --- parse_pack_data with OOB OFS_DELTA offset ---
-// (offset calculation underflows)
-
-#[test]
-fn parse_pack_data_ofs_delta_offset_underflow() {
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"delta data").unwrap();
-    let compressed = enc.finish().unwrap();
-
-    let mut pack = b"PACK".to_vec();
-    pack.extend_from_slice(&2u32.to_be_bytes());
-    pack.extend_from_slice(&1u32.to_be_bytes());
-    // OFS_DELTA (type=6), size = compressed.len()
-    pack.push((6 << 4) | 0x0f);
-    // Large OFS_DELTA offset encoded as multi-byte varint
-    // offset = 0x01 (MSB=0 means single byte, value=1)
-    // An offset of 1 with 0 objects in the index will produce checked_sub(1) = 0
-    // but objects is empty, so base_idx(0) is out of bounds.
-    // Actually this would work: offset=1 on an empty objects vec:
-    // checked_sub(1) = None → InvalidDelta. Let's test that.
-    pack.push(0x01);
-    pack.extend_from_slice(&compressed);
-    let result = parse_pack_data(&pack);
-    assert!(result.is_err());
-}
-
-// --- build_git_tree_objects with inline blob creation ---
-
-#[test]
-fn tree_from_inline_files_creates_blobs_in_tree_entries() {
-    let files = vec![HubFileEntry {
-        path: "a/b/file.txt".to_owned(),
-        size: 3,
-        sha: "abc".to_owned(),
-        is_lfs: false,
-    }];
-    let (root, sub_trees) = build_git_tree_objects(&files);
-    assert_eq!(sub_trees.len(), 2, "a/ and a/b/ sub-trees");
-    let root_sha = root.sha1();
-    assert_ne!(root_sha, [0u8; 20]);
 }
 
 // --- receive_pack with invalid pack data (error path, lines ~262) ---
@@ -1944,46 +1299,18 @@ async fn receive_pack_non_fast_forward_denied_leaves_no_side_effects() {
     );
 }
 
-// --- walk_git_tree with truncated SHA (error path, line ~1163) ---
-
 #[test]
-fn walk_git_tree_truncated_sha_errors() {
-    // Build a tree entry with a truncated SHA (only 10 bytes instead of 20)
+fn walk_git_tree_rejects_every_truncated_entry_prefix() {
     let blob = crate::git::pack::create_blob_object(b"dummy");
-    let mut tree_data = Vec::new();
-    tree_data.extend_from_slice(b"100644 f\0");
-    tree_data.extend_from_slice(&[0xaa; 10]); // only 10 bytes!
-
-    // Need to also include the null byte after the name for proper parsing
-    // Actually the format is: "100644 f\0" + 20 bytes SHA. If SHA is truncated,
-    // the sha_start + 20 > data.len() check should catch it.
-    let tree = crate::git::pack::GitObject::tree(tree_data);
-    let tree_sha = tree.sha1();
-
-    let owned = vec![blob, tree];
-    let objects: std::collections::HashMap<[u8; 20], &crate::git::pack::GitObject> =
-        owned.iter().map(|o| (o.sha1(), o)).collect();
-
-    let result = walk_git_tree(&tree_sha, &objects, "");
-    assert!(result.is_err());
-}
-
-// --- build_git_tree_objects with LFS leaf blob (line ~544) ---
-
-#[test]
-fn build_tree_entries_lfs_leaf_blob() {
-    // A single LFS file at the root level exercises the LFS blob creation
-    // in build_tree_entries (line 538).
-    let files = vec![HubFileEntry {
-        path: "model.bin".to_owned(),
-        size: 2_000_000,
-        sha: "oid_lfs_leaf".to_owned(),
-        is_lfs: true,
-    }];
-    let (root, sub_trees) = build_git_tree_objects(&files);
-    assert!(sub_trees.is_empty());
-    let root_sha = root.sha1();
-    assert_ne!(root_sha, [0u8; 20]);
+    let complete = crate::git::pack::create_tree_object(&[(0o100644, "file", &blob.sha1())]);
+    for length in 1..complete.data.len() {
+        let tree = GitObject::tree(complete.data[..length].to_vec());
+        let objects = std::collections::HashMap::from([(blob.sha1(), &blob), (tree.sha1(), &tree)]);
+        assert!(
+            walk_git_tree(&tree.sha1(), &objects, "").is_err(),
+            "accepted entry truncated to {length} bytes"
+        );
+    }
 }
 
 // --- info_refs_upload_pack / info_refs_receive_pack wrappers ---

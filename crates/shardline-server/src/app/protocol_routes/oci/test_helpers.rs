@@ -1,12 +1,15 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
-use axum::{Router, routing};
-use tokio::sync::Semaphore;
+use axum::{
+    Router,
+    body::Body,
+    http::{Method, header},
+    routing,
+};
 
 use crate::{
-    AppState, ServerBackend, ServerConfig, ServerFrontend, TransferLimiter, app::ProtocolMetrics,
-    app::protocol_routes::oci_dispatch, reconstruction_cache::ReconstructionCacheService,
-    server_role::ServerRole,
+    AppState, ServerBackend, ServerConfig, ServerFrontend, TransferLimiter,
+    app::protocol_routes::oci_dispatch,
 };
 
 /// A guard that holds a `tempfile::TempDir` and an `Arc<AppState>` backed by a
@@ -26,98 +29,47 @@ pub(crate) struct OciPostgresTestCluster {
 }
 
 pub(crate) async fn build_oci_postgres_test_cluster() -> Option<OciPostgresTestCluster> {
-    let database_url = std::env::var("DATABASE_URL").ok()?;
-    let schema = format!(
-        "oci_fixture_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos()
-    );
-    let admin = sqlx::PgPool::connect(&database_url).await.ok()?;
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .ok()?;
-    admin.close().await;
-    let mut scoped_url = url::Url::parse(&database_url).ok()?;
-    let old_options = scoped_url
-        .query_pairs()
-        .find(|(key, _)| key == "options")
-        .map_or_else(String::new, |(_, value)| value.into_owned());
-    let other_parameters: Vec<_> = scoped_url
-        .query_pairs()
-        .filter(|(key, _)| key != "options")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    scoped_url.set_query(None);
-    scoped_url
-        .query_pairs_mut()
-        .extend_pairs(other_parameters)
-        .append_pair("options", &format!("{old_options} -csearch_path={schema}"));
-    let bootstrap = sqlx::PgPool::connect(scoped_url.as_str()).await.ok()?;
-    crate::apply_database_migrations(&bootstrap).await.ok()?;
-    bootstrap.close().await;
-    build_oci_postgres_test_cluster_for_url(scoped_url.as_str()).await
+    let scoped_url = crate::test_support::postgres_fixture::isolated_postgres_url("oci").await?;
+    Some(build_oci_postgres_test_cluster_for_url(&scoped_url).await)
 }
 
 pub(crate) async fn build_oci_postgres_test_cluster_for_url(
     database_url: &str,
-) -> Option<OciPostgresTestCluster> {
-    let temp = tempfile::tempdir().ok()?;
-    let shared_store = crate::ServerObjectStore::local(temp.path().join("objects")).ok()?;
+) -> OciPostgresTestCluster {
+    let temp = tempfile::tempdir().expect("create PostgreSQL OCI scratch directory");
+    let shared_store = crate::ServerObjectStore::local(temp.path().join("objects"))
+        .expect("create PostgreSQL OCI object store");
     let node_a = build_oci_postgres_state(
         database_url,
         temp.path().join("node-a"),
         shared_store.clone(),
     )
-    .await?;
+    .await;
     let node_b =
-        build_oci_postgres_state(database_url, temp.path().join("node-b"), shared_store).await?;
-    Some(OciPostgresTestCluster {
+        build_oci_postgres_state(database_url, temp.path().join("node-b"), shared_store).await;
+    OciPostgresTestCluster {
         _temp: temp,
         node_a,
         node_b,
-    })
+    }
 }
 
 async fn build_oci_postgres_state(
     database_url: &str,
     root: std::path::PathBuf,
     object_store: crate::ServerObjectStore,
-) -> Option<Arc<AppState>> {
-    let chunk_size = NonZeroUsize::new(65_536)?;
-    let config = ServerConfig::new(
-        "127.0.0.1:0".parse().ok()?,
-        "http://127.0.0.1:8080".to_owned(),
-        root.clone(),
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::Oci])
-    .ok()?;
+) -> Arc<AppState> {
+    let config = oci_test_config(root.clone());
     let backend = crate::PostgresBackend::new_with_object_store(
         root,
         "http://127.0.0.1:8080".to_owned(),
-        chunk_size,
+        config.chunk_size(),
         database_url,
         object_store,
     )
     .await
-    .ok()?;
-    Some(Arc::new(AppState {
-        config,
-        role: ServerRole::All,
-        backend: ServerBackend::Postgres(backend),
-        auth: None,
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(NonZeroUsize::new(4096)?, NonZeroUsize::new(16)?),
-        oci_registry_token_limiter: Arc::new(Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(NonZeroUsize::new(256)?),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    }))
+    .expect("initialize configured PostgreSQL OCI backend");
+    oci_test_state(config, ServerBackend::Postgres(backend))
 }
 
 /// Builds a minimal [`AppState`] backed by a local filesystem backend rooted
@@ -130,43 +82,37 @@ async fn build_oci_postgres_state(
 /// backend initialisation) fails.
 pub(crate) async fn build_oci_test_state() -> OciTestContext {
     let temp = tempfile::tempdir().expect("failed to create temp dir");
-    let root = temp.path().to_path_buf();
-    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let chunk_size = NonZeroUsize::new(65536).unwrap();
-
-    let config = ServerConfig::new(
-        bind_addr,
-        "http://127.0.0.1:8080".to_owned(),
-        root,
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::Oci])
-    .expect("failed to set server frontends");
-
+    let config = oci_test_config(temp.path().to_path_buf());
     let backend = ServerBackend::from_config(&config)
         .await
         .expect("failed to create backend");
 
-    let state = Arc::new(AppState {
+    let state = oci_test_state(config, backend);
+
+    OciTestContext { _temp: temp, state }
+}
+
+fn oci_test_config(root: std::path::PathBuf) -> ServerConfig {
+    ServerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        "http://127.0.0.1:8080".to_owned(),
+        root,
+        NonZeroUsize::new(65_536).unwrap(),
+    )
+    .with_server_frontends([ServerFrontend::Oci])
+    .expect("failed to set server frontends")
+}
+
+fn oci_test_state(config: ServerConfig, backend: ServerBackend) -> Arc<AppState> {
+    crate::test_support::protocol_state(
         config,
-        role: ServerRole::All,
         backend,
-        auth: None,
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(
+        None,
+        TransferLimiter::new(
             NonZeroUsize::new(4096).unwrap(),
             NonZeroUsize::new(16).unwrap(),
         ),
-        oci_registry_token_limiter: Arc::new(Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(
-            std::num::NonZeroUsize::new(256).unwrap(),
-        ),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    });
-
-    OciTestContext { _temp: temp, state }
+    )
 }
 
 /// Builds an Axum [`Router`] with the OCI dispatch routes wired up for the
@@ -179,4 +125,35 @@ pub(crate) fn oci_test_router(state: &Arc<AppState>) -> Router {
             crate::app::gc_write_barrier_middleware,
         ))
         .with_state(Arc::clone(state))
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+pub(crate) async fn send(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Body,
+) -> axum::http::Response<Body> {
+    send_with_content_type(app, method, uri, body, "application/octet-stream").await
+}
+
+pub(crate) async fn send_with_content_type(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Body,
+    content_type: &str,
+) -> axum::http::Response<Body> {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(body)
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap()
 }

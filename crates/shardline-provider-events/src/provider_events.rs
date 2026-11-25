@@ -1,4 +1,4 @@
-use crate::{outcome, repository, state};
+use crate::{repository, state};
 
 use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,20 +150,6 @@ pub enum ProviderEventsError {
     ParseStoredFileRecord(#[from] ParseStoredFileRecordError),
 }
 
-pub(crate) fn duplicate_webhook_outcome(event: &RepositoryWebhookEvent) -> ProviderWebhookOutcome {
-    ProviderWebhookOutcome {
-        provider: event.repository().provider(),
-        owner: event.repository().owner().to_owned(),
-        repo: event.repository().name().to_owned(),
-        delivery_id: event.delivery_id().as_str().to_owned(),
-        event_kind: outcome::duplicate_webhook_event_kind(event.kind()),
-        affected_file_versions: 0,
-        affected_chunks: 0,
-        applied_holds: 0,
-        retention_seconds: None,
-    }
-}
-
 /// Planned atomic Postgres mutation and its applied/duplicate protocol outcomes.
 #[derive(Debug, Clone)]
 pub struct PlannedPostgresProviderWebhook {
@@ -239,7 +225,7 @@ pub async fn plan_postgres_provider_repository_webhook(
                 None,
                 None,
             ));
-            duplicate_webhook_outcome(event)
+            ProviderWebhookOutcome::for_event(event)
         }
         RepositoryWebhookEventKind::RevisionPushed { revision } => {
             mutation.upsert_provider_repository_state(ProviderRepositoryState::new(
@@ -250,13 +236,13 @@ pub async fn plan_postgres_provider_repository_webhook(
                 Some(processed_at),
                 Some(revision.as_str().to_owned()),
             ));
-            duplicate_webhook_outcome(event)
+            ProviderWebhookOutcome::for_event(event)
         }
     };
     Ok(PlannedPostgresProviderWebhook {
         mutation,
         applied_outcome,
-        duplicate_outcome: duplicate_webhook_outcome(event),
+        duplicate_outcome: ProviderWebhookOutcome::for_event(event),
     })
 }
 
@@ -338,7 +324,7 @@ where
         .await
         .map_err(Into::into)?
     {
-        return Ok(duplicate_webhook_outcome(event));
+        return Ok(ProviderWebhookOutcome::for_event(event));
     }
     purge_expired_webhook_deliveries(index_store).await;
 

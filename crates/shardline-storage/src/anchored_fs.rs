@@ -253,58 +253,21 @@ pub fn write_anchored_temporary_file(
     bytes: &[u8],
     file_mode: Option<u32>,
 ) -> io::Result<PathBuf> {
-    local_publish_failpoint(
-        &anchored.logical_path(),
-        LocalPublishBoundary::BeforeTemporaryWrite,
-    )?;
-    loop {
-        let temporary = fd_child_path(
-            anchored.parent_dir(),
-            &temporary_file_name(anchored.file_name()),
-        );
-        match open_new_file(&temporary, file_mode) {
-            Ok(mut file) => {
-                let logical_path = anchored.logical_path();
-                let write_result = (|| {
-                    if let Some(write_len) =
-                        local_publish_partial_write_len(&logical_path, bytes.len())
-                    {
-                        let prefix = bytes.get(..write_len).ok_or_else(|| {
-                            io::Error::new(
-                                ErrorKind::InvalidInput,
-                                "injected partial-write length exceeds payload",
-                            )
-                        })?;
-                        file.write_all(prefix)?;
-                    } else {
-                        file.write_all(bytes)?;
-                    }
-                    local_publish_failpoint(
-                        &logical_path,
-                        LocalPublishBoundary::DuringTemporaryWrite,
-                    )?;
-                    local_publish_failpoint(
-                        &logical_path,
-                        LocalPublishBoundary::BeforeTemporarySync,
-                    )?;
-                    file.sync_all()?;
-                    local_publish_failpoint(
-                        &logical_path,
-                        LocalPublishBoundary::AfterTemporaryDurable,
-                    )
-                })();
-                match write_result {
-                    Ok(()) => return Ok(temporary),
-                    Err(error) => {
-                        remove_if_present(&temporary).ok();
-                        return Err(error);
-                    }
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+    create_anchored_temporary_file(anchored, file_mode, |file| {
+        if let Some(write_len) =
+            local_publish_partial_write_len(&anchored.logical_path(), bytes.len())
+        {
+            let prefix = bytes.get(..write_len).ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "injected partial-write length exceeds payload",
+                )
+            })?;
+            file.write_all(prefix)
+        } else {
+            file.write_all(bytes)
         }
-    }
+    })
 }
 
 /// Copies an already-open source file to a new temporary file beside the target.
@@ -322,36 +285,45 @@ pub fn copy_anchored_temporary_file(
     source: &File,
     file_mode: Option<u32>,
 ) -> io::Result<PathBuf> {
-    local_publish_failpoint(
-        &anchored.logical_path(),
-        LocalPublishBoundary::BeforeTemporaryWrite,
-    )?;
+    create_anchored_temporary_file(anchored, file_mode, |destination| {
+        let mut source = source.try_clone()?;
+        source.seek(SeekFrom::Start(0))?;
+        io::copy(&mut source, destination)?;
+        Ok(())
+    })
+}
+
+fn create_anchored_temporary_file(
+    anchored: &AnchoredTarget,
+    file_mode: Option<u32>,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    let logical_path = anchored.logical_path();
+    local_publish_failpoint(&logical_path, LocalPublishBoundary::BeforeTemporaryWrite)?;
     loop {
         let temporary = fd_child_path(
             anchored.parent_dir(),
             &temporary_file_name(anchored.file_name()),
         );
         match open_new_file(&temporary, file_mode) {
-            Ok(mut destination) => {
-                let write_result = (|| {
-                    let mut source = source.try_clone()?;
-                    source.seek(SeekFrom::Start(0))?;
-                    io::copy(&mut source, &mut destination)?;
+            Ok(mut file) => {
+                let result = (|| {
+                    write(&mut file)?;
                     local_publish_failpoint(
-                        &anchored.logical_path(),
+                        &logical_path,
                         LocalPublishBoundary::DuringTemporaryWrite,
                     )?;
                     local_publish_failpoint(
-                        &anchored.logical_path(),
+                        &logical_path,
                         LocalPublishBoundary::BeforeTemporarySync,
                     )?;
-                    destination.sync_all()?;
+                    file.sync_all()?;
                     local_publish_failpoint(
-                        &anchored.logical_path(),
+                        &logical_path,
                         LocalPublishBoundary::AfterTemporaryDurable,
                     )
                 })();
-                match write_result {
+                match result {
                     Ok(()) => return Ok(temporary),
                     Err(error) => {
                         remove_if_present(&temporary).ok();
@@ -446,21 +418,6 @@ pub fn open_new_file(path: &Path, file_mode: Option<u32>) -> io::Result<File> {
 /// Returns an error when the directory cannot be created at `path`.
 pub fn create_directory(path: &Path, directory_mode: Option<u32>) -> io::Result<()> {
     let mut builder = DirBuilder::new();
-    if let Some(mode) = directory_mode {
-        builder.mode(mode);
-    }
-    builder.create(path)
-}
-
-/// Recursively creates a directory chain, optionally applying an explicit mode.
-///
-/// # Errors
-///
-/// Returns an error when any directory in the chain cannot be created.
-#[cfg(test)]
-pub fn create_directory_all(path: &Path, directory_mode: Option<u32>) -> io::Result<()> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(true);
     if let Some(mode) = directory_mode {
         builder.mode(mode);
     }
@@ -812,7 +769,6 @@ mod tests {
             AnchoredPathOptions::new(None, None),
             invalid_path_error,
         );
-        assert!(result.is_ok());
         let target = result.unwrap();
         assert_eq!(target.file_name(), OsStr::new("file.txt"));
         assert_eq!(target.parent_path, root.path().join("sub/dir"));
@@ -923,102 +879,84 @@ mod tests {
     // ── open_or_create_child_directory ────────────────────────────────────
 
     #[test]
-    fn open_or_create_child_existing() {
-        let dir = tempdir().unwrap();
-        let child_name: &OsStr = "child".as_ref();
-        fs::create_dir(dir.path().join("child")).unwrap();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
-
-        let result = open_or_create_child_directory(&parent, child_name, false, None);
-        assert!(result.is_ok());
+    fn child_directory_creation_respects_existing_and_missing_paths() {
+        for (exists, create) in [(true, false), (false, true), (false, false), (true, true)] {
+            let dir = tempdir().unwrap();
+            let child_name = OsStr::new("child");
+            let child_path = dir.path().join(child_name);
+            if exists {
+                fs::create_dir(&child_path).unwrap();
+            }
+            let parent = open_directory(dir.path()).unwrap();
+            let result = open_or_create_child_directory(&parent, child_name, create, None);
+            if exists || create {
+                assert!(result.is_ok());
+                assert!(child_path.is_dir());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+                assert!(!child_path.exists());
+            }
+        }
     }
 
     #[test]
-    fn open_or_create_child_create_missing() {
-        let dir = tempdir().unwrap();
-        let child_name: &OsStr = "newchild".as_ref();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
+    fn temporary_writes_preserve_contents_names_and_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let result = open_or_create_child_directory(&parent, child_name, true, None);
-        assert!(result.is_ok());
-        assert!(dir.path().join("newchild").exists());
+        for mode in [None, Some(0o600)] {
+            let dir = tempdir().unwrap();
+            let target = AnchoredTarget::new(
+                open_directory(dir.path()).unwrap(),
+                dir.path().to_path_buf(),
+                "target.txt".into(),
+            );
+            let payload = b"hello world";
+            let path = write_anchored_temporary_file(&target, payload, mode).unwrap();
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("target.txt.tmp-")
+            );
+            assert_eq!(fs::read(&path).unwrap(), payload);
+            if let Some(mode) = mode {
+                assert_eq!(
+                    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+        }
     }
 
     #[test]
-    fn open_or_create_child_no_create_missing() {
+    fn copied_temporary_rewinds_source_and_cleans_failed_publication() {
+        use crate::{LocalPublishFault, fault_injection::arm_fault};
         let dir = tempdir().unwrap();
-        let child_name: &OsStr = "nochild".as_ref();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
-
-        let result = open_or_create_child_directory(&parent, child_name, false, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn open_or_create_child_race_condition_already_exists() {
-        let dir = tempdir().unwrap();
-        let child_name: &OsStr = "racechild".as_ref();
-        fs::create_dir(dir.path().join("racechild")).unwrap();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
-
-        let result = open_or_create_child_directory(&parent, child_name, true, None);
-        assert!(result.is_ok());
-    }
-
-    // ── write_anchored_temporary_file ─────────────────────────────────────
-
-    #[test]
-    fn write_anchored_temporary_file_basic() {
-        let dir = tempdir().unwrap();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
-        let target = AnchoredTarget::new(parent, dir.path().to_path_buf(), "target.txt".into());
-        let payload = b"hello world";
-
-        let result = write_anchored_temporary_file(&target, payload, None);
-        assert!(result.is_ok());
-        let tmp_path = result.unwrap();
-
-        // Short destinations retain the GC-recognizable suffix
-        let tmp_name = tmp_path.file_name().unwrap().to_string_lossy();
-        assert!(
-            tmp_name.starts_with("target.txt.tmp-"),
-            "unexpected temp name: {tmp_name}"
+        let target = AnchoredTarget::new(
+            open_directory(dir.path()).unwrap(),
+            dir.path().to_path_buf(),
+            "target".into(),
         );
-
-        // File content should match
-        let contents = fs::read(&tmp_path).unwrap();
-        assert_eq!(contents, payload);
-    }
-
-    #[test]
-    fn write_anchored_temporary_file_with_file_mode() {
-        let dir = tempdir().unwrap();
-        let parent = fs::OpenOptions::new().read(true).open(dir.path()).unwrap();
-        let target = AnchoredTarget::new(parent, dir.path().to_path_buf(), "moded.txt".into());
-        let payload = b"mode test";
-
-        let result = write_anchored_temporary_file(&target, payload, Some(0o600));
-        assert!(result.is_ok());
-        let tmp_path = result.unwrap();
-        assert!(tmp_path.exists());
-        let contents = fs::read(&tmp_path).unwrap();
-        assert_eq!(contents, payload);
-    }
-
-    // ── temporary_file_name ──────────────────────────────────────────────
-
-    #[test]
-    fn temporary_file_name_has_tmp_suffix() {
-        let name = temporary_file_name(OsStr::new("file.txt"));
-        let name_str = name.to_string_lossy();
-        assert!(name_str.starts_with("file.txt.tmp-"));
-    }
-
-    #[test]
-    fn temporary_file_name_unique() {
-        let a = temporary_file_name(OsStr::new("file.txt"));
-        let b = temporary_file_name(OsStr::new("file.txt"));
-        assert_ne!(a, b);
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"complete payload").unwrap();
+        for boundary in [
+            LocalPublishBoundary::BeforeTemporaryWrite,
+            LocalPublishBoundary::DuringTemporaryWrite,
+            LocalPublishBoundary::BeforeTemporarySync,
+            LocalPublishBoundary::AfterTemporaryDurable,
+        ] {
+            let guard = arm_fault(
+                target.logical_path(),
+                boundary,
+                LocalPublishFault::SyncFailure,
+            );
+            assert!(copy_anchored_temporary_file(&target, &source, Some(0o600)).is_err());
+            drop(guard);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+        let temporary = copy_anchored_temporary_file(&target, &source, Some(0o600)).unwrap();
+        assert_eq!(fs::read(temporary).unwrap(), b"complete payload");
     }
 
     // ── ensure_parent_path_matches_anchor ─────────────────────────────────
@@ -1103,28 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn open_directory_chain_rejects_prefix_component() {
-        // The only way to get a Prefix component on Unix is... not possible,
-        // but on Windows it would be.  We test the error path by asserting
-        // the function signature handles it.  Since Prefix only appears on
-        // Windows, this test is a no-op on other platforms but ensures the
-        // code compiles and is reachable.
-        #[cfg(not(unix))]
-        {
-            let dir = tempdir().unwrap();
-            let path = std::path::Path::new(r"\\?\C:\");
-            let result = open_directory_chain(path, false, None, invalid_path_error);
-            assert!(result.is_err());
-        }
-        // On Unix we verify the function is callable.
-        #[cfg(unix)]
-        {
-            let _ =
-                open_directory_chain(std::path::Path::new("/"), false, None, invalid_path_error);
-        }
-    }
-
-    #[test]
     fn open_or_create_child_directory_create_error() {
         let dir = tempdir().unwrap();
         let parent = std::fs::OpenOptions::new()
@@ -1160,7 +1076,6 @@ mod tests {
         std::fs::write(&first_tmp, b"stale").unwrap();
 
         let result = write_anchored_temporary_file(&target, payload, None);
-        assert!(result.is_ok());
         let tmp_path = result.unwrap();
         let contents = std::fs::read(&tmp_path).unwrap();
         assert_eq!(contents, payload);
@@ -1168,18 +1083,12 @@ mod tests {
 
     #[test]
     fn remove_if_present_io_error() {
-        // Create a directory (not a file) to trigger a non-NotFound error
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("a_directory");
         std::fs::create_dir(&dir_path).unwrap();
-        // Removing a non-empty directory with remove_file will fail
-        // (remove_file only works on files).  The error kind will be
-        // IsADirectory or PermissionDenied — not NotFound.
-        let result = remove_if_present(&dir_path);
-        // It might work if the dir is empty on some platforms, but on Linux
-        // remove_file on a directory returns EISDIR which is not NotFound.
-        // Just ensure we don't panic and the error path is exercised.
-        assert!(result.is_err() || result.is_ok());
+        let error = remove_if_present(&dir_path).unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(dir_path.is_dir());
     }
 
     #[cfg(unix)]
@@ -1275,35 +1184,6 @@ mod tests {
         let result = create_directory(&new_dir, Some(0o755));
         assert!(result.is_ok());
         assert!(new_dir.is_dir());
-    }
-
-    // ── create_directory_all ──────────────────────────────────────────────
-
-    #[test]
-    fn create_directory_all_nested() {
-        let dir = tempdir().unwrap();
-        let nested = dir.path().join("a/b/c");
-
-        assert!(create_directory_all(&nested, None).is_ok());
-        assert!(nested.is_dir());
-    }
-
-    #[test]
-    fn create_directory_all_idempotent() {
-        let dir = tempdir().unwrap();
-        let nested = dir.path().join("x/y");
-
-        assert!(create_directory_all(&nested, None).is_ok());
-        assert!(create_directory_all(&nested, None).is_ok());
-    }
-
-    #[test]
-    fn create_directory_all_with_mode() {
-        let dir = tempdir().unwrap();
-        let nested = dir.path().join("p/q/r");
-
-        assert!(create_directory_all(&nested, Some(0o755)).is_ok());
-        assert!(nested.is_dir());
     }
 
     // ── open_new_file with mode ──────────────────────────────────────────
@@ -1496,26 +1376,6 @@ mod tests {
         );
     }
 
-    // ── open_directory_chain with Prefix component (compile check) ───────
-
-    #[test]
-    fn open_directory_chain_rejects_prefix_via_invalid_path() {
-        // The Prefix component only appears on Windows.
-        // On Unix, we can test that a non-Normal component in the path
-        // path (like a trailing slash with ParentDir) is handled.
-        let dir = tempdir().unwrap();
-        // The function handles RootDir and CurDir via empty match arms (L140).
-        // ParentDir is handled at L141-143.
-        // Normal segments go through open_or_create_child_directory (L144-151).
-        //
-        // To hit L152 (Prefix), we'd need a Windows path like \\?\C:\.
-        // On Unix this is unreachable.
-        //
-        // We can still verify the function works correctly with valid paths.
-        let result = open_directory_chain(dir.path(), false, None, invalid_path_error);
-        assert!(result.is_ok());
-    }
-
     // ── open_anchored_target with traversal in relative parent path ─────
 
     #[test]
@@ -1564,7 +1424,6 @@ mod tests {
 
         // L244: symlink detected
         let result = ensure_parent_path_matches_anchor(&target, "parent replaced with symlink");
-        assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }

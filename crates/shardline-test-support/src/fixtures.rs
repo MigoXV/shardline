@@ -89,3 +89,55 @@ impl Default for TempStorage {
         Self::new()
     }
 }
+
+/// Deterministic xorshift payload shared by chaos fixtures.
+///
+/// Preserves fixture seeds without adding an RNG dependency.
+#[must_use]
+pub fn deterministic_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.push((state & 0xff) as u8);
+    }
+    out
+}
+
+/// Counts files recursively, ignoring unreadable or missing fixture directories.
+#[must_use]
+pub fn count_files_recursive(dir: &Path) -> usize {
+    let mut count: usize = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count = count.saturating_add(count_files_recursive(&path));
+            } else {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
+}
+
+/// Counts files beneath a local fixture storage root’s `chunks` directory.
+#[must_use]
+pub fn count_chunk_files(root: &Path) -> usize {
+    count_files_recursive(&root.join("chunks"))
+}
+
+/// Deterministic little-endian LCG bytes for chunking and container fixtures.
+#[must_use]
+pub fn lcg_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(len);
+    let mut state = seed;
+    while data.len() < len {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        data.extend_from_slice(&state.to_le_bytes());
+    }
+    data.truncate(len);
+    data
+}

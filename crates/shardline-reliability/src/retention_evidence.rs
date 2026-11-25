@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::snapshot_event::{SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain};
-use crate::snapshot_log::SnapshotEvidenceLog;
+use crate::snapshot_event::{
+    SnapshotEvidence, SnapshotEvidenceEvent, verify_snapshot_chain, verify_snapshot_chain_for,
+};
+use crate::snapshot_log::{SnapshotEvidenceLog, verify_and_reactivate_snapshot};
 use crate::{OperationIdentity, OperationKind, ReliabilityError};
 
 /// Lifecycle state of a durable retention hold.
@@ -138,24 +140,12 @@ pub type RetentionEvidenceLog = SnapshotEvidenceLog<RetentionHoldSnapshot>;
 /// Returns an error when the evidence chain is invalid, the prior state is
 /// not `Released`, or the new snapshot cannot be appended.
 pub fn verify_and_reactivate_retention_hold(
-    mut evidence: RetentionEvidenceLog,
+    evidence: RetentionEvidenceLog,
     snapshot: RetentionHoldSnapshot,
 ) -> Result<(RetentionEvidenceLog, bool), ReliabilityError> {
-    if evidence.events().is_empty() {
-        return Ok((RetentionEvidenceLog::baseline(snapshot)?, true));
-    }
-    if !evidence.is_head_only() {
-        verify_snapshot_chain(evidence.events())?;
-    }
-    let last = evidence
-        .events()
-        .last()
-        .ok_or(ReliabilityError::OperationMismatch)?;
-    if last.after.state != RetentionHoldLifecycleState::Released {
-        return Err(ReliabilityError::StateMismatch);
-    }
-    evidence.record(snapshot)?;
-    Ok((evidence, false))
+    verify_and_reactivate_snapshot(evidence, snapshot, |previous| {
+        previous.state == RetentionHoldLifecycleState::Released
+    })
 }
 
 ///
@@ -176,12 +166,7 @@ pub fn verify_retention_hold_lifecycle_events(
     events: &[RetentionHoldLifecycleEvent],
     expected: &RetentionHoldSnapshot,
 ) -> Result<(), ReliabilityError> {
-    verify_retention_hold_lifecycle_chain(events)?;
-    if events.last().is_some_and(|event| event.after == *expected) {
-        Ok(())
-    } else {
-        Err(ReliabilityError::StateMismatch)
-    }
+    verify_snapshot_chain_for(events, expected)
 }
 
 #[cfg(test)]

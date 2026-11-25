@@ -1,4 +1,4 @@
-use shardline_index::{AsyncIndexStore, StoredObjectId};
+use shardline_index::{AsyncIndexStore, StoredObjectId, UploadIntentState};
 use shardline_reliability::{
     OperationIdentity, ReliabilityError, upload_lifecycle_event, upload_operation_identity,
 };
@@ -70,13 +70,7 @@ impl<I, O, R> CasCoordinator<I, O, R> {
     }
 }
 
-impl<I, O, R> CasCoordinator<I, O, R>
-where
-    I: AsyncIndexStore + Send + Sync,
-    <I as AsyncIndexStore>::Error: std::error::Error + Send + Sync + 'static,
-    O: AsyncObjectStore + Clone + 'static,
-    <O as AsyncObjectStore>::Error: std::error::Error + Send + Sync + 'static,
-{
+impl<I, O: AsyncObjectStore, R> CasCoordinator<I, O, R> {
     /// # Errors
     ///
     /// Returns CasError when the body exceeds the configured limit or the
@@ -198,7 +192,8 @@ where
     {
         let tenant = tenant.into();
         let repository = repository.into();
-        self.begin_upload_scoped(intent, &tenant, &repository)
+        let current = self
+            .begin_upload_record_scoped(intent, &tenant, &repository)
             .await
             .map_err(E::from)?;
         upload_lifecycle_failpoint(
@@ -206,14 +201,6 @@ where
             UploadLifecycleBoundary::AfterIntentCreated,
         )
         .map_err(E::from)?;
-        let current = self
-            .index
-            .intent_by_id(intent.intent_id())
-            .await
-            .map_err(CasError::from_record)
-            .map_err(E::from)?
-            .ok_or_else(|| E::from(CasError::InvalidUploadTransition))?;
-
         // Content-addressed upload retries are idempotent. Once an intent is
         // visible, repeat the storage work only to obtain the protocol response;
         // never reopen the completed durable lifecycle.
@@ -227,7 +214,7 @@ where
         if current.state() == shardline_index::UploadIntentState::Failed {
             return Err(E::from(CasError::InvalidUploadTransition));
         }
-        self.transition_upload_in_scope(
+        self.transition_upload_scoped(
             &tenant,
             &repository,
             intent.intent_id(),
@@ -238,42 +225,23 @@ where
         upload_lifecycle_failpoint(intent.intent_id(), UploadLifecycleBoundary::AfterStoring)
             .map_err(E::from)?;
 
-        match work().await {
-            Ok(result) => {
-                upload_lifecycle_failpoint(
-                    intent.intent_id(),
-                    UploadLifecycleBoundary::AfterObjectWork,
-                )
-                .map_err(E::from)?;
-                self.complete_upload_in_scope(&tenant, &repository, intent.intent_id())
-                    .await
-                    .map_err(E::from)?;
-                upload_lifecycle_failpoint(
-                    intent.intent_id(),
-                    UploadLifecycleBoundary::AfterStored,
-                )
-                .map_err(E::from)?;
-                upload_lifecycle_failpoint(
-                    intent.intent_id(),
-                    UploadLifecycleBoundary::AfterMetadataCommitted,
-                )
-                .map_err(E::from)?;
-                upload_lifecycle_failpoint(
-                    intent.intent_id(),
-                    UploadLifecycleBoundary::AfterVisible,
-                )
-                .map_err(E::from)?;
-                Ok(result)
-            }
-            // A returned error does not establish whether an object-store or
-            // metadata commit happened before its acknowledgement was lost.
-            // Keep the intent at its last durable in-flight boundary so an
-            // idempotent retry or startup reconciliation can inspect reality.
-            // Marking it terminal here would make an ambiguous success
-            // unrecoverable and could let one failed duplicate poison a
-            // concurrent winner.
-            Err(error) => Err(error),
+        // A returned error does not establish whether an external commit
+        // succeeded before its acknowledgement was lost. Preserve the in-flight
+        // intent so retry or reconciliation can inspect durable state.
+        let result = work().await?;
+        upload_lifecycle_failpoint(intent.intent_id(), UploadLifecycleBoundary::AfterObjectWork)
+            .map_err(E::from)?;
+        self.complete_upload_in_scope(&tenant, &repository, intent.intent_id())
+            .await
+            .map_err(E::from)?;
+        for boundary in [
+            UploadLifecycleBoundary::AfterStored,
+            UploadLifecycleBoundary::AfterMetadataCommitted,
+            UploadLifecycleBoundary::AfterVisible,
+        ] {
+            upload_lifecycle_failpoint(intent.intent_id(), boundary).map_err(E::from)?;
         }
+        Ok(result)
     }
 
     /// Creates a durable upload intent before any object-store mutation.
@@ -299,6 +267,19 @@ where
         tenant: &str,
         repository: &str,
     ) -> Result<(), CasError> {
+        self.begin_upload_record_scoped(intent, tenant, repository)
+            .await
+            .map(|_| ())
+    }
+
+    // Return the identity-checked snapshot so upload work need not read it again.
+    // State transitions still recheck their own snapshots atomically in the store.
+    async fn begin_upload_record_scoped(
+        &self,
+        intent: &shardline_index::UploadIntent,
+        tenant: &str,
+        repository: &str,
+    ) -> Result<shardline_index::UploadIntent, CasError> {
         self.index
             .create_intent_scoped(intent, tenant, repository)
             .await
@@ -308,11 +289,9 @@ where
             .intent_by_id(intent.intent_id())
             .await
             .map_err(CasError::from_record)?;
-        if stored.is_some_and(|stored| stored.has_same_identity(intent)) {
-            Ok(())
-        } else {
-            Err(CasError::InvalidUploadTransition)
-        }
+        stored
+            .filter(|stored| stored.has_same_identity(intent))
+            .ok_or(CasError::InvalidUploadTransition)
     }
 
     /// Records one validated persistence boundary for an upload.
@@ -330,7 +309,7 @@ where
         intent_id: &str,
         next: shardline_index::UploadIntentState,
     ) -> Result<(), CasError> {
-        self.transition_upload_in_scope("shardline", "default", intent_id, next)
+        self.transition_upload_scoped("shardline", "default", intent_id, next)
             .await
     }
 
@@ -347,17 +326,6 @@ where
         intent_id: &str,
         next: shardline_index::UploadIntentState,
     ) -> Result<(), CasError> {
-        self.transition_upload_in_scope(tenant, repository, intent_id, next)
-            .await
-    }
-
-    async fn transition_upload_in_scope(
-        &self,
-        tenant: &str,
-        repository: &str,
-        intent_id: &str,
-        next: shardline_index::UploadIntentState,
-    ) -> Result<(), CasError> {
         let current = self
             .index
             .intent_by_id(intent_id)
@@ -366,19 +334,12 @@ where
         let Some(current) = current else {
             return Err(CasError::InvalidUploadTransition);
         };
-        if current.state() == shardline_index::UploadIntentState::Failed {
-            return if next == shardline_index::UploadIntentState::Failed {
-                Ok(())
-            } else {
-                Err(CasError::InvalidUploadTransition)
-            };
-        }
-        // Already at or past the target in the committed chain: a concurrent
-        // duplicate caller advanced it, so the boundary is effectively reached.
-        if next != shardline_index::UploadIntentState::Failed
-            && current.state().committed_rank() >= next.committed_rank()
-        {
+        // Apply the same completion rule to this snapshot and a raced update.
+        if upload_boundary_reached(current.state(), next) {
             return Ok(());
+        }
+        if current.state() == UploadIntentState::Failed {
+            return Err(CasError::InvalidUploadTransition);
         }
         let event = upload_lifecycle_event(
             tenant,
@@ -407,27 +368,24 @@ where
             .intent_by_id(intent_id)
             .await
             .map_err(CasError::from_record)?;
-        match after {
-            Some(intent) if intent.state() == shardline_index::UploadIntentState::Failed => {
-                if next == shardline_index::UploadIntentState::Failed {
-                    Ok(())
-                } else {
-                    Err(CasError::InvalidUploadTransition)
-                }
-            }
-            Some(intent)
-                if next != shardline_index::UploadIntentState::Failed
-                    && intent.state().committed_rank() >= next.committed_rank() =>
-            {
-                Ok(())
-            }
-            _ => Err(CasError::InvalidUploadTransition),
+        if after.is_some_and(|intent| upload_boundary_reached(intent.state(), next)) {
+            Ok(())
+        } else {
+            Err(CasError::InvalidUploadTransition)
         }
     }
 }
 
+/// Successful boundaries advance monotonically; failure only satisfies itself.
+fn upload_boundary_reached(current: UploadIntentState, target: UploadIntentState) -> bool {
+    if current == UploadIntentState::Failed || target == UploadIntentState::Failed {
+        current == target
+    } else {
+        current.committed_rank() >= target.committed_rank()
+    }
+}
+
 fn map_upload_intent_store_error(error: impl std::error::Error + 'static) -> CasError {
-    let message = error.to_string();
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(current) = source {
         if current
@@ -438,7 +396,7 @@ fn map_upload_intent_store_error(error: impl std::error::Error + 'static) -> Cas
         }
         source = current.source();
     }
-    CasError::Record(message)
+    CasError::Record(error.to_string())
 }
 
 #[async_trait::async_trait]
@@ -575,41 +533,42 @@ mod tests {
     }
 
     #[test]
+    fn upload_boundaries_keep_failure_separate_from_success() {
+        use UploadIntentState::{Created, Failed, MetadataCommitted, Stored, Storing, Visible};
+        let states = [Created, Storing, Stored, MetadataCommitted, Visible, Failed];
+        let expected = [
+            [true, false, false, false, false, false],
+            [true, true, false, false, false, false],
+            [true, true, true, false, false, false],
+            [true, true, true, true, false, false],
+            [true, true, true, true, true, false],
+            [false, false, false, false, false, true],
+        ];
+        for (current, row) in states.into_iter().zip(expected) {
+            for (target, reached) in states.into_iter().zip(row) {
+                assert_eq!(
+                    super::upload_boundary_reached(current, target),
+                    reached,
+                    "{current:?} -> {target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn coordinator_keeps_adapters_and_limits() {
-        let limits = CasLimits::new(NonZeroU64::MIN, NonZeroU64::MAX, NonZeroU64::MIN);
-        let c = CasCoordinator::new(IndexProbe, ObjectStoreProbe, RecordStoreProbe, limits);
-        assert_eq!(c.index(), &IndexProbe);
-        assert_eq!(c.object_store(), &ObjectStoreProbe);
-        assert_eq!(c.record_store(), &RecordStoreProbe);
-        assert_eq!(c.limits(), limits);
-    }
-
-    #[test]
-    fn coordinator_debug_format() {
-        let limits = CasLimits::new(
-            NonZeroU64::new(1).unwrap(),
-            NonZeroU64::new(2).unwrap(),
-            NonZeroU64::new(3).unwrap(),
-        );
-        let c = CasCoordinator::new(IndexProbe, ObjectStoreProbe, RecordStoreProbe, limits);
-        let debug = format!("{c:?}");
-        assert!(debug.contains("CasCoordinator"));
-        assert!(debug.contains("RecordStoreProbe"));
-    }
-
-    #[test]
-    fn coordinator_with_different_types() {
-        let limits = CasLimits::new(NonZeroU64::MIN, NonZeroU64::MIN, NonZeroU64::MIN);
-        let c = CasCoordinator::new(
-            42_usize,
-            String::from("store"),
-            String::from("records"),
-            limits,
-        );
-        assert_eq!(c.index(), &42_usize);
-        assert_eq!(c.object_store(), &"store");
-        assert_eq!(c.record_store(), &"records");
-        assert_eq!(c.limits(), limits);
+        for limits in [
+            CasLimits::new(NonZeroU64::MIN, NonZeroU64::MAX, NonZeroU64::MIN),
+            CasLimits::new(NonZeroU64::MIN, NonZeroU64::MIN, NonZeroU64::MIN),
+            CasLimits::new(NonZeroU64::MAX, NonZeroU64::MAX, NonZeroU64::MAX),
+        ] {
+            let coordinator =
+                CasCoordinator::new(IndexProbe, ObjectStoreProbe, RecordStoreProbe, limits);
+            assert_eq!(coordinator.index(), &IndexProbe);
+            assert_eq!(coordinator.object_store(), &ObjectStoreProbe);
+            assert_eq!(coordinator.record_store(), &RecordStoreProbe);
+            assert_eq!(coordinator.limits(), limits);
+        }
     }
 
     #[test]
@@ -632,16 +591,6 @@ mod tests {
         assert_eq!(
             identity.content_sha256.as_deref(),
             Some("a".repeat(64).as_str())
-        );
-    }
-
-    #[test]
-    fn coordinator_limits_independent() {
-        let a = CasLimits::new(NonZeroU64::MIN, NonZeroU64::MIN, NonZeroU64::MIN);
-        let b = CasLimits::new(NonZeroU64::MAX, NonZeroU64::MAX, NonZeroU64::MAX);
-        assert_ne!(
-            CasCoordinator::new((), (), (), a).limits(),
-            CasCoordinator::new((), (), (), b).limits()
         );
     }
 

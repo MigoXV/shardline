@@ -26,7 +26,7 @@ use crate::{
     hash::compute_term_verification_hash,
     retry::RetryContext,
     transfer::{ByteRange, TransferClient},
-    xorb::{DecodedChunk, XorbReader},
+    xorb::XorbReader,
 };
 
 /// A fully reconstructed byte range (or full file) with its resolved terms.
@@ -76,28 +76,14 @@ pub async fn reconstruct(
     file_id: &str,
     requested_range: Option<ByteRange>,
 ) -> Result<ReconstructedFile, SdxError> {
-    let plan =
-        fetch_reconstruction(transfer, retry, api_base, token, file_id, requested_range).await?;
-    assemble(transfer, retry, token, plan, requested_range).await
-}
-
-/// Fetches the reconstruction plan, preferring V2 and falling back to V1 on
-/// 404/501 (V2 not served).
-async fn fetch_reconstruction(
-    transfer: &TransferClient,
-    retry: Option<&RetryContext>,
-    api_base: &str,
-    token: &str,
-    file_id: &str,
-    requested_range: Option<ByteRange>,
-) -> Result<Reconstruction, SdxError> {
     let response =
         fetch_reconstruction_response(transfer, retry, api_base, token, file_id, requested_range)
             .await?;
-    match response {
-        ReconstructionResponse::V2(response) => Ok(Reconstruction::from_v2(response)?),
-        ReconstructionResponse::V1(response) => Ok(Reconstruction::from_v1(response)?),
-    }
+    let plan = match response {
+        ReconstructionResponse::V2(response) => Reconstruction::from_v2(response),
+        ReconstructionResponse::V1(response) => Reconstruction::from_v1(response),
+    }?;
+    assemble(transfer, retry, token, plan, requested_range).await
 }
 
 /// A raw reconstruction response in either supported wire version.
@@ -125,29 +111,27 @@ pub(crate) async fn fetch_reconstruction_response(
     file_id: &str,
     requested_range: Option<ByteRange>,
 ) -> Result<ReconstructionResponse, SdxError> {
-    let v2: Result<ReconstructionResponse, SdxError> =
-        match run_with_retry(retry, token, |tok| async move {
-            transfer
-                .reconstruction_v2(api_base, &tok, file_id, requested_range)
-                .await
-        })
-        .await
-        {
-            Ok(response) => Ok(ReconstructionResponse::V2(response)),
-            Err(TransferError::NotFound(_) | TransferError::HttpStatus { status: 501, .. }) => {
-                // V2 not available on this frontend: fall back to V1
-                // (SDX_PLAN.md §7 item 7, cross-frontend M7).
-                let response = run_with_retry(retry, token, |tok| async move {
-                    transfer
-                        .reconstruction_v1(api_base, &tok, file_id, requested_range)
-                        .await
-                })
-                .await?;
-                Ok(ReconstructionResponse::V1(response))
-            }
-            Err(error) => Err(error.into()),
-        };
-    v2
+    match run_with_retry(retry, token, |tok| async move {
+        transfer
+            .reconstruction_v2(api_base, &tok, file_id, requested_range)
+            .await
+    })
+    .await
+    {
+        Ok(response) => Ok(ReconstructionResponse::V2(response)),
+        Err(TransferError::NotFound(_) | TransferError::HttpStatus { status: 501, .. }) => {
+            // V2 not available on this frontend: fall back to V1
+            // (SDX_PLAN.md §7 item 7, cross-frontend M7).
+            let response = run_with_retry(retry, token, |tok| async move {
+                transfer
+                    .reconstruction_v1(api_base, &tok, file_id, requested_range)
+                    .await
+            })
+            .await?;
+            Ok(ReconstructionResponse::V1(response))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Runs a reconstruction HTTP call through the retry context if present,
@@ -176,17 +160,14 @@ async fn assemble(
     plan: Reconstruction,
     requested_range: Option<ByteRange>,
 ) -> Result<ReconstructedFile, SdxError> {
-    let mut decoded_fetches: HashMap<usize, Vec<DecodedChunk>> = HashMap::new();
-    for (fetch_index, fetch) in plan.fetches.iter().enumerate() {
-        let fetch_url = fetch.url.clone();
+    let mut decoded_fetches = Vec::with_capacity(plan.fetches.len());
+    for fetch in &plan.fetches {
+        let fetch_url = &fetch.url;
         let fetch_bytes = fetch.bytes;
-        let ranged = run_with_retry(retry, token, move |tok| {
-            let fetch_url = fetch_url.clone();
-            async move {
-                transfer
-                    .fetch_xorb_range(&fetch_url, &tok, fetch_bytes)
-                    .await
-            }
+        let ranged = run_with_retry(retry, token, |tok| async move {
+            transfer
+                .fetch_xorb_range(fetch_url, &tok, fetch_bytes)
+                .await
         })
         .await?;
         let chunks = XorbReader::new(ranged.data).decode_chunks()?;
@@ -199,22 +180,15 @@ async fn assemble(
                 actual: actual_chunks,
             });
         }
-        decoded_fetches.insert(fetch_index, chunks);
+        decoded_fetches.push((fetch, chunks));
     }
 
     let mut output = Vec::new();
     let mut resolved_terms = Vec::with_capacity(plan.terms.len());
-    for (term_index, term) in plan.terms.iter().enumerate() {
-        let fetch =
-            plan.fetches
-                .get(term.fetch_index)
-                .ok_or_else(|| SdxError::MissingFetchInfo {
-                    term_index,
-                    hash: term.xorb_hash.clone(),
-                })?;
-        let chunks =
+    for (term_index, term) in plan.terms.into_iter().enumerate() {
+        let (fetch, chunks) =
             decoded_fetches
-                .get(&term.fetch_index)
+                .get(term.fetch_index)
                 .ok_or_else(|| SdxError::MissingFetchInfo {
                     term_index,
                     hash: term.xorb_hash.clone(),
@@ -270,26 +244,21 @@ async fn assemble(
                 actual: offset,
             });
         }
-        let term_byte_size = term.unpacked_length.saturating_sub(offset);
-
-        let mut term_data = Vec::with_capacity(decoded_len as usize);
-        for chunk in term_chunks {
-            term_data.extend_from_slice(&chunk.data);
-        }
-        term_data.drain(..usize::try_from(offset).unwrap_or(usize::MAX));
-        term_data.truncate(usize::try_from(term_byte_size).unwrap_or(usize::MAX));
-
         let chunk_hashes: Vec<MerkleHash> = term_chunks.iter().map(|chunk| chunk.hash).collect();
         let verification_hash = compute_term_verification_hash(&chunk_hashes);
 
         resolved_terms.push(ResolvedTerm {
-            xorb_hash: term.xorb_hash.clone(),
+            xorb_hash: term.xorb_hash,
             chunk_range: term.chunk_range,
             unpacked_length: term.unpacked_length,
             verification_hash,
             output_offset: u64::try_from(output.len()).unwrap_or(u64::MAX),
         });
-        output.extend_from_slice(&term_data);
+        let mut skip = usize::try_from(offset).unwrap_or(usize::MAX);
+        for chunk in term_chunks {
+            output.extend_from_slice(chunk.data.get(skip..).unwrap_or_default());
+            skip = skip.saturating_sub(chunk.data.len());
+        }
     }
 
     if let Some(range) = requested_range {
@@ -321,49 +290,44 @@ struct Reconstruction {
 
 impl Reconstruction {
     fn from_v1(response: FileReconstructionResponse) -> Result<Self, SdxError> {
-        let mut raw_fetches = Vec::new();
-        for (hash, entries) in response.fetch_info {
-            for entry in entries {
-                raw_fetches.push(FetchEntry {
-                    xorb_hash: hash.clone(),
-                    url: entry.url,
-                    bytes: ByteRange::new(entry.url_range.start, entry.url_range.end),
-                    chunks: (entry.range.start, entry.range.end),
-                });
-            }
-        }
+        let raw_fetches = response.fetch_info.into_iter().flat_map(|(hash, entries)| {
+            entries.into_iter().map(move |entry| FetchEntry {
+                xorb_hash: hash.clone(),
+                url: entry.url,
+                bytes: ByteRange::new(entry.url_range.start, entry.url_range.end),
+                chunks: (entry.range.start, entry.range.end),
+            })
+        });
         Self::build(
             response.offset_into_first_range,
-            &response.terms,
+            response.terms,
             raw_fetches,
         )
     }
 
     fn from_v2(response: FileReconstructionV2Response) -> Result<Self, SdxError> {
-        let mut raw_fetches = Vec::new();
-        for (hash, entries) in response.xorbs {
-            for entry in entries {
-                for descriptor in entry.ranges {
-                    raw_fetches.push(FetchEntry {
-                        xorb_hash: hash.clone(),
-                        url: entry.url.clone(),
-                        bytes: ByteRange::new(descriptor.bytes.start, descriptor.bytes.end),
-                        chunks: (descriptor.chunks.start, descriptor.chunks.end),
-                    });
-                }
-            }
-        }
+        let raw_fetches = response.xorbs.into_iter().flat_map(|(hash, entries)| {
+            entries.into_iter().flat_map(move |entry| {
+                let hash = hash.clone();
+                entry.ranges.into_iter().map(move |descriptor| FetchEntry {
+                    xorb_hash: hash.clone(),
+                    url: entry.url.clone(),
+                    bytes: ByteRange::new(descriptor.bytes.start, descriptor.bytes.end),
+                    chunks: (descriptor.chunks.start, descriptor.chunks.end),
+                })
+            })
+        });
         Self::build(
             response.offset_into_first_range,
-            &response.terms,
+            response.terms,
             raw_fetches,
         )
     }
 
     fn build(
         offset_into_first_range: u64,
-        terms: &[ReconstructionTerm],
-        raw_fetches: Vec<FetchEntry>,
+        terms: Vec<ReconstructionTerm>,
+        raw_fetches: impl IntoIterator<Item = FetchEntry>,
     ) -> Result<Self, SdxError> {
         // Coalesce fetch entries per xorb: shardline's reconstruction emits one
         // fetch entry per chunk, so a large file would otherwise produce one
@@ -378,21 +342,19 @@ impl Reconstruction {
         let mut fetches: Vec<FetchEntry> = Vec::new();
         for mut group in groups.into_values() {
             group.sort_by_key(|fetch| (fetch.chunks.0, fetch.chunks.1));
-            let mut merged: Vec<FetchEntry> = Vec::new();
-            for fetch in group {
-                match merged.last_mut() {
-                    Some(entry) if entry.chunks.1 >= fetch.chunks.0 => {
-                        entry.chunks.1 = entry.chunks.1.max(fetch.chunks.1);
-                        entry.bytes.end = entry.bytes.end.max(fetch.bytes.end);
-                    }
-                    _ => merged.push(fetch),
+            group.dedup_by(|next, current| {
+                let overlaps = current.chunks.1 >= next.chunks.0;
+                if overlaps {
+                    current.chunks.1 = current.chunks.1.max(next.chunks.1);
+                    current.bytes.end = current.bytes.end.max(next.bytes.end);
                 }
-            }
-            fetches.extend(merged);
+                overlaps
+            });
+            fetches.extend(group);
         }
 
         let mut planned_terms = Vec::with_capacity(terms.len());
-        for (term_index, term) in terms.iter().enumerate() {
+        for (term_index, term) in terms.into_iter().enumerate() {
             let fetch_index = fetches
                 .iter()
                 .position(|fetch| {
@@ -405,7 +367,7 @@ impl Reconstruction {
                     hash: term.hash.clone(),
                 })?;
             planned_terms.push(TermPlan {
-                xorb_hash: term.hash.clone(),
+                xorb_hash: term.hash,
                 chunk_range: (term.range.start, term.range.end),
                 unpacked_length: term.unpacked_length,
                 fetch_index,
@@ -449,7 +411,7 @@ mod tests {
     use super::Reconstruction;
     use crate::error::SdxError;
     use crate::hash::compute_chunk_hash;
-    use crate::retry::{RetryContext, RetryMarkers, RetryPolicy, RetryScope};
+    use crate::retry::{RetryContext, RetryPolicy, RetryScope};
     use crate::transfer::TransferClient;
 
     const FILE_ID: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -491,94 +453,95 @@ mod tests {
         terms: serde_json::Value,
         xorbs: serde_json::Value,
     ) -> serde_json::Value {
-        let mut body = serde_json::Map::new();
-        body.insert(
-            "offset_into_first_range".to_owned(),
-            serde_json::Value::from(offset),
-        );
-        body.insert("terms".to_owned(), terms);
-        body.insert("xorbs".to_owned(), xorbs);
-        serde_json::Value::Object(body)
+        serde_json::Value::Object(serde_json::Map::from_iter([
+            ("offset_into_first_range".to_owned(), offset.into()),
+            ("terms".to_owned(), terms),
+            ("xorbs".to_owned(), xorbs),
+        ]))
     }
 
     #[test]
-    fn plan_from_v2_merges_contiguous_ranges_and_resolves_terms() {
-        let xorbs = json!({
-            XORB_HASH: [{
-                "url": format!("http://cas/transfer/xorb/default/{XORB_HASH}"),
-                "ranges": [
-                    {"chunks": {"start": 0, "end": 2}, "bytes": {"start": 0, "end": 99}},
-                    {"chunks": {"start": 2, "end": 4}, "bytes": {"start": 100, "end": 199}}
-                ]
-            }]
-        });
-        let terms = json!([
-            {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 0, "end": 2}},
-            {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 2, "end": 4}}
-        ]);
-        let body = v2_response_body(0, terms, xorbs);
-        let response: shardline_xet_adapter::FileReconstructionV2Response =
-            serde_json::from_value(body).unwrap();
-        let plan = Reconstruction::from_v2(response).unwrap();
-        // Contiguous chunk ranges in one xorb coalesce into a single fetch.
-        assert_eq!(plan.fetches.len(), 1);
-        assert_eq!(plan.fetches[0].chunks, (0, 4));
-        assert_eq!(plan.fetches[0].bytes, super::ByteRange::new(0, 199));
-        assert_eq!(plan.terms.len(), 2);
-        assert_eq!(plan.terms[0].fetch_index, 0);
-        assert_eq!(plan.terms[1].fetch_index, 0);
-    }
-
-    #[test]
-    fn plan_keeps_disjoint_chunk_ranges_as_separate_fetches() {
-        let xorbs = json!({
-            XORB_HASH: [{
-                "url": format!("http://cas/transfer/xorb/default/{XORB_HASH}"),
-                "ranges": [
-                    {"chunks": {"start": 0, "end": 2}, "bytes": {"start": 0, "end": 99}},
-                    {"chunks": {"start": 5, "end": 7}, "bytes": {"start": 300, "end": 399}}
-                ]
-            }]
-        });
-        let terms = json!([
-            {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 0, "end": 2}},
-            {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 5, "end": 7}}
-        ]);
-        let body = v2_response_body(0, terms, xorbs);
-        let response: shardline_xet_adapter::FileReconstructionV2Response =
-            serde_json::from_value(body).unwrap();
-        let plan = Reconstruction::from_v2(response).unwrap();
-        // A gap between chunk ranges keeps them as separate fetches.
-        assert_eq!(plan.fetches.len(), 2);
-        assert_eq!(plan.terms[0].fetch_index, 0);
-        assert_eq!(plan.terms[1].fetch_index, 1);
-    }
-
-    #[test]
-    fn plan_from_v2_deduplicates_identical_fetch_ranges() {
-        let xorbs = json!({
-            XORB_HASH: [{
-                "url": format!("http://cas/transfer/xorb/default/{XORB_HASH}"),
-                "ranges": [
-                    {"chunks": {"start": 0, "end": 1}, "bytes": {"start": 0, "end": 9}},
-                    {"chunks": {"start": 1, "end": 2}, "bytes": {"start": 0, "end": 9}}
-                ]
-            }]
-        });
-        let terms = json!([
-            {"hash": XORB_HASH, "unpacked_length": 5, "range": {"start": 0, "end": 1}},
-            {"hash": XORB_HASH, "unpacked_length": 5, "range": {"start": 1, "end": 2}}
-        ]);
-        let body = v2_response_body(0, terms, xorbs);
-        let response: shardline_xet_adapter::FileReconstructionV2Response =
-            serde_json::from_value(body).unwrap();
-        let plan = Reconstruction::from_v2(response).unwrap();
-        // Both descriptors point at the same byte range → one fetch whose chunk
-        // range is the union covering both terms.
-        assert_eq!(plan.fetches.len(), 1);
-        assert_eq!(plan.fetches[0].chunks, (0, 2));
-        assert_eq!(plan.terms[0].fetch_index, 0);
-        assert_eq!(plan.terms[1].fetch_index, 0);
+    fn v2_planning_coalesces_overlaps_but_preserves_gaps() {
+        // Descriptors: (chunk start, chunk end, byte start, byte end).
+        // Terms: (chunk start, chunk end, unpacked length).
+        for (name, descriptors, terms, expected_fetches, expected_indexes) in [
+            (
+                "overlapping and contiguous ranges",
+                vec![
+                    (1, 3, 50, 149),
+                    (0, 1, 0, 49),
+                    (0, 2, 0, 99),
+                    (2, 4, 100, 199),
+                ],
+                vec![(0, 2, 64), (2, 4, 64)],
+                vec![((0, 4), super::ByteRange::new(0, 199))],
+                vec![0, 0],
+            ),
+            (
+                "disjoint ranges",
+                vec![(0, 2, 0, 99), (5, 7, 300, 399)],
+                vec![(0, 2, 64), (5, 7, 64)],
+                vec![
+                    ((0, 2), super::ByteRange::new(0, 99)),
+                    ((5, 7), super::ByteRange::new(300, 399)),
+                ],
+                vec![0, 1],
+            ),
+            (
+                "identical byte ranges",
+                vec![(0, 1, 0, 9), (1, 2, 0, 9)],
+                vec![(0, 1, 5), (1, 2, 5)],
+                vec![((0, 2), super::ByteRange::new(0, 9))],
+                vec![0, 0],
+            ),
+        ] {
+            let ranges: Vec<_> = descriptors
+                .into_iter()
+                .map(|(start, end, first, last)| {
+                    json!({
+                        "chunks": {"start": start, "end": end},
+                        "bytes": {"start": first, "end": last}
+                    })
+                })
+                .collect();
+            let terms: Vec<_> = terms
+                .into_iter()
+                .map(|(start, end, length)| {
+                    json!({
+                        "hash": XORB_HASH, "unpacked_length": length,
+                        "range": {"start": start, "end": end}
+                    })
+                })
+                .collect();
+            let body = v2_response_body(
+                0,
+                json!(terms),
+                json!({
+                    XORB_HASH: [{
+                        "url": format!("http://cas/transfer/xorb/default/{XORB_HASH}"),
+                        "ranges": ranges
+                    }]
+                }),
+            );
+            let response = serde_json::from_value(body).unwrap();
+            let plan = Reconstruction::from_v2(response).unwrap();
+            assert_eq!(
+                plan.fetches
+                    .iter()
+                    .map(|fetch| (fetch.chunks, fetch.bytes))
+                    .collect::<Vec<_>>(),
+                expected_fetches,
+                "{name}"
+            );
+            assert_eq!(
+                plan.terms
+                    .iter()
+                    .map(|term| term.fetch_index)
+                    .collect::<Vec<_>>(),
+                expected_indexes,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -705,44 +668,49 @@ mod tests {
 
     #[tokio::test]
     async fn reconstruct_honors_offset_into_first_range() {
-        let server = MockServer::start().await;
-        let chunk = vec![7u8; 64];
-        let payload = serialize_payload(&[&chunk]);
+        for offset in [0, 16, 32, 48] {
+            let server = MockServer::start().await;
+            let chunks = [vec![7u8; 32], vec![9u8; 32]];
+            let payload = serialize_payload(&[&chunks[0], &chunks[1]]);
 
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/reconstructions/{FILE_ID}")))
-            .and(header("range", "bytes=16-63"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(v2_response_body(
-                16,
-                json!([
-                    {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 0, "end": 1}}
-                ]),
-                json!({
-                    XORB_HASH: [{
-                        "url": format!("{}/transfer/xorb/default/{XORB_HASH}", server.uri()),
-                        "ranges": [
-                            {"chunks": {"start": 0, "end": 1}, "bytes": {"start": 0, "end": payload.len() - 1}}
-                        ]
-                    }]
-                }),
-            )))
-            .mount(&server)
-            .await;
-        xorb_range_mock(&server, XORB_HASH, 0, (payload.len() - 1) as u64, payload).await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/reconstructions/{FILE_ID}")))
+                .and(header("range", format!("bytes={offset}-63")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(v2_response_body(
+                    offset,
+                    json!([
+                        {"hash": XORB_HASH, "unpacked_length": 64, "range": {"start": 0, "end": 2}}
+                    ]),
+                    json!({
+                        XORB_HASH: [{
+                            "url": format!("{}/transfer/xorb/default/{XORB_HASH}", server.uri()),
+                            "ranges": [
+                                {"chunks": {"start": 0, "end": 2}, "bytes": {"start": 0, "end": payload.len() - 1}}
+                            ]
+                        }]
+                    }),
+                )))
+                .mount(&server)
+                .await;
+            xorb_range_mock(&server, XORB_HASH, 0, (payload.len() - 1) as u64, payload).await;
 
-        let transfer = transfer_client();
-        let range = super::ByteRange::new(16, 63);
-        let file = super::reconstruct(
-            &transfer,
-            None,
-            &server.uri(),
-            "read-token",
-            FILE_ID,
-            Some(range),
-        )
-        .await
-        .unwrap();
-        assert_eq!(file.data, chunk[16..64]);
+            let transfer = transfer_client();
+            let range = super::ByteRange::new(offset, 63);
+            let file = super::reconstruct(
+                &transfer,
+                None,
+                &server.uri(),
+                "read-token",
+                FILE_ID,
+                Some(range),
+            )
+            .await
+            .unwrap();
+            assert_eq!(file.data, chunks.concat()[offset as usize..]);
+            assert_eq!(file.terms.len(), 1);
+            assert_eq!(file.terms[0].output_offset, 0);
+            assert_eq!(file.terms[0].unpacked_length, 64);
+        }
     }
 
     #[tokio::test]
@@ -908,7 +876,7 @@ mod tests {
                 .with_jitter(false),
             tokens: None,
             scope: RetryScope::Read,
-            markers: RetryMarkers::reconstruction(),
+            refresh_on_forbidden: false,
         };
         let transfer = transfer_client();
         let file = super::reconstruct(

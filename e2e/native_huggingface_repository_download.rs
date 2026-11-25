@@ -25,6 +25,7 @@ async fn qualify(
         python_package_available("hf_xet"),
         "stock hf_xet is required"
     );
+    let supports_verified_range = services.is_some();
     let _measurements = MEASUREMENTS.lock().await;
     let runtime = start_runtime_with_services(&[ServerFrontend::Hub], services).await?;
     let client = reqwest::Client::builder()
@@ -118,5 +119,45 @@ async fn qualify(
         assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.bytes().await?.as_ref(), &bytes[65530..65550]);
     }
+    let url = format!("{}/v1/hub/xet-files/{digest}/range", runtime.base_url);
+    for token in [&denied, &hidden] {
+        let rejected = client
+            .get(&url)
+            .bearer_auth(token)
+            .header("Range", "bytes=65530-65549")
+            .send()
+            .await?;
+        assert!(
+            [
+                reqwest::StatusCode::FORBIDDEN,
+                reqwest::StatusCode::NOT_FOUND
+            ]
+            .contains(&rejected.status()),
+            "a credential outside the repository-wide scope returned {}",
+            rejected.status()
+        );
+    }
+    let response = client
+        .get(&url)
+        .bearer_auth(&root)
+        .header("Range", "bytes=65530-65549")
+        .send()
+        .await?;
+    if supports_verified_range {
+        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        let content_range = format!("bytes 65530-65549/{}", bytes.len());
+        assert_eq!(response.headers()["content-range"], content_range.as_str());
+        assert_eq!(response.headers()["etag"], format!("\"{digest}\"").as_str());
+        assert_eq!(response.bytes().await?.as_ref(), &bytes[65530..65550]);
+    } else {
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    }
+    let oversized = client
+        .get(&url)
+        .bearer_auth(&root)
+        .header("Range", "bytes=0-1048576")
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
     Ok(())
 }

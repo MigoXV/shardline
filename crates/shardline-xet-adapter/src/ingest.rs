@@ -12,8 +12,7 @@ use crate::{
 };
 
 use super::{
-    dedupe_shard_mapping, parse_uploaded_shard, parse_uploaded_shard_file, store_uploaded_xorb,
-    store_uploaded_xorb_file,
+    parse_uploaded_shard, parse_uploaded_shard_file, store_uploaded_xorb, store_uploaded_xorb_file,
 };
 
 /// # Errors
@@ -65,20 +64,9 @@ where
         repository_scope,
         shard_metadata_limits,
     )?;
-    let mappings = parsed
-        .dedupe_chunk_hashes
-        .iter()
-        .map(|chunk_hash_hex| dedupe_shard_mapping(chunk_hash_hex, &parsed.shard_key))
-        .collect::<Result<Vec<_>, _>>()?;
-    // Parsing can perform synchronous verification. Give a cancellation queued
-    // during that work a scheduling boundary before invoking durable metadata
-    // publication, even when the callback's future completes immediately.
-    tokio::task::yield_now().await;
-    commit_metadata(parsed.records, mappings).await?;
-
-    Ok(ShardUploadResponse {
-        result: parsed.result,
-    })
+    parsed
+        .register(|records, mappings, _identities| commit_metadata(records, mappings))
+        .await
 }
 
 /// Registers a shard parsed directly from a temporary file. Metadata sections
@@ -101,16 +89,9 @@ where
 {
     let parsed =
         parse_uploaded_shard_file(object_store, path, repository_scope, shard_metadata_limits)?;
-    let mappings = parsed
-        .dedupe_chunk_hashes
-        .iter()
-        .map(|chunk_hash_hex| dedupe_shard_mapping(chunk_hash_hex, &parsed.shard_key))
-        .collect::<Result<Vec<_>, _>>()?;
-    tokio::task::yield_now().await;
-    commit_metadata(parsed.records, mappings).await?;
-    Ok(ShardUploadResponse {
-        result: parsed.result,
-    })
+    parsed
+        .register(|records, mappings, _identities| commit_metadata(records, mappings))
+        .await
 }
 
 /// Registers a shard and supplies physical member references obtained during
@@ -255,8 +236,6 @@ mod tests {
         merklehash::{compute_data_hash, file_hash, xorb_hash},
         metadata_shard::{
             file_structs::{FileDataSequenceEntry, FileDataSequenceHeader, MDBFileInfo},
-            shard_format::MDBShardInfo,
-            shard_in_memory::MDBInMemoryShard,
             xorb_structs::{MDBXorbInfo, XorbChunkSequenceEntry, XorbChunkSequenceHeader},
         },
         xorb_object::{
@@ -267,40 +246,10 @@ mod tests {
 
     use super::*;
     use crate::error::XetAdapterError;
+    use crate::shard_store::test_support::{serialize_test_shard, single_chunk_shard};
 
-    // ---- helpers ----
-
-    fn serialize_test_shard(file_infos: Vec<MDBFileInfo>, xorb_infos: Vec<MDBXorbInfo>) -> Vec<u8> {
-        let mut shard = MDBInMemoryShard::default();
-        for file_info in file_infos {
-            assert!(shard.add_file_reconstruction_info(file_info).is_ok());
-        }
-        for xorb_info in xorb_infos {
-            assert!(shard.add_xorb_block(xorb_info).is_ok());
-        }
-        let mut serialized = Vec::new();
-        assert!(MDBShardInfo::serialize_from(&mut serialized, &shard, None).is_ok());
-        serialized
-    }
-
-    // ---- helpers ----
-
-    fn async_store_xorb_bytes(
-        store: &ServerObjectStore,
-        hash: &str,
-        body: &[u8],
-    ) -> Result<XorbUploadResponse, XetAdapterError> {
-        let rt = tokio::runtime::Runtime::new().map_err(XetAdapterError::Io)?;
-        rt.block_on(store_uploaded_xorb_bytes(store, hash, body))
-    }
-
-    fn store_xorb_sync(store: &ServerObjectStore, hash: &str, body: &[u8]) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(store_uploaded_xorb(store, hash, body)).unwrap();
-    }
-
-    #[test]
-    fn member_aware_byte_and_file_registration_preserve_legacy_metadata() {
+    #[tokio::test]
+    async fn member_aware_byte_and_file_registration_preserve_legacy_metadata() {
         use std::io::Write;
         let root = tempfile::tempdir().unwrap();
         let objects = ServerObjectStore::local(root.path().join("objects")).unwrap();
@@ -311,7 +260,9 @@ mod tests {
         )
         .unwrap();
         let hash = serialized.hash;
-        store_xorb_sync(&objects, &hash.hex(), &serialized.serialized_data);
+        store_uploaded_xorb(&objects, &hash.hex(), &serialized.serialized_data)
+            .await
+            .unwrap();
         let shard = serialize_test_shard(
             vec![MDBFileInfo {
                 metadata: FileDataSequenceHeader::new(
@@ -335,48 +286,47 @@ mod tests {
             &shardline_index::xet_hash_hex_string(validated.chunks().first().unwrap().hash()),
         )
         .unwrap();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
         let mut legacy = None;
-        runtime
-            .block_on(register_uploaded_shard_bytes(
-                &objects,
-                &shard,
-                None,
-                DEFAULT_SHARD_METADATA_LIMITS,
-                |records, mappings| {
-                    legacy = Some((records, mappings));
-                    async { Ok(()) }
-                },
-            ))
-            .unwrap();
+        register_uploaded_shard_bytes(
+            &objects,
+            &shard,
+            None,
+            DEFAULT_SHARD_METADATA_LIMITS,
+            |records, mappings| {
+                legacy = Some((records, mappings));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
         let mut from_bytes = None;
-        let byte_response = runtime
-            .block_on(register_uploaded_shard_bytes_with_member_references(
-                &objects,
-                &shard,
-                None,
-                DEFAULT_SHARD_METADATA_LIMITS,
-                |records, mappings, references, identities| {
-                    from_bytes = Some((records, mappings, references, identities));
-                    async { Ok(()) }
-                },
-            ))
-            .unwrap();
+        let byte_response = register_uploaded_shard_bytes_with_member_references(
+            &objects,
+            &shard,
+            None,
+            DEFAULT_SHARD_METADATA_LIMITS,
+            |records, mappings, references, identities| {
+                from_bytes = Some((records, mappings, references, identities));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&shard).unwrap();
         let mut from_file = None;
-        let file_response = runtime
-            .block_on(register_uploaded_shard_file_with_member_references(
-                &objects,
-                file.path(),
-                None,
-                DEFAULT_SHARD_METADATA_LIMITS,
-                |records, mappings, references, identities| {
-                    from_file = Some((records, mappings, references, identities));
-                    async { Ok(()) }
-                },
-            ))
-            .unwrap();
+        let file_response = register_uploaded_shard_file_with_member_references(
+            &objects,
+            file.path(),
+            None,
+            DEFAULT_SHARD_METADATA_LIMITS,
+            |records, mappings, references, identities| {
+                from_file = Some((records, mappings, references, identities));
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
         let (records, mappings, references, identities) = from_bytes.unwrap();
         let (file_records, file_mappings, file_references, file_identities) = from_file.unwrap();
         assert_eq!((records.clone(), mappings.clone()), legacy.unwrap());
@@ -391,8 +341,8 @@ mod tests {
 
     // ---- store_uploaded_xorb_bytes ----
 
-    #[test]
-    fn store_uploaded_xorb_bytes_stores_and_returns_response() {
+    #[tokio::test]
+    async fn store_uploaded_xorb_bytes_stores_and_returns_response() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -402,7 +352,8 @@ mod tests {
                 .unwrap();
         let hash = serialized.hash.hex();
 
-        let result = async_store_xorb_bytes(&object_store, &hash, &serialized.serialized_data);
+        let result =
+            store_uploaded_xorb_bytes(&object_store, &hash, &serialized.serialized_data).await;
         assert!(
             result.is_ok(),
             "store_uploaded_xorb_bytes failed: {result:?}"
@@ -411,8 +362,8 @@ mod tests {
         assert!(response.was_inserted);
     }
 
-    #[test]
-    fn store_uploaded_xorb_bytes_rejects_wrong_hash() {
+    #[tokio::test]
+    async fn store_uploaded_xorb_bytes_rejects_wrong_hash() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -423,12 +374,13 @@ mod tests {
         let wrong_hash = "00".repeat(32);
 
         let result =
-            async_store_xorb_bytes(&object_store, &wrong_hash, &serialized.serialized_data);
+            store_uploaded_xorb_bytes(&object_store, &wrong_hash, &serialized.serialized_data)
+                .await;
         assert!(result.is_err(), "expected error for wrong hash");
     }
 
-    #[test]
-    fn store_uploaded_xorb_bytes_idempotent() {
+    #[tokio::test]
+    async fn store_uploaded_xorb_bytes_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -438,11 +390,13 @@ mod tests {
                 .unwrap();
         let hash = serialized.hash.hex();
 
-        let first = async_store_xorb_bytes(&object_store, &hash, &serialized.serialized_data);
+        let first =
+            store_uploaded_xorb_bytes(&object_store, &hash, &serialized.serialized_data).await;
         assert!(first.is_ok());
         assert!(first.unwrap().was_inserted);
 
-        let second = async_store_xorb_bytes(&object_store, &hash, &serialized.serialized_data);
+        let second =
+            store_uploaded_xorb_bytes(&object_store, &hash, &serialized.serialized_data).await;
         assert!(second.is_ok());
         assert!(
             !second.unwrap().was_inserted,
@@ -450,22 +404,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn store_uploaded_xorb_bytes_rejects_invalid_hash_format() {
+    #[tokio::test]
+    async fn store_uploaded_xorb_bytes_rejects_invalid_hash_format() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
-        let result = async_store_xorb_bytes(&object_store, "not-a-hash", b"data");
+        let result = store_uploaded_xorb_bytes(&object_store, "not-a-hash", b"data").await;
         assert!(result.is_err(), "expected error for invalid hash format");
     }
 
-    #[test]
-    fn store_uploaded_xorb_bytes_rejects_empty_body_with_valid_hash() {
+    #[tokio::test]
+    async fn store_uploaded_xorb_bytes_rejects_empty_body_with_valid_hash() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
         let hash = "ab".repeat(32);
 
-        let result = async_store_xorb_bytes(&object_store, &hash, b"");
+        let result = store_uploaded_xorb_bytes(&object_store, &hash, b"").await;
         assert!(
             result.is_err(),
             "expected error for empty body with valid hash"
@@ -474,8 +428,8 @@ mod tests {
 
     // ---- register_uploaded_shard_bytes ----
 
-    #[test]
-    fn register_uploaded_shard_bytes_success_path() {
+    #[tokio::test]
+    async fn register_uploaded_shard_bytes_success_path() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -485,30 +439,18 @@ mod tests {
             SerializedXorbObject::from_xorb_with_compression(raw, CompressionScheme::None, true)
                 .unwrap();
         let xorb_hash = serialized.hash;
-        store_xorb_sync(&object_store, &xorb_hash.hex(), &serialized.serialized_data);
+        store_uploaded_xorb(&object_store, &xorb_hash.hex(), &serialized.serialized_data)
+            .await
+            .unwrap();
 
         // 2. Build a shard referencing that xorb
-        let chunk_hash = compute_data_hash(&[0_u8; 256]);
-        let file_hash = file_hash(&[(chunk_hash, 256_u64)]);
-        let shard = serialize_test_shard(
-            vec![MDBFileInfo {
-                metadata: FileDataSequenceHeader::new(file_hash, 1u64, false, false),
-                segments: vec![FileDataSequenceEntry::new(xorb_hash, 256_u64, 0_u64, 1_u64)],
-                verification: Vec::new(),
-                metadata_ext: None,
-            }],
-            vec![MDBXorbInfo {
-                metadata: XorbChunkSequenceHeader::new(xorb_hash, 1_u64, 256_u64),
-                chunks: vec![XorbChunkSequenceEntry::new(chunk_hash, 256_u64, 0_u64)],
-            }],
-        );
+        let shard = single_chunk_shard(xorb_hash, Vec::new());
 
-        // 3. Register with a commit closure
+        // Register with a commit closure.
         let mut committed_records = None;
         let mut committed_mappings = None;
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(register_uploaded_shard_bytes(
+        let result = register_uploaded_shard_bytes(
             &object_store,
             &shard,
             None,
@@ -518,7 +460,8 @@ mod tests {
                 committed_mappings = Some(mappings);
                 async { Ok(()) }
             },
-        ));
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -542,8 +485,8 @@ mod tests {
         assert!(!records[0].file_id.is_empty());
     }
 
-    #[test]
-    fn forged_chunk_membership_never_reaches_metadata_publication() {
+    #[tokio::test]
+    async fn forged_chunk_membership_never_reaches_metadata_publication() {
         use shardline_storage::ObjectStore;
 
         let temp = tempfile::tempdir().unwrap();
@@ -554,13 +497,14 @@ mod tests {
             true,
         )
         .unwrap();
-        store_xorb_sync(
+        store_uploaded_xorb(
             &objects,
             &serialized.hash.hex(),
             &serialized.serialized_data,
-        );
+        )
+        .await
+        .unwrap();
         let actual_chunk = compute_data_hash(&[0_u8; 256]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
         for mutation in 0..5 {
             let mut claimed = XorbChunkSequenceEntry::new(actual_chunk, 256, 0);
             let mut header = XorbChunkSequenceHeader::new(serialized.hash, 1, 256);
@@ -595,7 +539,7 @@ mod tests {
             );
             let key = crate::shard_object_key(&compute_data_hash(&shard).hex()).unwrap();
             let mut committed = false;
-            let result = rt.block_on(register_uploaded_shard_bytes(
+            let result = register_uploaded_shard_bytes(
                 &objects,
                 &shard,
                 None,
@@ -604,7 +548,8 @@ mod tests {
                     committed = true;
                     async { Ok(()) }
                 },
-            ));
+            )
+            .await;
             assert!(matches!(
                 result,
                 Err(XetAdapterError::InvalidSerializedShard(
@@ -616,8 +561,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn register_uploaded_shard_bytes_rejects_missing_xorb() {
+    #[tokio::test]
+    async fn register_uploaded_shard_bytes_rejects_missing_xorb() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -638,14 +583,14 @@ mod tests {
             }],
         );
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(register_uploaded_shard_bytes(
+        let result = register_uploaded_shard_bytes(
             &object_store,
             &shard,
             None,
             DEFAULT_SHARD_METADATA_LIMITS,
             |_records, _mappings| async { Ok(()) },
-        ));
+        )
+        .await;
 
         assert!(
             matches!(result, Err(XetAdapterError::MissingReferencedXorb)),
@@ -653,8 +598,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_uploaded_shard_bytes_propagates_commit_error() {
+    #[tokio::test]
+    async fn register_uploaded_shard_bytes_propagates_commit_error() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
@@ -664,32 +609,21 @@ mod tests {
             SerializedXorbObject::from_xorb_with_compression(raw, CompressionScheme::None, true)
                 .unwrap();
         let xorb_hash = serialized.hash;
-        store_xorb_sync(&object_store, &xorb_hash.hex(), &serialized.serialized_data);
+        store_uploaded_xorb(&object_store, &xorb_hash.hex(), &serialized.serialized_data)
+            .await
+            .unwrap();
 
         // 2. Build a shard referencing that xorb
-        let chunk_hash = compute_data_hash(&[0_u8; 256]);
-        let file_hash = file_hash(&[(chunk_hash, 256_u64)]);
-        let shard = serialize_test_shard(
-            vec![MDBFileInfo {
-                metadata: FileDataSequenceHeader::new(file_hash, 1u64, false, false),
-                segments: vec![FileDataSequenceEntry::new(xorb_hash, 256_u64, 0_u64, 1_u64)],
-                verification: Vec::new(),
-                metadata_ext: None,
-            }],
-            vec![MDBXorbInfo {
-                metadata: XorbChunkSequenceHeader::new(xorb_hash, 1_u64, 256_u64),
-                chunks: vec![XorbChunkSequenceEntry::new(chunk_hash, 256_u64, 0_u64)],
-            }],
-        );
+        let shard = single_chunk_shard(xorb_hash, Vec::new());
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(register_uploaded_shard_bytes(
+        let result = register_uploaded_shard_bytes(
             &object_store,
             &shard,
             None,
             DEFAULT_SHARD_METADATA_LIMITS,
             |_records, _mappings| async { Err(XetAdapterError::Overflow) },
-        ));
+        )
+        .await;
 
         assert!(
             matches!(result, Err(XetAdapterError::Overflow)),
@@ -697,25 +631,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_uploaded_shard_bytes_rejects_empty_shard() {
+    #[tokio::test]
+    async fn register_uploaded_shard_bytes_rejects_empty_shard() {
         let temp = tempfile::tempdir().unwrap();
         let object_store = ServerObjectStore::local(temp.path().join("objects")).unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(register_uploaded_shard_bytes(
+        let result = register_uploaded_shard_bytes(
             &object_store,
             b"",
             None,
             DEFAULT_SHARD_METADATA_LIMITS,
             |_records, _mappings| async { Ok(()) },
-        ));
+        )
+        .await;
 
         assert!(result.is_err(), "expected error for empty shard");
     }
 
-    #[test]
-    fn register_uploaded_shard_bytes_with_repository_scope() {
+    #[tokio::test]
+    async fn register_uploaded_shard_bytes_with_repository_scope() {
         use shardline_protocol::{RepositoryProvider, RepositoryScope};
 
         let temp = tempfile::tempdir().unwrap();
@@ -726,33 +660,18 @@ mod tests {
             SerializedXorbObject::from_xorb_with_compression(raw, CompressionScheme::None, true)
                 .unwrap();
         let xorb_hash = serialized.hash;
-        store_xorb_sync(&object_store, &xorb_hash.hex(), &serialized.serialized_data);
+        store_uploaded_xorb(&object_store, &xorb_hash.hex(), &serialized.serialized_data)
+            .await
+            .unwrap();
 
-        let chunk_hash = compute_data_hash(&[0_u8; 256]);
-        let file_hash = file_hash(&[(chunk_hash, 256_u64)]);
-        let shard = serialize_test_shard(
-            vec![MDBFileInfo {
-                metadata: FileDataSequenceHeader::new(file_hash, 1u64, false, false),
-                segments: vec![FileDataSequenceEntry::new(xorb_hash, 256_u64, 0_u64, 1_u64)],
-                verification: Vec::new(),
-                metadata_ext: None,
-            }],
-            vec![MDBXorbInfo {
-                metadata: XorbChunkSequenceHeader::new(xorb_hash, 1_u64, 256_u64),
-                chunks: vec![XorbChunkSequenceEntry::new(chunk_hash, 256_u64, 0_u64)],
-            }],
-        );
+        let shard = single_chunk_shard(xorb_hash, Vec::new());
 
         let scope =
             RepositoryScope::new(RepositoryProvider::GitHub, "test-owner", "test-repo", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+        let scope = scope.expect("expected valid scope");
 
         let mut committed = false;
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(register_uploaded_shard_bytes(
+        let result = register_uploaded_shard_bytes(
             &object_store,
             &shard,
             Some(&scope),
@@ -763,7 +682,8 @@ mod tests {
                 assert_eq!(records[0].repository_scope, Some(scope.clone()));
                 async { Ok(()) }
             },
-        ));
+        )
+        .await;
 
         assert!(result.is_ok(), "register with scope failed: {result:?}");
         assert!(committed, "commit closure should have been called");

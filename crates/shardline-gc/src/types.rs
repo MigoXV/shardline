@@ -9,10 +9,9 @@ pub use shardline_server_core::DEFAULT_LOCAL_GC_RETENTION_SECONDS;
 ///
 /// Prevents data loss from the TOCTOU race between the GC mark phase and
 /// concurrent uploads that have written chunks on disk but not yet committed
-/// their file records.  A non-zero retention gives concurrent uploads time
-/// to finish before orphaned chunks are physically deleted.
-///
-/// See [`crate::run_gc_with_stores`] for the clamping logic.
+/// their file records. The CLI enforces this minimum; low-level callers set
+/// retention through [`LocalGcOptions`] and must honor the writer-exclusion
+/// contract of [`crate::run_gc_with_stores`].
 pub const MINIMUM_GC_RETENTION_SECONDS: u64 = 3600; // 1 hour
 
 /// Local filesystem garbage-collection execution options.
@@ -48,12 +47,7 @@ pub struct LocalGcOptions {
 
 impl Default for LocalGcOptions {
     fn default() -> Self {
-        Self {
-            mark: false,
-            sweep: false,
-            retention_seconds: DEFAULT_LOCAL_GC_RETENTION_SECONDS,
-            max_revisions_per_repo: None,
-        }
+        Self::dry_run()
     }
 }
 
@@ -74,9 +68,8 @@ impl LocalGcOptions {
     pub const fn mark_only(retention_seconds: u64) -> Self {
         Self {
             mark: true,
-            sweep: false,
             retention_seconds,
-            max_revisions_per_repo: None,
+            ..Self::dry_run()
         }
     }
 
@@ -84,10 +77,8 @@ impl LocalGcOptions {
     #[must_use]
     pub const fn sweep_only() -> Self {
         Self {
-            mark: false,
             sweep: true,
-            retention_seconds: DEFAULT_LOCAL_GC_RETENTION_SECONDS,
-            max_revisions_per_repo: None,
+            ..Self::dry_run()
         }
     }
 
@@ -95,10 +86,8 @@ impl LocalGcOptions {
     #[must_use]
     pub const fn mark_and_sweep(retention_seconds: u64) -> Self {
         Self {
-            mark: true,
             sweep: true,
-            retention_seconds,
-            max_revisions_per_repo: None,
+            ..Self::mark_only(retention_seconds)
         }
     }
 

@@ -11,6 +11,8 @@ mod durable;
 mod error;
 mod event;
 mod event_metadata;
+mod hub_ref_archive;
+mod hub_state_checkpoint;
 mod lifecycle_log;
 mod lifecycle_profile;
 mod merkle;
@@ -59,7 +61,15 @@ pub use event::{
     verify_state_transition_chain_ends_at, verify_upload_lifecycle_events,
     verify_upload_lifecycle_head,
 };
-pub use event_metadata::EvidenceEventMetadata;
+pub use event_metadata::{EvidenceEventMetadata, events_after_sequence};
+pub use hub_ref_archive::{
+    HubRefBatchArchiveAnchor, HubRefBatchArchiveCheckpointPin, HubRefBatchArchiveEvent,
+    HubRefBatchArchiveRecordV1, HubRefBatchHead, HubRefBatchManifestReferenceV1,
+    HubRefBatchSnapshot, MAX_HUB_REF_ARCHIVE_RECORD_BYTES, validate_hub_ref_archive_key_id,
+};
+pub use hub_state_checkpoint::{
+    HubRefStateCheckpointRecordV1, HubRefStateCheckpointV1, MAX_HUB_REF_STATE_CHECKPOINT_REFS,
+};
 pub use lifecycle_log::LifecycleEvidenceLog;
 pub use lifecycle_profile::{
     LifecycleCommand, ResumableLifecycleProfile, UploadLifecycleProfile, native_lifecycle_registry,
@@ -142,7 +152,7 @@ pub use task_artifact::{
     MaintenanceArtifactProof, sign_maintenance_artifact, verify_maintenance_artifact,
 };
 #[cfg(feature = "task-journal")]
-pub use task_journal::SqliteTaskJournal;
+pub use task_journal::{SqliteTaskJournal, task_record_blob};
 #[cfg(feature = "task-journal")]
 pub use task_supervision::{LocalTaskSupervisor, restore_local_task_supervisor};
 pub use webhook_evidence::{

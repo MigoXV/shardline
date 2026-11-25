@@ -156,16 +156,8 @@ fn parse_verifying_keys(bytes: &[u8]) -> Result<Vec<VerifyingKey>, AuthError> {
     enforce_verifying_key_limit(encoded_keys.len())?;
     let mut keys = Vec::with_capacity(encoded_keys.len());
     for encoded in encoded_keys {
-        let decoded = hex::decode(encoded).map_err(|error| {
-            AuthError::ProviderError(format!("invalid Ed25519 hexadecimal key: {error}"))
-        })?;
-        let key = parse_raw_verifying_key(&decoded)?;
-        if key.is_weak() {
-            return Err(AuthError::ProviderError(
-                "Ed25519 public key must not be a weak small-order point".to_owned(),
-            ));
-        }
-        if !keys.iter().any(|existing: &VerifyingKey| existing == &key) {
+        let key = parse_verifying_key(encoded.as_bytes())?;
+        if !keys.contains(&key) {
             keys.push(key);
         }
     }
@@ -177,7 +169,7 @@ fn append_unique_verifying_keys(
     additional: Vec<VerifyingKey>,
 ) {
     for key in additional {
-        if !destination.iter().any(|existing| existing == &key) {
+        if !destination.contains(&key) {
             destination.push(key);
         }
     }
@@ -345,13 +337,27 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_sign_and_verify() {
+    fn private_key_formats_sign_and_verify() {
         let seed = test_seed();
-        let provider = Ed25519AuthProvider::new(&seed).expect("valid provider");
+        let signing_key = SigningKey::from_bytes(&seed);
+        let keypair = signing_key.to_keypair_bytes();
+        let pem = signing_key
+            .to_pkcs8_pem(Default::default())
+            .expect("PEM serialization should succeed");
         let claims = test_claims();
-        let token = provider.mint_token(&claims).expect("should mint token");
-        let verified = provider.verify_token(&token).expect("should verify");
-        assert_eq!(verified, claims);
+        for (format, bytes) in [
+            ("32-byte seed", seed.as_slice()),
+            ("64-byte keypair", keypair.as_slice()),
+            ("PKCS8 PEM", pem.as_bytes()),
+        ] {
+            let provider = Ed25519AuthProvider::new(bytes).expect(format);
+            let token = provider.mint_token(&claims).expect(format);
+            assert_eq!(
+                provider.verify_token(&token).expect(format),
+                claims,
+                "{format}"
+            );
+        }
     }
 
     #[test]
@@ -416,22 +422,12 @@ mod tests {
     fn verify_rejects_malformed_token() {
         let seed = test_seed();
         let provider = Ed25519AuthProvider::new(&seed).expect("valid provider");
-        assert!(matches!(
-            provider.verify_token("not-a-token"),
-            Err(AuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            provider.verify_token(""),
-            Err(AuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            provider.verify_token("abc.def"),
-            Err(AuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            provider.verify_token("aa.bb.cc"),
-            Err(AuthError::InvalidToken)
-        ));
+        for token in ["not-a-token", "", "abc.def", "aa.bb.cc"] {
+            assert!(
+                matches!(provider.verify_token(token), Err(AuthError::InvalidToken)),
+                "{token:?}"
+            );
+        }
     }
 
     #[test]
@@ -497,19 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_64_byte_keypair() {
-        let seed = test_seed();
-        let signing_key = SigningKey::from_bytes(&seed);
-        let keypair_bytes = signing_key.to_keypair_bytes();
-        let provider =
-            Ed25519AuthProvider::new(&keypair_bytes).expect("should accept 64-byte keypair");
-        let claims = test_claims();
-        let token = provider.mint_token(&claims).expect("should mint");
-        let verified = provider.verify_token(&token).expect("should verify");
-        assert_eq!(verified, claims);
-    }
-
-    #[test]
     fn cross_instance_verify_with_public_key_only() {
         // Provider A (has private key) mints a token.
         let seed = test_seed();
@@ -526,20 +509,6 @@ mod tests {
         let verified = provider_b
             .verify_token(&token)
             .expect("should verify cross-instance");
-        assert_eq!(verified, claims);
-    }
-
-    #[test]
-    fn accept_pem_format_key() {
-        let seed = test_seed();
-        let signing_key = SigningKey::from_bytes(&seed);
-        let pem = signing_key
-            .to_pkcs8_pem(Default::default())
-            .expect("PEM serialization should succeed");
-        let provider = Ed25519AuthProvider::new(pem.as_bytes()).expect("should accept PEM");
-        let claims = test_claims();
-        let token = provider.mint_token(&claims).expect("should mint");
-        let verified = provider.verify_token(&token).expect("should verify");
         assert_eq!(verified, claims);
     }
 
@@ -639,8 +608,29 @@ mod tests {
 
     #[test]
     fn rejects_weak_public_key() {
-        let error = Ed25519AuthProvider::with_public_key(&[0_u8; 32]).unwrap_err();
-        assert!(error.to_string().contains("weak"));
+        let raw = [0_u8; 32];
+        let hex = hex::encode(raw);
+        let pem = VerifyingKey::from_bytes(&raw)
+            .unwrap()
+            .to_public_key_pem(Default::default())
+            .unwrap();
+        let ring = format!(
+            "{}\n{hex}",
+            hex::encode(
+                SigningKey::from_bytes(&test_seed())
+                    .verifying_key()
+                    .to_bytes()
+            )
+        );
+        for (format, bytes) in [
+            ("raw", raw.as_slice()),
+            ("hex", hex.as_bytes()),
+            ("PEM", pem.as_bytes()),
+            ("key ring", ring.as_bytes()),
+        ] {
+            let error = Ed25519AuthProvider::with_public_key(bytes).unwrap_err();
+            assert!(error.to_string().contains("weak"), "{format}: {error}");
+        }
     }
 
     #[test]

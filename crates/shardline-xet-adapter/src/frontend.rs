@@ -2,17 +2,11 @@ use shardline_index::parse_xet_hash_hex;
 
 use crate::error::XetAdapterError;
 
-pub const XORB_TRANSFER_NAMESPACE: &str = "default";
-pub const XORB_TRANSFER_ROUTE: &str = "/transfer/xorb/{prefix}/{hash}";
-pub const XET_READ_TOKEN_ROUTE: &str = "/api/{provider}/{owner}/{repo}/xet-read-token/{rev}";
-pub const XET_WRITE_TOKEN_ROUTE: &str = "/api/{provider}/{owner}/{repo}/xet-write-token/{rev}";
-pub const XET_TREE_ROUTE: &str = "/api/{provider}/{owner}/{repo}/tree/{rev}";
-pub const XET_PATH_ROUTE: &str = "/api/{provider}/{owner}/{repo}/path/{rev}/{*path}";
-pub const XET_REVISIONS_ROUTE: &str = "/api/{provider}/{owner}/{repo}/revisions";
-pub const XET_REVISION_ROUTE: &str = "/api/{provider}/{owner}/{repo}/revisions/{rev}";
-/// Accept media type used by native Xet metadata clients to disambiguate
-/// metadata routes from overlapping Hub API paths when both frontends run.
-pub const XET_METADATA_ACCEPT: &str = "application/vnd.stexs.xet-metadata+json";
+pub use shardline_protocol_adapters::xet::{
+    XET_METADATA_ACCEPT, XET_PATH_ROUTE, XET_READ_TOKEN_ROUTE, XET_REVISION_ROUTE,
+    XET_REVISIONS_ROUTE, XET_TREE_ROUTE, XET_WRITE_TOKEN_ROUTE, XORB_TRANSFER_NAMESPACE,
+    XORB_TRANSFER_ROUTE,
+};
 
 /// Validates that a hash path is a 64-character lowercase hex digest.
 ///
@@ -125,41 +119,40 @@ mod tests {
     use crate::error::XetAdapterError;
 
     #[test]
-    fn validate_hash_path_accepts_valid_64_char_hex_hash() {
-        let hash = "abcdef0123456789".repeat(4);
-        assert_eq!(hash.len(), 64);
-        assert!(validate_hash_path(&hash).is_ok());
+    fn required_and_optional_hashes_share_validation() {
+        for hash in ["abcdef0123456789".repeat(4), "a".repeat(64)] {
+            assert_eq!(hash.len(), 64);
+            assert!(validate_hash_path(&hash).is_ok());
+            assert!(validate_optional_content_hash(Some(&hash)).is_ok());
+        }
+        for hash in [
+            "AB".repeat(32),
+            "a".repeat(63),
+            "a".repeat(65),
+            "not-a-hash".to_owned(),
+        ] {
+            assert!(validate_hash_path(&hash).is_err(), "{hash}");
+            assert!(
+                validate_optional_content_hash(Some(&hash)).is_err(),
+                "{hash}"
+            );
+        }
+        assert!(validate_optional_content_hash(None).is_ok());
     }
 
     #[test]
-    fn validate_hash_path_rejects_uppercase_characters() {
-        let hash = "AB".repeat(32);
-        assert!(validate_hash_path(&hash).is_err());
-    }
-
-    #[test]
-    fn validate_hash_path_rejects_wrong_length() {
-        // 63 chars instead of 64
-        let hash = "a".repeat(63);
-        assert!(validate_hash_path(&hash).is_err());
-        // 65 chars instead of 64
-        let hash = "a".repeat(65);
-        assert!(validate_hash_path(&hash).is_err());
-    }
-
-    #[test]
-    fn validate_optional_content_hash_validates_present_hash() {
-        assert!(validate_optional_content_hash(Some(&"a".repeat(64))).is_ok());
-        assert!(validate_optional_content_hash(Some("not-a-hash")).is_err());
-    }
-
-    #[test]
-    fn build_xorb_transfer_url_uses_default_namespace() {
-        let url = build_xorb_transfer_url("http://127.0.0.1:8080/", &"a".repeat(64));
-        assert_eq!(
-            url,
-            "http://127.0.0.1:8080/transfer/xorb/default/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
+    fn transfer_urls_preserve_the_base_and_default_namespace() {
+        for (base, hash, expected_base) in [
+            ("http://127.0.0.1:8080/", "a", "http://127.0.0.1:8080"),
+            ("http://example.com", "a", "http://example.com"),
+            ("", "b", ""),
+        ] {
+            let hash = hash.repeat(64);
+            assert_eq!(
+                build_xorb_transfer_url(base, &hash),
+                format!("{expected_base}/transfer/xorb/default/{hash}")
+            );
+        }
     }
 
     #[test]
@@ -169,32 +162,5 @@ mod tests {
             Err(XetAdapterError::InvalidXorbPrefix)
         ));
         assert!(validate_xorb_transfer_namespace(XORB_TRANSFER_NAMESPACE).is_ok());
-    }
-
-    #[test]
-    fn validate_optional_content_hash_accepts_absent_hash() {
-        assert!(validate_optional_content_hash(None).is_ok());
-    }
-
-    #[test]
-    fn validate_hash_path_rejects_invalid_hash() {
-        assert!(validate_hash_path("not-a-hash").is_err());
-    }
-
-    #[test]
-    fn build_xorb_transfer_url_without_trailing_slash_on_base() {
-        let url = build_xorb_transfer_url("http://example.com", &"a".repeat(64));
-        assert!(url.starts_with("http://example.com/transfer/xorb/default/"));
-        assert_eq!(
-            url.len(),
-            "http://example.com/transfer/xorb/default/".len() + 64
-        );
-    }
-
-    #[test]
-    fn build_xorb_transfer_url_empty_base_url() {
-        let url = build_xorb_transfer_url("", &"b".repeat(64));
-        assert!(url.starts_with("/transfer/xorb/default/"));
-        assert_eq!(url.len(), "/transfer/xorb/default/".len() + 64);
     }
 }

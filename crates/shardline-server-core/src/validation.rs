@@ -1,16 +1,7 @@
 use shardline_protocol::ShardlineHash;
-use shardline_storage::{ObjectKey, ObjectKeyError};
+use shardline_storage::ObjectKey;
 
 use crate::object_store::ServerObjectStoreError;
-
-pub(crate) const fn map_object_key_error(error: ObjectKeyError) -> ServerObjectStoreError {
-    match error {
-        ObjectKeyError::Empty
-        | ObjectKeyError::UnsafePath
-        | ObjectKeyError::ControlCharacter
-        | ObjectKeyError::TooLong => ServerObjectStoreError::Overflow,
-    }
-}
 
 /// Returns the chunk object key for a hex-encoded content hash.
 ///
@@ -40,7 +31,7 @@ pub fn chunk_object_key(hash_hex: &str) -> Result<ObjectKey, ServerObjectStoreEr
     })?;
     let prefix = hash_hex.get(..2).ok_or(ServerObjectStoreError::Overflow)?;
     let key = format!("{prefix}/{hash_hex}");
-    ObjectKey::parse(&key).map_err(map_object_key_error)
+    ObjectKey::parse(&key).map_err(|_error| ServerObjectStoreError::Overflow)
 }
 
 /// Extracts the chunk hash from a chunk object key if the key matches the expected layout.
@@ -79,26 +70,16 @@ pub fn chunk_object_key(hash_hex: &str) -> Result<ObjectKey, ServerObjectStoreEr
 pub fn chunk_hash_from_chunk_object_key_if_present(
     key: &ObjectKey,
 ) -> Result<Option<&str>, ServerObjectStoreError> {
-    let mut segments = key.as_str().split('/');
-    let Some(prefix) = segments.next() else {
+    let Some((prefix, candidate_hash_hex)) = key.as_str().split_once('/') else {
         return Ok(None);
     };
-    let Some(candidate_hash_hex) = segments.next() else {
-        return Ok(None);
-    };
-    if segments.next().is_some() {
+    if prefix.len() != 2 || !candidate_hash_hex.starts_with(prefix) {
         return Ok(None);
     }
-    if prefix.len() != 2 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Ok(None);
-    }
-    if !candidate_hash_hex.starts_with(prefix) {
-        return Ok(None);
-    }
-    if !shardline_validation::validate_content_hash_with(candidate_hash_hex, || {
+    if shardline_validation::validate_content_hash_with(candidate_hash_hex, || {
         ServerObjectStoreError::InvalidContentHash
     })
-    .is_ok()
+    .is_err()
     {
         // Passes the structural chunk gates but is not a finished chunk key:
         // skip it so a GC orphan scan or fsck never aborts the whole pass over

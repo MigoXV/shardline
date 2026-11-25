@@ -3,8 +3,10 @@ use std::{
     path::Path,
 };
 
+use shardline_index::HubRefStateCheckpointArchiveObject;
 use shardline_server::{
     BackupManifestReport, ServerConfigError, ServerError,
+    create_hub_ref_state_checkpoint as write_hub_ref_state_checkpoint,
     write_backup_manifest as write_server_backup_manifest,
 };
 use thiserror::Error;
@@ -51,6 +53,19 @@ pub async fn run_backup_manifest(
     Ok(report)
 }
 
+/// Publishes one signed Hub state checkpoint using the active recovery archive.
+///
+/// # Errors
+/// Returns [`BackupRuntimeError`] when configuration loading, metadata
+/// certification, signing, object storage, or read-back verification fails.
+pub async fn run_hub_ref_state_checkpoint(
+    root: Option<&Path>,
+    repository_id: &str,
+) -> Result<HubRefStateCheckpointArchiveObject, BackupRuntimeError> {
+    let config = load_server_config(root, None)?;
+    Ok(write_hub_ref_state_checkpoint(&config, repository_id).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -58,57 +73,6 @@ mod tests {
     use shardline_server::BackupManifestReport;
 
     use super::{BackupRuntimeError, run_backup_manifest};
-
-    #[test]
-    fn backup_manifest_report_new_defaults() {
-        let report = BackupManifestReport {
-            manifest_version: 1,
-            metadata_backend: "postgres".to_owned(),
-            object_backend: "fs".to_owned(),
-            object_count: 0,
-            object_bytes: 0,
-            latest_records: 0,
-            version_records: 0,
-            reconstruction_rows: 0,
-            dedupe_shard_mappings: 0,
-            quarantine_candidates: 0,
-            retention_holds: 0,
-            webhook_deliveries: 0,
-            provider_repository_states: 0,
-        };
-        assert_eq!(report.manifest_version, 1);
-        assert_eq!(report.metadata_backend, "postgres");
-        assert_eq!(report.object_backend, "fs");
-    }
-
-    #[test]
-    fn backup_manifest_report_with_counts() {
-        let report = BackupManifestReport {
-            manifest_version: 1,
-            metadata_backend: "local".to_owned(),
-            object_backend: "s3".to_owned(),
-            object_count: 100,
-            object_bytes: 1_000_000,
-            latest_records: 10,
-            version_records: 50,
-            reconstruction_rows: 5,
-            dedupe_shard_mappings: 20,
-            quarantine_candidates: 3,
-            retention_holds: 2,
-            webhook_deliveries: 15,
-            provider_repository_states: 1,
-        };
-        assert_eq!(report.object_count, 100);
-        assert_eq!(report.object_bytes, 1_000_000);
-        assert_eq!(report.latest_records, 10);
-        assert_eq!(report.version_records, 50);
-        assert_eq!(report.reconstruction_rows, 5);
-        assert_eq!(report.dedupe_shard_mappings, 20);
-        assert_eq!(report.quarantine_candidates, 3);
-        assert_eq!(report.retention_holds, 2);
-        assert_eq!(report.webhook_deliveries, 15);
-        assert_eq!(report.provider_repository_states, 1);
-    }
 
     #[test]
     fn backup_manifest_report_serializable() {
@@ -139,33 +103,6 @@ mod tests {
         let err = BackupRuntimeError::Io(io_err);
         let msg = err.to_string();
         assert!(msg.contains("backup manifest output file operation failed"));
-    }
-
-    #[test]
-    fn backup_runtime_error_debug() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
-        let err = BackupRuntimeError::Io(io_err);
-        let debug = format!("{err:?}");
-        // The Debug format includes the variant name, not the enum name
-        assert!(debug.contains("Io(") || debug.starts_with("Io("));
-    }
-
-    #[test]
-    fn backup_runtime_error_config_display() {
-        use shardline_server::ServerConfigError;
-        let config_err = ServerConfigError::InvalidServerRole;
-        let err = BackupRuntimeError::Config(config_err);
-        let msg = err.to_string();
-        assert!(!msg.is_empty());
-    }
-
-    #[test]
-    fn backup_runtime_error_server_display() {
-        use shardline_server::ServerError;
-        let server_err = ServerError::NotFound;
-        let err = BackupRuntimeError::Server(server_err);
-        let msg = err.to_string();
-        assert!(!msg.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

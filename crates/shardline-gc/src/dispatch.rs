@@ -18,38 +18,16 @@ pub(super) fn optional_chunk_container_keys(
     frontends: &[ServerFrontend],
     chunk_hash: &str,
 ) -> Result<Vec<ObjectKey>, GcError> {
-    let mut object_keys = Vec::new();
-    for frontend in frontends {
-        match frontend {
-            // Hub uploads use the same native Xet storage even when the public
-            // Xet frontend was not selected separately.
-            ServerFrontend::Xet | ServerFrontend::Hub => {
-                let object_key = xorb_object_key(chunk_hash)?;
-                if !object_keys.contains(&object_key) {
-                    object_keys.push(object_key);
-                }
-                // Also reference the xorb chunk-hash cache sidecar so the
-                // GC does not treat it as an orphan.  The sidecar shares
-                // the same xorb hash and is safe to reference alongside
-                // the xorb container itself.
-                let cache_prefix = chunk_hash.get(..2).ok_or(GcError::InvalidContentHash)?;
-                let cache_key_str = format!("_xorb_chunks/{cache_prefix}/{chunk_hash}");
-                if let Ok(cache_key) = ObjectKey::parse(&cache_key_str)
-                    && !object_keys.contains(&cache_key)
-                {
-                    object_keys.push(cache_key);
-                }
-            }
-            // S3 protocol keys are skipped by `scan_orphan_objects`'s
-            // unrecognized-key path and chunks are record-protected, so GC/fsck
-            // need no behavior change.
-            ServerFrontend::Lfs
-            | ServerFrontend::BazelHttp
-            | ServerFrontend::Oci
-            | ServerFrontend::S3 => {}
-        }
+    if !uses_native_xet_storage(frontends) {
+        return Ok(Vec::new());
     }
-
+    let mut object_keys = vec![xorb_object_key(chunk_hash)?];
+    // Keep the derived member-cache sidecar alongside its source container.
+    let cache_prefix = chunk_hash.get(..2).ok_or(GcError::InvalidContentHash)?;
+    let cache_key = format!("_xorb_chunks/{cache_prefix}/{chunk_hash}");
+    if let Ok(cache_key) = ObjectKey::parse(&cache_key) {
+        object_keys.push(cache_key);
+    }
     Ok(object_keys)
 }
 
@@ -68,25 +46,13 @@ pub(super) fn managed_protocol_object_identity(
     frontends: &[ServerFrontend],
     key: &ObjectKey,
 ) -> Result<Option<String>, GcError> {
-    for frontend in frontends {
-        match frontend {
-            ServerFrontend::Xet | ServerFrontend::Hub => {
-                if let Some(hash) = xorb_hash_from_object_key_if_present(key)? {
-                    return Ok(Some(hash.to_owned()));
-                }
-                if let Some(hash) = shard_hash_from_object_key_if_present(key)? {
-                    return Ok(Some(hash.to_owned()));
-                }
-            }
-            // S3 objects are handled by the unrecognized-key path; no-op here.
-            ServerFrontend::Lfs
-            | ServerFrontend::BazelHttp
-            | ServerFrontend::Oci
-            | ServerFrontend::S3 => {}
-        }
+    if !uses_native_xet_storage(frontends) {
+        return Ok(None);
     }
-
-    Ok(None)
+    if let Some(hash) = xorb_hash_from_object_key_if_present(key)? {
+        return Ok(Some(hash.to_owned()));
+    }
+    Ok(shard_hash_from_object_key_if_present(key)?.map(str::to_owned))
 }
 
 pub(super) fn visit_protocol_object_member_chunks<Visitor>(
@@ -98,60 +64,29 @@ pub(super) fn visit_protocol_object_member_chunks<Visitor>(
 where
     Visitor: FnMut(String) -> Result<(), GcError>,
 {
-    for frontend in frontends {
-        match frontend {
-            ServerFrontend::Xet | ServerFrontend::Hub => {
-                if xorb_hash_from_object_key_if_present(object_key)?.is_some() {
-                    let mut result = Ok(());
-                    let present = visit_stored_xorb_chunk_hashes_if_present(
-                        object_store,
-                        object_key,
-                        |chunk_hash_hex| match visitor(chunk_hash_hex) {
-                            Ok(()) => Ok(()),
-                            Err(e) => {
-                                result = Err(e);
-                                Err(XetAdapterError::NotFound)
-                            }
-                        },
-                    )?;
-                    result?;
-                    return Ok(present);
+    if !uses_native_xet_storage(frontends)
+        || xorb_hash_from_object_key_if_present(object_key)?.is_none()
+    {
+        return Ok(false);
+    }
+    let mut result = Ok(());
+    let present =
+        visit_stored_xorb_chunk_hashes_if_present(object_store, object_key, |chunk_hash_hex| {
+            match visitor(chunk_hash_hex) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    result = Err(error);
+                    Err(XetAdapterError::NotFound)
                 }
             }
-            // S3 chunks are record-protected, so GC/fsck need no behavior change.
-            ServerFrontend::Lfs
-            | ServerFrontend::BazelHttp
-            | ServerFrontend::Oci
-            | ServerFrontend::S3 => {}
-        }
-    }
-
-    Ok(false)
+        });
+    result?;
+    present.map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shardline_storage::ObjectKey;
-
-    #[test]
-    fn hub_only_frontend_resolves_native_xet_terms() {
-        let hash = "a".repeat(64);
-        let expected = xorb_object_key(&hash).unwrap();
-        assert_eq!(
-            referenced_term_object_key(&[ServerFrontend::Hub], &hash).unwrap(),
-            expected
-        );
-        assert_eq!(
-            managed_protocol_object_identity(&[ServerFrontend::Hub], &expected).unwrap(),
-            Some(hash.clone())
-        );
-        assert!(
-            optional_chunk_container_keys(&[ServerFrontend::Hub], &hash)
-                .unwrap()
-                .contains(&expected)
-        );
-    }
 
     #[test]
     fn hub_git_archives_are_excluded_from_orphan_sweep() {
@@ -198,305 +133,85 @@ mod tests {
     const VALID_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
-    fn optional_chunk_container_keys_with_xet_returns_xorb_key() {
-        let keys = optional_chunk_container_keys(&[ServerFrontend::Xet], VALID_HASH).unwrap();
-        assert_eq!(keys.len(), 2, "xorb_key + cache sidecar");
-        // Keys[0] is the xorb container, keys[1] is the cache sidecar.
-        assert!(keys[0].as_str().starts_with("xorbs/default/"));
-        assert!(keys[0].as_str().ends_with(".xorb"));
-        assert!(keys[1].as_str().starts_with("_xorb_chunks/"));
-    }
-
-    #[test]
-    fn optional_chunk_container_keys_with_lfs_only_returns_empty() {
-        let keys = optional_chunk_container_keys(&[ServerFrontend::Lfs], VALID_HASH).unwrap();
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn optional_chunk_container_keys_with_multiple_frontends_returns_one_xorb_key() {
-        let frontends = [
-            ServerFrontend::Xet,
-            ServerFrontend::Lfs,
-            ServerFrontend::Hub,
+    fn frontend_selection_preserves_native_keys_and_excludes_other_namespaces() {
+        use ServerFrontend::{BazelHttp, Hub, Lfs, Oci, S3, Xet};
+        let cases: &[(&[ServerFrontend], bool)] = &[
+            (&[], false),
+            (&[Lfs], false),
+            (&[BazelHttp], false),
+            (&[Oci], false),
+            (&[S3], false),
+            (&[Lfs, BazelHttp, Oci, S3], false),
+            (&[Xet], true),
+            (&[Hub], true),
+            (&[Xet, Xet], true),
+            (&[Xet, Lfs], true),
+            (&[Xet, Lfs, Hub], true),
+            (&[Lfs, Hub, Xet], true),
         ];
-        let keys = optional_chunk_container_keys(&frontends, VALID_HASH).unwrap();
-        assert_eq!(keys.len(), 2, "xorb key + cache sidecar");
-        assert!(keys[0].as_str().starts_with("xorbs/default/"));
-        assert!(keys[1].as_str().starts_with("_xorb_chunks/"));
-    }
-
-    #[test]
-    fn referenced_term_object_key_with_xet_returns_ok() {
-        let result = referenced_term_object_key(&[ServerFrontend::Xet], VALID_HASH);
-        assert!(result.is_ok());
-        let key = result.unwrap();
-        // Should produce a valid xorb key
-        assert!(key.as_str().starts_with("xorbs/default/"));
-        assert!(key.as_str().ends_with(".xorb"));
-    }
-
-    #[test]
-    fn referenced_term_object_key_without_xet_returns_error() {
-        let result = referenced_term_object_key(&[ServerFrontend::Lfs], VALID_HASH);
-        assert!(matches!(result, Err(GcError::InvalidContentHash)));
-    }
-
-    #[test]
-    fn managed_protocol_object_identity_with_xet_and_xorb_key_returns_hash() {
-        let xorb_key = xorb_object_key(VALID_HASH).unwrap();
-        let result = managed_protocol_object_identity(&[ServerFrontend::Xet], &xorb_key).unwrap();
-        assert_eq!(result.as_deref(), Some(VALID_HASH));
-    }
-
-    #[test]
-    fn managed_protocol_object_identity_with_non_xorb_key_returns_none() {
-        // A key that doesn't match xorbs/ or shards/ pattern
-        let key = ObjectKey::parse("other/somevalue").unwrap();
-        let result = managed_protocol_object_identity(&[ServerFrontend::Xet], &key).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn managed_protocol_object_identity_without_xet_returns_none() {
-        let xorb_key = xorb_object_key(VALID_HASH).unwrap();
-        let result = managed_protocol_object_identity(&[ServerFrontend::Lfs], &xorb_key).unwrap();
-        assert_eq!(result, None);
-    }
-
-    // --- GC safety guarantee tests ---
-
-    #[test]
-    fn optional_chunk_container_keys_xet_and_lfs_no_duplicates() {
-        // When both Xet and Lfs are present, only the Xet xorb key should be
-        // returned — no duplicate entries.  The cache sidecar is also returned.
-        let frontends = [ServerFrontend::Xet, ServerFrontend::Lfs];
-        let keys = optional_chunk_container_keys(&frontends, VALID_HASH).unwrap();
-        assert_eq!(keys.len(), 2, "xorb key + cache sidecar");
-        assert!(keys[0].as_str().starts_with("xorbs/default/"));
-        assert!(keys[1].as_str().starts_with("_xorb_chunks/"));
-    }
-
-    #[test]
-    fn optional_chunk_container_keys_non_xet_frontends_returns_empty() {
-        // Frontends that don't contribute chunk container keys should yield an
-        // empty vec.
-        let frontends = [
-            ServerFrontend::Lfs,
-            ServerFrontend::BazelHttp,
-            ServerFrontend::Oci,
-            ServerFrontend::S3,
-        ];
-        let keys = optional_chunk_container_keys(&frontends, VALID_HASH).unwrap();
-        assert!(keys.is_empty());
-    }
-
-    #[test]
-    fn referenced_term_object_key_empty_frontends_returns_invalid_content_hash() {
-        let result = referenced_term_object_key(&[], VALID_HASH);
-        assert!(
-            matches!(result, Err(GcError::InvalidContentHash)),
-            "empty frontends should yield InvalidContentHash"
-        );
-    }
-
-    #[test]
-    fn referenced_term_object_key_with_xet_and_invalid_hash_returns_error() {
-        // A hash shorter than 64 hex characters should be rejected.
-        let short_hash = "abc123";
-        let result = referenced_term_object_key(&[ServerFrontend::Xet], short_hash);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn managed_protocol_object_identity_with_shard_key_returns_hash() {
-        // Shard keys follow the format shards/<prefix>/<hash>.shard
-        let shard_key = shardline_xet_adapter::shard_object_key(VALID_HASH).unwrap();
-        let result = managed_protocol_object_identity(&[ServerFrontend::Xet], &shard_key).unwrap();
-        assert_eq!(
-            result.as_deref(),
-            Some(VALID_HASH),
-            "shard key should yield the embedded hash"
-        );
-    }
-
-    #[test]
-    fn managed_protocol_object_identity_with_chunk_key_returns_none() {
-        // Chunk keys use the format <prefix>/<hash> which is neither an xorb nor
-        // a shard key, so managed_protocol_object_identity should return None.
-        let chunk_key = shardline_server_core::chunk_object_key(VALID_HASH).unwrap();
-        let result = managed_protocol_object_identity(&[ServerFrontend::Xet], &chunk_key).unwrap();
-        assert_eq!(result, None, "chunk key is not an xorb or shard");
-    }
-
-    // ── visit_protocol_object_member_chunks tests ────────────────────────
-
-    #[test]
-    fn visit_protocol_object_member_chunks_without_xet_returns_ok() {
-        // When the frontend list doesn't include Xet, the function should
-        // return Ok(false) without calling the visitor.
-        let object_store = ServerObjectStore::blackhole();
-        let key = ObjectKey::parse("some/key").unwrap();
-        let mut visited = false;
-        let result = visit_protocol_object_member_chunks(
-            &[ServerFrontend::Lfs],
-            &object_store,
-            &key,
-            |_hash| {
-                visited = true;
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(
-            !visited,
-            "visitor should not be called without Xet frontend"
-        );
-    }
-
-    #[test]
-    fn visit_protocol_object_member_chunks_with_non_xorb_key_returns_ok() {
-        // When the key is not an xorb, the function should return Ok(false)
-        // without calling the visitor.
-        let object_store = ServerObjectStore::blackhole();
-        let key = ObjectKey::parse("some/key").unwrap();
-        let mut visited = false;
-        let result = visit_protocol_object_member_chunks(
-            &[ServerFrontend::Xet],
-            &object_store,
-            &key,
-            |_hash| {
-                visited = true;
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(!visited, "visitor should not be called for non-xorb key");
-    }
-
-    #[test]
-    fn visit_protocol_object_member_chunks_with_empty_frontends_returns_ok() {
-        let object_store = ServerObjectStore::blackhole();
-        let key = ObjectKey::parse("some/key").unwrap();
-        let mut visited = false;
-        let result = visit_protocol_object_member_chunks(&[], &object_store, &key, |_hash| {
-            visited = true;
-            Ok(())
-        });
-        assert!(result.is_ok());
-        assert!(!visited);
-    }
-
-    #[test]
-    fn visit_protocol_object_member_chunks_multiple_frontends_xet_first() {
-        // With multiple frontends including Xet, and a non-xorb key,
-        // the function should still complete without error.
-        let object_store = ServerObjectStore::blackhole();
-        let key = ObjectKey::parse("some/key").unwrap();
-        let mut visited = false;
-        let result = visit_protocol_object_member_chunks(
-            &[ServerFrontend::Xet, ServerFrontend::Lfs],
-            &object_store,
-            &key,
-            |_hash| {
-                visited = true;
-                Ok(())
-            },
-        );
-        assert!(result.is_ok());
-        assert!(!visited);
-    }
-
-    // ── optional_chunk_container_keys additional coverage ───────────────
-
-    #[test]
-    fn optional_chunk_container_keys_with_duplicate_xet_key_dedup() {
-        // When Xet appears twice in the frontend list, the result should
-        // contain one xorb key + one cache sidecar key (deduplication via
-        // contains check prevents 2 xorb keys and 2 cache keys).
-        let frontends = [ServerFrontend::Xet, ServerFrontend::Xet];
-        let keys = optional_chunk_container_keys(&frontends, VALID_HASH).unwrap();
-        assert_eq!(
-            keys.len(),
-            2,
-            "duplicate Xet frontends must not produce duplicate xorb or cache keys"
-        );
-        assert!(keys[0].as_str().starts_with("xorbs/default/"));
-        assert!(keys[1].as_str().starts_with("_xorb_chunks/"));
-    }
-
-    // ── Timeout / cancellation tests ─────────────────────────────────────
-
-    use std::time::Duration;
-    use tokio::time::timeout;
-
-    /// Verifies that `visit_protocol_object_member_chunks` completes under
-    /// `spawn_blocking` with a reasonable outer timeout.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn visit_protocol_object_member_chunks_completes_within_timeout() {
-        let object_store = ServerObjectStore::blackhole();
-        let key = ObjectKey::parse("xorbs/default/ab/aa".repeat(16).as_str()).unwrap();
-        let mut visited = false;
-
-        let result = timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || {
-                visit_protocol_object_member_chunks(
-                    &[ServerFrontend::Xet],
-                    &object_store,
-                    &key,
-                    |_hash| {
-                        visited = true;
-                        Ok(())
-                    },
-                )
-            }),
-        )
-        .await;
-
-        // The spawn_blocking and visit should complete well within 5 seconds.
-        assert!(result.is_ok(), "dispatch should not time out");
-        let joined = result.unwrap();
-        assert!(joined.is_ok(), "dispatch result should be Ok");
-    }
-
-    /// Verifies that a slow synchronous dispatch-like operation can be
-    /// cancelled via `tokio::time::timeout` when wrapped in `spawn_blocking`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_gc_operation_times_out_when_slow() {
-        use std::sync::Arc;
-        let slow_store = Arc::new(ServerObjectStore::blackhole());
-        let slow_key = ObjectKey::parse("xorbs/default/ab/aa".repeat(16).as_str()).unwrap();
-
-        // Simulate a slow blocking GC operation by sleeping inside
-        // spawn_blocking. This mirrors how real sync I/O (e.g. S3 reads)
-        // would behave.
-        let store_clone = Arc::clone(&slow_store);
-        let result = timeout(
-            Duration::from_millis(10),
-            tokio::task::spawn_blocking(move || {
-                // Simulate a slow I/O operation that the GC dispatch might
-                // perform (e.g. reading xorb metadata from the object store).
-                std::thread::sleep(Duration::from_millis(500));
+        let xorb = xorb_object_key(VALID_HASH).unwrap();
+        let shard = shardline_xet_adapter::shard_object_key(VALID_HASH).unwrap();
+        let chunk = shardline_server_core::chunk_object_key(VALID_HASH).unwrap();
+        let sidecar = ObjectKey::parse(&format!("_xorb_chunks/aa/{VALID_HASH}")).unwrap();
+        let unrelated = ObjectKey::parse("some/key").unwrap();
+        let store = ServerObjectStore::blackhole();
+        for &(frontends, native) in cases {
+            assert_eq!(uses_native_xet_storage(frontends), native);
+            let expected = if native {
+                vec![xorb.clone(), sidecar.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                optional_chunk_container_keys(frontends, VALID_HASH).unwrap(),
+                expected
+            );
+            match referenced_term_object_key(frontends, VALID_HASH) {
+                Ok(key) => {
+                    assert!(native);
+                    assert_eq!(key, xorb);
+                }
+                Err(error) => {
+                    assert!(!native);
+                    assert!(matches!(error, GcError::InvalidContentHash));
+                }
+            }
+            for (key, managed) in [
+                (&xorb, native),
+                (&shard, native),
+                (&chunk, false),
+                (&unrelated, false),
+            ] {
+                assert_eq!(
+                    managed_protocol_object_identity(frontends, key)
+                        .unwrap()
+                        .as_deref(),
+                    managed.then_some(VALID_HASH),
+                    "frontends={frontends:?}, key={key:?}",
+                );
                 let mut visited = false;
-                visit_protocol_object_member_chunks(
-                    &[ServerFrontend::Xet],
-                    &store_clone,
-                    &slow_key,
-                    |_hash| {
+                assert!(
+                    !visit_protocol_object_member_chunks(frontends, &store, key, |_| {
                         visited = true;
                         Ok(())
-                    },
-                )
-            }),
-        )
-        .await;
+                    })
+                    .unwrap()
+                );
+                assert!(
+                    !visited,
+                    "absent or unrelated sources must not expose members"
+                );
+            }
+        }
+    }
 
-        // The short 10ms outer timeout should fire before the 500ms sleep
-        // completes.
-        assert!(
-            result.is_err(),
-            "slow GC operation should be cancelled by timeout"
-        );
+    #[test]
+    fn native_term_keys_reject_invalid_hashes() {
+        for frontend in [ServerFrontend::Xet, ServerFrontend::Hub] {
+            for hash in ["abc123", "", "not-a-hash"] {
+                assert!(referenced_term_object_key(&[frontend], hash).is_err());
+                assert!(optional_chunk_container_keys(&[frontend], hash).is_err());
+            }
+        }
     }
 }

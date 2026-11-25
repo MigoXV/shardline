@@ -2,15 +2,13 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_s3_writers_and_gc_progress_with_one_connection_per_pool() {
-    let Some(url) = isolated_postgres_url().await else {
+    let Some(url) = isolated_postgres_url("s3").await else {
         return;
     };
     let tmp = TempDir::new().unwrap();
     let object_store =
         crate::object_store::ServerObjectStore::local(tmp.path().join("objects")).unwrap();
-    let mut state = build_postgres_state(&url, tmp.path(), object_store)
-        .await
-        .unwrap();
+    let mut state = build_postgres_state(&url, tmp.path(), object_store).await;
     let unique_state = Arc::get_mut(&mut state).unwrap();
     let crate::ServerBackend::Postgres(backend) = &mut unique_state.backend else {
         unreachable!();

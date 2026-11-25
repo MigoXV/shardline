@@ -1,5 +1,3 @@
-use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd};
-use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut};
@@ -25,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// assert_eq!(bytes.len(), 32);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DataHash([u64; 4]);
 
 impl Deref for DataHash {
@@ -82,29 +80,6 @@ impl AsRef<DataHash> for DataHash {
     }
 }
 
-impl PartialEq for DataHash {
-    fn eq(&self, other: &Self) -> bool {
-        self.0[0] == other.0[0]
-            && self.0[1] == other.0[1]
-            && self.0[2] == other.0[2]
-            && self.0[3] == other.0[3]
-    }
-}
-
-impl Eq for DataHash {}
-
-impl Ord for DataHash {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-
-impl PartialOrd for DataHash {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 impl core::ops::Rem<u64> for DataHash {
     type Output = u64;
 
@@ -113,16 +88,9 @@ impl core::ops::Rem<u64> for DataHash {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Invalid hex input for DataHash")]
 pub struct DataHashHexParseError;
-
-impl Error for DataHashHexParseError {}
-
-impl fmt::Display for DataHashHexParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Invalid hex input for DataHash")
-    }
-}
 
 impl From<ParseIntError> for DataHashHexParseError {
     fn from(_err: ParseIntError) -> Self {
@@ -143,13 +111,7 @@ impl DataHash {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn hex(&self) -> String {
-        format!(
-            "{:016x}{:016x}{:016x}{:016x}",
-            self.0[0].to_le(),
-            self.0[1].to_le(),
-            self.0[2].to_le(),
-            self.0[3].to_le()
-        )
+        format!("{self:x}")
     }
 
     /// Parses a 64-character hex string into a hash.
@@ -194,47 +156,39 @@ impl DataHash {
     }
 
     pub fn from_slice(value: &[u8]) -> Result<Self, DataHashBytesParseError> {
-        if value.len() != 32 {
-            return Err(DataHashBytesParseError);
-        }
-        let mut hash: DataHash = DataHash::default();
-        for (i, word) in hash.0.iter_mut().enumerate() {
-            let start = i * 8;
-            *word =
-                u64::from_le_bytes(value[start..start + 8].try_into().expect("slice len is 8"));
-        }
-        Ok(hash)
+        let bytes: &[u8; 32] = value.try_into().map_err(|_error| DataHashBytesParseError)?;
+        Ok(Self::from(bytes))
     }
 }
 
 impl fmt::LowerHex for DataHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.hex())
+        write!(
+            f,
+            "{:016x}{:016x}{:016x}{:016x}",
+            self.0[0].to_le(),
+            self.0[1].to_le(),
+            self.0[2].to_le(),
+            self.0[3].to_le()
+        )
     }
 }
 
 impl fmt::Display for DataHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.hex())
+        fmt::LowerHex::fmt(self, f)
     }
 }
 
 impl fmt::Debug for DataHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.hex())
+        fmt::LowerHex::fmt(self, f)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("Invalid bytes input for DataHash")]
 pub struct DataHashBytesParseError;
-
-impl Error for DataHashBytesParseError {}
-
-impl fmt::Display for DataHashBytesParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Invalid bytes input for DataHash")
-    }
-}
 
 impl TryFrom<&[u8]> for DataHash {
     type Error = DataHashBytesParseError;
@@ -340,42 +294,31 @@ mod tests {
     }
 
     #[test]
-    fn from_u8_32_and_back() {
-        let arr = [0xABu8; 32];
-        let h = DataHash::from(arr);
-        let back: [u8; 32] = h.into();
-        assert_eq!(arr, back);
-    }
-
-    #[test]
-    fn from_ref_u8_32() {
-        let arr = [0xCDu8; 32];
-        let h = DataHash::from(&arr);
-        let back: [u8; 32] = h.into();
-        assert_eq!(arr, back);
-    }
-
-    #[test]
-    fn from_slice_valid() {
-        let bytes = vec![42u8; 32];
-        let h = DataHash::from_slice(&bytes).unwrap();
-        let back: [u8; 32] = h.into();
-        assert_eq!(&bytes, &back[..]);
-    }
-
-    #[test]
-    fn from_slice_wrong_length() {
-        assert!(DataHash::from_slice(&[0u8; 31]).is_err());
-        assert!(DataHash::from_slice(&[0u8; 33]).is_err());
-    }
-
-    #[test]
-    fn try_from_slice() {
-        let bytes = [7u8; 32];
-        let h = DataHash::try_from(bytes.as_slice()).unwrap();
-        let back: [u8; 32] = h.into();
-        assert_eq!(bytes, back);
-        assert!(DataHash::try_from(&[0u8; 16][..]).is_err());
+    fn byte_conversions_preserve_little_endian_words() {
+        for bytes in [
+            [1; 32],
+            [0xAB; 32],
+            [0xCD; 32],
+            [42; 32],
+            [7; 32],
+            std::array::from_fn(|i| i as u8),
+        ] {
+            let hash = DataHash::from(bytes);
+            for (word, chunk) in hash.iter().zip(bytes.as_chunks::<8>().0) {
+                assert_eq!(*word, u64::from_le_bytes(*chunk));
+            }
+            assert_eq!(DataHash::from(&bytes), hash);
+            assert_eq!(DataHash::from_slice(&bytes).unwrap(), hash);
+            assert_eq!(DataHash::try_from(bytes.as_slice()).unwrap(), hash);
+            assert_eq!(<[u8; 32]>::from(hash), bytes);
+            assert_eq!(hash.to_bytes(), bytes);
+            assert_eq!(Vec::<u8>::from(hash), bytes);
+        }
+        for len in [0, 16, 31, 33] {
+            let bytes = vec![0; len];
+            assert!(DataHash::from_slice(&bytes).is_err());
+            assert!(DataHash::try_from(bytes.as_slice()).is_err());
+        }
     }
 
     #[test]
@@ -397,6 +340,7 @@ mod tests {
 
     #[test]
     fn from_hex_invalid_chars() {
+        assert!(DataHash::from_hex(&"g".repeat(64)).is_err());
         assert!(DataHash::from_hex(&"z".repeat(64)).is_err());
         assert!(DataHash::from_hex(&"xyz".repeat(22)[..64]).is_err());
     }
@@ -420,19 +364,24 @@ mod tests {
     }
 
     #[test]
-    fn display_and_lower_hex() {
-        let h = DataHash::from([1u64, 2, 3, 4]);
-        assert_eq!(format!("{h}"), format!("{h:x}"));
-        assert_eq!(format!("{h}").len(), 64);
-    }
-
-    #[test]
-    fn debug_output_is_hex() {
-        let h = DataHash::from([0u64; 4]);
-        assert_eq!(
-            format!("{h:?}"),
-            "0000000000000000000000000000000000000000000000000000000000000000"
-        );
+    fn all_formatters_preserve_canonical_hex_and_existing_flag_behavior() {
+        for expected in [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000001000000000000000200000000000000030000000000000004",
+        ] {
+            let hash = DataHash::from_hex(expected).unwrap();
+            for formatted in [
+                hash.hex(),
+                format!("{hash}"),
+                format!("{hash:x}"),
+                format!("{hash:?}"),
+                format!("{hash:>80}"),
+                format!("{hash:#x}"),
+                format!("{hash:.8}"),
+            ] {
+                assert_eq!(formatted, expected);
+            }
+        }
     }
 
     #[test]
@@ -441,6 +390,10 @@ mod tests {
         let b = DataHash::from([2u64, 0, 0, 0]);
         assert!(a < b);
         assert!(b > a);
+        assert!(a <= a);
+        assert!(a >= a);
+        assert_eq!(DataHash::from([1, 2, 3, 4]), DataHash::from([1, 2, 3, 4]));
+        assert_ne!(DataHash::from([1, 2, 3, 4]), DataHash::from([1, 2, 3, 5]));
         assert_eq!(a, a);
         assert_ne!(a, b);
     }
@@ -451,13 +404,6 @@ mod tests {
         assert_eq!(h % 3, 1);
         assert_eq!(h % 5, 0);
         assert_eq!(h % 10, 0);
-    }
-
-    #[test]
-    fn into_bytes() {
-        let h = DataHash::from([1u64, 2, 3, 4]);
-        let bytes: [u8; 32] = h.into();
-        assert_eq!(bytes.len(), 32);
     }
 
     #[test]
@@ -543,7 +489,10 @@ mod tests {
         w.write_all(b"part1").unwrap();
         w.write_all(b"part2").unwrap();
         assert_eq!(w.hash(), compute_data_hash(b"part1part2"));
+        w.write_all(b"part3").unwrap();
+        assert_eq!(w.hash(), compute_data_hash(b"part1part2part3"));
         w.flush().unwrap();
+        assert_eq!(w.into_inner(), b"part1part2part3");
     }
 
     #[test]

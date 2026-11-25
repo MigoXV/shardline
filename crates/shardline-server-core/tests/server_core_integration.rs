@@ -503,3 +503,39 @@ fn local_store_put_overwrite_then_read() {
         .expect("read after overwrite");
     assert_eq!(contents, updated);
 }
+
+// The owning crates test every fixture. This crate promises
+// backward-compatible public re-exports of the same types, not wrapper types.
+#[test]
+fn shared_reexports_preserve_type_identity() {
+    use std::any::TypeId;
+    for (name, public, owning) in [
+        (
+            "AuthContext",
+            TypeId::of::<shardline_server_core::AuthContext>(),
+            TypeId::of::<shardline_auth::AuthContext>(),
+        ),
+        (
+            "AuthError",
+            TypeId::of::<shardline_server_core::AuthError>(),
+            TypeId::of::<shardline_auth::AuthError>(),
+        ),
+        (
+            "InvalidLifecycleMetadataError",
+            TypeId::of::<shardline_server_core::InvalidLifecycleMetadataError>(),
+            TypeId::of::<shardline_validation::InvalidLifecycleMetadataError>(),
+        ),
+        (
+            "InvalidSerializedShardError",
+            TypeId::of::<shardline_server_core::InvalidSerializedShardError>(),
+            TypeId::of::<shardline_validation::InvalidSerializedShardError>(),
+        ),
+        (
+            "InvalidReconstructionResponseError",
+            TypeId::of::<shardline_server_core::InvalidReconstructionResponseError>(),
+            TypeId::of::<shardline_validation::InvalidReconstructionResponseError>(),
+        ),
+    ] {
+        assert_eq!(public, owning, "{name} must remain a direct re-export");
+    }
+}

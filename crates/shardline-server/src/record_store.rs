@@ -2,12 +2,39 @@ use crate::ServerError;
 
 mod membership;
 mod xorb_range;
-pub(crate) use membership::any_repository_hash_record;
+pub(crate) use membership::repository_references_hash_in_scope;
 pub(crate) use xorb_range::{
     Coverage as XorbRangeCoverage, first_xorb_coverage, repository_xorb_coverage,
 };
 
 pub(crate) use shardline_index::LocalRecordStore;
+
+pub(crate) fn file_record_locator<Store: shardline_index::RecordTraversal>(
+    store: &Store,
+    file_id: &str,
+    content_hash: Option<&str>,
+    repository_scope: Option<&shardline_protocol::RepositoryScope>,
+) -> Result<Store::Locator, ServerError> {
+    crate::validation::validate_identifier(file_id)?;
+    if let Some(hash) = content_hash {
+        crate::validation::validate_content_hash(hash)?;
+    }
+    let probe = shardline_index::FileRecord {
+        deduplication_domain: None,
+        file_id: file_id.to_owned(),
+        content_hash: content_hash.unwrap_or_default().to_owned(),
+        total_bytes: 0,
+        chunk_size: 0,
+        storage_repr: shardline_index::StorageRepresentation::WholeFileV1,
+        repository_scope: repository_scope.cloned(),
+        chunks: Vec::new(),
+    };
+    Ok(if content_hash.is_some() {
+        store.version_record_locator(&probe)
+    } else {
+        store.latest_record_locator(&probe)
+    })
+}
 
 pub(crate) fn parse_stored_file_record_bytes(
     bytes: &[u8],

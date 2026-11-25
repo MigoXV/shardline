@@ -14,6 +14,7 @@ use shardline_xet_adapter::{XET_REVISION_ROUTE, XET_REVISIONS_ROUTE};
 use crate::{
     client::XetClient,
     error::{SdxError, TransferError},
+    retry::RetryScope,
     tree::MetadataClient,
 };
 
@@ -24,7 +25,9 @@ const REVISION_RESPONSE_LIMIT: usize = 1152;
 const REVISION_PAGE_RESPONSE_LIMIT: usize = 1_153_152;
 
 /// A revision record (`{name,createdAt,updatedAt}`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase")]
 pub struct Revision {
     /// Revision name.
     pub name: String,
@@ -37,17 +40,8 @@ pub struct Revision {
 #[derive(Debug, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "camelCase")]
-struct RevisionJson {
-    name: String,
-    created_at: u64,
-    updated_at: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase")]
 struct RevisionsResponse {
-    revisions: Vec<RevisionJson>,
+    revisions: Vec<Revision>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
@@ -57,7 +51,7 @@ struct RevisionsResponse {
 #[serde(rename_all = "camelCase")]
 struct DeleteRevisionResponse {}
 
-impl MetadataClient {
+impl MetadataClient<'_> {
     /// Lists every revision of the repository by walking the keyset-cursor
     /// pages until the server reports no `nextCursor`.
     ///
@@ -65,18 +59,15 @@ impl MetadataClient {
     /// more revisions than one page would silently truncate without this loop
     /// (F-84).
     async fn list_revisions(&self) -> Result<Vec<Revision>, SdxError> {
-        let retry = self.read_retry();
+        let retry = self.retry(RetryScope::Read);
         let token = self.tokens.read_token().await?;
         let route = self.repo_route(XET_REVISIONS_ROUTE);
         let mut revisions = Vec::new();
         let mut cursor: Option<String> = None;
         let mut cursors = HashSet::new();
         loop {
-            let query: Vec<(String, String)> = cursor
-                .as_deref()
-                .map(|c| vec![("cursor".to_owned(), c.to_owned())])
-                .unwrap_or_default();
-            let url = crate::tree::build_url(&self.api_base, &route, &query);
+            let query = cursor.as_deref().map(|cursor| ("cursor", cursor));
+            let url = crate::tree::build_url(self.api_base, &route, query.as_slice());
             let response: RevisionsResponse = self
                 .send_json(
                     &retry,
@@ -87,11 +78,7 @@ impl MetadataClient {
                     ("list_revisions", REVISION_PAGE_RESPONSE_LIMIT),
                 )
                 .await?;
-            revisions.extend(response.revisions.into_iter().map(|revision| Revision {
-                name: revision.name,
-                created_at: revision.created_at,
-                updated_at: revision.updated_at,
-            }));
+            revisions.extend(response.revisions);
             cursor = crate::tree::checked_next_cursor(
                 "list_revisions",
                 response.next_cursor,
@@ -105,14 +92,14 @@ impl MetadataClient {
     }
 
     async fn create_revision(&self, rev: &str) -> Result<Revision, SdxError> {
-        let retry = self.write_retry();
+        let retry = self.retry(RetryScope::Write);
         let token = self.tokens.write_token().await?;
         let route = self
             .repo_route_scope(XET_REVISION_ROUTE)
             .replace("{rev}", &crate::tree::encode_path_segment(rev));
-        let url = crate::tree::build_url(&self.api_base, &route, crate::tree::no_query());
+        let url = crate::tree::build_url(self.api_base, &route, &[]);
         match self
-            .send_json::<RevisionJson>(
+            .send_json::<Revision>(
                 &retry,
                 token.token,
                 Method::POST,
@@ -122,11 +109,7 @@ impl MetadataClient {
             )
             .await
         {
-            Ok(revision) => Ok(Revision {
-                name: revision.name,
-                created_at: revision.created_at,
-                updated_at: revision.updated_at,
-            }),
+            Ok(revision) => Ok(revision),
             Err(SdxError::Transfer(TransferError::HttpStatus { status: 409, .. })) => {
                 Err(SdxError::RevisionExists(rev.to_owned()))
             }
@@ -135,12 +118,12 @@ impl MetadataClient {
     }
 
     async fn delete_revision(&self, rev: &str) -> Result<(), SdxError> {
-        let retry = self.write_retry();
+        let retry = self.retry(RetryScope::Write);
         let token = self.tokens.write_token().await?;
         let route = self
             .repo_route_scope(XET_REVISION_ROUTE)
             .replace("{rev}", &crate::tree::encode_path_segment(rev));
-        let url = crate::tree::build_url(&self.api_base, &route, crate::tree::no_query());
+        let url = crate::tree::build_url(self.api_base, &route, &[]);
         let _: DeleteRevisionResponse = self
             .send_json(
                 &retry,
@@ -199,7 +182,7 @@ mod tests {
         // Names permit quotes and backslashes (controls are rejected), both
         // serialized as two bytes. Cursor is the raw last revision name.
         let name = "\"\\".repeat(256);
-        let record = super::RevisionJson {
+        let record = super::Revision {
             name: name.clone(),
             created_at: u64::MAX,
             updated_at: u64::MAX,
@@ -210,7 +193,7 @@ mod tests {
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Page<'wire> {
-            revisions: Vec<&'wire super::RevisionJson>,
+            revisions: Vec<&'wire super::Revision>,
             next_cursor: Option<&'wire str>,
         }
         let page = Page {
@@ -227,42 +210,7 @@ mod tests {
     };
 
     use super::Revision;
-    use crate::{Auth, RepositoryId, XetClientBuilder};
-
-    const READ_TOKEN: &str = "read-token";
-
-    async fn build_client(server: &MockServer) -> crate::XetClient {
-        let auth = Auth::new(
-            &server.uri(),
-            RepositoryId {
-                provider: "github".to_owned(),
-                owner: "team".to_owned(),
-                repo: "assets".to_owned(),
-                revision: "main".to_owned(),
-            },
-        )
-        .unwrap()
-        .with_api_key("bootstrap".to_owned())
-        .with_subject("user".to_owned());
-        let port = server.uri().split(':').next_back().unwrap().to_owned();
-        XetClientBuilder::new()
-            .endpoint(format!("xet://127.0.0.1:{port}/github/team/assets/main"))
-            .auth(auth)
-            .build()
-            .unwrap()
-    }
-
-    async fn mock_read_token(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/api/github/team/assets/xet-read-token/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "casUrl": server.uri(),
-                "exp": 4_000_000_000u64,
-                "accessToken": READ_TOKEN,
-            })))
-            .mount(server)
-            .await;
-    }
+    use crate::metadata_test_support::{build_client, mock_read_token};
 
     fn revision_json(name: &str) -> serde_json::Value {
         json!({"name": name, "createdAt": 1, "updatedAt": 2})
@@ -292,7 +240,7 @@ mod tests {
                     .mount(&server)
                     .await;
             }
-            let client = build_client(&server).await;
+            let client = build_client(&server);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), client.list_revisions())
                     .await
@@ -315,11 +263,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let error = build_client(&server)
-            .await
-            .list_revisions()
-            .await
-            .unwrap_err();
+        let error = build_client(&server).list_revisions().await.unwrap_err();
         assert!(
             matches!(error, crate::SdxError::Metadata(message) if message.starts_with("list_revisions: "))
         );
@@ -337,11 +281,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let error = build_client(&server)
-            .await
-            .list_revisions()
-            .await
-            .unwrap_err();
+        let error = build_client(&server).list_revisions().await.unwrap_err();
         assert!(matches!(error, crate::SdxError::Metadata(message)
             if message.starts_with("list_revisions: ") && message.len() <= 8 * 1024 + "list_revisions: ".len()
                 && message.contains("[truncated; at line 1 column ")));
@@ -358,7 +298,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         for revision in [
             "release candidate",
             "release+candidate",
@@ -444,7 +384,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         let revisions = client.list_revisions().await.unwrap();
         let names: Vec<&str> = revisions.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["one", "two", "three", "four"]);
@@ -464,7 +404,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         let revisions = client.list_revisions().await.unwrap();
         let names: Vec<&str> = revisions.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["main"]);

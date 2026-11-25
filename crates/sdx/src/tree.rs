@@ -28,13 +28,15 @@ use crate::{
     auth::{RepositoryId, TokenService},
     client::XetClient,
     error::SdxError,
-    retry::{RetryContext, RetryMarkers, RetryPolicy, RetryScope},
+    retry::{RetryContext, RetryPolicy, RetryScope},
     session::DownloadSessionInner,
     transfer::TransferClient,
 };
 
 /// A resolved path → `file_id` mapping (`{path,fileId,size,updatedAt}`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase")]
 pub struct PathEntry {
     /// Canonical path (no leading/trailing slash).
     pub path: String,
@@ -47,7 +49,9 @@ pub struct PathEntry {
 }
 
 /// A single directory-listing entry (file or derived directory).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase")]
 pub struct DirEntry {
     /// Canonical child path; directories carry a trailing slash.
     pub path: String,
@@ -62,7 +66,9 @@ pub struct DirEntry {
 }
 
 /// One page of a directory listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+#[serde(rename_all = "camelCase")]
 pub struct DirListing {
     /// Entries for this page (already sorted by path).
     pub entries: Vec<DirEntry>,
@@ -71,9 +77,11 @@ pub struct DirListing {
 }
 
 /// Result of registering a path (mirrors the server's `RegisterResponse`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct RegisterResult {
     /// The registered path entry.
+    #[serde(flatten)]
     pub entry: PathEntry,
     /// Whether this path was newly created (`false` on a re-registration that
     /// repointed an existing path).
@@ -93,48 +101,6 @@ fn tree_page_response_limit(limit: Option<usize>) -> usize {
         .saturating_add(8_450)
 }
 
-// ── wire response shapes (camelCase) ────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase")]
-struct ResolveResponse {
-    path: String,
-    file_id: String,
-    size: u64,
-    updated_at: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase")]
-struct ListEntry {
-    path: String,
-    is_dir: bool,
-    file_id: Option<String>,
-    size: Option<u64>,
-    updated_at: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase")]
-struct ListResponse {
-    entries: Vec<ListEntry>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-#[serde(rename_all = "camelCase")]
-struct RegisterResponse {
-    path: String,
-    file_id: String,
-    size: u64,
-    updated_at: u64,
-    created: bool,
-}
-
 #[derive(Debug, Deserialize)]
 #[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "camelCase")]
@@ -144,77 +110,55 @@ struct DeletePathResponse {
 
 /// Low-level transport for the metadata endpoints. Both the [`XetClient`]
 /// surface and the upload session's automatic registration use it.
-#[derive(Clone)]
-pub(crate) struct MetadataClient {
-    pub(crate) transfer: TransferClient,
-    pub(crate) tokens: TokenService,
-    pub(crate) api_base: String,
-    pub(crate) repository: RepositoryId,
-    pub(crate) retry_policy: RetryPolicy,
+pub(crate) struct MetadataClient<'session> {
+    pub(crate) transfer: &'session TransferClient,
+    pub(crate) tokens: &'session TokenService,
+    pub(crate) api_base: &'session str,
+    pub(crate) repository: &'session RepositoryId,
+    pub(crate) retry_policy: &'session RetryPolicy,
 }
 
-impl MetadataClient {
+impl<'session> MetadataClient<'session> {
     /// Builds a metadata client from the client's shared session state.
-    pub(crate) fn from_download(inner: &DownloadSessionInner) -> Self {
-        Self {
-            transfer: inner.transfer.clone(),
-            tokens: inner.tokens.clone(),
-            api_base: inner.api_base.clone(),
-            repository: inner.repository.clone(),
-            retry_policy: inner.retry_policy.clone(),
-        }
+    pub(crate) fn from_download(inner: &'session DownloadSessionInner) -> Self {
+        Self::from_upload(
+            &inner.transfer,
+            &inner.tokens,
+            &inner.api_base,
+            &inner.repository,
+            &inner.retry_policy,
+        )
     }
 
     /// Builds a metadata client from the upload session's shared state.
-    pub(crate) fn from_upload(
-        transfer: &TransferClient,
-        tokens: &TokenService,
-        api_base: &str,
-        repository: &RepositoryId,
-        retry_policy: &RetryPolicy,
+    pub(crate) const fn from_upload(
+        transfer: &'session TransferClient,
+        tokens: &'session TokenService,
+        api_base: &'session str,
+        repository: &'session RepositoryId,
+        retry_policy: &'session RetryPolicy,
     ) -> Self {
         Self {
-            transfer: transfer.clone(),
-            tokens: tokens.clone(),
-            api_base: api_base.to_owned(),
-            repository: repository.clone(),
-            retry_policy: retry_policy.clone(),
+            transfer,
+            tokens,
+            api_base,
+            repository,
+            retry_policy,
         }
     }
 
-    pub(crate) fn read_retry(&self) -> RetryContext {
+    pub(crate) fn retry(&self, scope: RetryScope) -> RetryContext {
         RetryContext {
             policy: self.retry_policy.clone(),
             tokens: Some(self.tokens.clone()),
-            scope: RetryScope::Read,
-            markers: RetryMarkers {
-                retry_on_403: true,
-                ..RetryMarkers::default()
-            },
-        }
-    }
-
-    pub(crate) fn write_retry(&self) -> RetryContext {
-        RetryContext {
-            policy: self.retry_policy.clone(),
-            tokens: Some(self.tokens.clone()),
-            scope: RetryScope::Write,
-            markers: RetryMarkers {
-                retry_on_403: true,
-                ..RetryMarkers::default()
-            },
+            scope,
+            refresh_on_forbidden: true,
         }
     }
 
     /// Substitutes `{provider}/{owner}/{repo}/{rev}` into a route template.
     pub(crate) fn repo_route(&self, template: &str) -> String {
-        template
-            .replace(
-                "{provider}",
-                &encode_path_segment(&self.repository.provider),
-            )
-            .replace("{owner}", &encode_path_segment(&self.repository.owner))
-            .replace("{repo}", &encode_path_segment(&self.repository.repo))
+        self.repo_route_scope(template)
             .replace("{rev}", &encode_path_segment(&self.repository.revision))
     }
 
@@ -241,16 +185,14 @@ impl MetadataClient {
         body: Option<serde_json::Value>,
         response: (&'static str, usize),
     ) -> Result<T, SdxError> {
-        let transfer = self.transfer.clone();
         let decoded = retry
-            .run(token, move |tok| {
-                let transfer = transfer.clone();
-                let url = url.clone();
-                let method = method.clone();
-                let body = body.clone();
+            .run(token, |tok| {
+                let url = &url;
+                let method = &method;
+                let body = body.as_ref();
                 async move {
-                    transfer
-                        .request_json::<T>(&method, &url, &tok, body.as_ref(), response.1)
+                    self.transfer
+                        .request_json::<T>(method, url, &tok, body, response.1)
                         .await
                 }
             })
@@ -259,27 +201,19 @@ impl MetadataClient {
     }
 
     async fn resolve_path(&self, path: &str) -> Result<PathEntry, SdxError> {
-        let retry = self.read_retry();
+        let retry = self.retry(RetryScope::Read);
         let token = self.tokens.read_token().await?;
         let route = self.repo_route(XET_TREE_ROUTE);
-        let url = build_url(&self.api_base, &route, &[("path", path)]);
-        let response: ResolveResponse = self
-            .send_json(
-                &retry,
-                token.token,
-                Method::GET,
-                url,
-                None,
-                ("resolve_path", PATH_RESPONSE_LIMIT),
-            )
-            .await?;
-
-        Ok(PathEntry {
-            path: response.path,
-            file_id: response.file_id,
-            size: response.size,
-            updated_at: response.updated_at,
-        })
+        let url = build_url(self.api_base, &route, &[("path", path)]);
+        self.send_json(
+            &retry,
+            token.token,
+            Method::GET,
+            url,
+            None,
+            ("resolve_path", PATH_RESPONSE_LIMIT),
+        )
+        .await
     }
 
     async fn list_paged(
@@ -288,42 +222,37 @@ impl MetadataClient {
         limit: Option<usize>,
         cursor: Option<&str>,
     ) -> Result<DirListing, SdxError> {
-        let retry = self.read_retry();
+        let retry = self.retry(RetryScope::Read);
         let token = self.tokens.read_token().await?;
         let route = self.repo_route(XET_TREE_ROUTE);
-        let mut query: Vec<(String, String)> = vec![("prefix".to_owned(), prefix.to_owned())];
-        if let Some(limit) = limit {
-            query.push(("limit".to_owned(), limit.to_string()));
+        let limit_value = limit.map(|limit| limit.to_string());
+        let mut query = vec![("prefix", prefix)];
+        if let Some(encoded_limit) = limit_value.as_deref() {
+            query.push(("limit", encoded_limit));
         }
         if let Some(cursor) = cursor {
-            query.push(("cursor".to_owned(), cursor.to_owned()));
+            query.push(("cursor", cursor));
         }
-        let url = build_url(&self.api_base, &route, &query);
-        let response: ListResponse = self
-            .send_json(
-                &retry,
-                token.token,
-                Method::GET,
-                url,
-                None,
-                ("list_dir", tree_page_response_limit(limit)),
-            )
-            .await?;
+        let url = build_url(self.api_base, &route, &query);
+        self.send_json(
+            &retry,
+            token.token,
+            Method::GET,
+            url,
+            None,
+            ("list_dir", tree_page_response_limit(limit)),
+        )
+        .await
+    }
 
-        Ok(DirListing {
-            entries: response
-                .entries
-                .into_iter()
-                .map(|entry| DirEntry {
-                    path: entry.path,
-                    is_dir: entry.is_dir,
-                    file_id: entry.file_id,
-                    size: entry.size,
-                    updated_at: entry.updated_at,
-                })
-                .collect(),
-            next_cursor: response.next_cursor,
-        })
+    /// Validate before resolving credentials, then encode each wildcard segment
+    /// so registration and deletion address the same remote key.
+    fn mutation_url(&self, remote: &str) -> Result<String, SdxError> {
+        validate_mutation_path(remote)?;
+        let route = self
+            .repo_route(XET_PATH_ROUTE)
+            .replace("{*path}", &encode_path_segments(remote));
+        Ok(build_url(self.api_base, &route, &[]))
     }
 
     pub(crate) async fn register_path(
@@ -331,43 +260,24 @@ impl MetadataClient {
         remote: &str,
         file_id: &str,
     ) -> Result<RegisterResult, SdxError> {
-        validate_mutation_path(remote)?;
-        let retry = self.write_retry();
+        let url = self.mutation_url(remote)?;
+        let retry = self.retry(RetryScope::Write);
         let token = self.tokens.write_token().await?;
-        let route = self.repo_route(XET_PATH_ROUTE);
-        let url = build_url(&self.api_base, &route, no_query());
-        // Substitute the `{*path}` wildcard with the remote path (axum decodes
-        // the captured value; encode each segment so special characters survive).
-        let url = url.replace("{*path}", &encode_path_segments(remote));
-        let response: RegisterResponse = self
-            .send_json(
-                &retry,
-                token.token,
-                Method::PUT,
-                url,
-                Some(serde_json::json!({ "fileId": file_id })),
-                ("register_path", PATH_RESPONSE_LIMIT),
-            )
-            .await?;
-
-        Ok(RegisterResult {
-            entry: PathEntry {
-                path: response.path,
-                file_id: response.file_id,
-                size: response.size,
-                updated_at: response.updated_at,
-            },
-            created: response.created,
-        })
+        self.send_json(
+            &retry,
+            token.token,
+            Method::PUT,
+            url,
+            Some(serde_json::json!({ "fileId": file_id })),
+            ("register_path", PATH_RESPONSE_LIMIT),
+        )
+        .await
     }
 
     async fn delete_path(&self, remote: &str, recursive: bool) -> Result<u64, SdxError> {
-        validate_mutation_path(remote)?;
-        let retry = self.write_retry();
+        let mut url = self.mutation_url(remote)?;
+        let retry = self.retry(RetryScope::Write);
         let token = self.tokens.write_token().await?;
-        let route = self.repo_route(XET_PATH_ROUTE);
-        let mut url = build_url(&self.api_base, &route, no_query());
-        url = url.replace("{*path}", &encode_path_segments(remote));
         if recursive {
             url.push_str("?recursive=true");
         }
@@ -489,16 +399,7 @@ impl XetClient {
 
 /// Builds a URL from an API base + route template + query pairs, percent-
 /// encoding query values (URL-safe, avoids `Url::parse` fallibility).
-/// An empty query parameter slice (gives `build_url` a concrete element type).
-pub(crate) const fn no_query() -> &'static [(&'static str, &'static str)] {
-    &[]
-}
-
-pub(crate) fn build_url<K: AsRef<str>, V: AsRef<str>>(
-    api_base: &str,
-    route: &str,
-    query: &[(K, V)],
-) -> String {
+pub(crate) fn build_url(api_base: &str, route: &str, query: &[(&str, &str)]) -> String {
     let mut url = format!("{}{}", api_base.trim_end_matches('/'), route);
     if !query.is_empty() {
         url.push('?');
@@ -506,22 +407,18 @@ pub(crate) fn build_url<K: AsRef<str>, V: AsRef<str>>(
             if index > 0 {
                 url.push('&');
             }
-            url.push_str(key.as_ref());
+            url.push_str(key);
             url.push('=');
-            url.push_str(&encode_query(value.as_ref()));
+            url.extend(url::form_urlencoded::byte_serialize(value.as_bytes()));
         }
     }
     url
 }
 
-pub(crate) fn encode_query(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
-}
-
 /// Percent-encodes each path segment, preserving `/` separators (so a
 /// `{*path}` wildcard captures the raw segments and axum decodes them).
 ///
-/// Unlike [`encode_query`], this uses RFC-3986 path-segment encoding rather than
+/// Unlike query-value encoding, this uses RFC-3986 path-segment encoding rather than
 /// `form_urlencoded::byte_serialize`. The query encoder treats a space as `+`
 /// (valid only in query strings), but path segments are NOT query strings: axum's
 /// `Path` percent-decodes segments and treats `+` literally, so using the query
@@ -554,15 +451,14 @@ const PATH_SEGMENT_PCHAR: &percent_encoding::AsciiSet = &percent_encoding::NON_A
     .remove(b':')
     .remove(b'@');
 
+const PATH_PCHAR: &percent_encoding::AsciiSet = &PATH_SEGMENT_PCHAR.remove(b'/');
+
 pub(crate) fn encode_path_segment(segment: &str) -> String {
     percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT_PCHAR).to_string()
 }
 
 pub(crate) fn encode_path_segments(path: &str) -> String {
-    path.split('/')
-        .map(encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/")
+    percent_encoding::utf8_percent_encode(path, PATH_PCHAR).to_string()
 }
 
 /// HTTP URL parsers remove literal dot segments before the server can reject
@@ -605,24 +501,21 @@ mod tests {
     #[test]
     fn metadata_response_envelopes_cover_maximum_legal_paths_and_pages() {
         let path = "\"".repeat(4096);
-        let entry = super::ListEntry {
+        let entry = super::DirEntry {
             path: path.clone(),
             is_dir: false,
             file_id: Some("a".repeat(64)),
             size: Some(u64::MAX),
             updated_at: Some(u64::MAX),
         };
-        let resolve = super::ResolveResponse {
+        let resolve = super::PathEntry {
             path: path.clone(),
             file_id: "a".repeat(64),
             size: u64::MAX,
             updated_at: u64::MAX,
         };
-        let register = super::RegisterResponse {
-            path: path.clone(),
-            file_id: "a".repeat(64),
-            size: u64::MAX,
-            updated_at: u64::MAX,
+        let register = super::RegisterResult {
+            entry: resolve.clone(),
             created: false,
         };
         assert!(serde_json::to_vec(&resolve).unwrap().len() <= super::PATH_RESPONSE_LIMIT);
@@ -632,7 +525,7 @@ mod tests {
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Page<'wire> {
-            entries: Vec<&'wire super::ListEntry>,
+            entries: Vec<&'wire super::DirEntry>,
             next_cursor: Option<&'wire str>,
         }
         struct Count(usize);
@@ -667,45 +560,12 @@ mod tests {
         matchers::{method, path, path_regex, query_param},
     };
 
-    use super::{encode_path_segments, encode_query};
+    use super::{build_url, encode_path_segments};
     use crate::{Auth, RepositoryId, XetClientBuilder};
 
-    const READ_TOKEN: &str = "read-token";
+    use crate::metadata_test_support::{BOOTSTRAP_KEY, READ_TOKEN, build_client, mock_read_token};
+
     const WRITE_TOKEN: &str = "write-token";
-    const BOOTSTRAP_KEY: &str = "bootstrap";
-
-    async fn build_client(server: &MockServer) -> crate::XetClient {
-        let auth = Auth::new(
-            &server.uri(),
-            RepositoryId {
-                provider: "github".to_owned(),
-                owner: "team".to_owned(),
-                repo: "assets".to_owned(),
-                revision: "main".to_owned(),
-            },
-        )
-        .unwrap()
-        .with_api_key(BOOTSTRAP_KEY.to_owned())
-        .with_subject("user".to_owned());
-        let port = server.uri().split(':').next_back().unwrap().to_owned();
-        XetClientBuilder::new()
-            .endpoint(format!("xet://127.0.0.1:{port}/github/team/assets/main"))
-            .auth(auth)
-            .build()
-            .unwrap()
-    }
-
-    async fn mock_read_token(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/api/github/team/assets/xet-read-token/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "casUrl": server.uri(),
-                "exp": 4_000_000_000u64,
-                "accessToken": READ_TOKEN,
-            })))
-            .mount(server)
-            .await;
-    }
 
     async fn mock_write_token(server: &MockServer) {
         Mock::given(method("GET"))
@@ -730,7 +590,6 @@ mod tests {
             .mount(&server)
             .await;
         let error = build_client(&server)
-            .await
             .resolve_path("file.txt")
             .await
             .unwrap_err();
@@ -740,16 +599,31 @@ mod tests {
     }
 
     #[test]
-    fn encode_query_escapes_reserved_characters() {
-        assert_eq!(encode_query("data/model.pt"), "data%2Fmodel.pt");
-        assert_eq!(encode_query("a b.txt"), "a+b.txt");
-        assert_eq!(encode_query("plain"), "plain");
+    fn build_url_encodes_query_values() {
+        for (value, encoded) in [
+            ("data/model.pt", "data%2Fmodel.pt"),
+            ("a b.txt", "a+b.txt"),
+            ("plain", "plain"),
+            ("a+b&c%", "a%2Bb%26c%25"),
+        ] {
+            assert_eq!(
+                build_url("http://h/", "/route", &[("path", value)]),
+                format!("http://h/route?path={encoded}")
+            );
+        }
     }
 
     #[test]
     fn encode_path_segments_preserves_separators() {
-        assert_eq!(encode_path_segments("data/model.pt"), "data/model.pt");
-        assert_eq!(encode_path_segments("a b/c.txt"), "a%20b/c.txt");
+        for (path, encoded) in [
+            ("data/model.pt", "data/model.pt"),
+            ("a b/c.txt", "a%20b/c.txt"),
+            ("", ""),
+            ("/", "/"),
+            ("//a///", "//a///"),
+        ] {
+            assert_eq!(encode_path_segments(path), encoded, "{path:?}");
+        }
     }
 
     #[tokio::test]
@@ -769,7 +643,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         for remote in ["directory/../victim", "directory/./victim", ".", ".."] {
             assert!(matches!(
                 client.delete_path(remote, false).await,
@@ -858,7 +732,7 @@ mod tests {
                     .mount(&server)
                     .await;
             }
-            let client = build_client(&server).await;
+            let client = build_client(&server);
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), client.list_dir_all(""))
                     .await
@@ -963,7 +837,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         let all = client.list_dir_all("").await.unwrap();
         // `dir/` appears on both pages but is deduplicated.
         let paths: Vec<String> = all.iter().map(|entry| entry.path.clone()).collect();
@@ -994,7 +868,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         let err = client
             .register_path("a/b.txt", &"0".repeat(64))
             .await
@@ -1016,7 +890,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = build_client(&server).await;
+        let client = build_client(&server);
         let err = client.resolve_path("missing.txt").await.unwrap_err();
         assert!(matches!(
             err,

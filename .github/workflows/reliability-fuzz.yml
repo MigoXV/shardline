@@ -26,11 +26,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Setup Rust CI toolchain and tools
-        uses: ./.github/actions/rust-ci-setup
-        with:
-          cargo-tools: cargo-make,cargo-nextest,cargo-fuzz
-
       - name: Discover registered reliability fuzz targets
         id: targets
         shell: bash
@@ -56,7 +51,7 @@ jobs:
       - name: Setup Rust CI toolchain and tools
         uses: ./.github/actions/rust-ci-setup
         with:
-          cargo-tools: cargo-make,cargo-nextest,cargo-fuzz
+          cargo-tools: cargo-fuzz
 
       - name: Run reliability fuzz campaign
         run: bash scripts/shardline/fuzz.sh reliability ${{ matrix.target }}

@@ -27,11 +27,7 @@ pub(crate) fn parse_sha256_digest(value: &str) -> Result<String, ServerError> {
     core_ps::parse_sha256_digest(value)
 }
 
-pub(crate) fn scope_namespace(
-    repository_scope: Option<&shardline_protocol::RepositoryScope>,
-) -> String {
-    core_ps::scope_namespace(repository_scope)
-}
+pub(crate) use core_ps::scope_namespace;
 
 /// Historical ambiguous spelling, retained for compatibility fixtures.
 #[cfg(test)]
@@ -168,10 +164,7 @@ mod tests {
     #[test]
     fn oci_repository_scope_validator_accepts_bound_roots_and_nested_namespaces() {
         let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+        let scope = scope.expect("expected valid scope");
 
         assert!(validate_oci_repository_scope("team/assets", Some(&scope)).is_ok());
         assert!(validate_oci_repository_scope("team/assets/cache", Some(&scope)).is_ok());
@@ -204,10 +197,7 @@ mod tests {
         let key = shared_sha256_object_key(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         );
-        assert!(key.is_ok());
-        let Ok(key) = key else {
-            return;
-        };
+        let key = key.expect("expected valid key");
         assert_eq!(
             key.as_str(),
             "protocols/shared/sha256/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

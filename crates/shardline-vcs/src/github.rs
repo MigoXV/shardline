@@ -6,8 +6,8 @@ use crate::{
     ProviderAdapter, ProviderKind, RepositoryMetadata, RepositoryRef, RepositoryWebhookEvent,
     RepositoryWebhookEventKind, WebhookRequest,
     builtin::{
-        parse_delivery_id, parse_repository_from_full_name, parse_revision, parse_webhook_json,
-        value_str, verify_prefixed_hmac_sha256,
+        parse_delivery_id, parse_repository_from_full_name, parse_repository_rename,
+        parse_revision, parse_webhook_json, value_str, verify_prefixed_hmac_sha256,
     },
 };
 
@@ -111,22 +111,7 @@ fn parse_repository_event(
             delivery_id,
             RepositoryWebhookEventKind::RepositoryDeleted,
         ))),
-        "renamed" => {
-            let Some(previous_name) = github_previous_name(&payload) else {
-                return Ok(None);
-            };
-            let previous =
-                RepositoryRef::new(ProviderKind::GitHub, repository.owner(), previous_name)
-                    .map_err(|_error| BuiltInProviderError::InvalidRepositoryPayload)?;
-
-            Ok(Some(RepositoryWebhookEvent::new(
-                previous,
-                delivery_id,
-                RepositoryWebhookEventKind::RepositoryRenamed {
-                    new_repository: repository,
-                },
-            )))
-        }
+        "renamed" => parse_repository_rename(&payload, repository, delivery_id),
         "edited" | "privatized" | "publicized" | "transferred" => {
             Ok(Some(RepositoryWebhookEvent::new(
                 repository,
@@ -139,23 +124,16 @@ fn parse_repository_event(
 }
 
 fn github_repository(payload: &Value) -> Result<RepositoryRef, BuiltInProviderError> {
-    let Some(full_name) = value_str(payload, &["repository", "full_name"]) else {
-        return Err(BuiltInProviderError::InvalidRepositoryPayload);
-    };
+    let full_name = value_str(payload, &["repository", "full_name"])
+        .ok_or(BuiltInProviderError::InvalidRepositoryPayload)?;
 
     parse_repository_from_full_name(ProviderKind::GitHub, full_name)
-}
-
-fn github_previous_name(payload: &Value) -> Option<&str> {
-    value_str(payload, &["changes", "repository", "name", "from"])
-        .or_else(|| value_str(payload, &["changes", "name", "from"]))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use hmac::Mac;
     use shardline_protocol::SecretString;
 
     use super::GitHubAdapter;
@@ -167,22 +145,11 @@ mod tests {
     };
 
     fn adapter() -> Result<GitHubAdapter, BuiltInProviderError> {
-        let mut catalog = BuiltInProviderCatalog::new("github-app")?;
-        let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets")
-            .map_err(|_error| BuiltInProviderError::InvalidRepositoryPayload)?;
-        let subject = ProviderSubject::new("github-user-1")
-            .map_err(|_error| BuiltInProviderError::InvalidIntegrationSubject)?;
-        let metadata = configured_metadata(
-            repository,
-            RepositoryVisibility::Private,
-            "main",
+        let catalog = crate::provider::test_support::catalog(
+            ProviderKind::GitHub,
+            "github-app",
             "https://github.example/team/assets.git",
         )?;
-        catalog.register(ProviderRepositoryPolicy::new(
-            metadata,
-            HashSet::from([subject.clone()]),
-            HashSet::from([subject]),
-        ))?;
 
         Ok(GitHubAdapter::new(
             catalog,
@@ -191,37 +158,15 @@ mod tests {
     }
 
     fn signature(body: &[u8]) -> Option<String> {
-        let mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"secret");
-        assert!(mac.is_ok());
-        let Ok(mut mac) = mac else {
-            return None;
-        };
-        mac.update(body);
-        Some(format!(
-            "sha256={}",
-            hex::encode(mac.finalize().into_bytes())
-        ))
+        crate::provider::test_support::signature(body).map(|hex| format!("sha256={hex}"))
     }
 
     #[test]
     fn github_adapter_returns_registered_metadata() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
-        let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
-        assert!(repository.is_ok());
-        let Ok(repository) = repository else {
-            return;
-        };
+        let adapter = adapter().unwrap();
+        let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets").unwrap();
 
-        let metadata = adapter.repository_metadata(&repository);
-
-        assert!(metadata.is_ok());
-        let Ok(metadata) = metadata else {
-            return;
-        };
+        let metadata = adapter.repository_metadata(&repository).unwrap();
         assert_eq!(
             metadata.clone_url().as_str(),
             "https://github.example/team/assets.git"
@@ -231,24 +176,11 @@ mod tests {
 
     #[test]
     fn github_adapter_allows_registered_write_access() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
-        let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets");
-        let revision = RevisionRef::new("refs/heads/main");
-        let subject = ProviderSubject::new("github-user-1");
-        let denied_subject = ProviderSubject::new("github-user-2");
-        assert!(repository.is_ok());
-        assert!(revision.is_ok());
-        assert!(subject.is_ok());
-        assert!(denied_subject.is_ok());
-        let (Ok(repository), Ok(revision), Ok(subject), Ok(denied_subject)) =
-            (repository, revision, subject, denied_subject)
-        else {
-            return;
-        };
+        let adapter = adapter().unwrap();
+        let repository = RepositoryRef::new(ProviderKind::GitHub, "team", "assets").unwrap();
+        let revision = RevisionRef::new("refs/heads/main").unwrap();
+        let subject = ProviderSubject::new("github-user-1").unwrap();
+        let denied_subject = ProviderSubject::new("github-user-2").unwrap();
         let request = AuthorizationRequest::new(
             subject.clone(),
             repository.clone(),
@@ -262,28 +194,15 @@ mod tests {
             RepositoryAccess::Write,
         );
 
-        let decision = adapter.check_access(&request);
-        let denied_decision = adapter.check_access(&denied_request);
-
-        assert!(decision.is_ok());
-        assert!(denied_decision.is_ok());
-        let Ok(decision) = decision else {
-            return;
-        };
-        let Ok(denied_decision) = denied_decision else {
-            return;
-        };
+        let decision = adapter.check_access(&request).unwrap();
+        let denied_decision = adapter.check_access(&denied_request).unwrap();
         assert_eq!(decision, AuthorizationDecision::Allow(subject));
         assert_eq!(denied_decision, AuthorizationDecision::Deny);
     }
 
     #[test]
     fn github_adapter_parses_push_webhook() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
+        let adapter = adapter().unwrap();
         let body = br#"{
             "ref":"refs/heads/main",
             "repository":{"full_name":"team/assets"}
@@ -291,20 +210,9 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("push", "delivery-1", signature.as_deref(), body);
 
-        let event = adapter.parse_webhook(request);
-
-        assert!(event.is_ok());
-        let Ok(event) = event else {
-            return;
-        };
-        let Some(event) = event else {
-            return;
-        };
-        let revision = RevisionRef::new("refs/heads/main");
-        assert!(revision.is_ok());
-        let Ok(revision) = revision else {
-            return;
-        };
+        let event = adapter.parse_webhook(request).unwrap();
+        let event = event.expect("expected webhook event");
+        let revision = RevisionRef::new("refs/heads/main").unwrap();
         assert_eq!(event.delivery_id().as_str(), "delivery-1");
         assert_eq!(
             event.kind(),
@@ -314,11 +222,7 @@ mod tests {
 
     #[test]
     fn github_adapter_parses_repository_rename() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
+        let adapter = adapter().unwrap();
         let body = br#"{
             "action":"renamed",
             "repository":{"full_name":"team/new-assets"},
@@ -327,20 +231,10 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("repository", "delivery-2", signature.as_deref(), body);
 
-        let event = adapter.parse_webhook(request);
-
-        assert!(event.is_ok());
-        let Ok(event) = event else {
-            return;
-        };
-        let Some(event) = event else {
-            return;
-        };
-        let new_repository = RepositoryRef::new(ProviderKind::GitHub, "team", "new-assets");
-        assert!(new_repository.is_ok());
-        let Ok(new_repository) = new_repository else {
-            return;
-        };
+        let event = adapter.parse_webhook(request).unwrap();
+        let event = event.expect("expected webhook event");
+        let new_repository =
+            RepositoryRef::new(ProviderKind::GitHub, "team", "new-assets").unwrap();
         assert_eq!(event.repository().name(), "assets");
         assert_eq!(
             event.kind(),
@@ -350,11 +244,7 @@ mod tests {
 
     #[test]
     fn github_adapter_parses_repository_transfer_as_access_change() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
+        let adapter = adapter().unwrap();
         let body = br#"{
             "action":"transferred",
             "repository":{"full_name":"team/assets"}
@@ -362,15 +252,8 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("repository", "delivery-3", signature.as_deref(), body);
 
-        let event = adapter.parse_webhook(request);
-
-        assert!(event.is_ok());
-        let Ok(event) = event else {
-            return;
-        };
-        let Some(event) = event else {
-            return;
-        };
+        let event = adapter.parse_webhook(request).unwrap();
+        let event = event.expect("expected webhook event");
         assert_eq!(event.repository().owner(), "team");
         assert_eq!(event.repository().name(), "assets");
         assert_eq!(event.kind(), &RepositoryWebhookEventKind::AccessChanged);
@@ -378,11 +261,7 @@ mod tests {
 
     #[test]
     fn github_adapter_rejects_invalid_signature() {
-        let adapter = adapter();
-        assert!(adapter.is_ok());
-        let Ok(adapter) = adapter else {
-            return;
-        };
+        let adapter = adapter().unwrap();
         let body = br#"{"ref":"refs/heads/main","repository":{"full_name":"team/assets"}}"#;
         let request = WebhookRequest::new("push", "delivery-1", Some("sha256=deadbeef"), body);
 
@@ -465,9 +344,7 @@ mod tests {
         let request =
             WebhookRequest::new("repository", "delivery-edit", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else {
-            return;
-        };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.kind(), &RepositoryWebhookEventKind::AccessChanged);
     }
 
@@ -482,9 +359,7 @@ mod tests {
         let request =
             WebhookRequest::new("repository", "delivery-priv", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else {
-            return;
-        };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.kind(), &RepositoryWebhookEventKind::AccessChanged);
     }
 
@@ -498,9 +373,7 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("repository", "delivery-pub", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else {
-            return;
-        };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.kind(), &RepositoryWebhookEventKind::AccessChanged);
     }
 
@@ -528,9 +401,7 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("repository", "delivery-alt", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else {
-            return;
-        };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.repository().name(), "assets");
     }
 
@@ -624,24 +495,9 @@ mod tests {
         let signature = signature(body);
         let request = WebhookRequest::new("repository", "delivery-del", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else { return };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.kind(), &RepositoryWebhookEventKind::RepositoryDeleted);
         assert_eq!(event.repository().owner(), "team");
-    }
-
-    #[test]
-    fn github_adapter_parses_repository_edit_as_access_change() {
-        let adapter = adapter().unwrap();
-        let body = br#"{
-            "action":"edited",
-            "repository":{"full_name":"team/assets"}
-        }"#;
-        let signature = signature(body);
-        let request =
-            WebhookRequest::new("repository", "delivery-edit", signature.as_deref(), body);
-        let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else { return };
-        assert_eq!(event.kind(), &RepositoryWebhookEventKind::AccessChanged);
     }
 
     #[test]
@@ -656,7 +512,7 @@ mod tests {
         let request =
             WebhookRequest::new("repository", "delivery-alt2", signature.as_deref(), body);
         let event = adapter.parse_webhook(request).unwrap();
-        let Some(event) = event else { return };
+        let event = event.expect("expected webhook event");
         assert_eq!(event.repository().name(), "assets");
     }
 

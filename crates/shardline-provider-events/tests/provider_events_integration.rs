@@ -36,6 +36,7 @@ use shardline_provider_events::{
 /// object-key derivation works without touching the object store.
 fn test_record(scope: RepositoryScope) -> FileRecord {
     FileRecord {
+        deduplication_domain: None,
         file_id: "asset.bin".to_owned(),
         content_hash: "a".repeat(64),
         total_bytes: 8,
@@ -58,6 +59,7 @@ fn test_record_with_seed(scope: RepositoryScope, seed: &str) -> FileRecord {
     let content_hash = test_hash("content", seed);
     let chunk_hash = test_hash("chunk", seed);
     FileRecord {
+        deduplication_domain: None,
         file_id: format!("asset-{seed}.bin"),
         content_hash,
         total_bytes: 8,
@@ -276,10 +278,14 @@ async fn postgres_delete_plan_commits_holds_records_state_and_delivery_together(
     .execute(&pool)
     .await?;
 
-    let scope = RepositoryScope::new(RepositoryProvider::GitHub, &owner, repo, Some("main"))?;
-    let record = test_record_with_seed(scope, &owner);
-    RecordMutation::write_version_record(&records, &record).await?;
-    RecordMutation::write_latest_record(&records, &record).await?;
+    let mut scoped_records = Vec::new();
+    for revision in [Some("main"), None, Some("latest")] {
+        let scope = RepositoryScope::new(RepositoryProvider::GitHub, &owner, repo, revision)?;
+        let record = test_record_with_seed(scope, &owner);
+        RecordMutation::write_version_record(&records, &record).await?;
+        RecordMutation::write_latest_record(&records, &record).await?;
+        scoped_records.push(record);
+    }
     index
         .upsert_provider_repository_state(&shardline_index::ProviderRepositoryState::new(
             RepositoryProvider::GitHub,
@@ -304,6 +310,8 @@ async fn postgres_delete_plan_commits_holds_records_state_and_delivery_together(
         applied.event_kind,
         ProviderWebhookOutcomeKind::RepositoryDeleted
     );
+    assert_eq!(applied.affected_file_versions, 3);
+    assert_eq!(applied.affected_chunks, 1);
     assert_eq!(applied.applied_holds, 2);
 
     let resource = format!("github:{owner}/{repo}");
@@ -328,10 +336,12 @@ async fn postgres_delete_plan_commits_holds_records_state_and_delivery_together(
     .await?;
     assert_eq!(committed, PostgresProviderMutationOutcome::Applied);
 
-    let version = RecordTraversal::version_record_locator(&records, &record);
-    let latest = RecordTraversal::latest_record_locator(&records, &record);
-    assert!(!RecordTraversal::record_locator_exists(&records, &version).await?);
-    assert!(!RecordTraversal::record_locator_exists(&records, &latest).await?);
+    for record in &scoped_records {
+        let version = RecordTraversal::version_record_locator(&records, record);
+        let latest = RecordTraversal::latest_record_locator(&records, record);
+        assert!(!RecordTraversal::record_locator_exists(&records, &version).await?);
+        assert!(!RecordTraversal::record_locator_exists(&records, &latest).await?);
+    }
     assert!(
         index
             .provider_repository_state(RepositoryProvider::GitHub, &owner, repo)
@@ -463,10 +473,14 @@ async fn repository_deleted_with_records_creates_holds() -> Result<(), Box<dyn E
     let index_store = MemoryIndexStore::new();
     let object_store = local_object_store()?;
 
-    let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"))?;
-    let record = test_record(scope);
-    RecordMutation::write_version_record(&record_store, &record).await?;
-    RecordMutation::write_latest_record(&record_store, &record).await?;
+    let mut scoped_records = Vec::new();
+    for revision in [Some("main"), None, Some("latest")] {
+        let scope = RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", revision)?;
+        let record = test_record(scope);
+        RecordMutation::write_version_record(&record_store, &record).await?;
+        RecordMutation::write_latest_record(&record_store, &record).await?;
+        scoped_records.push(record);
+    }
 
     let event = RepositoryWebhookEvent::new(
         RepositoryRef::new(ProviderKind::GitHub, "team", "assets")?,
@@ -482,7 +496,7 @@ async fn repository_deleted_with_records_creates_holds() -> Result<(), Box<dyn E
         outcome.event_kind,
         ProviderWebhookOutcomeKind::RepositoryDeleted,
     );
-    assert_eq!(outcome.affected_file_versions, 1);
+    assert_eq!(outcome.affected_file_versions, 3);
     assert_eq!(outcome.affected_chunks, 1);
     // One chunk + one xorb = two retention holds.
     assert_eq!(outcome.applied_holds, 2);
@@ -491,20 +505,14 @@ async fn repository_deleted_with_records_creates_holds() -> Result<(), Box<dyn E
         "deleted repository should have a retention window",
     );
 
-    // Verify records were removed.
-    let latest_exists = RecordTraversal::record_locator_exists(
-        &record_store,
-        &RecordTraversal::latest_record_locator(&record_store, &record),
-    )
-    .await?;
-    assert!(!latest_exists, "latest record should have been removed");
-
-    let version_exists = RecordTraversal::record_locator_exists(
-        &record_store,
-        &RecordTraversal::version_record_locator(&record_store, &record),
-    )
-    .await?;
-    assert!(!version_exists, "version record should have been removed");
+    for record in &scoped_records {
+        for locator in [
+            RecordTraversal::latest_record_locator(&record_store, record),
+            RecordTraversal::version_record_locator(&record_store, record),
+        ] {
+            assert!(!RecordTraversal::record_locator_exists(&record_store, &locator).await?);
+        }
+    }
 
     Ok(())
 }

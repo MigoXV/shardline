@@ -339,6 +339,7 @@ mod tests {
             observed.store(true, Ordering::SeqCst);
         });
         let record = shardline_index::FileRecord {
+            deduplication_domain: None,
             file_id: "a".repeat(64),
             content_hash: "c".repeat(64),
             total_bytes: 12,
@@ -621,7 +622,6 @@ mod tests {
         };
         let mut output = Vec::new();
         let result = append_referenced_term_bytes(&store, &term, &mut output);
-        assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(
             err,
@@ -645,7 +645,6 @@ mod tests {
         };
         let mut output = Vec::new();
         let result = append_referenced_term_bytes(&store, &term, &mut output);
-        assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(
             err,

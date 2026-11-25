@@ -20,12 +20,71 @@ use crate::{ServerError, admission::blocking_work, record_store::parse_stored_fi
 mod cohort;
 
 impl ServerBackend {
+    pub(crate) async fn cache_verified_xorb_descriptor(
+        &self,
+        descriptor: &XetXorbDescriptor,
+    ) -> Result<(), ServerError> {
+        match self {
+            Self::Local(backend) => {
+                backend
+                    .record_store()
+                    .cache_xet_xorb_descriptors(std::slice::from_ref(descriptor))
+                    .await?
+            }
+            Self::Postgres(backend) => {
+                backend
+                    .record_store()
+                    .cache_xet_xorb_descriptors(std::slice::from_ref(descriptor))
+                    .await?
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn scoped_dedup_shard(
         &self,
         chunk_hash: &str,
         scope: Option<&RepositoryScope>,
         limits: crate::ShardMetadataLimits,
     ) -> Result<Vec<u8>, ServerError> {
+        self.with_scoped_dedup_sources(chunk_hash, scope, limits, |sources| {
+            let (infos, masks): (Vec<_>, Vec<_>) = sources
+                .into_iter()
+                .map(|(_, info, visible)| (info, visible))
+                .unzip();
+            let mut public_key = [0_u8; 32];
+            let mut private_key = [0_u8; 32];
+            getrandom::fill(&mut public_key)
+                .and_then(|()| getrandom::fill(&mut private_key))
+                .map_err(|_error| {
+                    ServerError::Io(io::Error::other("deduplication entropy unavailable"))
+                })?;
+            serialize_scoped_keyed_dedup_shard(
+                &infos,
+                &masks,
+                public_key.into(),
+                private_key.into(),
+                Duration::from_secs(900),
+            )
+            .map_err(|_error| invalid_descriptor())
+        })
+        .await
+    }
+
+    /// Runs native and server-side reuse through the same authorization,
+    /// descriptor verification and remote-delete admission boundary.
+    pub(crate) async fn with_scoped_dedup_sources<Output: Send + 'static>(
+        &self,
+        chunk_hash: &str,
+        scope: Option<&RepositoryScope>,
+        limits: crate::ShardMetadataLimits,
+        prepare: impl FnOnce(
+            Vec<(XetXorbDescriptor, MDBXorbInfo, Vec<bool>)>,
+        ) -> Result<Output, ServerError>
+        + Send
+        + 'static,
+    ) -> Result<Output, ServerError> {
+        let domain = shardline_index::DeduplicationDomain::from_scope(scope);
         let mut after = None::<String>;
         let mut legacy_attempted = false;
         loop {
@@ -33,13 +92,13 @@ impl ServerBackend {
                 Self::Local(backend) => {
                     backend
                         .record_store()
-                        .xet_chunk_candidates_after(chunk_hash, scope, after.as_deref())
+                        .xet_domain_chunk_candidates_after(chunk_hash, &domain, after.as_deref())
                         .await?
                 }
                 Self::Postgres(backend) => {
                     backend
                         .record_store()
-                        .xet_chunk_candidates_after(chunk_hash, scope, after.as_deref())
+                        .xet_domain_chunk_candidates_after(chunk_hash, &domain, after.as_deref())
                         .await?
                 }
             };
@@ -69,14 +128,7 @@ impl ServerBackend {
                 if u64::try_from(shard.len())? != length {
                     return Err(invalid_descriptor());
                 }
-                let (objects, pool) = match self {
-                    Self::Local(backend) => {
-                        (backend.object_store(), backend.stream_work_pool.clone())
-                    }
-                    Self::Postgres(backend) => {
-                        (backend.object_store(), backend.stream_work_pool.clone())
-                    }
-                };
+                let (objects, pool) = (self.object_store(), self.stream_work_pool().clone());
                 let lookup_hash = chunk_hash.to_owned();
                 let claims = blocking_work(&pool, move || {
                     Ok(shardline_xet_adapter::dedup_xorb_candidates(
@@ -89,7 +141,7 @@ impl ServerBackend {
                 let mut authorized = Vec::new();
                 for claimed in claims {
                     let allowed = match (self, scope) {
-                        (Self::Local(backend), Some(scope)) => {
+                        (Self::Local(backend), scope) => {
                             legacy_member_visible(
                                 backend.record_store(),
                                 &claimed,
@@ -98,7 +150,7 @@ impl ServerBackend {
                             )
                             .await?
                         }
-                        (Self::Postgres(backend), Some(scope)) => {
+                        (Self::Postgres(backend), scope) => {
                             legacy_member_visible(
                                 backend.record_store(),
                                 &claimed,
@@ -107,7 +159,6 @@ impl ServerBackend {
                             )
                             .await?
                         }
-                        (_, None) => true,
                     };
                     if allowed {
                         authorized.push(claimed);
@@ -128,20 +179,7 @@ impl ServerBackend {
                 })
                 .await?;
                 if let Some(descriptor) = descriptor {
-                    match self {
-                        Self::Local(backend) => {
-                            backend
-                                .record_store()
-                                .cache_xet_xorb_descriptors(std::slice::from_ref(&descriptor))
-                                .await?
-                        }
-                        Self::Postgres(backend) => {
-                            backend
-                                .record_store()
-                                .cache_xet_xorb_descriptors(std::slice::from_ref(&descriptor))
-                                .await?
-                        }
-                    }
+                    self.cache_verified_xorb_descriptor(&descriptor).await?;
                     candidates.push(descriptor);
                 }
             }
@@ -154,13 +192,12 @@ impl ServerBackend {
                 // root verification authenticates the chunk identities and lengths.
                 let info = descriptor_info(&descriptor)?;
                 let visible = match (self, scope) {
-                    (Self::Local(backend), Some(scope)) => {
+                    (Self::Local(backend), scope) => {
                         visibility(backend.record_store(), &descriptor, scope).await?
                     }
-                    (Self::Postgres(backend), Some(scope)) => {
+                    (Self::Postgres(backend), scope) => {
                         visibility(backend.record_store(), &descriptor, scope).await?
                     }
-                    (_, None) => vec![true; descriptor.chunks.len()],
                 };
                 if !descriptor
                     .chunks
@@ -170,21 +207,18 @@ impl ServerBackend {
                 {
                     continue;
                 }
-                let mut prepared = vec![(descriptor.clone(), info, visible)];
-                for sibling in cohort::descriptors(self, &descriptor, scope, limits)
-                    .await?
-                    .into_iter()
-                    .skip(1)
-                {
+                let siblings =
+                    cohort::sibling_descriptors(self, &descriptor, scope, limits).await?;
+                let mut prepared = vec![(descriptor, info, visible)];
+                for sibling in siblings {
                     let sibling_info = descriptor_info(&sibling)?;
                     let sibling_visible = match (self, scope) {
-                        (Self::Local(backend), Some(scope)) => {
+                        (Self::Local(backend), scope) => {
                             visibility(backend.record_store(), &sibling, scope).await?
                         }
-                        (Self::Postgres(backend), Some(scope)) => {
+                        (Self::Postgres(backend), scope) => {
                             visibility(backend.record_store(), &sibling, scope).await?
                         }
-                        (_, None) => continue,
                     };
                     if sibling_visible.iter().any(|allowed| *allowed) {
                         prepared.push((sibling, sibling_info, sibling_visible));
@@ -194,14 +228,7 @@ impl ServerBackend {
                     .iter()
                     .map(|(source, _, _)| crate::xet_adapter::xorb_object_key(&source.hash))
                     .collect::<Result<Vec<_>, _>>()?;
-                let (objects, pool) = match self {
-                    Self::Local(backend) => {
-                        (backend.object_store(), backend.stream_work_pool.clone())
-                    }
-                    Self::Postgres(backend) => {
-                        (backend.object_store(), backend.stream_work_pool.clone())
-                    }
-                };
+                let (objects, pool) = (self.object_store(), self.stream_work_pool().clone());
                 // Do not advertise an unresolved remote deletion, even if a late
                 // object-store response still reports the object as present.
                 let mut settled_keys = None;
@@ -235,8 +262,7 @@ impl ServerBackend {
                     }
                     Self::Local(_) => None,
                 };
-                let mut infos = Vec::new();
-                let mut masks = Vec::new();
+                let mut sources = Vec::new();
                 for (index, ((source, source_info, source_visible), key)) in
                     prepared.into_iter().zip(&keys).enumerate()
                 {
@@ -254,34 +280,16 @@ impl ServerBackend {
                     if metadata.length() != source.total_bytes {
                         return Err(invalid_descriptor());
                     }
-                    infos.push(source_info);
-                    masks.push(source_visible);
+                    sources.push((source, source_info, source_visible));
                 }
-                let bytes = blocking_work(&pool, move || {
-                    let mut public_key = [0_u8; 32];
-                    let mut private_key = [0_u8; 32];
-                    getrandom::fill(&mut public_key)
-                        .and_then(|()| getrandom::fill(&mut private_key))
-                        .map_err(|_error| {
-                            ServerError::Io(io::Error::other("deduplication entropy unavailable"))
-                        })?;
-                    serialize_scoped_keyed_dedup_shard(
-                        &infos,
-                        &masks,
-                        public_key.into(),
-                        private_key.into(),
-                        Duration::from_secs(900),
-                    )
-                    .map_err(|_error| invalid_descriptor())
-                })
-                .await?;
+                let output = blocking_work(&pool, move || prepare(sources)).await?;
                 if let Some(transaction) = delete_guard.take() {
                     transaction
                         .commit()
                         .await
                         .map_err(shardline_index::PostgresMetadataStoreError::from)?;
                 }
-                return Ok(bytes);
+                return Ok(output);
             }
             if legacy_attempted {
                 return Err(ServerError::NotFound);
@@ -304,11 +312,12 @@ async fn legacy_member_visible<Store: RecordTraversal + Sync>(
     store: &Store,
     claimed: &MDBXorbInfo,
     chunk_hash: &str,
-    scope: &RepositoryScope,
+    scope: Option<&RepositoryScope>,
 ) -> Result<bool, ServerError>
 where
     ServerError: From<Store::Error>,
 {
+    let domain = shardline_index::DeduplicationDomain::from_scope(scope);
     let expected = MerkleHash::from(*parse_xet_hash_hex(chunk_hash)?.as_bytes());
     let positions = claimed
         .chunks
@@ -320,9 +329,9 @@ where
     let hash = claimed.metadata.xorb_hash.hex();
     let mut visible = false;
     store
-        .visit_repository_hash_records(scope, &hash, |entry| {
+        .visit_deduplication_hash_records(&domain, &hash, |entry| {
             let record = parse_stored_file_record_bytes(&entry.bytes)?;
-            if record.repository_scope.as_ref() == Some(scope) {
+            if record.reuse_domain() == domain {
                 visible |= record.chunks.iter().any(|term| {
                     term.hash == hash
                         && positions.iter().any(|position| {
@@ -383,16 +392,17 @@ pub(super) fn descriptor_info(descriptor: &XetXorbDescriptor) -> Result<MDBXorbI
 async fn visibility<Store: RecordTraversal + Sync>(
     store: &Store,
     descriptor: &XetXorbDescriptor,
-    scope: &RepositoryScope,
+    scope: Option<&RepositoryScope>,
 ) -> Result<Vec<bool>, ServerError>
 where
     ServerError: From<Store::Error>,
 {
+    let domain = shardline_index::DeduplicationDomain::from_scope(scope);
     let mut visible = vec![false; descriptor.chunks.len()];
     store
-        .visit_repository_hash_records(scope, &descriptor.hash, |entry| {
+        .visit_deduplication_hash_records(&domain, &descriptor.hash, |entry| {
             let record = parse_stored_file_record_bytes(&entry.bytes)?;
-            if record.repository_scope.as_ref() != Some(scope) {
+            if record.reuse_domain() != domain {
                 return Ok::<_, ServerError>(());
             }
             for term in record

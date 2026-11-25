@@ -17,10 +17,7 @@ pub(crate) fn authorize(
     headers: &HeaderMap,
     required_scope: TokenScope,
 ) -> Result<(), HubApiError> {
-    if let Some(auth) = &state.auth {
-        auth.authorize(headers, required_scope)?;
-    }
-    Ok(())
+    authorize_with_context(state, headers, required_scope).map(|_| ())
 }
 
 /// Authorize the request and return the verified auth context, when auth is
@@ -548,6 +545,7 @@ mod tests {
         let state = HubState {
             store: boxed,
             object_store,
+            recovery_archive: None,
             auth: Some(HubAuth::new(Box::new(ScopedProvider { ns, repo }))),
             http_client: None,
             webhook_secret_cipher: None,

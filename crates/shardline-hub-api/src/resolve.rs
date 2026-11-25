@@ -40,10 +40,7 @@ pub fn resolve_file_from_store_scoped(
     file_path: &str,
     _auth: &AuthorizedRepository,
 ) -> Result<DownloadResult, HubApiError> {
-    let files = state
-        .store
-        .get_files(commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = state.store.get_files(commit_sha)?;
     let file = files
         .iter()
         .find(|f| f.path == file_path)
@@ -273,6 +270,7 @@ mod tests {
         let state = HubState {
             store,
             object_store,
+            recovery_archive: None,
             auth: None,
             http_client: None,
             webhook_secret_cipher: None,

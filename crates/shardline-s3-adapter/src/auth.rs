@@ -22,10 +22,9 @@ impl TryFrom<&str> for AuthScheme {
     type Error = ();
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let bytes = value.as_bytes();
-        if bytes.get(.."Bearer ".len()) == Some(b"Bearer ") {
+        if value.starts_with("Bearer ") {
             Ok(Self::Bearer)
-        } else if bytes.get(.."AWS4-HMAC-SHA256 ".len()) == Some(b"AWS4-HMAC-SHA256 ") {
+        } else if value.starts_with("AWS4-HMAC-SHA256 ") {
             Ok(Self::SigV4)
         } else {
             Err(())
@@ -70,17 +69,12 @@ impl<'value> CredentialScope<'value> {
     #[must_use]
     pub fn parse(value: &'value str) -> Self {
         let mut parts = value.split('/');
-        let access_key = parts.next().unwrap_or("");
-        let date = parts.next().unwrap_or("");
-        let region = parts.next().unwrap_or("");
-        let service = parts.next().unwrap_or("");
-        let terminator = parts.next().unwrap_or("");
         Self {
-            access_key,
-            date,
-            region,
-            service,
-            terminator,
+            access_key: parts.next().unwrap_or(""),
+            date: parts.next().unwrap_or(""),
+            region: parts.next().unwrap_or(""),
+            service: parts.next().unwrap_or(""),
+            terminator: parts.next().unwrap_or(""),
         }
     }
 
@@ -92,11 +86,7 @@ impl<'value> CredentialScope<'value> {
     pub fn parse_credential_field(field: &'value str) -> Option<Self> {
         let scope = field.strip_prefix("Credential=")?;
         let scope = Self::parse(scope);
-        if scope.access_key.is_empty() {
-            None
-        } else {
-            Some(scope)
-        }
+        (!scope.access_key.is_empty()).then_some(scope)
     }
 }
 
@@ -111,11 +101,7 @@ impl<'value> QueryCredential<'value> {
     #[must_use]
     pub fn parse(value: &'value str) -> Option<Self> {
         let scope = CredentialScope::parse(value);
-        if scope.access_key.is_empty() {
-            None
-        } else {
-            Some(Self(scope))
-        }
+        (!scope.access_key.is_empty()).then_some(Self(scope))
     }
 
     /// Returns the parsed access key.
@@ -169,12 +155,7 @@ const fn is_amz_credential_name(name: &str) -> bool {
 /// ```
 #[must_use]
 pub fn extract_access_key(headers: &HeaderMap) -> Option<&str> {
-    if headers.get_all(AUTHORIZATION).iter().nth(1).is_some() {
-        return None;
-    }
-    let authorization = headers.get(AUTHORIZATION);
-    if let Some(authorization) = authorization {
-        let value = authorization.to_str().ok()?;
+    if let Some(value) = singleton_header(headers, AUTHORIZATION.as_str()).ok()? {
         let authorization_token = match AuthScheme::try_from(value) {
             Ok(AuthScheme::Bearer) => value.get(AuthScheme::Bearer.prefix_len()..),
             Ok(AuthScheme::SigV4) => extract_sigv4_access_key(value),
@@ -185,15 +166,26 @@ pub fn extract_access_key(headers: &HeaderMap) -> Option<&str> {
         }
     }
     // Only inspect the fallback after no higher-priority credential was selected.
-    if headers
-        .get_all(X_AMZ_SECURITY_TOKEN_HEADER)
-        .iter()
-        .nth(1)
-        .is_some()
-    {
-        return None;
+    singleton_header(headers, X_AMZ_SECURITY_TOKEN_HEADER)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn singleton_header<'headers>(
+    headers: &'headers HeaderMap,
+    name: &str,
+) -> Result<Option<&'headers str>, S3Error> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(S3Error::access_denied());
     }
-    headers.get(X_AMZ_SECURITY_TOKEN_HEADER)?.to_str().ok()
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_invalid_header| S3Error::access_denied())
 }
 
 /// Extracts the access-key component from a SigV4 `Authorization` header value.
@@ -291,59 +283,50 @@ mod tests {
     }
 
     #[test]
-    fn sigv4_header_extracts_access_key_from_full_credential() {
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
+    fn header_credential_extraction_cases() {
+        for (name, value, expected) in [
+            (
+                AUTHORIZATION.as_str(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=abc123",
-        )]);
-        assert_eq!(extract_access_key(&headers), Some("AKIDEXAMPLE"));
-    }
-
-    #[test]
-    fn sigv4_header_extracts_access_key_from_bare_credential() {
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request",
-        )]);
-        assert_eq!(extract_access_key(&headers), Some("AKIDEXAMPLE"));
+                Some("AKIDEXAMPLE"),
+            ),
+            (
+                AUTHORIZATION.as_str(),
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request",
+                Some("AKIDEXAMPLE"),
+            ),
+            (
+                AUTHORIZATION.as_str(),
+                "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc",
+                None,
+            ),
+            (AUTHORIZATION.as_str(), "Basic dXNlcjpwYXNz", None),
+            (
+                AUTHORIZATION.as_str(),
+                "AWS4-HMAC-SHA256 Credential=/20150830/us-east-1/s3/aws4_request",
+                None,
+            ),
+            (
+                AUTHORIZATION.as_str(),
+                "Bearer shardline-token-abc",
+                Some("shardline-token-abc"),
+            ),
+            (
+                "x-amz-security-token",
+                "shardline-token-xyz",
+                Some("shardline-token-xyz"),
+            ),
+        ] {
+            let headers = header_map(&[(name, value)]);
+            assert_eq!(extract_access_key(&headers), expected, "{name}: {value}");
+        }
     }
 
     #[test]
     fn missing_authorization_header_returns_none() {
         let headers = HeaderMap::new();
         assert_eq!(extract_access_key(&headers), None);
-    }
-
-    #[test]
-    fn malformed_sigv4_header_returns_none() {
-        // Wrong scheme.
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
-            "AWS4-HMAC-SHA256 SignedHeaders=host, Signature=abc",
-        )]);
-        assert_eq!(extract_access_key(&headers), None);
-        // Scheme present but not the SigV4 scheme.
-        let headers = header_map(&[(AUTHORIZATION.as_str(), "Basic dXNlcjpwYXNz")]);
-        assert_eq!(extract_access_key(&headers), None);
-        // Empty access key in the credential scope.
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
-            "AWS4-HMAC-SHA256 Credential=/20150830/us-east-1/s3/aws4_request",
-        )]);
-        assert_eq!(extract_access_key(&headers), None);
-    }
-
-    #[test]
-    fn bearer_header_is_returned_as_token() {
-        let headers = header_map(&[(AUTHORIZATION.as_str(), "Bearer shardline-token-abc")]);
-        assert_eq!(extract_access_key(&headers), Some("shardline-token-abc"));
-    }
-
-    #[test]
-    fn x_amz_security_token_header_is_accepted() {
-        let headers = header_map(&[("x-amz-security-token", "shardline-token-xyz")]);
-        assert_eq!(extract_access_key(&headers), Some("shardline-token-xyz"));
     }
 
     #[test]
@@ -377,60 +360,38 @@ mod tests {
     }
 
     #[test]
-    fn bucket_binding_rejects_owner_mismatch() {
+    fn bucket_binding_rejects_scope_and_bucket_errors() {
         let claims = scope("acme", "models");
-        let error = require_s3_bucket_binding(Some(&claims), "other.models").unwrap_err();
-        assert_eq!(error.code, "AccessDenied");
-        assert_eq!(error.status, 403);
-    }
-
-    #[test]
-    fn bucket_binding_rejects_name_mismatch() {
-        let claims = scope("acme", "models");
-        let error = require_s3_bucket_binding(Some(&claims), "acme.datasets").unwrap_err();
-        assert_eq!(error.code, "AccessDenied");
-        assert_eq!(error.status, 403);
-    }
-
-    #[test]
-    fn bucket_binding_rejects_missing_claims() {
-        let error = require_s3_bucket_binding(None, "acme.models").unwrap_err();
-        assert_eq!(error.code, "AccessDenied");
-        assert_eq!(error.status, 403);
-    }
-
-    #[test]
-    fn bucket_binding_rejects_undecodable_bucket() {
-        let claims = scope("acme", "models");
-        let error = require_s3_bucket_binding(Some(&claims), "not-a-bucket").unwrap_err();
-        assert_eq!(error.code, "NoSuchBucket");
-        assert_eq!(error.status, 404);
-        // Uppercase buckets are undecodable too.
-        let error = require_s3_bucket_binding(Some(&claims), "Acme.models").unwrap_err();
-        assert_eq!(error.code, "NoSuchBucket");
+        for (claims, bucket, code, status) in [
+            (Some(&claims), "other.models", "AccessDenied", 403),
+            (Some(&claims), "acme.datasets", "AccessDenied", 403),
+            (None, "acme.models", "AccessDenied", 403),
+            (Some(&claims), "not-a-bucket", "NoSuchBucket", 404),
+            (Some(&claims), "Acme.models", "NoSuchBucket", 404),
+        ] {
+            let error = require_s3_bucket_binding(claims, bucket).unwrap_err();
+            assert_eq!(error.code, code, "bucket {bucket:?}, claims {claims:?}");
+            assert_eq!(error.status, status, "bucket {bucket:?}, claims {claims:?}");
+        }
     }
 
     #[test]
     fn sigv4_header_ignores_extra_commas_and_malformed_dates() {
         // Extra commas / malformed date segments after the access key are
         // irrelevant — only the first Credential path segment is the key.
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
+        for authorization in [
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/,,,/us-east-1/s3/aws4_request, \
              SignedHeaders=host, Signature=abc",
-        )]);
-        assert_eq!(extract_access_key(&headers), Some("AKIDEXAMPLE"));
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/not-a-date/us-east-1/s3/aws4_request",
-        )]);
-        assert_eq!(extract_access_key(&headers), Some("AKIDEXAMPLE"));
-        // A trailing credential scope with extra slash segments is fine too.
-        let headers = header_map(&[(
-            AUTHORIZATION.as_str(),
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260813//s3///aws4_request",
-        )]);
-        assert_eq!(extract_access_key(&headers), Some("AKIDEXAMPLE"));
+        ] {
+            let headers = header_map(&[(AUTHORIZATION.as_str(), authorization)]);
+            assert_eq!(
+                extract_access_key(&headers),
+                Some("AKIDEXAMPLE"),
+                "authorization: {authorization}"
+            );
+        }
     }
 
     #[test]
@@ -506,6 +467,19 @@ mod tests {
             HeaderValue::from_static("fallback-token"),
         );
         assert_eq!(extract_access_key(&headers), Some("fallback-token"));
+        // Invalid Authorization bytes cannot be repaired by a valid fallback.
+        headers.insert(AUTHORIZATION, HeaderValue::from_bytes(b"\x80").unwrap());
+        assert_eq!(extract_access_key(&headers), None);
+        // An invalid unused fallback cannot override a valid Authorization.
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer primary-token"),
+        );
+        headers.insert(
+            X_AMZ_SECURITY_TOKEN_HEADER,
+            HeaderValue::from_bytes(b"\x80").unwrap(),
+        );
+        assert_eq!(extract_access_key(&headers), Some("primary-token"));
     }
 
     #[test]

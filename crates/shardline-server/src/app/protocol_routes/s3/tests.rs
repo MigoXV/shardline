@@ -18,6 +18,7 @@
     clippy::string_add
 )]
 
+use crate::test_support::postgres_fixture::isolated_postgres_url;
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::Path,
@@ -32,19 +33,18 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
-use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenClaims, TokenScope};
-use shardline_server_core::{AuthProvider, auth::LocalHmacProvider};
+use shardline_protocol::{RepositoryProvider, RepositoryScope, TokenScope};
 use tempfile::TempDir;
 use tower::ServiceExt;
+mod deduplication_domains;
 mod range_checksums;
 
-use crate::{
-    ServerConfig, ServerFrontend, ServerRole,
-    app::{AppState, ProtocolMetrics},
-    reconstruction_cache::ReconstructionCacheService,
-    transfer_limiter::TransferLimiter,
-};
+use crate::app::AppState;
 
+use super::test_support::{
+    BUCKET, NAME, OWNER, body_bytes, build_state, build_state_with_backend, build_test_state,
+    build_test_state_with_options, extract_tag, mint_token, put_request, sigv4_auth, test_config,
+};
 use super::{
     bucket::{
         s3_create_bucket, s3_delete_bucket, s3_get_bucket, s3_head_bucket, s3_list_buckets,
@@ -55,123 +55,39 @@ use super::{
 };
 use crc_fast::{CrcAlgorithm, Digest as CrcDigest};
 
-/// Test signing key matching the one used in e2e tests.
-const TEST_SIGNING_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
-const OWNER: &str = "acme";
-const NAME: &str = "models";
-const BUCKET: &str = "acme.models";
 const KEY: &str = "data/model.pt";
-
-/// Builds an auth-enabled [`AppState`] whose token scope is `acme.models`.
-async fn build_test_state() -> (Arc<AppState>, TempDir) {
-    build_test_state_with_options(
-        NonZeroU64::new(1).unwrap(),
-        NonZeroU64::new(1 << 40).unwrap(),
-    )
-    .await
-}
 
 /// Builds the same S3 router over Postgres metadata so multipart uses the
 /// durable object-store session path. Returns `None` outside the Postgres CI job.
 async fn build_postgres_test_state() -> Option<(Arc<AppState>, TempDir)> {
-    let database_url = isolated_postgres_url().await?;
+    let database_url = isolated_postgres_url("s3").await?;
     let tmp = TempDir::new().expect("configured PostgreSQL fixture scratch directory");
     let object_store = crate::object_store::ServerObjectStore::local(tmp.path().join("objects"))
         .expect("configured PostgreSQL fixture object store");
-    let state = build_postgres_state(&database_url, tmp.path(), object_store).await?;
+    let state = build_postgres_state(&database_url, tmp.path(), object_store).await;
     Some((state, tmp))
-}
-
-async fn isolated_postgres_url() -> Option<String> {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return None,
-        Err(std::env::VarError::NotUnicode(_value)) => {
-            panic!("configured PostgreSQL fixture URL must be valid Unicode")
-        }
-    };
-    let schema = format!(
-        "s3_fixture_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let admin = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("configured PostgreSQL fixture");
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
-    let mut scoped = url::Url::parse(&database_url).unwrap();
-    let options = scoped
-        .query_pairs()
-        .find(|(key, _)| key == "options")
-        .map_or_else(String::new, |(_, value)| value.into_owned());
-    let parameters: Vec<_> = scoped
-        .query_pairs()
-        .filter(|(key, _)| key != "options")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    scoped.set_query(None);
-    scoped
-        .query_pairs_mut()
-        .extend_pairs(parameters)
-        .append_pair("options", &format!("{options} -csearch_path={schema}"));
-    let pool = sqlx::PgPool::connect(scoped.as_str()).await.unwrap();
-    crate::apply_database_migrations(&pool).await.unwrap();
-    pool.close().await;
-    Some(scoped.into())
 }
 
 async fn build_postgres_state(
     database_url: &str,
     root: &Path,
     object_store: crate::object_store::ServerObjectStore,
-) -> Option<Arc<AppState>> {
-    let chunk_size = NonZeroUsize::new(65_536).unwrap();
-    let config = ServerConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        "http://127.0.0.1:8080".to_owned(),
-        root.to_path_buf(),
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::S3])
-    .expect("configured PostgreSQL fixture frontends")
-    .with_token_signing_key(TEST_SIGNING_KEY.to_vec())
-    .expect("configured PostgreSQL fixture signing key")
-    .with_s3_max_part_bytes(NonZeroU64::new(1_048_576).unwrap())
-    .expect("configured PostgreSQL fixture maximum part size")
-    .with_s3_min_part_bytes(NonZeroU64::MIN)
-    .expect("configured PostgreSQL fixture minimum part size");
+) -> Arc<AppState> {
+    let config = test_config(root)
+        .with_s3_max_part_bytes(NonZeroU64::new(1_048_576).unwrap())
+        .expect("configured PostgreSQL fixture maximum part size")
+        .with_s3_min_part_bytes(NonZeroU64::MIN)
+        .expect("configured PostgreSQL fixture minimum part size");
     let backend = crate::PostgresBackend::new_with_object_store(
         root.to_path_buf(),
         "http://127.0.0.1:8080".to_owned(),
-        chunk_size,
+        config.chunk_size(),
         database_url,
         object_store,
     )
     .await
     .unwrap_or_else(|_error| panic!("configured PostgreSQL fixture backend initialization"));
-    let auth = crate::auth::ServerAuth::new(TEST_SIGNING_KEY)
-        .expect("configured PostgreSQL fixture authentication");
-    let state = Arc::new(AppState {
-        config,
-        role: ServerRole::All,
-        backend: crate::ServerBackend::Postgres(backend),
-        auth: Some(auth),
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(chunk_size, NonZeroUsize::new(64).unwrap()),
-        oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(NonZeroUsize::new(256).unwrap()),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    });
-    Some(state)
+    build_state_with_backend(config, crate::ServerBackend::Postgres(backend))
 }
 
 #[tokio::test]
@@ -183,102 +99,21 @@ async fn configured_postgres_backend_failure_does_not_skip_test() {
     build_postgres_state("invalid-postgres-url", temporary.path(), objects).await;
 }
 
-/// Like [`build_test_state`] but with an explicit S3 minimum part size and
-/// session byte quota (used by the quota/min-size hardening tests).
-async fn build_test_state_with_options(
-    min_part_bytes: NonZeroU64,
-    session_max_bytes: NonZeroU64,
-) -> (Arc<AppState>, TempDir) {
-    let tmp = TempDir::new().expect("tempdir");
-    let chunk_size = NonZeroUsize::new(65536).unwrap();
-    let config = ServerConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        "http://127.0.0.1:8080".to_owned(),
-        tmp.path().to_path_buf(),
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::S3])
-    .expect("server frontends")
-    .with_token_signing_key(TEST_SIGNING_KEY.to_vec())
-    .expect("token signing key")
-    .with_s3_max_part_bytes(NonZeroU64::new(1_048_576).unwrap())
-    .expect("s3 max part bytes")
-    .with_s3_min_part_bytes(min_part_bytes)
-    .expect("s3 min part bytes")
-    .with_s3_upload_session_max_bytes(session_max_bytes)
-    .expect("s3 session max bytes");
-
-    let backend = crate::ServerBackend::from_config(&config)
-        .await
-        .expect("backend from config");
-
-    let auth = crate::auth::ServerAuth::new(TEST_SIGNING_KEY).expect("ServerAuth");
-
-    let state = Arc::new(AppState {
-        config,
-        role: ServerRole::All,
-        backend,
-        auth: Some(auth),
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(chunk_size, NonZeroUsize::new(64).unwrap()),
-        oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(
-            std::num::NonZeroUsize::new(256).unwrap(),
-        ),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    });
-
-    (state, tmp)
-}
-
 /// Like [`build_test_state_with_options`] but with an explicit global
 /// active-part-file cap (used by the F-19 part-file-cap hardening test).
 async fn build_test_state_with_s3_part_file_cap(
     max_active_part_files: NonZeroUsize,
 ) -> (Arc<AppState>, TempDir) {
     let tmp = TempDir::new().expect("tempdir");
-    let chunk_size = NonZeroUsize::new(65536).unwrap();
-    let config = ServerConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        "http://127.0.0.1:8080".to_owned(),
-        tmp.path().to_path_buf(),
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::S3])
-    .expect("server frontends")
-    .with_token_signing_key(TEST_SIGNING_KEY.to_vec())
-    .expect("token signing key")
-    .with_s3_min_part_bytes(NonZeroU64::new(1).unwrap())
-    .expect("s3 min part bytes")
-    .with_s3_upload_session_max_bytes(NonZeroU64::new(1 << 40).unwrap())
-    .expect("s3 session max bytes")
-    .with_s3_upload_max_active_part_files(max_active_part_files)
-    .expect("s3 max active part files");
+    let config = test_config(tmp.path())
+        .with_s3_min_part_bytes(NonZeroU64::new(1).unwrap())
+        .expect("s3 min part bytes")
+        .with_s3_upload_session_max_bytes(NonZeroU64::new(1 << 40).unwrap())
+        .expect("s3 session max bytes")
+        .with_s3_upload_max_active_part_files(max_active_part_files)
+        .expect("s3 max active part files");
 
-    let backend = crate::ServerBackend::from_config(&config)
-        .await
-        .expect("backend from config");
-
-    let auth = crate::auth::ServerAuth::new(TEST_SIGNING_KEY).expect("ServerAuth");
-
-    let state = Arc::new(AppState {
-        config,
-        role: ServerRole::All,
-        backend,
-        auth: Some(auth),
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(chunk_size, NonZeroUsize::new(64).unwrap()),
-        oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(
-            std::num::NonZeroUsize::new(256).unwrap(),
-        ),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    });
-
+    let state = build_state(config).await;
     (state, tmp)
 }
 
@@ -292,64 +127,16 @@ async fn build_test_state_with_part_sizes(
     session_max_bytes: NonZeroU64,
 ) -> (Arc<AppState>, TempDir) {
     let tmp = TempDir::new().expect("tempdir");
-    let chunk_size = NonZeroUsize::new(65536).unwrap();
-    let config = ServerConfig::new(
-        "127.0.0.1:0".parse().unwrap(),
-        "http://127.0.0.1:8080".to_owned(),
-        tmp.path().to_path_buf(),
-        chunk_size,
-    )
-    .with_server_frontends([ServerFrontend::S3])
-    .expect("server frontends")
-    .with_token_signing_key(TEST_SIGNING_KEY.to_vec())
-    .expect("token signing key")
-    .with_s3_max_part_bytes(max_part_bytes)
-    .expect("s3 max part bytes")
-    .with_s3_min_part_bytes(min_part_bytes)
-    .expect("s3 min part bytes")
-    .with_s3_upload_session_max_bytes(session_max_bytes)
-    .expect("s3 session max bytes");
+    let config = test_config(tmp.path())
+        .with_s3_max_part_bytes(max_part_bytes)
+        .expect("s3 max part bytes")
+        .with_s3_min_part_bytes(min_part_bytes)
+        .expect("s3 min part bytes")
+        .with_s3_upload_session_max_bytes(session_max_bytes)
+        .expect("s3 session max bytes");
 
-    let backend = crate::ServerBackend::from_config(&config)
-        .await
-        .expect("backend from config");
-
-    let auth = crate::auth::ServerAuth::new(TEST_SIGNING_KEY).expect("ServerAuth");
-
-    let state = Arc::new(AppState {
-        config,
-        role: ServerRole::All,
-        backend,
-        auth: Some(auth),
-        provider_tokens: None,
-        reconstruction_cache: ReconstructionCacheService::disabled(),
-        transfer_limiter: TransferLimiter::new(chunk_size, NonZeroUsize::new(64).unwrap()),
-        oci_registry_token_limiter: Arc::new(tokio::sync::Semaphore::new(64)),
-        admission: crate::admission::WeightedAdmission::new(
-            std::num::NonZeroUsize::new(256).unwrap(),
-        ),
-        pools: crate::admission::ExecutionPools::default_sizes(),
-        protocol_metrics: ProtocolMetrics::default(),
-    });
-
+    let state = build_state(config).await;
     (state, tmp)
-}
-
-/// Mints a token scoped to `owner.name` with the test signing key.
-fn mint_token(scope: TokenScope, owner: &str, name: &str) -> String {
-    let provider = LocalHmacProvider::new(TEST_SIGNING_KEY).unwrap();
-    let repo = RepositoryScope::new(RepositoryProvider::Generic, owner, name, None).unwrap();
-    let claims = TokenClaims::new("shardline", "test", scope, repo, u64::MAX).unwrap();
-    provider.mint_token(&claims).unwrap()
-}
-
-/// Builds a SigV4-style `Authorization` header whose access key **is** the
-/// bearer token.
-fn sigv4_auth(token: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential={token}/20260813/us-east-1/s3/aws4_request, \
-         SignedHeaders=host;x-amz-date, Signature=deadbeef"
-    )
 }
 
 /// Builds the S3 router with the test state attached.
@@ -379,25 +166,12 @@ fn s3_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Collects a response body into bytes.
-async fn body_bytes(response: axum::http::Response<Body>) -> Vec<u8> {
-    axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap()
-        .to_vec()
-}
-
-/// A default write-token request builder for the `acme.models` bucket.
-fn put_request(uri: String, body: Vec<u8>) -> axum::http::Request<Body> {
+fn authenticated_empty_request(method: &str, uri: impl AsRef<str>, auth: &str) -> Request<Body> {
     Request::builder()
-        .method("PUT")
-        .uri(uri)
-        .header(
-            header::AUTHORIZATION,
-            sigv4_auth(&mint_token(TokenScope::Write, OWNER, NAME)),
-        )
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(Body::from(body))
+        .method(method)
+        .uri(uri.as_ref())
+        .header(header::AUTHORIZATION, auth)
+        .body(Body::empty())
         .unwrap()
 }
 
@@ -407,10 +181,9 @@ fn put_request(uri: String, body: Vec<u8>) -> axum::http::Request<Body> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_postgres_put_rejects_lost_request_barrier_and_preserves_previous_object() {
-    if std::env::var("DATABASE_URL").is_err() {
+    let Some((mut state, _tmp)) = build_postgres_test_state().await else {
         return;
-    }
-    let (mut state, _tmp) = build_postgres_test_state().await.unwrap();
+    };
     let inner = Arc::get_mut(&mut state).unwrap();
     let backend = match &mut inner.backend {
         crate::ServerBackend::Postgres(backend) => backend,
@@ -482,14 +255,7 @@ async fn s3_postgres_put_rejects_lost_request_barrier_and_preserves_previous_obj
     let auth = sigv4_auth(&mint_token(TokenScope::Write, OWNER, NAME));
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(&uri)
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request("GET", &uri, &auth))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -530,14 +296,11 @@ async fn s3_put_get_head_delete_roundtrip() {
 
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -545,14 +308,11 @@ async fn s3_put_get_head_delete_roundtrip() {
 
     let head = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "HEAD",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::OK);
@@ -572,28 +332,22 @@ async fn s3_put_get_head_delete_roundtrip() {
 
     let delete = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "DELETE",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
 
     let get_after = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get_after.status(), StatusCode::NOT_FOUND);
@@ -691,14 +445,11 @@ async fn s3_get_and_head_response_overrides_follow_status_semantics() {
 
     let unsupported = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}?response-custom-header=value"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}?response-custom-header=value"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(unsupported.status(), StatusCode::NOT_IMPLEMENTED);
@@ -766,37 +517,26 @@ async fn s3_get_open_ended_and_suffix_ranges() {
         .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
 
-    let open_ended = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .header(header::RANGE, "bytes=14-")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(open_ended.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(body_bytes(open_ended).await, b"ef");
-
-    let suffix = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .header(header::RANGE, "bytes=-3")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(suffix.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(body_bytes(suffix).await, b"def");
+    for (range, expected) in [
+        ("bytes=14-", b"ef".as_slice()),
+        ("bytes=-3", b"def".as_slice()),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/{BUCKET}/{KEY}"))
+                    .header(header::AUTHORIZATION, &auth)
+                    .header(header::RANGE, range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(body_bytes(response).await, expected, "{range}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -813,38 +553,31 @@ async fn s3_get_unsatisfiable_range_returns_416_invalid_range() {
         .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
 
-    let get = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .header(header::RANGE, "bytes=100-200")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(get.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-    let body = String::from_utf8(body_bytes(get).await).unwrap();
-    assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
-
-    let multi_range = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .header(header::RANGE, "bytes=0-1,4-5")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(multi_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-    let body = String::from_utf8(body_bytes(multi_range).await).unwrap();
-    assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+    for range in ["bytes=100-200", "bytes=0-1,4-5"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/{BUCKET}/{KEY}"))
+                    .header(header::AUTHORIZATION, &auth)
+                    .header(header::RANGE, range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "{range}"
+        );
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(
+            body.contains("<Code>InvalidRange</Code>"),
+            "{range}: {body}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -855,14 +588,11 @@ async fn s3_get_missing_key_returns_404_no_such_key_xml() {
 
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/missing.pt"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/missing.pt"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::NOT_FOUND);
@@ -987,14 +717,11 @@ async fn s3_put_overwrite_returns_new_content() {
 
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -1048,14 +775,11 @@ async fn s3_index_row_present_after_put_absent_after_delete() {
 
     let delete = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "DELETE",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
@@ -1135,14 +859,11 @@ async fn s3_delete_object_is_idempotent() {
     // Deleting a key that never existed still returns 204.
     let delete = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/{BUCKET}/never-existed.pt"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "DELETE",
+            format!("/{BUCKET}/never-existed.pt"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
@@ -1422,22 +1143,25 @@ async fn s3_unsupported_storage_acl_and_encryption_options_fail_closed() {
     let public_acl = String::from_utf8(body_bytes(public_acl).await).unwrap();
     assert!(public_acl.contains("<Code>AccessControlListNotSupported</Code>"));
 
-    let encrypted_read = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/{BUCKET}/{key}"))
-                .header(
-                    header::AUTHORIZATION,
-                    sigv4_auth(&mint_token(TokenScope::Read, OWNER, NAME)),
-                )
-                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(encrypted_read.status(), StatusCode::NOT_IMPLEMENTED);
+    for query in ["", "?attributes"] {
+        let encrypted_read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{BUCKET}/{key}{query}"))
+                    .header(
+                        header::AUTHORIZATION,
+                        sigv4_auth(&mint_token(TokenScope::Read, OWNER, NAME)),
+                    )
+                    .header("x-amz-object-attributes", "ETag")
+                    .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(encrypted_read.status(), StatusCode::NOT_IMPLEMENTED);
+    }
 
     let unsupported_multipart = app
         .clone()
@@ -1583,14 +1307,11 @@ async fn s3_bucket_stubs_create_head_location() {
     // CreateBucket → 200 no-op.
     let create = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("/{BUCKET}"))
-                .header(header::AUTHORIZATION, &write_auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "PUT",
+            format!("/{BUCKET}"),
+            &write_auth,
+        ))
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
@@ -1627,14 +1348,11 @@ async fn s3_bucket_stubs_create_head_location() {
     // HeadBucket → 200.
     let head = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri(format!("/{BUCKET}"))
-                .header(header::AUTHORIZATION, &read_auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "HEAD",
+            format!("/{BUCKET}"),
+            &read_auth,
+        ))
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::OK);
@@ -1642,14 +1360,11 @@ async fn s3_bucket_stubs_create_head_location() {
     // GetBucketLocation → XML stub.
     let location = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}?location"))
-                .header(header::AUTHORIZATION, &read_auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}?location"),
+            &read_auth,
+        ))
         .await
         .unwrap();
     assert_eq!(location.status(), StatusCode::OK);
@@ -2034,15 +1749,6 @@ async fn create_upload_id(app: &Router) -> String {
     extract_tag(&xml, "UploadId")
 }
 
-/// Extracts the text content of the first `<tag>…</tag>` occurrence.
-fn extract_tag(xml: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open).unwrap() + open.len();
-    let end = xml.find(&close).unwrap();
-    xml[start..end].to_owned()
-}
-
 type ObservedPartEtags = std::collections::HashMap<(String, u32), String>;
 
 fn observed_part_etags() -> &'static std::sync::Mutex<ObservedPartEtags> {
@@ -2175,14 +1881,11 @@ async fn s3_multipart_roundtrip_assembles_parts_and_ranges() {
     // Full GET returns the assembled bytes.
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -2564,7 +2267,7 @@ async fn s3_postgres_multipart_rejects_wrong_key_before_claiming_completion() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_postgres_multipart_resumes_across_nodes_without_shared_rwx() {
-    let Some(database_url) = isolated_postgres_url().await else {
+    let Some(database_url) = isolated_postgres_url("s3").await else {
         return;
     };
     let tmp = TempDir::new().unwrap();
@@ -2572,15 +2275,8 @@ async fn s3_postgres_multipart_resumes_across_nodes_without_shared_rwx() {
         crate::object_store::ServerObjectStore::local(tmp.path().join("objects")).unwrap();
     let node_a_root = tmp.path().join("node-a");
     let node_b_root = tmp.path().join("node-b");
-    let Some(node_a) =
-        build_postgres_state(&database_url, &node_a_root, shared_objects.clone()).await
-    else {
-        return;
-    };
-    let Some(node_b) = build_postgres_state(&database_url, &node_b_root, shared_objects).await
-    else {
-        return;
-    };
+    let node_a = build_postgres_state(&database_url, &node_a_root, shared_objects.clone()).await;
+    let node_b = build_postgres_state(&database_url, &node_b_root, shared_objects).await;
     let app_a = s3_router(node_a);
     let app_b = s3_router(node_b);
 
@@ -2620,26 +2316,20 @@ async fn s3_postgres_multipart_resumes_across_nodes_without_shared_rwx() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_postgres_delete_and_put_are_one_cross_replica_order() {
-    let Some(database_url) = isolated_postgres_url().await else {
+    let Some(database_url) = isolated_postgres_url("s3").await else {
         return;
     };
     let tmp = TempDir::new().unwrap();
     let shared_objects =
         crate::object_store::ServerObjectStore::local(tmp.path().join("objects")).unwrap();
-    let Some(node_a) = build_postgres_state(
+    let node_a = build_postgres_state(
         &database_url,
         &tmp.path().join("node-a"),
         shared_objects.clone(),
     )
-    .await
-    else {
-        return;
-    };
-    let Some(node_b) =
-        build_postgres_state(&database_url, &tmp.path().join("node-b"), shared_objects).await
-    else {
-        return;
-    };
+    .await;
+    let node_b =
+        build_postgres_state(&database_url, &tmp.path().join("node-b"), shared_objects).await;
     let app_a = s3_router(node_a);
     let app_b = s3_router(node_b);
     let suffix = hex::encode(blake3::hash(tmp.path().as_os_str().as_encoded_bytes()).as_bytes());
@@ -2819,14 +2509,11 @@ async fn s3_abort_multipart_leaves_no_object_and_no_index_row() {
 
     let abort = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/{BUCKET}/{KEY}?uploadId={upload_id}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "DELETE",
+            format!("/{BUCKET}/{KEY}?uploadId={upload_id}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(abort.status(), StatusCode::NO_CONTENT);
@@ -2834,14 +2521,11 @@ async fn s3_abort_multipart_leaves_no_object_and_no_index_row() {
     // No object…
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::NOT_FOUND);
@@ -2974,14 +2658,11 @@ async fn s3_list_parts_missing_upload_and_unsupported_upload_listing() {
 
     let list_uploads = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}?uploads"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}?uploads"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(list_uploads.status(), StatusCode::OK);
@@ -3567,14 +3248,11 @@ async fn s3_failed_overwrite_keeps_old_object_and_index() {
     // The old object is still readable and the index still points at it.
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -3628,14 +3306,11 @@ async fn s3_overwrite_is_atomic_no_transient_404_for_readers() {
             for _ in 0..12 {
                 let response = app
                     .clone()
-                    .oneshot(
-                        Request::builder()
-                            .method("GET")
-                            .uri(format!("/{BUCKET}/{KEY}"))
-                            .header(header::AUTHORIZATION, &read_auth)
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
+                    .oneshot(authenticated_empty_request(
+                        "GET",
+                        format!("/{BUCKET}/{KEY}"),
+                        &read_auth,
+                    ))
                     .await
                     .unwrap();
                 let body = body_bytes(response).await;
@@ -3695,14 +3370,11 @@ async fn s3_overwrite_stress_readers_never_see_torn_or_absent_object() {
                     let read_auth = read_auth.clone();
                     tasks.push(tokio::spawn(async move {
                         let response = app
-                            .oneshot(
-                                Request::builder()
-                                    .method("GET")
-                                    .uri(format!("/{BUCKET}/{KEY}"))
-                                    .header(header::AUTHORIZATION, &read_auth)
-                                    .body(Body::empty())
-                                    .unwrap(),
-                            )
+                            .oneshot(authenticated_empty_request(
+                                "GET",
+                                format!("/{BUCKET}/{KEY}"),
+                                &read_auth,
+                            ))
                             .await
                             .unwrap();
                         let status = response.status();
@@ -3801,14 +3473,11 @@ async fn s3_complete_accepts_small_last_part() {
     // The assembled object is byte-identical to the parts.
     let get = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(format!("/{BUCKET}/{KEY}"))
-                .header(header::AUTHORIZATION, &auth)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(authenticated_empty_request(
+            "GET",
+            format!("/{BUCKET}/{KEY}"),
+            &auth,
+        ))
         .await
         .unwrap();
     assert_eq!(get.status(), StatusCode::OK);
@@ -5050,7 +4719,7 @@ async fn s3_read_conditions_and_if_range_preserve_representation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_postgres_corrupt_durable_part_preserves_old_object_and_allows_verified_retry() {
-    let Some(database_url) = isolated_postgres_url().await else {
+    let Some(database_url) = isolated_postgres_url("s3").await else {
         return;
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -5448,7 +5117,7 @@ async fn s3_local_multipart_completion_honors_conditional_headers_and_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_postgres_multipart_completion_honors_conditional_headers_and_retry() {
-    let Some(database_url) = isolated_postgres_url().await else {
+    let Some(database_url) = isolated_postgres_url("s3").await else {
         return;
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -5466,7 +5135,7 @@ async fn s3_postgres_multipart_completion_honors_conditional_headers_and_retry()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s3_postgres_multipart_completion_conditional_race_has_one_winner() {
-    let Some(database_url) = isolated_postgres_url().await else {
+    let Some(database_url) = isolated_postgres_url("s3").await else {
         return;
     };
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -5477,12 +5146,9 @@ async fn s3_postgres_multipart_completion_conditional_race_has_one_winner() {
     crate::apply_database_migrations(&pool).await.unwrap();
     let tmp = TempDir::new().unwrap();
     let shared = crate::object_store::ServerObjectStore::local(tmp.path().join("objects")).unwrap();
-    let state_a = build_postgres_state(&database_url, &tmp.path().join("node-a"), shared.clone())
-        .await
-        .unwrap();
-    let state_b = build_postgres_state(&database_url, &tmp.path().join("node-b"), shared)
-        .await
-        .unwrap();
+    let state_a =
+        build_postgres_state(&database_url, &tmp.path().join("node-a"), shared.clone()).await;
+    let state_b = build_postgres_state(&database_url, &tmp.path().join("node-b"), shared).await;
     let app_a = s3_router(state_a.clone());
     let app_b = s3_router(state_b);
     let delete = Request::builder()

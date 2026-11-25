@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::{commit::validate_commit_path, error::HubApiError, models::RepoType};
 
-use super::{HubRepository, HubState};
+use super::{HubRepository, HubState, tree::lfs_pointer_size};
 
 const MAX_PATHS_INFO_REQUEST: usize = 1_000;
 const MAX_PATHS_INFO_BODY_BYTES: usize = 64 * 1024;
@@ -54,8 +54,7 @@ pub(crate) async fn paths_info(
     let repo_id = format!("{namespace}/{repo_name}");
     let stored_repo = state
         .store
-        .get_repo(&repo_id)
-        .map_err(|error| HubApiError::CasError(error.to_string()))?
+        .get_repo(&repo_id)?
         .ok_or(HubApiError::RepoNotFound)?;
     if RepoType::from(stored_repo.repo_type) != requested_type {
         return Err(HubApiError::RepoNotFound);
@@ -71,10 +70,7 @@ pub(crate) async fn paths_info(
         _repo.capability(),
     )
     .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|error| HubApiError::CasError(error.to_string()))?;
+    let files = state.store.get_files(&commit_sha)?;
     let oids = crate::git::smart_http::path_oids(
         state.clone(),
         repo_id.clone(),
@@ -98,8 +94,8 @@ pub(crate) async fn paths_info(
         std::collections::HashMap::new()
     };
     let by_path: std::collections::HashMap<_, _> = files
-        .into_iter()
-        .map(|file| (file.path.clone(), file))
+        .iter()
+        .map(|file| (file.path.as_str(), file))
         .collect();
 
     let mut response = Vec::with_capacity(requested.len());
@@ -107,7 +103,7 @@ pub(crate) async fn paths_info(
         let Some(metadata) = oids.get(&path) else {
             continue;
         };
-        if let Some(file) = by_path.get(&path) {
+        if let Some(file) = by_path.get(path.as_str()) {
             response.push(serde_json::json!({
                 "type": "file",
                 "path": file.path,
@@ -183,10 +179,6 @@ async fn parse_paths_info_request(
             "paths-info requires application/json or application/x-www-form-urlencoded".to_owned(),
         )),
     }
-}
-
-fn lfs_pointer_size(oid: &str, size: u64) -> usize {
-    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n").len()
 }
 
 #[cfg(test)]

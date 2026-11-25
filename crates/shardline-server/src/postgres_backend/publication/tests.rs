@@ -1693,6 +1693,7 @@ async fn an_old_transaction_snapshot_cannot_hide_a_pending_delete() {
                     b"pending deletion after snapshot",
                 )),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2037,7 +2038,7 @@ async fn s3_publication_rejects_a_chunk_deleted_after_staging() {
     let bytes = Bytes::from_static(b"orphan bytes prepared before the delete completed");
     let seed = fixture
         .backend
-        .prepare_s3_object_stream(&logical, RequestBodyReader::from_bytes(bytes.clone()))
+        .prepare_s3_object_stream(&logical, RequestBodyReader::from_bytes(bytes.clone()), None)
         .await
         .unwrap();
     let hash = &seed.record.chunks[0].hash;
@@ -2061,11 +2062,11 @@ async fn s3_publication_rejects_a_chunk_deleted_after_staging() {
         )
         .await
         .unwrap();
-    let prepared = fixture
+    let retry = fixture
         .backend
-        .prepare_s3_object_stream(&logical, RequestBodyReader::from_bytes(bytes))
-        .await
-        .unwrap();
+        .prepare_s3_object_stream(&logical, RequestBodyReader::from_bytes(bytes), None)
+        .await;
+    let prepared = seed;
     let entry = S3ObjectEntry {
         scope_namespace: namespace,
         object_key: "staged-object".to_owned(),
@@ -2076,6 +2077,26 @@ async fn s3_publication_rejects_a_chunk_deleted_after_staging() {
         user_metadata: Vec::new(),
         updated_at_unix_seconds: 1,
     };
+    // Staging may independently repack unpublished bytes without discovering a
+    // reusable source. Both that retry and the original staged record must be
+    // fenced at publication while their backing object is being deleted.
+    match retry {
+        Err(error) => assert!(error.is_remote_delete_pending(), "{error}"),
+        Ok(retry) => {
+            let error = fixture
+                .backend
+                .publish_s3_object_locked(
+                    &mut guard,
+                    &retry,
+                    &entry,
+                    &S3PublishCondition::Unconditional,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.is_remote_delete_pending(), "{error}");
+        }
+    }
     let pending = fixture
         .backend
         .publish_s3_object_locked(
@@ -2148,6 +2169,7 @@ async fn s3_publication_rejects_a_chunk_deleted_after_staging() {
             RequestBodyReader::from_bytes(Bytes::from_static(
                 b"orphan bytes prepared before the delete completed",
             )),
+            None,
         )
         .await
         .unwrap();
@@ -2221,6 +2243,7 @@ async fn staged_content_locks_last_until_the_publication_transaction_ends() {
             "locked-file",
             RequestBodyReader::from_bytes(Bytes::from_static(b"locked backing bytes")),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2253,4 +2276,82 @@ async fn staged_content_locks_last_until_the_publication_transaction_ends() {
         after,
         "the backing-object lock must release with the transaction"
     );
+}
+
+#[tokio::test]
+async fn protocol_preparation_reuses_members_and_publication_rejects_missing_source() {
+    let Some(fixture) = PostgresFixture::new().await else {
+        return;
+    };
+    fixture.migrate().await;
+    let backend = fixture.postgres();
+    let original = Bytes::from(vec![b'a'; 32768]);
+    let (first, _) = backend
+        .prepare_file_stream(
+            "reuse-source",
+            RequestBodyReader::from_bytes(original.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut connection = backend.record_store.pool().acquire().await.unwrap();
+    backend
+        .commit_staged_file_on_connection(&mut connection, &first)
+        .await
+        .unwrap();
+    drop(connection);
+    let mut edited = original.to_vec();
+    edited[0] = b'b';
+    let (second, response) = backend
+        .prepare_file_stream(
+            "reuse-copy",
+            RequestBodyReader::from_bytes(Bytes::from(edited.clone())),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(response.reused_chunks > 0);
+    assert!(
+        second
+            .chunks
+            .iter()
+            .any(|chunk| first.chunks.iter().any(|old| old.hash == chunk.hash))
+    );
+    let mut connection = backend.record_store.pool().acquire().await.unwrap();
+    backend
+        .commit_staged_file_on_connection(&mut connection, &second)
+        .await
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        backend
+            .download_file("reuse-copy", Some(&response.content_hash), None)
+            .await
+            .unwrap(),
+        edited
+    );
+    let (lost, _) = backend
+        .prepare_file_stream(
+            "reuse-lost",
+            RequestBodyReader::from_bytes(original),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let source = first.chunks.first().unwrap();
+    let key = crate::xet_adapter::xorb_object_key(&source.hash).unwrap();
+    backend.object_store().delete_if_present(&key).unwrap();
+    let mut connection = backend.record_store.pool().acquire().await.unwrap();
+    assert!(
+        backend
+            .commit_staged_file_on_connection(&mut connection, &lost)
+            .await
+            .is_err()
+    );
+    drop(connection);
+    assert!(backend.protocol_file_record("reuse-lost").await.is_err());
+    fixture.finish().await;
 }

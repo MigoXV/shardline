@@ -98,15 +98,7 @@ impl AuthorizedRepository {
         token: &str,
         required_scope: TokenScope,
     ) -> Result<Self, AuthError> {
-        let claims = provider.verify_token(token)?;
-        if !scope_allows(claims.scope(), required_scope) {
-            return Err(AuthError::InsufficientScope);
-        }
-        let scope = claims.scope();
-        Ok(Self {
-            claims: Some(claims),
-            scope,
-        })
+        Self::from_verified_context(provider.verify_verified(token)?, required_scope)
     }
 
     /// Auth-layer extractor seam: builds a capability from a
@@ -273,10 +265,7 @@ mod tests {
         let capability =
             AuthorizedRepository::verify_and_authorize(&provider, &token, TokenScope::Write);
 
-        assert!(capability.is_ok());
-        let Ok(capability) = capability else {
-            return;
-        };
+        let capability = capability.expect("expected valid capability");
         let claims = capability.claims().expect("capability carries claims");
         assert_eq!(claims.subject(), "provider-user-1");
         assert_eq!(claims.scope(), TokenScope::Write);
@@ -382,23 +371,18 @@ mod tests {
     // ── scope_allows ─────────────────────────────────────────────────────
 
     #[test]
-    fn scope_allows_read_when_scope_is_read() {
-        assert!(scope_allows(TokenScope::Read, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_write_when_scope_is_write() {
-        assert!(scope_allows(TokenScope::Write, TokenScope::Write));
-    }
-
-    #[test]
-    fn scope_allows_read_when_scope_is_write() {
-        // Write scope implicitly allows Read
-        assert!(scope_allows(TokenScope::Write, TokenScope::Read));
-    }
-
-    #[test]
-    fn scope_allows_rejects_write_when_scope_is_read() {
-        assert!(!scope_allows(TokenScope::Read, TokenScope::Write));
+    fn scope_allows_checks_all_granted_and_required_combinations() {
+        for (actual, required, allowed) in [
+            (TokenScope::Read, TokenScope::Read, true),
+            (TokenScope::Write, TokenScope::Write, true),
+            (TokenScope::Write, TokenScope::Read, true),
+            (TokenScope::Read, TokenScope::Write, false),
+        ] {
+            assert_eq!(
+                scope_allows(actual, required),
+                allowed,
+                "{actual:?} -> {required:?}"
+            );
+        }
     }
 }

@@ -11,25 +11,12 @@ fuzz_target!(|data: (
     bool,
     bool, // quarantine: object_exists, is_reachable, is_held
     Option<u64>,
-    u64,
-    bool,
-    u64, // retention: release_after, held_at, exists, now
+    u64, // retention: release_after, now
     u64,
     u64,
     u64, // webhook: processed_at, stale_cutoff, max_processed_at
 )| {
-    let (
-        q_exists,
-        q_reachable,
-        q_held,
-        r_release,
-        r_held_at,
-        r_exists,
-        r_now,
-        w_processed,
-        w_stale,
-        w_max,
-    ) = data;
+    let (q_exists, q_reachable, q_held, r_release, r_now, w_processed, w_stale, w_max) = data;
 
     // --- Quarantine classification ---
     let q1 = fuzz_classify_quarantine(q_exists, q_reachable, q_held);
@@ -45,22 +32,18 @@ fuzz_target!(|data: (
     }
 
     // --- Retention classification ---
-    let r1 = fuzz_classify_retention(r_release, r_held_at, r_exists, r_now);
-    let r2 = fuzz_classify_retention(r_release, r_held_at, r_exists, r_now);
-    assert_eq!(r1, r2, "retention classification must be deterministic");
-
-    // Verify state consistency
-    if r_release.is_some_and(|ra| ra <= r_now) {
-        assert_eq!(
-            r1,
-            FuzzRetentionAction::DeleteExpired,
-            "release_after={ra:?} <= now={r_now} should expire",
-            ra = r_release
-        );
+    // Missing bytes do not end a finite or permanent hold; only its expiry does.
+    let expected_retention = if r_release.is_some_and(|release| release <= r_now) {
+        FuzzRetentionAction::DeleteExpired
     } else {
-        // An absent object may arrive later; neither finite nor permanent
-        // protection ends merely because its bytes are currently missing.
-        assert_eq!(r1, FuzzRetentionAction::Keep);
+        FuzzRetentionAction::Keep
+    };
+    for _ in 0..2 {
+        let result = fuzz_classify_retention(r_release, r_now);
+        assert!(
+            matches!(&result, Ok(action) if *action == expected_retention),
+            "release_after={r_release:?}, now={r_now}: {result:?}"
+        );
     }
 
     // --- Webhook classification ---

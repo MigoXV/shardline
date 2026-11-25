@@ -12,7 +12,7 @@ use super::xorb_chunk_format::{
 use super::{CompressionScheme, XorbChunkHeader};
 use crate::{
     error::{CoreError, Validate},
-    merklehash::{MerkleHash, compute_data_hash, xorb_hash},
+    merklehash::{MerkleHash, aggregated_hashes::xorb_hash_from_owned, compute_data_hash},
     utils::serialization_utils::*,
 };
 
@@ -307,6 +307,13 @@ impl XorbObjectInfoV1 {
         }
 
         let is_v1 = s.version == 1;
+        let read_metadata_integer = |reader: &mut _| {
+            if is_v1 {
+                read_u32(reader).map(u64::from)
+            } else {
+                read_u64(reader)
+            }
+        };
 
         s.xorb_hash = read_hash(r)?;
 
@@ -326,11 +333,7 @@ impl XorbObjectInfoV1 {
             ));
         }
 
-        let num_chunks_2 = if is_v1 {
-            read_u32(r)? as u64
-        } else {
-            read_u64(r)?
-        };
+        let num_chunks_2 = read_metadata_integer(r)?;
 
         s.chunk_hashes
             .reserve(prealloc_num_chunks(num_chunks_2 as usize));
@@ -354,11 +357,7 @@ impl XorbObjectInfoV1 {
             ));
         }
 
-        let num_chunks_3 = if is_v1 {
-            read_u32(r)? as u64
-        } else {
-            read_u64(r)?
-        };
+        let num_chunks_3 = read_metadata_integer(r)?;
         if num_chunks_2 != num_chunks_3 {
             return Err(CoreError::MalformedData(
                 "Xorb Invalid: inconsistent num_chunks between hashes and boundaries section."
@@ -369,28 +368,16 @@ impl XorbObjectInfoV1 {
         s.chunk_boundary_offsets
             .reserve(prealloc_num_chunks(num_chunks_3 as usize));
         for _ in 0..num_chunks_3 {
-            s.chunk_boundary_offsets.push(if is_v1 {
-                read_u32(r)? as u64
-            } else {
-                read_u64(r)?
-            });
+            s.chunk_boundary_offsets.push(read_metadata_integer(r)?);
         }
 
         s.unpacked_chunk_offsets
             .reserve(prealloc_num_chunks(num_chunks_3 as usize));
         for _ in 0..num_chunks_3 {
-            s.unpacked_chunk_offsets.push(if is_v1 {
-                read_u32(r)? as u64
-            } else {
-                read_u64(r)?
-            });
+            s.unpacked_chunk_offsets.push(read_metadata_integer(r)?);
         }
 
-        s.num_chunks = if is_v1 {
-            read_u32(r)? as u64
-        } else {
-            read_u64(r)?
-        };
+        s.num_chunks = read_metadata_integer(r)?;
         if s.num_chunks != num_chunks_2 {
             return Err(CoreError::MalformedData(
                 "Xorb Invalid: inconsistent num_chunks between metadata and hashes section."
@@ -398,16 +385,8 @@ impl XorbObjectInfoV1 {
             ));
         }
 
-        s.hashes_section_offset_from_end = if is_v1 {
-            read_u32(r)? as u64
-        } else {
-            read_u64(r)?
-        };
-        s.boundary_section_offset_from_end = if is_v1 {
-            read_u32(r)? as u64
-        } else {
-            read_u64(r)?
-        };
+        s.hashes_section_offset_from_end = read_metadata_integer(r)?;
+        s.boundary_section_offset_from_end = read_metadata_integer(r)?;
 
         read_bytes(r, &mut s._buffer)?;
 
@@ -514,10 +493,7 @@ impl XorbObject {
 
     pub fn get_info_length<R: Read + Seek>(reader: &mut R) -> Result<u64, CoreError> {
         reader.seek(SeekFrom::End(-(size_of::<u64>() as i64)))?;
-        let mut info_length = [0u8; 8];
-        reader.read_exact(&mut info_length)?;
-        let info_length = u64::from_le_bytes(info_length);
-        Ok(info_length)
+        Ok(read_u64(reader)?)
     }
 
     pub fn deserialize<R: Read + Seek>(reader: &mut R) -> Result<Self, CoreError> {
@@ -540,14 +516,10 @@ impl XorbObject {
         w: &mut W,
         info: XorbObjectInfoV1,
     ) -> Result<(Self, usize), CoreError> {
-        let mut total_written_bytes: usize = 0;
-        let info_length = info.serialize(w)? as u64;
-        total_written_bytes += info_length as usize;
+        let written = info.serialize(w)?;
+        let info_length = written as u64;
         write_u64(w, info_length)?;
-        total_written_bytes += size_of::<u64>();
-
-        let xorb_obj = Self { info, info_length };
-        Ok((xorb_obj, total_written_bytes))
+        Ok((Self { info, info_length }, written + size_of::<u64>()))
     }
 
     pub fn from_info(info: XorbObjectInfoV1) -> Self {
@@ -623,7 +595,6 @@ impl XorbObject {
         let mut hash_chunks = Vec::with_capacity(xorb.info.num_chunks as usize);
         let mut cumulative_compressed_length: u64 = 0;
         let mut unpacked_chunk_offset: u64 = 0;
-        let mut start_offset: u64 = 0;
 
         // Encoded chunks are contiguous. Validate their declared boundaries
         // against bytes consumed below, without discarding a buffered reader's
@@ -658,12 +629,10 @@ impl XorbObject {
                 .chunk_boundary_offsets
                 .get(idx as usize)
                 .ok_or_else(|| CoreError::MalformedData("missing chunk boundary offset".into()))?;
-            if (start_offset + compressed_chunk_length as u64) != boundary {
+            if cumulative_compressed_length != boundary {
                 warn!("XORB Validation: Chunk boundary byte index does not match Info object.");
                 return Ok(None);
             }
-
-            start_offset = boundary;
 
             if xorb.info.boundaries_version == XORB_OBJECT_FORMAT_BOUNDARIES_VERSION
                 && unpacked_chunk_offset
@@ -690,15 +659,16 @@ impl XorbObject {
         }
 
         let cur_position = reader.stream_position()?;
-        let expected_position = cumulative_compressed_length;
         let expected_from_end_position =
             Self::checked_info_start(reader.seek(SeekFrom::End(0))?, xorb.info_length)?;
-        if cur_position != expected_position || cur_position != expected_from_end_position {
+        if cur_position != cumulative_compressed_length
+            || cur_position != expected_from_end_position
+        {
             warn!("XORB Validation: Content bytes after known chunks in Info object.");
             return Ok(None);
         }
 
-        let xorb_hash = xorb_hash(&hash_chunks);
+        let xorb_hash = xorb_hash_from_owned(hash_chunks);
         if xorb_hash != *hash || xorb_hash != xorb.info.xorb_hash {
             warn!("XORB Validation: Computed hash does not match provided hash or Info hash.");
             return Ok(None);
@@ -768,28 +738,27 @@ impl SerializedXorbObject {
         compression_scheme: CompressionScheme,
         serialize_footer: bool,
     ) -> Result<Self, CoreError> {
-        let mut xorb_object_info = XorbObjectInfoV1::default();
-
         let (hash, chunk_hashes) = xorb.hash_with_chunk_hashes();
-        xorb_object_info.xorb_hash = hash;
-        let raw_num_bytes = xorb.num_bytes() as u64;
+        let raw_num_bytes = xorb.num_bytes();
         let num_chunks = xorb.data.len();
+        let mut xorb_object_info = XorbObjectInfoV1 {
+            xorb_hash: hash,
+            num_chunks: num_chunks as u64,
+            chunk_boundary_offsets: Vec::with_capacity(num_chunks),
+            chunk_hashes,
+            unpacked_chunk_offsets: xorb
+                .xorb_info
+                .chunk_boundaries
+                .iter()
+                .map(|&b| u64::from(b))
+                .collect(),
+            ..XorbObjectInfoV1::default()
+        };
 
-        xorb_object_info.num_chunks = xorb.data.len() as u64;
-        xorb_object_info.chunk_boundary_offsets =
-            Vec::with_capacity(xorb_object_info.num_chunks as usize);
-        xorb_object_info.chunk_hashes = chunk_hashes;
-        xorb_object_info.unpacked_chunk_offsets = xorb
-            .xorb_info
-            .chunk_boundaries
-            .iter()
-            .map(|&b| b as u64)
-            .collect();
-
-        let size_upper_bound = xorb.num_bytes()
+        let size_upper_bound = raw_num_bytes
             + size_of::<XorbObjectInfoV1>()
             + (32 + 2 * size_of::<u64>() + size_of::<MerkleHash>() + size_of::<XorbChunkHeader>())
-                * xorb.data.len();
+                * num_chunks;
 
         let mut serialized_data = Vec::with_capacity(size_upper_bound);
 
@@ -802,16 +771,18 @@ impl SerializedXorbObject {
 
         xorb_object_info.fill_in_boundary_offsets();
 
-        let mut footer_start = None;
-        if serialize_footer {
-            footer_start = Some(serialized_data.len() as u64);
+        let footer_start = if serialize_footer {
+            let start = serialized_data.len() as u64;
             XorbObject::serialize_given_info(&mut serialized_data, xorb_object_info)?;
-        }
+            Some(start)
+        } else {
+            None
+        };
 
         Ok(Self {
             serialized_data,
             hash,
-            raw_num_bytes,
+            raw_num_bytes: raw_num_bytes as u64,
             num_chunks,
             footer_start,
         })
@@ -914,14 +885,14 @@ fn inspect_footerless_chunks(
         position = packed_end;
 
         let declared_uncompressed_len = u64::from(chunk_header.get_uncompressed_length());
-        if total_decompressed_bytes
+        let next_decompressed_bytes = total_decompressed_bytes
             .checked_add(declared_uncompressed_len)
-            .is_none_or(|total| total > MAX_DECOMPRESSED_OUTPUT_BYTES)
-        {
-            return Err(CoreError::MalformedData(
-                "decompressed output exceeds normalization limit".to_owned(),
-            ));
-        }
+            .filter(|total| *total <= MAX_DECOMPRESSED_OUTPUT_BYTES)
+            .ok_or_else(|| {
+                CoreError::MalformedData(
+                    "decompressed output exceeds normalization limit".to_owned(),
+                )
+            })?;
         let uncompressed_data = {
             // Bound per-chunk decompression to the header's declared
             // uncompressed length DURING decompression (not after), so a crafted
@@ -948,36 +919,20 @@ fn inspect_footerless_chunks(
             dest
         };
 
-        let uncompressed_len = uncompressed_data.len() as u64;
-        total_decompressed_bytes = total_decompressed_bytes
-            .checked_add(uncompressed_len)
-            .ok_or_else(|| {
-                CoreError::MalformedData("decompressed output size overflow".to_string())
-            })?;
-        if total_decompressed_bytes > MAX_DECOMPRESSED_OUTPUT_BYTES {
-            return Err(CoreError::MalformedData(format!(
-                "decompressed output exceeds maximum of {MAX_DECOMPRESSED_OUTPUT_BYTES} bytes"
-            )));
-        }
-
+        // Bounded decompression and the exact-length check above establish
+        // that the checked declared total is also the actual decoded total.
+        total_decompressed_bytes = next_decompressed_bytes;
         let chunk_hash = compute_data_hash(&uncompressed_data);
-        chunk_hash_and_size.push((chunk_hash, uncompressed_data.len() as u64));
-
+        chunk_hash_and_size.push((chunk_hash, declared_uncompressed_len));
         info.chunk_hashes.push(chunk_hash);
-        info.chunk_boundary_offsets.push(
-            info.chunk_boundary_offsets.last().unwrap_or(&0)
-                + (size_of::<XorbChunkHeader>() + compressed_len) as u64,
-        );
-        info.unpacked_chunk_offsets.push(
-            info.unpacked_chunk_offsets.last().unwrap_or(&0) + uncompressed_data.len() as u64,
-        );
+        info.chunk_boundary_offsets.push(position);
+        info.unpacked_chunk_offsets.push(total_decompressed_bytes);
 
         visit(&chunk_header, &compressed_buf)?;
     }
 
-    let computed_hash = xorb_hash(&chunk_hash_and_size);
-    info.xorb_hash = computed_hash;
     info.num_chunks = chunk_hash_and_size.len() as u64;
+    info.xorb_hash = xorb_hash_from_owned(chunk_hash_and_size);
     info.fill_in_boundary_offsets();
 
     Ok(info)
@@ -1024,66 +979,51 @@ mod tests {
     fn v0_default() {
         let info = XorbObjectInfoV0::default();
         assert_eq!(info.version, 0);
+        assert_eq!(info.num_chunks, 0);
         assert!(info.chunk_boundary_offsets.is_empty());
         assert!(info.chunk_hashes.is_empty());
     }
 
     #[test]
-    fn v0_serialize_roundtrip() {
-        let info = make_v0_info(2, b"v0test");
-        let mut buf = Vec::new();
-        #[allow(deprecated)]
-        let written = info.serialize(&mut buf).unwrap();
-        assert!(written > 0);
-        let mut r = Cursor::new(&buf);
-        #[allow(deprecated)]
-        let (info2, _) = XorbObjectInfoV0::deserialize(&mut r).unwrap();
-        assert_eq!(info2.xorb_hash, info.xorb_hash);
-        assert_eq!(info2.num_chunks, 2);
-        assert_eq!(info2.chunk_boundary_offsets, info.chunk_boundary_offsets);
+    fn v0_roundtrips_preserve_metadata_and_byte_counts() {
+        for (chunks, seed) in [
+            (0, b"zero".as_slice()),
+            (1, b"single".as_slice()),
+            (2, b"v0test".as_slice()),
+            (3, b"v0dir".as_slice()),
+        ] {
+            let info = make_v0_info(chunks, seed);
+            let mut bytes = Vec::new();
+            #[allow(deprecated)]
+            let written = info.serialize(&mut bytes).unwrap();
+            assert_eq!(written, bytes.len());
+            #[allow(deprecated)]
+            let (decoded, read) = XorbObjectInfoV0::deserialize(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(decoded, info);
+            assert_eq!(read as usize, bytes.len());
+            let (decoded, read) =
+                XorbObjectInfoV0::deserialize_v0(&mut Cursor::new(&bytes[8..])).unwrap();
+            assert_eq!(decoded, info);
+            assert_eq!(read as usize, bytes.len() - 8);
+        }
     }
 
     #[allow(deprecated)]
     #[test]
-    fn v0_deserialize_invalid_ident() {
-        let mut buf = vec![0u8; 100];
-        buf[..7].copy_from_slice(b"INVALID");
-        assert!(XorbObjectInfoV0::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn v0_deserialize_invalid_version() {
-        let mut buf = vec![0u8; 100];
-        buf[..7].copy_from_slice(b"XETBLOB");
-        buf[7] = 99;
-        assert!(XorbObjectInfoV0::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[allow(deprecated)]
-    #[test]
-    fn v0_deserialize_v0_direct() {
-        let info = make_v0_info(3, b"v0dir");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // Skip ident+version (8 bytes)
-        let mut r = Cursor::new(&buf[8..]);
-        let (info2, _) = XorbObjectInfoV0::deserialize_v0(&mut r).unwrap();
-        assert_eq!(info2.num_chunks, 3);
-        assert_eq!(info2.chunk_hashes.len(), 3);
-    }
-
-    #[test]
-    fn v0_zero_chunks() {
-        let info = make_v0_info(0, b"zero");
-        let mut buf = Vec::new();
-        #[allow(deprecated)]
-        let _written = info.serialize(&mut buf).unwrap();
-        let mut r = Cursor::new(&buf);
-        #[allow(deprecated)]
-        let (info2, _) = XorbObjectInfoV0::deserialize(&mut r).unwrap();
-        assert_eq!(info2.num_chunks, 0);
-        assert!(info2.chunk_hashes.is_empty());
+    fn v0_rejects_invalid_ident_and_version() {
+        for (ident, version, expected) in [
+            (b"INVALID", 0, "Xorb Invalid Ident"),
+            (b"XETBLOB", 99, "Xorb Invalid Format Version"),
+        ] {
+            let mut bytes = vec![0; 100];
+            bytes[..7].copy_from_slice(ident);
+            bytes[7] = version;
+            let error = XorbObjectInfoV0::deserialize(&mut Cursor::new(bytes)).unwrap_err();
+            let CoreError::MalformedData(message) = error else {
+                panic!("{error}");
+            };
+            assert_eq!(message, expected);
+        }
     }
 
     // ======= XorbObjectInfoV1 =======
@@ -1124,29 +1064,49 @@ mod tests {
     }
 
     #[test]
-    fn v1_serialize_roundtrip() {
-        let info = make_v1_info(2, b"v1ser");
-        let mut buf = Vec::new();
-        let written = info.serialize(&mut buf).unwrap();
-        assert!(written > 0);
-        let mut r = Cursor::new(&buf);
-        let (info2, read) = XorbObjectInfoV1::deserialize(&mut r).unwrap();
-        assert_eq!(read, written as u32);
-        assert_eq!(info2.xorb_hash, info.xorb_hash);
-        assert_eq!(info2.num_chunks, 2);
-        assert_eq!(info2.chunk_hashes, info.chunk_hashes);
-        assert_eq!(info2.chunk_boundary_offsets, info.chunk_boundary_offsets);
-        assert_eq!(info2.unpacked_chunk_offsets, info.unpacked_chunk_offsets);
+    fn metadata_integer_widths_preserve_v1_and_v2_wire_formats() {
+        for (version, width, hashes_offset, boundary_offset) in [(1, 4, 132, 56), (2, 8, 168, 88)] {
+            let mut info = make_v1_info(2, b"v1ser");
+            info.version = version;
+            info.hashes_section_offset_from_end = hashes_offset;
+            info.boundary_section_offset_from_end = boundary_offset;
+            let mut bytes = b"XETBLOB".to_vec();
+            bytes.push(version);
+            bytes.extend_from_slice(&info.xorb_hash.to_bytes());
+            bytes.extend_from_slice(b"XBLBHSH\0");
+            let append_integer = |bytes: &mut Vec<u8>, value: u64| {
+                bytes.extend_from_slice(&value.to_le_bytes()[..width]);
+            };
+            append_integer(&mut bytes, 2);
+            for hash in &info.chunk_hashes {
+                bytes.extend_from_slice(&hash.to_bytes());
+            }
+            bytes.extend_from_slice(b"XBLBBND\x01");
+            for value in [2, 100, 200, 50, 100, 2, hashes_offset, boundary_offset] {
+                append_integer(&mut bytes, value);
+            }
+            bytes.extend_from_slice(&[0; 16]);
+            let (decoded, read) = XorbObjectInfoV1::deserialize(&mut Cursor::new(&bytes)).unwrap();
+            assert_eq!(read as usize, bytes.len());
+            assert_eq!(decoded, info);
+            if version == 2 {
+                let mut serialized = Vec::new();
+                assert_eq!(info.serialize(&mut serialized).unwrap(), bytes.len());
+                assert_eq!(serialized, bytes);
+            }
+        }
     }
 
     #[test]
     fn v1_serialize_zero_chunks() {
         let info = XorbObjectInfoV1::default();
         let mut buf = Vec::new();
-        let _written = info.serialize(&mut buf).unwrap();
+        let written = info.serialize(&mut buf).unwrap();
         let mut r = Cursor::new(&buf);
-        let (info2, _) = XorbObjectInfoV1::deserialize(&mut r).unwrap();
-        assert_eq!(info2.num_chunks, 0);
+        let (info2, read) = XorbObjectInfoV1::deserialize(&mut r).unwrap();
+        assert_eq!(info2, info);
+        assert_eq!(written, buf.len());
+        assert_eq!(read as usize, written);
     }
 
     #[test]
@@ -1171,136 +1131,87 @@ mod tests {
     }
 
     #[test]
-    fn v1_deserialize_invalid_ident() {
-        let mut buf = vec![0u8; 200];
-        buf[..7].copy_from_slice(b"BADIDNT");
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_invalid_version() {
-        let mut buf = vec![0u8; 200];
-        buf[..7].copy_from_slice(b"XETBLOB");
-        buf[7] = 5;
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_v0_compat() {
-        let v0 = make_v0_info(1, b"compat");
-        let mut v0_buf = Vec::new();
-        #[allow(deprecated)]
-        v0.serialize(&mut v0_buf).unwrap();
-        let mut r = Cursor::new(v0_buf);
-        let (v1, _) = XorbObjectInfoV1::deserialize(&mut r).unwrap();
-        assert_eq!(v1.version, 2);
-        assert_eq!(v1.xorb_hash, v0.xorb_hash);
-        assert_eq!(v1.num_chunks, 1);
-    }
-
-    #[test]
-    fn v1_from_v0() {
-        let v0 = make_v0_info(2, b"fromv0");
-        let v1 = XorbObjectInfoV1::from_v0(v0.clone());
-        assert_eq!(v1.version, 2);
-        assert_eq!(v1.xorb_hash, v0.xorb_hash);
-        assert_eq!(v1.num_chunks, 2);
-        assert_eq!(v1.chunk_hashes.len(), 2);
-        assert_eq!(v1.chunk_boundary_offsets.len(), 2);
-        assert!(v1.unpacked_chunk_offsets.is_empty()); // v0 has no unpacked
-    }
-
-    #[test]
-    fn v1_deserialize_wrong_hash_section_ident() {
-        let info = make_v1_info(0, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // Corrupt hash section ident (offset 40 for n=0: 7+1+32=40)
-        if buf.len() > 47 {
-            buf[40..47].copy_from_slice(b"CORRUPT");
+    fn metadata_corruption_reports_the_rejected_field() {
+        for count in [0, 1, 2] {
+            let mut valid = Vec::new();
+            make_v1_info(count as u64, b"test")
+                .serialize(&mut valid)
+                .unwrap();
+            // Version 2: 40-byte header, two section headers, chunk tables,
+            // three trailing u64 values and 16 reserved bytes.
+            let boundaries_start = 56 + 32 * count;
+            let trailer_start = 72 + 48 * count;
+            assert_eq!(valid.len(), trailer_start + 40);
+            for (offset, expected) in [
+                (0, "Xorb Invalid Ident"),
+                (7, "Xorb Invalid Format Version"),
+                (40, "Xorb Invalid Ident for Hash Metadata Section"),
+                (47, "Xorb Invalid Format Version for Hash Metadata Section"),
+                (
+                    boundaries_start,
+                    "Xorb Invalid Ident for Boundary Metadata Section",
+                ),
+                (
+                    boundaries_start + 7,
+                    "Xorb Invalid Format Version for Boundaries Metadata Section",
+                ),
+                (
+                    boundaries_start + 8,
+                    "Xorb Invalid: inconsistent num_chunks between hashes and boundaries section.",
+                ),
+                (
+                    trailer_start,
+                    "Xorb Invalid: inconsistent num_chunks between metadata and hashes section.",
+                ),
+                (
+                    trailer_start + 8,
+                    "Xorb Invalid: incorrect hashes_section_offset_from_end.",
+                ),
+                (
+                    trailer_start + 16,
+                    "Xorb Invalid: incorrect boundary_section_offset_from_end.",
+                ),
+            ] {
+                let mut corrupted = valid.clone();
+                corrupted[offset] ^= 0xFF;
+                let error = XorbObjectInfoV1::deserialize(&mut Cursor::new(corrupted)).unwrap_err();
+                let CoreError::MalformedData(message) = error else {
+                    panic!("offset {offset}: {error}");
+                };
+                assert_eq!(message, expected, "offset {offset}");
+            }
         }
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
     }
 
     #[test]
-    fn v1_deserialize_wrong_boundary_section_ident() {
-        let info = make_v1_info(0, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // Boundary section ident after: ident(7)+ver(1)+hash(32)+hash_ident(7)+hash_ver(1)+nchunks(4)=52
-        if buf.len() > 59 {
-            buf[52..59].copy_from_slice(b"CORRUPT");
+    fn legacy_conversion_preserves_metadata_and_byte_counts() {
+        for count in [0, 1, 2, 3] {
+            let v0 = make_v0_info(count, b"legacy");
+            let mut expected = XorbObjectInfoV1 {
+                xorb_hash: v0.xorb_hash,
+                num_chunks: u64::from(count),
+                chunk_hashes: v0.chunk_hashes.clone(),
+                chunk_boundary_offsets: v0
+                    .chunk_boundary_offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect(),
+                boundaries_version: XORB_OBJECT_FORMAT_BOUNDARIES_VERSION_NO_UNPACKED_INFO,
+                ..Default::default()
+            };
+            expected.fill_in_boundary_offsets();
+            assert_eq!(XorbObjectInfoV1::from_v0(v0.clone()), expected);
+
+            let mut bytes = Vec::new();
+            #[allow(deprecated)]
+            let written = v0.serialize(&mut bytes).unwrap();
+            let mut reader = Cursor::new(&bytes);
+            let (decoded, read) = XorbObjectInfoV1::deserialize(&mut reader).unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(written, bytes.len());
+            assert_eq!(read as usize, written);
+            assert_eq!(reader.position() as usize, written);
         }
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_wrong_hashes_version() {
-        let info = make_v1_info(0, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // hashes_version at offset 47: 7+1+32+7 = 47
-        if buf.len() > 47 {
-            buf[47] = 99;
-        }
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_wrong_boundaries_version() {
-        let info = make_v1_info(0, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // boundaries_version at offset 63: 7+1+32+7+1+8+7 = 63
-        if buf.len() > 63 {
-            buf[63] = 99;
-        }
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_inconsistent_num_chunks() {
-        let info = make_v1_info(1, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // Boundary section num_chunks at offset 92 for n=1
-        if buf.len() > 95 {
-            buf[92..96].copy_from_slice(&2u32.to_le_bytes());
-        }
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_inconsistent_final_num_chunks() {
-        let info = make_v1_info(1, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // Final num_chunks at offset 120 for n=1
-        assert!(buf.len() > 127);
-        buf[120..128].copy_from_slice(&99u64.to_le_bytes());
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_incorrect_hashes_section_offset() {
-        let info = make_v1_info(1, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // hashes_section_offset at offset 128 for n=1
-        assert!(buf.len() > 135);
-        buf[128..136].copy_from_slice(&0u64.to_le_bytes());
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
-    }
-
-    #[test]
-    fn v1_deserialize_incorrect_boundary_section_offset() {
-        let info = make_v1_info(1, b"test");
-        let mut buf = Vec::new();
-        info.serialize(&mut buf).unwrap();
-        // boundary_section_offset at offset 136 for n=1
-        assert!(buf.len() > 143);
-        buf[136..144].copy_from_slice(&0u64.to_le_bytes());
-        assert!(XorbObjectInfoV1::deserialize(&mut Cursor::new(buf)).is_err());
     }
 
     // ======= XorbObject =======
@@ -1314,10 +1225,11 @@ mod tests {
 
     #[test]
     fn xorb_object_from_info() {
-        let info = make_v1_info(1, b"frominfo");
-        let len = info.serialized_length() as u64;
-        let obj = XorbObject::from_info(info);
-        assert_eq!(obj.info_length, len);
+        for info in [XorbObjectInfoV1::default(), make_v1_info(1, b"frominfo")] {
+            let len = info.serialized_length() as u64;
+            let obj = XorbObject::from_info(info);
+            assert_eq!(obj.info_length, len);
+        }
     }
 
     #[test]
@@ -1398,10 +1310,10 @@ mod tests {
     // ======= validate_xorb_object paths =======
 
     #[test]
-    fn validate_xorb_object_success_path() {
+    fn validation_checks_every_chunk_boundary() {
         use crate::xorb_object::xorb_format_test_utils::{ChunkSize, build_xorb_object};
         let (obj, chunk_data, _, _) =
-            build_xorb_object(1, ChunkSize::Fixed(100), CompressionScheme::LZ4).unwrap();
+            build_xorb_object(3, ChunkSize::Fixed(100), CompressionScheme::LZ4).unwrap();
         let mut buf = Vec::new();
         buf.extend_from_slice(&chunk_data);
         let info_len = obj.info.serialize(&mut buf).unwrap();
@@ -1415,6 +1327,24 @@ mod tests {
             XorbObject::validate_xorb_object_with_info(&mut Cursor::new(&buf), parsed, &hash)
                 .unwrap();
         assert_eq!(result, reused);
+        for index in 0..3 {
+            for delta in [-1, 1] {
+                let mut invalid = obj.clone();
+                invalid.info.chunk_boundary_offsets[index] = invalid.info.chunk_boundary_offsets
+                    [index]
+                    .checked_add_signed(delta)
+                    .unwrap();
+                assert!(
+                    XorbObject::validate_xorb_object_with_info(
+                        &mut Cursor::new(&buf),
+                        invalid,
+                        &hash
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+        }
     }
 
     #[test]

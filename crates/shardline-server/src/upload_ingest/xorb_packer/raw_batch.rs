@@ -13,19 +13,20 @@ pub(in crate::upload_ingest) struct RecoverableXorbBatch {
 
 impl RecoverableXorbBatch {
     pub(in crate::upload_ingest) fn new(chunks: Vec<(Vec<u8>, u64)>) -> Self {
-        let offsets: Vec<_> = chunks.iter().map(|(_, offset)| *offset).collect();
-        let boundaries = offsets.iter().map(|offset| *offset as usize).collect();
-        let data = chunks
+        let (data, offsets) = chunks
             .into_iter()
-            .map(|(data, _)| Cow::Owned(data))
-            .collect();
+            .map(|(data, offset)| (Cow::Owned(data), offset))
+            .unzip();
         Self {
-            raw: RawXorbData::from_owned_data(data, boundaries),
+            raw: RawXorbData::from_owned_data(data, Vec::new()),
             offsets,
         }
     }
 
     pub(in crate::upload_ingest) fn pack(&self) -> Result<PackedXorb, ServerError> {
+        if self.raw.data.is_empty() {
+            return Err(ServerError::Overflow);
+        }
         let serialized = SerializedXorbObject::from_xorb_ref_with_compression(
             &self.raw,
             CompressionScheme::ByteGrouping4LZ4,
@@ -37,23 +38,23 @@ impl RecoverableXorbBatch {
                 format!("xorb serialization failed: {error}"),
             ))
         })?;
-        let metadata: Vec<_> = self
+        let metadata = self
             .raw
             .data
             .iter()
             .zip(&self.offsets)
-            .map(|(data, offset)| (data.len(), *offset))
-            .collect();
-        packed_xorb_from_serialized(serialized, &metadata)
+            .map(|(data, offset)| (data.len(), *offset));
+        packed_xorb_from_serialized(serialized, metadata)
     }
 
-    pub(in crate::upload_ingest) fn into_chunks(self) -> Vec<(Vec<u8>, u64)> {
+    pub(in crate::upload_ingest) fn into_chunks(
+        self,
+    ) -> impl ExactSizeIterator<Item = (Vec<u8>, u64)> {
         self.raw
             .data
             .into_iter()
             .zip(self.offsets)
             .map(|(data, offset)| (data.into_owned(), offset))
-            .collect()
     }
 }
 
@@ -67,12 +68,21 @@ mod tests {
         let address = bytes.as_ptr();
         let batch = RecoverableXorbBatch::new(vec![(bytes, 0)]);
         let packed = batch.pack().unwrap();
-        let recovered = batch.into_chunks();
+        let recovered: Vec<_> = batch.into_chunks().collect();
         assert_eq!(recovered[0].0.as_ptr(), address);
         assert_eq!(recovered[0].0, b"recoverable bounded payload");
-        let expected = super::super::pack_chunks_into_xorb(&recovered).unwrap();
-        assert_eq!(packed.serialized, expected.serialized);
-        assert_eq!(packed.xorb_hash_hex, expected.xorb_hash_hex);
-        assert_eq!(packed.chunk_entries, expected.chunk_entries);
+        let expected = SerializedXorbObject::from_xorb_with_compression(
+            RawXorbData::from_owned_data(vec![Cow::Owned(recovered[0].0.clone())], vec![0]),
+            CompressionScheme::ByteGrouping4LZ4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(packed.serialized, expected.serialized_data);
+        assert_eq!(packed.xorb_hash_hex, expected.hash.hex());
+        assert_eq!(packed.chunk_entries[0].raw_offset, recovered[0].1);
+        assert_eq!(
+            packed.chunk_entries[0].raw_length,
+            recovered[0].0.len() as u64
+        );
     }
 }

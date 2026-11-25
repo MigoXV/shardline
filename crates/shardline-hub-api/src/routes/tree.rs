@@ -81,20 +81,17 @@ pub(super) async fn file_tree_for_path(
         } else {
             format!("{file_path}/")
         };
-        let page = state
-            .store
-            .get_tree_page(
-                &commit_sha,
-                &HubTreePageOptions {
-                    path: file_path.clone(),
-                    recursive: query.recursive,
-                    cursor: query
-                        .cursor
-                        .map(|cursor| cursor.strip_prefix(&prefix).unwrap_or(&cursor).to_owned()),
-                    limit,
-                },
-            )
-            .map_err(|error| HubApiError::CasError(error.to_string()))?;
+        let page = state.store.get_tree_page(
+            &commit_sha,
+            &HubTreePageOptions {
+                path: file_path.clone(),
+                recursive: query.recursive,
+                cursor: query
+                    .cursor
+                    .map(|cursor| cursor.strip_prefix(&prefix).unwrap_or(&cursor).to_owned()),
+                limit,
+            },
+        )?;
         let has_more = page.has_more;
         let entries = page
             .entries
@@ -107,17 +104,9 @@ pub(super) async fn file_tree_for_path(
                     oid: None,
                     lfs: None,
                 },
-                HubTreePageEntry::File(file) => TreeEntry {
-                    entry_type: "file".to_owned(),
-                    path: format!("{prefix}{}", file.path),
-                    size: Some(file.size),
-                    oid: Some(file.sha.clone()),
-                    lfs: file.is_lfs.then_some(TreeEntryLfs {
-                        oid: file.sha.clone(),
-                        size: file.size,
-                        pointer_size: lfs_pointer_size(&file.sha, file.size),
-                    }),
-                },
+                HubTreePageEntry::File(file) => {
+                    file_tree_entry(&file, format!("{prefix}{}", file.path))
+                }
             })
             .collect();
         return Ok(TreeListing {
@@ -134,10 +123,7 @@ pub(super) async fn file_tree_for_path(
             has_more,
         });
     }
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = state.store.get_files(&commit_sha)?;
     let entries = if query.recursive {
         tree_entries_recursive(&files, &file_path)?
     } else {
@@ -216,13 +202,12 @@ pub(crate) fn tree_entries_at_path(files: &[HubFileEntry], path: &str) -> Vec<Tr
     let mut seen_dirs = std::collections::HashSet::new();
 
     for file in files {
-        if !prefix.is_empty() && !file.path.starts_with(&prefix) {
+        let Some(relative) = file.path.strip_prefix(&prefix) else {
             continue;
-        }
-        let relative = file.path.strip_prefix(&prefix).unwrap_or(&file.path);
+        };
 
         if let Some((dir, _rest)) = relative.split_once('/') {
-            if seen_dirs.insert(dir.to_owned()) {
+            if seen_dirs.insert(dir) {
                 entries.push(TreeEntry {
                     entry_type: "directory".to_owned(),
                     path: format!("{prefix}{dir}"),
@@ -232,22 +217,7 @@ pub(crate) fn tree_entries_at_path(files: &[HubFileEntry], path: &str) -> Vec<Tr
                 });
             }
         } else {
-            let lfs = if file.is_lfs {
-                Some(TreeEntryLfs {
-                    oid: file.sha.clone(),
-                    size: file.size,
-                    pointer_size: lfs_pointer_size(&file.sha, file.size),
-                })
-            } else {
-                None
-            };
-            entries.push(TreeEntry {
-                entry_type: "file".to_owned(),
-                path: file.path.clone(),
-                size: Some(file.size),
-                oid: Some(file.sha.clone()),
-                lfs,
-            });
+            entries.push(file_tree_entry(file, file.path.clone()));
         }
     }
 
@@ -272,18 +242,18 @@ pub(crate) fn tree_entries_recursive(
     };
 
     let mut entries = Vec::new();
-    let mut directories = std::collections::BTreeSet::new();
+    let mut directories = std::collections::HashSet::new();
 
     for file in files {
-        if !prefix.is_empty() && !file.path.starts_with(&prefix) {
+        let Some(relative) = file.path.strip_prefix(&prefix) else {
             continue;
-        }
-        let relative = file.path.strip_prefix(&prefix).unwrap_or(&file.path);
+        };
         if relative.is_empty() {
             continue;
         }
         for (index, _) in relative.match_indices('/') {
-            directories.insert(format!("{prefix}{}", &relative[..index]));
+            let directory_end = prefix.len().saturating_add(index);
+            directories.insert(&file.path[..directory_end]);
             if directories.len() > shardline_index::hub::HUB_TREE_READ_CEILING {
                 return Err(HubApiError::CasError(
                     "recursive directory metadata exceeds tree limit".to_owned(),
@@ -291,27 +261,12 @@ pub(crate) fn tree_entries_recursive(
             }
         }
 
-        let lfs = if file.is_lfs {
-            Some(TreeEntryLfs {
-                oid: file.sha.clone(),
-                size: file.size,
-                pointer_size: lfs_pointer_size(&file.sha, file.size),
-            })
-        } else {
-            None
-        };
-        entries.push(TreeEntry {
-            entry_type: "file".to_owned(),
-            path: file.path.clone(),
-            size: Some(file.size),
-            oid: Some(file.sha.clone()),
-            lfs,
-        });
+        entries.push(file_tree_entry(file, file.path.clone()));
     }
 
     entries.extend(directories.into_iter().map(|directory| TreeEntry {
         entry_type: "directory".to_owned(),
-        path: directory,
+        path: directory.to_owned(),
         size: None,
         oid: None,
         lfs: None,
@@ -320,7 +275,21 @@ pub(crate) fn tree_entries_recursive(
     Ok(entries)
 }
 
-fn lfs_pointer_size(oid: &str, size: u64) -> u64 {
+fn file_tree_entry(file: &HubFileEntry, path: String) -> TreeEntry {
+    TreeEntry {
+        entry_type: "file".to_owned(),
+        path,
+        size: Some(file.size),
+        oid: Some(file.sha.clone()),
+        lfs: file.is_lfs.then(|| TreeEntryLfs {
+            oid: file.sha.clone(),
+            size: file.size,
+            pointer_size: lfs_pointer_size(&file.sha, file.size),
+        }),
+    }
+}
+
+pub(super) fn lfs_pointer_size(oid: &str, size: u64) -> u64 {
     format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n").len()
         as u64
 }

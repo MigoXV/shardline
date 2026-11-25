@@ -20,6 +20,28 @@ pub struct ShardlineTomlConfig {
     pub cache: Option<CacheSection>,
     #[serde(default)]
     pub auth: Option<AuthSection>,
+    #[serde(default)]
+    pub recovery: Option<RecoverySection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySection {
+    #[serde(default)]
+    pub hub: Option<HubRecoverySection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubRecoverySection {
+    pub mode: Option<String>,
+    pub deployment_id: Option<String>,
+    pub key_id: Option<String>,
+    /// Path to the external Ed25519 recovery signing key. Key material is not
+    /// accepted inline in TOML or as an environment value.
+    pub signing_key_path: Option<String>,
+    /// The archive target uses the same typed adapter schema as payload storage.
+    pub archive: Option<StorageSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +54,9 @@ pub struct ServerSection {
     pub root_dir: Option<String>,
     pub max_request_body_bytes: Option<u64>,
     pub max_xorb_body_bytes: Option<u64>,
+    /// Opts native serialized-Xorb ranges into selected-member verification.
+    /// Omitted means strict whole-container verification.
+    pub selective_serialized_xorb_ranges: Option<bool>,
     pub chunk_size: Option<String>,
     pub chunk_size_bytes: Option<u64>,
     pub upload_max_in_flight_chunks: Option<u64>,
@@ -88,6 +113,8 @@ pub struct AuthSection {
     pub provider_api_key_path: Option<String>,
     pub provider_token_issuer: Option<String>,
     pub provider_token_ttl_seconds: Option<u64>,
+    pub jwt_repository_claim: Option<String>,
+    pub jwt_scope_claim: Option<String>,
     pub jwks: Option<JwksSection>,
     pub oidc: Option<OidcSection>,
     pub ed25519: Option<Ed25519Section>,
@@ -97,6 +124,8 @@ pub struct AuthSection {
 #[serde(deny_unknown_fields)]
 pub struct JwksSection {
     pub url: Option<String>,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

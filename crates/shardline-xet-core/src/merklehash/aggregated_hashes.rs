@@ -25,22 +25,10 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 #[inline]
 fn write_hex_u64(buf: &mut [u8], pos: &mut usize, val: u64) {
     let p = *pos;
-    buf[p] = HEX_DIGITS[((val >> 60) & 0xF) as usize];
-    buf[p + 1] = HEX_DIGITS[((val >> 56) & 0xF) as usize];
-    buf[p + 2] = HEX_DIGITS[((val >> 52) & 0xF) as usize];
-    buf[p + 3] = HEX_DIGITS[((val >> 48) & 0xF) as usize];
-    buf[p + 4] = HEX_DIGITS[((val >> 44) & 0xF) as usize];
-    buf[p + 5] = HEX_DIGITS[((val >> 40) & 0xF) as usize];
-    buf[p + 6] = HEX_DIGITS[((val >> 36) & 0xF) as usize];
-    buf[p + 7] = HEX_DIGITS[((val >> 32) & 0xF) as usize];
-    buf[p + 8] = HEX_DIGITS[((val >> 28) & 0xF) as usize];
-    buf[p + 9] = HEX_DIGITS[((val >> 24) & 0xF) as usize];
-    buf[p + 10] = HEX_DIGITS[((val >> 20) & 0xF) as usize];
-    buf[p + 11] = HEX_DIGITS[((val >> 16) & 0xF) as usize];
-    buf[p + 12] = HEX_DIGITS[((val >> 12) & 0xF) as usize];
-    buf[p + 13] = HEX_DIGITS[((val >> 8) & 0xF) as usize];
-    buf[p + 14] = HEX_DIGITS[((val >> 4) & 0xF) as usize];
-    buf[p + 15] = HEX_DIGITS[(val & 0xF) as usize];
+    for (index, byte) in val.to_be_bytes().into_iter().enumerate() {
+        buf[p + 2 * index] = HEX_DIGITS[usize::from(byte >> 4)];
+        buf[p + 2 * index + 1] = HEX_DIGITS[usize::from(byte & 0xF)];
+    }
     *pos = p + 16;
 }
 
@@ -94,37 +82,37 @@ fn merged_hash_of_sequence(hash: &[(MerkleHash, u64)]) -> (MerkleHash, u64) {
     (compute_internal_node_hash(&buf[..pos]), total_len)
 }
 
+/// Consumes an existing member buffer as scratch space for tree reduction.
 #[inline]
-fn aggregated_node_hash(chunks: &[(MerkleHash, u64)]) -> MerkleHash {
-    if chunks.is_empty() {
+pub fn xorb_hash_from_owned(mut hashes: Vec<(MerkleHash, u64)>) -> MerkleHash {
+    if hashes.is_empty() {
         return MerkleHash::default();
     }
 
-    let mut hv = chunks.to_vec();
-
-    while hv.len() > 1 {
+    while hashes.len() > 1 {
         let mut write_idx = 0;
         let mut read_idx = 0;
 
-        while read_idx != hv.len() {
-            let next_cut = read_idx + next_merge_cut(&hv[read_idx..]);
-            hv[write_idx] = merged_hash_of_sequence(&hv[read_idx..next_cut]);
+        while read_idx != hashes.len() {
+            let next_cut = read_idx + next_merge_cut(&hashes[read_idx..]);
+            hashes[write_idx] = merged_hash_of_sequence(&hashes[read_idx..next_cut]);
             write_idx += 1;
             read_idx = next_cut;
         }
 
-        hv.resize(write_idx, Default::default());
+        hashes.truncate(write_idx);
     }
 
-    hv[0].0
+    hashes[0].0
 }
 
 #[inline]
 pub fn xorb_hash(chunks: &[(MerkleHash, u64)]) -> MerkleHash {
-    if chunks.is_empty() {
-        return MerkleHash::default();
+    match chunks {
+        [] => MerkleHash::default(),
+        [(hash, _)] => *hash,
+        _ => xorb_hash_from_owned(chunks.to_vec()),
     }
-    aggregated_node_hash(chunks)
 }
 
 #[inline]
@@ -133,7 +121,7 @@ pub fn file_hash_with_salt(chunks: &[(MerkleHash, u64)], salt: &[u8; 32]) -> Mer
         return MerkleHash::default();
     }
     let key_bytes: [u8; 32] = *salt;
-    let aggregated = aggregated_node_hash(chunks);
+    let aggregated = xorb_hash(chunks);
     let agg_bytes: [u8; 32] = aggregated.into();
     let digest = blake3::keyed_hash(&key_bytes, &agg_bytes);
     MerkleHash::from(*digest.as_bytes())
@@ -163,16 +151,18 @@ pub fn file_hash_from_iter<'a>(chunks: impl Iterator<Item = (MerkleHash, u64)> +
             .chain(std::iter::once(second))
             .chain(level);
         level = Box::new(std::iter::from_fn(move || {
-            let mut group = Vec::with_capacity(MAX_GROUP_SIZE);
+            let mut group = [(MerkleHash::default(), 0); MAX_GROUP_SIZE];
+            let mut len = 0;
             for entry in source.by_ref().take(MAX_GROUP_SIZE) {
                 let is_cut =
-                    group.len() >= 2 && entry.0 % AGGREGATED_HASHES_MEAN_TREE_BRANCHING_FACTOR == 0;
-                group.push(entry);
+                    len >= 2 && entry.0 % AGGREGATED_HASHES_MEAN_TREE_BRANCHING_FACTOR == 0;
+                group[len] = entry;
+                len += 1;
                 if is_cut {
                     break;
                 }
             }
-            (!group.is_empty()).then(|| merged_hash_of_sequence(&group))
+            (len != 0).then(|| merged_hash_of_sequence(&group[..len]))
         }));
     }
 }
@@ -189,8 +179,10 @@ mod tests {
 
     #[test]
     fn xorb_hash_single() {
-        let h = xorb_hash(&[(compute_data_hash(b"a"), 1)]);
-        assert_ne!(h, MerkleHash::default());
+        let hash = compute_data_hash(b"a");
+        for size in [0, 1, u64::MAX] {
+            assert_eq!(xorb_hash(&[(hash, size)]), hash);
+        }
     }
 
     #[test]
@@ -316,6 +308,9 @@ mod tests {
         let h2 = file_hash_with_salt(&chunks, &[2u8; 32]);
         assert_ne!(h1, h2);
         assert_ne!(h1, MerkleHash::default());
+        assert_ne!(h2, MerkleHash::default());
+        assert_eq!(file_hash(&chunks), file_hash_with_salt(&chunks, &[0; 32]));
+        assert_ne!(file_hash(&chunks), h1);
     }
 
     #[test]
@@ -326,29 +321,18 @@ mod tests {
     }
 
     #[test]
-    fn write_hex_u64_all_zero() {
-        let mut buf = [0u8; 20];
-        let mut pos = 0;
-        write_hex_u64(&mut buf, &mut pos, 0);
-        assert_eq!(&buf[..16], b"0000000000000000");
-        assert_eq!(pos, 16);
-    }
-
-    #[test]
-    fn write_hex_u64_all_ones() {
-        let mut buf = [0u8; 20];
-        let mut pos = 0;
-        write_hex_u64(&mut buf, &mut pos, u64::MAX);
-        assert_eq!(&buf[..16], b"ffffffffffffffff");
-        assert_eq!(pos, 16);
-    }
-
-    #[test]
-    fn write_hex_u64_pattern() {
-        let mut buf = [0u8; 20];
-        let mut pos = 0;
-        write_hex_u64(&mut buf, &mut pos, 0xDEADBEEFCAFEBABE);
-        assert_eq!(pos, 16);
+    fn write_hex_u64_preserves_format_and_surrounding_bytes() {
+        for value in [0, 1, u64::MAX, 0xDEADBEEFCAFEBABE, 0x0123456789ABCDEF] {
+            for start in [0, 3] {
+                let mut buf = [b'!'; 20];
+                let mut pos = start;
+                write_hex_u64(&mut buf, &mut pos, value);
+                assert_eq!(&buf[start..pos], format!("{value:016x}").as_bytes());
+                assert_eq!(pos, start + 16);
+                assert!(buf[..start].iter().all(|byte| *byte == b'!'));
+                assert!(buf[pos..].iter().all(|byte| *byte == b'!'));
+            }
+        }
     }
 
     #[test]
@@ -400,8 +384,8 @@ mod tests {
     }
 
     #[test]
-    fn aggregated_node_hash_empty() {
-        assert_eq!(aggregated_node_hash(&[]), MerkleHash::default());
+    fn xorb_hash_from_owned_empty() {
+        assert_eq!(xorb_hash_from_owned(Vec::new()), MerkleHash::default());
     }
 
     #[test]

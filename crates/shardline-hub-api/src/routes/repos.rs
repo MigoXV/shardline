@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 
 use axum::http::HeaderMap;
 use axum::{
@@ -30,14 +30,13 @@ const MAX_README_FRONT_MATTER_BYTES: usize = super::yaml_validation::MAX_CARD_BY
 
 pub(crate) async fn repo_create(
     State(state): State<HubState>,
-    _headers: HeaderMap,
     repo: HubRepository<true>,
     Json(request): Json<RepoCreateRequest>,
 ) -> Result<Response, HubApiError> {
-    let full_name = request.organization.as_deref().map_or_else(
-        || request.name.clone(),
-        |organization| format!("{organization}/{}", request.name),
-    );
+    let full_name = match request.organization {
+        Some(organization) => format!("{organization}/{}", request.name),
+        None => request.name,
+    };
     // This route has no repository in its path, so bind the requested identity
     // from the body before checking whether it already exists. A repository
     // scoped write token may create/retry only that exact repository unless
@@ -60,7 +59,6 @@ pub(crate) async fn repo_create(
 
 pub(crate) async fn repo_create_type(
     State(state): State<HubState>,
-    _headers: HeaderMap,
     repo: HubRepository<true, false>,
     Path((repo_type, _ns, _repo_name)): Path<(String, String, String)>,
     Json(body): Json<serde_json::Value>,
@@ -90,7 +88,7 @@ pub(crate) async fn repo_create_type(
 
 pub(crate) fn repo_response_for_public_base(
     public_base_url: &str,
-    repo: &shardline_index::hub::HubRepo,
+    repo: shardline_index::hub::HubRepo,
 ) -> RepoResponse {
     let mut response = repo_response_from_hub(repo);
     // The configured public origin is trusted deployment state. Host and
@@ -99,12 +97,11 @@ pub(crate) fn repo_response_for_public_base(
     response
 }
 
-pub(crate) fn repo_response_from_hub(repo: &shardline_index::hub::HubRepo) -> RepoResponse {
+pub(crate) fn repo_response_from_hub(repo: shardline_index::hub::HubRepo) -> RepoResponse {
     let last_modified = chrono::DateTime::from_timestamp(repo.updated_at_unix_seconds as i64, 0)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
         .unwrap_or_default();
     RepoResponse {
-        id: repo.repo_id.clone(),
         repo_type: repo.repo_type.into(),
         private: repo.private,
         sha: None,
@@ -120,6 +117,7 @@ pub(crate) fn repo_response_from_hub(repo: &shardline_index::hub::HubRepo) -> Re
                 repo_id = repo.repo_id
             ),
         },
+        id: repo.repo_id,
         default_branch: Some("main".to_owned()),
         tags: Vec::new(),
         downloads: 0,
@@ -154,19 +152,16 @@ pub(crate) async fn repo_list(
         let r = claims.repository();
         format!("{}/{}", r.owner(), r.name())
     });
-    let repos = state
-        .store
-        .list_repos()
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let repos = state.store.list_repos()?;
     // Cross-tenant privacy: a caller must never see another tenant's private
     // repositories, even though the list endpoint is global. Public repos and
     // the caller's own private repos (exact `owner/name` match) remain visible.
-    let visible: Vec<_> = repos
-        .into_iter()
-        .filter(|r| repo_visible_to_owner(r, caller_repo_id.as_deref()))
-        .collect();
     let response = RepoListResponse {
-        repos: visible.iter().map(repo_response_from_hub).collect(),
+        repos: repos
+            .into_iter()
+            .filter(|entry| repo_visible_to_owner(entry, caller_repo_id.as_deref()))
+            .map(repo_response_from_hub)
+            .collect(),
     };
     Ok(Json(response))
 }
@@ -219,21 +214,18 @@ pub(crate) async fn repo_search(
         _ if query.sort.is_some() && ascending => HubRepoSearchOrder::RepoIdDesc,
         _ => HubRepoSearchOrder::RepoIdAsc,
     };
-    let visible = state
-        .store
-        .search_repos_with_options(
-            Some(rt),
-            &query.q,
-            limit,
-            &HubRepoSearchOptions {
-                caller_repo_id,
-                author: query.author,
-                order,
-            },
-        )
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let visible = state.store.search_repos_with_options(
+        Some(rt),
+        &query.q,
+        limit,
+        &HubRepoSearchOptions {
+            caller_repo_id,
+            author: query.author,
+            order,
+        },
+    )?;
     let response = RepoListResponse {
-        repos: visible.iter().map(repo_response_from_hub).collect(),
+        repos: visible.into_iter().map(repo_response_from_hub).collect(),
     };
     Ok(Json(response))
 }
@@ -255,13 +247,7 @@ fn repo_visible_to_owner(
     repo: &shardline_index::hub::HubRepo,
     caller_repo_id: Option<&str>,
 ) -> bool {
-    let Some(caller_repo_id) = caller_repo_id else {
-        return true;
-    };
-    if !repo.private {
-        return true;
-    }
-    repo.repo_id == caller_repo_id
+    caller_repo_id.is_none_or(|caller| !repo.private || repo.repo_id == caller)
 }
 
 // ---- Stateless, bounded card validation ----
@@ -299,20 +285,15 @@ pub(crate) async fn repo_modelcard(
     let name = format!("{ns}/{repo_name}");
     let entry = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
     let commit_sha = state
         .store
-        .resolve_revision(&name, &entry.default_branch)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .resolve_revision(&name, &entry.default_branch)?
         .ok_or(HubApiError::RevisionNotFound)?;
     crate::revision_access::authorize_read(&state, &name, "main", &commit_sha, repo.capability())
         .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let files = state.store.get_files(&commit_sha)?;
     let readme = files
         .iter()
         .find(|f| f.path == "README.md")
@@ -340,9 +321,7 @@ pub(crate) async fn repo_modelcard(
     let mut response = stream_object(&state.object_store, key, length).into_response();
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
-        "text/markdown; charset=utf-8"
-            .parse()
-            .map_err(|_error| HubApiError::NotFound)?,
+        axum::http::HeaderValue::from_static("text/markdown; charset=utf-8"),
     );
     response.headers_mut().insert(
         "x-shardline-sha",
@@ -365,19 +344,14 @@ pub(crate) async fn repo_revisions(
     let name = format!("{ns}/{repo_name}");
     let _ = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
     let visible =
         crate::revision_access::visible_commits(&state, &name, _repo.capability()).await?;
     let revisions = if let Some(allowed) = &visible {
         let mut revisions = Vec::with_capacity(allowed.len());
         for sha in allowed {
-            if let Some(revision) = state
-                .store
-                .get_revision(&name, sha)
-                .map_err(|error| HubApiError::CasError(error.to_string()))?
-            {
+            if let Some(revision) = state.store.get_revision(&name, sha)? {
                 revisions.push(revision);
             }
         }
@@ -389,24 +363,20 @@ pub(crate) async fn repo_revisions(
         });
         revisions
     } else {
-        state
-            .store
-            .list_revisions(&name)
-            .map_err(|error| HubApiError::CasError(error.to_string()))?
+        state.store.list_revisions(&name)?
     };
+    let scoped_revision = _repo
+        .capability()
+        .repository()
+        .and_then(|scope| scope.revision());
     let response = RevisionListResponse {
         revisions: revisions
-            .iter()
-            .map(|r| RevisionResponse {
+            .into_iter()
+            .map(|revision| RevisionResponse {
                 // A reachable commit can originate on a different branch.
                 // Expose it as this credential's history without leaking that name.
-                ref_name: _repo
-                    .capability()
-                    .repository()
-                    .and_then(|scope| scope.revision())
-                    .unwrap_or(&r.ref_name)
-                    .to_owned(),
-                sha: r.sha.clone(),
+                ref_name: scoped_revision.map_or(revision.ref_name, str::to_owned),
+                sha: revision.sha,
             })
             .collect(),
     };
@@ -425,13 +395,9 @@ pub(crate) async fn repo_refs(
     let name = format!("{ns}/{repo_name}");
     state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
-    let refs = state
-        .store
-        .list_refs_bounded(&name, 10_000)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let refs = state.store.list_refs_bounded(&name, 10_000)?;
     let mut branches = Vec::new();
     let mut tags = Vec::new();
     let mut converts = Vec::new();
@@ -445,28 +411,25 @@ pub(crate) async fn repo_refs(
         }) {
             continue;
         }
-        let (items, short_name, full_name) =
-            if let Some(short) = reference.ref_name.strip_prefix("refs/tags/") {
-                (&mut tags, short.to_owned(), reference.ref_name.clone())
-            } else if let Some(short) = reference.ref_name.strip_prefix("refs/heads/") {
-                (&mut branches, short.to_owned(), reference.ref_name.clone())
-            } else if let Some(short) = reference.ref_name.strip_prefix("refs/pr/") {
-                (
-                    &mut pull_requests,
-                    short.to_owned(),
-                    reference.ref_name.clone(),
-                )
-            } else if let Some(short) = reference.ref_name.strip_prefix("refs/convert/") {
-                (&mut converts, short.to_owned(), reference.ref_name.clone())
-            } else if !reference.ref_name.starts_with("refs/") {
-                (
-                    &mut branches,
-                    reference.ref_name.clone(),
-                    format!("refs/heads/{}", reference.ref_name),
-                )
-            } else {
-                continue;
-            };
+        let full_name = if reference.ref_name.starts_with("refs/") {
+            Cow::Borrowed(reference.ref_name.as_str())
+        } else {
+            Cow::Owned(format!("refs/heads/{}", reference.ref_name))
+        };
+        let (items, short_name) = if let Some(short) = reference.ref_name.strip_prefix("refs/tags/")
+        {
+            (&mut tags, short)
+        } else if let Some(short) = reference.ref_name.strip_prefix("refs/heads/") {
+            (&mut branches, short)
+        } else if let Some(short) = reference.ref_name.strip_prefix("refs/pr/") {
+            (&mut pull_requests, short)
+        } else if let Some(short) = reference.ref_name.strip_prefix("refs/convert/") {
+            (&mut converts, short)
+        } else if !reference.ref_name.starts_with("refs/") {
+            (&mut branches, reference.ref_name.as_str())
+        } else {
+            continue;
+        };
         items.push(serde_json::json!({
             "name": short_name,
             "ref": full_name,
@@ -490,45 +453,18 @@ pub(crate) async fn repo_info(
     let name = format!("{ns}/{repo_name}");
     let entry = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
-    let mut response = repo_response_from_hub(&entry);
 
     // SDK repo_info() needs the same current commit and siblings as the
     // explicit revision endpoint, rather than an apparently empty repository.
-    if let Some(sha) = state
-        .store
-        .resolve_revision(&name, &entry.default_branch)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
-    {
+    let current_sha = state.store.resolve_revision(&name, &entry.default_branch)?;
+    let mut response = repo_response_from_hub(entry);
+    if let Some(sha) = current_sha {
         crate::revision_access::authorize_read(&state, &name, "main", &sha, repo.capability())
             .await?;
-        let files = state
-            .store
-            .get_files(&sha)
-            .map_err(|e| HubApiError::CasError(e.to_string()))?;
-        if files.iter().any(|file| file.path == "README.md")
-            && let Some(content) =
-                read_file_prefix_from_object_store(&state, &name, "main", &sha, repo.capability())
-                    .await
-        {
-            response.card_data = parse_yaml_frontmatter(&content);
-        }
-        response.sha = Some(
-            crate::git::smart_http::public_commit_id(&state, &name, &sha, repo.capability())
-                .await?,
-        );
-        response.siblings = Some(
-            files
-                .into_iter()
-                .map(|file| {
-                    serde_json::json!({
-                        "rfilename": file.path, "size": file.size, "blobId": file.sha,
-                    })
-                })
-                .collect(),
-        );
+        response =
+            revision_response(&state, repo.capability(), &name, "main", &sha, response).await?;
     }
 
     Ok(Json(response))
@@ -543,43 +479,57 @@ pub(crate) async fn repo_revision_info(
     let name = format!("{ns}/{repo_name}");
     let entry = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
     let commit_sha =
         crate::git::smart_http::resolve_commit_id(&state, &name, &rev, _repo.capability())?
             .ok_or(HubApiError::RevisionNotFound)?;
     crate::revision_access::authorize_read(&state, &name, &rev, &commit_sha, _repo.capability())
         .await?;
-    let files = state
-        .store
-        .get_files(&commit_sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
-    let mut response = repo_response_from_hub(&entry);
-    response.sha = Some(
-        crate::git::smart_http::public_commit_id(&state, &name, &commit_sha, _repo.capability())
-            .await?,
-    );
+    Ok(Json(
+        revision_response(
+            &state,
+            _repo.capability(),
+            &name,
+            &rev,
+            &commit_sha,
+            repo_response_from_hub(entry),
+        )
+        .await?,
+    ))
+}
+
+async fn revision_response(
+    state: &HubState,
+    auth: &AuthorizedRepository,
+    repo: &str,
+    requested: &str,
+    commit: &str,
+    mut response: RepoResponse,
+) -> Result<RepoResponse, HubApiError> {
+    let files = state.store.get_files(commit)?;
+    response.sha = Some(crate::git::smart_http::public_commit_id(state, repo, commit, auth).await?);
     if files.iter().any(|file| file.path == "README.md")
         && let Some(content) =
-            read_file_prefix_from_object_store(&state, &name, &rev, &commit_sha, _repo.capability())
-                .await
+            read_file_prefix_from_object_store(state, repo, requested, commit, auth).await
     {
         response.card_data = parse_yaml_frontmatter(&content);
     }
-    response.siblings = Some(
-        files
-            .into_iter()
-            .map(|file| {
-                serde_json::json!({
-                    "rfilename": file.path,
-                    "size": file.size,
-                    "blobId": file.sha,
-                })
+    response.siblings = Some(file_siblings(files));
+    Ok(response)
+}
+
+fn file_siblings(files: Vec<shardline_index::hub::HubFileEntry>) -> Vec<serde_json::Value> {
+    files
+        .into_iter()
+        .map(|file| {
+            serde_json::json!({
+                "rfilename": file.path,
+                "size": file.size,
+                "blobId": file.sha,
             })
-            .collect(),
-    );
-    Ok(Json(response))
+        })
+        .collect()
 }
 
 // ---- Repo delete (requires Write) ----
@@ -640,10 +590,7 @@ async fn read_file_prefix_from_object_store(
 /// separator is present, the owner is treated as empty (which can never match a
 /// scoped token's non-empty owner, so repo-scoped binding will deny it).
 fn split_repo_name(full_name: &str) -> (&str, &str) {
-    match full_name.split_once('/') {
-        Some((owner, name)) => (owner, name),
-        None => ("", full_name),
-    }
+    full_name.split_once('/').unwrap_or(("", full_name))
 }
 
 fn delete_repository(
@@ -661,12 +608,8 @@ fn delete_repository(
     // Verify repo exists
     let _repo = state
         .store
-        .get_repo(name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(name)?
         .ok_or(HubApiError::RepoNotFound)?;
-    state
-        .store
-        .delete_repo(name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    state.store.delete_repo(name)?;
     Ok(StatusCode::NO_CONTENT)
 }

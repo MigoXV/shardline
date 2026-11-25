@@ -37,18 +37,12 @@ pub(super) async fn load_oci_evidence(
         key.kind.as_str(),
         key.digest_hex.clone(),
     )?);
-    let event = super::index_store::load_postgres_latest_evidence_event(
+    super::index_store::load_postgres_snapshot_evidence(
         &mut *executor,
         OperationKind::Visibility,
         operation_id.as_str(),
     )
-    .await?;
-    let Some(event) = event else {
-        return Ok(OciObjectEvidenceLog::default());
-    };
-    Ok(OciObjectEvidenceLog::from_head(serde_json::from_value(
-        event,
-    )?)?)
+    .await
 }
 
 async fn record_oci_evidence(
@@ -84,19 +78,13 @@ async fn record_oci_evidence(
     };
     let (evidence, evidence_was_empty) =
         verify_and_append_snapshot_transition(evidence, fallback, after)?;
-    let event = evidence.events().last().ok_or_else(|| {
+    let _ = evidence.events().last().ok_or_else(|| {
         PostgresMetadataStoreError::Reliability(
             shardline_reliability::ReliabilityError::EmptyField("OCI object evidence event"),
         )
     })?;
-    if evidence_was_empty {
-        for stored_event in evidence.events() {
-            insert_reliability_event(&mut *executor, stored_event).await?;
-        }
-        Ok(())
-    } else {
-        insert_reliability_event(executor, event).await
-    }
+    super::index_store::persist_appended_events(executor, evidence.events(), evidence_was_empty)
+        .await
 }
 use crate::{
     OciObjectKey, OciObjectKind, OciObjectStore, OciObjectTombstone, OciTagEntry,
@@ -352,25 +340,15 @@ impl PostgresIndexStore {
         fence: &ResumableCompletionFence,
     ) -> Result<bool, PostgresMetadataStoreError> {
         let mut transaction = connection.begin().await?;
-        let owns_completion = query(
-            "SELECT scope_namespace, target_key FROM shardline_resumable_sessions
-             WHERE session_id = $1 AND state = 'completing' AND fence_epoch = $2
-             AND expires_at > clock_timestamp()
-             FOR UPDATE",
-        )
-        .bind(fence.session_id())
-        .bind(super::u64_to_i64(fence.epoch().get())?)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(owns_completion) = owns_completion else {
+        let completion_identity =
+            super::resumable_sessions::lock_completion_identity(&mut transaction, fence).await?;
+        let Some((scope_namespace, target_key)) = completion_identity else {
             transaction.rollback().await?;
             return Ok(false);
         };
         // Tag rows and their integrity-checked pointer histories share this
         // completion transaction, so a published manifest cannot expose an
         // unjournaled retarget.
-        let scope_namespace: String = owns_completion.try_get("scope_namespace")?;
-        let target_key: String = owns_completion.try_get("target_key")?;
         query(
             "DELETE FROM shardline_oci_object_tombstones
              WHERE scope_namespace = $1 AND repository = $2
@@ -729,9 +707,7 @@ mod tests {
     use sqlx::query_as;
     use std::time::Duration;
 
-    async fn connect_postgres() -> Option<sqlx::PgPool> {
-        super::super::connect_isolated_postgres().await
-    }
+    use super::super::connect_isolated_postgres as connect_postgres;
 
     fn object(scope_namespace: &str) -> OciObjectKey {
         OciObjectKey {
@@ -1494,31 +1470,6 @@ mod tests {
             "oci-tombstone-pg-{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        query("DELETE FROM shardline_oci_object_tombstones WHERE scope_namespace = $1")
-            .bind(&scope_namespace)
-            .execute(&pool)
-            .await
-            .unwrap();
-        query("DELETE FROM shardline_oci_tags WHERE scope_namespace = $1")
-            .bind(&scope_namespace)
-            .execute(&pool)
-            .await
-            .unwrap();
-        query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Visibility'
-               AND operation_id = $1",
-        )
-        .bind(format!(
-            "{}:{}:{}:{}",
-            scope_namespace,
-            "team/assets",
-            OciObjectKind::Manifest.as_str(),
-            "a".repeat(64)
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
         let store = PostgresIndexStore::new(pool);
         let manifest = object(&scope_namespace);
         let current = tag(&scope_namespace, "latest", 'a');
@@ -1685,32 +1636,6 @@ mod tests {
             kind: OciObjectKind::Blob,
             digest_hex: "f".repeat(64),
         };
-        query(
-            "DELETE FROM shardline_oci_object_tombstones
-             WHERE scope_namespace = $1 AND repository = $2
-               AND object_kind = $3 AND digest_hex = $4",
-        )
-        .bind(&key.scope_namespace)
-        .bind(&key.repository)
-        .bind(key.kind.as_str())
-        .bind(&key.digest_hex)
-        .execute(&pool)
-        .await
-        .unwrap();
-        query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Visibility' AND operation_id = $1",
-        )
-        .bind(format!(
-            "{}:{}:{}:{}",
-            key.scope_namespace,
-            key.repository,
-            key.kind.as_str(),
-            key.digest_hex
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
         store.delete_oci_object(&key).await.unwrap();
         let tombstone = store
             .list_oci_object_tombstones()
@@ -1756,20 +1681,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((count, minimum, maximum), (2, 0, 1));
-        query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Visibility' AND operation_id = $1",
-        )
-        .bind(format!(
-            "{}:{}:{}:{}",
-            key.scope_namespace,
-            key.repository,
-            key.kind.as_str(),
-            key.digest_hex
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

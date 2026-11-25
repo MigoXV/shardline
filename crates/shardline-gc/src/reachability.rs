@@ -98,17 +98,17 @@ where
             break;
         }
         for (xorb, ordinal, member) in page {
-            let cursor = (xorb.clone(), ordinal);
+            let cursor = (xorb, ordinal);
             if after.as_ref().is_some_and(|previous| previous >= &cursor) {
                 return Err(GcError::InvalidContentHash);
             }
-            after = Some(cursor);
             if reachability.live_dedupe_chunk_hashes.contains(&member) {
-                let key = shardline_xet_adapter::xorb_object_key(&xorb)?;
+                let key = shardline_xet_adapter::xorb_object_key(&cursor.0)?;
                 reachability
                     .referenced_object_keys
                     .insert(key.as_str().to_owned());
             }
+            after = Some(cursor);
         }
     }
 
@@ -139,7 +139,7 @@ fn collect_record_object_references<Locator>(
     let record = parse_stored_file_record_bytes(&entry.bytes)?;
     let storage_layout = record.storage_layout();
     reachability.scanned_records = checked_increment(reachability.scanned_records)?;
-    for chunk in &record.chunks {
+    for chunk in record.chunks {
         match storage_layout {
             FileRecordStorageLayout::ReferencedObjectTerms => {
                 let object_key = referenced_term_object_key(frontends, &chunk.hash)?;
@@ -158,10 +158,6 @@ fn collect_record_object_references<Locator>(
                 reachability
                     .referenced_object_keys
                     .insert(chunk_object_key.as_str().to_owned());
-                reachability
-                    .live_dedupe_chunk_hashes
-                    .insert(chunk.hash.clone());
-
                 for object_key in optional_chunk_container_keys(frontends, &chunk.hash)? {
                     if record.storage_repr == shardline_index::StorageRepresentation::XorbCdcV1
                         && shardline_xet_adapter::xorb_hash_from_object_key_if_present(&object_key)?
@@ -193,6 +189,7 @@ fn collect_record_object_references<Locator>(
                         &mut reachability.missing_optional_object_keys,
                     )?;
                 }
+                reachability.live_dedupe_chunk_hashes.insert(chunk.hash);
             }
         }
     }
@@ -210,13 +207,13 @@ where
     ObjectAdapter: ObjectStore,
     ObjectAdapter::Error: Into<GcError>,
 {
-    let object_key_string = object_key.as_str().to_owned();
-    if referenced_object_keys.contains(&object_key_string)
-        || missing_optional_object_keys.contains(&object_key_string)
+    if referenced_object_keys.contains(object_key.as_str())
+        || missing_optional_object_keys.contains(object_key.as_str())
     {
         return Ok(());
     }
 
+    let object_key_string = object_key.as_str().to_owned();
     if object_store
         .metadata(object_key)
         .map_err(Into::into)?
@@ -236,10 +233,9 @@ fn collect_live_chunk_references_from_protocol_object(
     object_key: &ObjectKey,
     reachability: &mut ReachabilityAccumulator,
 ) -> Result<bool, GcError> {
-    let object_key_string = object_key.as_str().to_owned();
     if let Some(present) = reachability
         .inspected_protocol_objects
-        .get(&object_key_string)
+        .get(object_key.as_str())
     {
         return Ok(*present);
     }
@@ -259,7 +255,7 @@ fn collect_live_chunk_references_from_protocol_object(
     )?;
     reachability
         .inspected_protocol_objects
-        .insert(object_key_string, present);
+        .insert(object_key.as_str().to_owned(), present);
     Ok(present)
 }
 
@@ -359,33 +355,9 @@ pub(super) fn managed_object_hash_or_object_key(
 /// live in-flight write look stale and get it reaped mid-write.
 pub(super) const STALE_TEMP_ARTIFACT_AGE_SECONDS: u64 = 60 * 60;
 
-/// Returns the embedded unix-nanoseconds creation timestamp of a temporary
-/// artifact key: `<managed-base>.tmp-<unix_nanos>-<counter>` where
-/// `<managed-base>` is a key this object store writes and `.tmp-<unix_nanos>-<counter>`
-/// is the temp-then-hardlink suffix produced by
-/// `write_anchored_temporary_file_shared` for EVERY local object write
-/// (chunks, xorb containers, shards, xorb chunk-cache sidecars, and the
-/// last-GC-clock anchor alike). Returns `None` when the key is not such a temp
-/// artifact.
-///
-/// The base is validated with [`is_gc_reaper_managed_base`], so the accepted
-/// key space mirrors exactly the keys the store writes through the
-/// temp-then-hardlink path: chunk `<2hex>/<64hex>`,
-/// `xorbs/default/<2hex>/<hash>.xorb`, `shards/<2hex>/<hash>.shard` (F-67),
-/// the xorb chunk-cache sidecar namespace `_xorb_chunks/<2hex>/<64hex>`, and
-/// the reserved GC clock anchor `gc/last-gc-clock-anchor` (F-99). This is
-/// important for two reasons:
-///
-/// * A matching key can never be a live object: the `.tmp-` suffix is only
-///   ever present on temp-then-hardlink write artifacts, and the final object
-///   is hard-linked/renamed to the suffix-free key. A crash between the temp
-///   write and the hardlink strands `<managed-base>.tmp-...`, which is exactly
-///   the artifact this predicate exists to reap.
-/// * It cannot match a user-controlled key: the namespaces above are
-///   server-internal, while user keys (for example S3 frontend objects under
-///   `protocols/s3/{scope}/{key}`) never parse as a store-written base key, so
-///   a user object that merely ends in `.tmp-<digits>-<digits>` is never
-///   reaped.
+/// Parses `<managed-base>.tmp-<unix_nanos>-<counter>`, accepting only decimal
+/// timestamps/counters and bases recognized by [`is_gc_reaper_managed_base`].
+/// A matching suffix alone must never make a user object eligible for reaping.
 fn temporary_artifact_unix_nanos(key: &ObjectKey, frontends: &[ServerFrontend]) -> Option<u128> {
     // `<managed-base>.tmp-<unix_nanos>-<counter>`
     let (base, temp_suffix) = key.as_str().rsplit_once(".tmp-")?;
@@ -397,12 +369,6 @@ fn temporary_artifact_unix_nanos(key: &ObjectKey, frontends: &[ServerFrontend]) 
     {
         return None;
     }
-    // The base must be exactly a key this store writes via the temp-then-
-    // hardlink local write path: a managed object key (chunk, xorb, or shard),
-    // the xorb chunk-cache sidecar namespace, or a reserved GC clock anchor/boot-observation key.
-    // Mirroring the store-written key space keeps the reaper's accepted keys
-    // identical to the namespace the rest of GC operates on, so a matching key
-    // can never be a live object or a user-controlled key (F-67, F-99).
     let Ok(base_key) = ObjectKey::parse(base) else {
         return None;
     };
@@ -412,44 +378,20 @@ fn temporary_artifact_unix_nanos(key: &ObjectKey, frontends: &[ServerFrontend]) 
     nanos_str.parse::<u128>().ok()
 }
 
-/// Returns true when `base_key` names a key this object store writes through
-/// the temp-then-hardlink local write path (`write_anchored_temporary_file_shared`
-/// followed by a hardlink or rename), so a stranded
-/// `<base>.tmp-<unix_nanos>-<counter>` sibling is a reaping candidate:
+/// Recognizes final keys written through the local temp-then-hardlink path:
+/// managed chunks, Xorbs and shards; Xorb chunk-cache sidecars; and the two
+/// reserved GC clock keys. A crash can strand a temporary sibling of these keys.
 ///
-/// * managed object keys — chunk `<2hex>/<64hex>`, xorb
-///   `xorbs/default/<2hex>/<hash>.xorb`, shard `shards/<2hex>/<hash>.shard`
-///   (mirroring [`managed_object_hash`], F-67);
-/// * the xorb chunk-cache sidecar namespace `_xorb_chunks/<2hex>/<64hex>`
-///   (written by `xorb_store::visit_stored_xorb_chunk_hashes`);
-/// * the reserved last-GC-clock anchor `gc/last-gc-clock-anchor` (written by
-///   `quarantine::write_last_gc_clock_anchor`).
-///
-/// Every final key above is written via the temp-then-hardlink path, so a
-/// crash between the temp write and the hardlink/rename strands
-/// `<base>.tmp-<unix_nanos>-<counter>`, which is exactly the artifact this
-/// reaper exists to collect (F-99).
-///
-/// The key space stays tight: a matching base can never be a live object (the
-/// `.tmp-` suffix is only ever present on temp-then-hardlink write artifacts),
-/// and user keys — for example S3 frontend objects under
-/// `protocols/s3/{scope}/{key}`, or any other `gc/`-shaped key that is not the
-/// exact anchor or boot-observation key — never match, so a user object that merely ends in
-/// `.tmp-<digits>-<digits>` is never reaped.
+/// Keep this namespace exact: user protocol keys, unrelated `gc/` keys and
+/// malformed sidecars must remain ineligible, regardless of their suffix or age.
+/// Only temporary siblings are reaped; the final keys themselves stay live.
 fn is_gc_reaper_managed_base(base_key: &ObjectKey, frontends: &[ServerFrontend]) -> bool {
-    if managed_object_hash(base_key, frontends)
-        .ok()
-        .is_some_and(|hash| hash.is_some())
-    {
-        return true;
-    }
-    if shardline_xet_adapter::xorb_chunks_cache_hash_from_key_if_present(base_key)
-        .ok()
-        .is_some_and(|hash| hash.is_some())
-    {
-        return true;
-    }
-    base_key.as_str() == LAST_GC_CLOCK_ANCHOR_KEY
+    matches!(managed_object_hash(base_key, frontends), Ok(Some(_)))
+        || matches!(
+            shardline_xet_adapter::xorb_chunks_cache_hash_from_key_if_present(base_key),
+            Ok(Some(_))
+        )
+        || base_key.as_str() == LAST_GC_CLOCK_ANCHOR_KEY
         || base_key.as_str() == crate::quarantine::GC_CLOCK_BOOT_OBSERVATION_KEY
 }
 
@@ -539,21 +481,37 @@ mod tests {
         DeleteOutcome, ObjectBody, ObjectIntegrity, ObjectMetadata, PutOutcome,
     };
 
-    /// A mock object store that returns metadata for a set of known keys.
-    struct MockObjectStore {
-        existing_keys: HashSet<String>,
+    /// A mock object store exposing controllable metadata (including
+    /// backend-observed mtimes) for a fixed set of keys.
+    struct MetadataObjectStore {
+        objects: Vec<ObjectMetadata>,
     }
 
-    impl MockObjectStore {
-        fn new(existing: &[&str]) -> Self {
+    impl MetadataObjectStore {
+        fn with_keys(keys: &[&str]) -> Self {
+            Self::new(keys.iter().map(|key| (*key, 1024, None)).collect())
+        }
+
+        fn new(objects: Vec<(&str, u64, Option<u64>)>) -> Self {
             Self {
-                existing_keys: existing.iter().map(|s| (*s).to_owned()).collect(),
+                objects: objects
+                    .into_iter()
+                    .map(|(key, length, modified)| {
+                        let metadata =
+                            ObjectMetadata::new(ObjectKey::parse(key).unwrap(), length, None);
+                        if let Some(modified) = modified {
+                            metadata.with_modified(modified)
+                        } else {
+                            metadata
+                        }
+                    })
+                    .collect(),
             }
         }
     }
 
     #[allow(clippy::unreachable)]
-    impl ObjectStore for MockObjectStore {
+    impl ObjectStore for MetadataObjectStore {
         type Error = std::io::Error;
 
         fn put_if_absent(
@@ -574,19 +532,19 @@ mod tests {
         }
 
         fn contains(&self, key: &ObjectKey) -> Result<bool, Self::Error> {
-            Ok(self.existing_keys.contains(key.as_str()))
+            Ok(self.objects.iter().any(|metadata| metadata.key() == key))
         }
 
         fn metadata(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>, Self::Error> {
-            if self.existing_keys.contains(key.as_str()) {
-                Ok(Some(ObjectMetadata::new(key.clone(), 1024, None)))
-            } else {
-                Ok(None)
-            }
+            Ok(self
+                .objects
+                .iter()
+                .find(|metadata| metadata.key() == key)
+                .cloned())
         }
 
         fn list_prefix(&self, _prefix: &ObjectPrefix) -> Result<Vec<ObjectMetadata>, Self::Error> {
-            unreachable!("not used in tests")
+            Ok(self.objects.clone())
         }
 
         fn delete_if_present(&self, _key: &ObjectKey) -> Result<DeleteOutcome, Self::Error> {
@@ -596,7 +554,7 @@ mod tests {
 
     #[test]
     fn mark_optional_existing_object_is_referenced() {
-        let store = MockObjectStore::new(&["chunks/abc123"]);
+        let store = MetadataObjectStore::with_keys(&["chunks/abc123"]);
         let key = ObjectKey::parse("chunks/abc123").unwrap();
         let mut referenced = HashSet::new();
         let mut missing = HashSet::new();
@@ -615,7 +573,7 @@ mod tests {
 
     #[test]
     fn mark_optional_missing_object_is_marked_missing() {
-        let store = MockObjectStore::new(&[]);
+        let store = MetadataObjectStore::with_keys(&[]);
         let key = ObjectKey::parse("chunks/xyz789").unwrap();
         let mut referenced = HashSet::new();
         let mut missing = HashSet::new();
@@ -634,7 +592,7 @@ mod tests {
 
     #[test]
     fn mark_optional_already_referenced_is_noop() {
-        let store = MockObjectStore::new(&["chunks/abc"]);
+        let store = MetadataObjectStore::with_keys(&["chunks/abc"]);
         let key = ObjectKey::parse("chunks/abc").unwrap();
         let mut referenced = HashSet::new();
         referenced.insert("chunks/abc".to_owned());
@@ -649,7 +607,7 @@ mod tests {
 
     #[test]
     fn mark_optional_already_missing_is_noop() {
-        let store = MockObjectStore::new(&[]);
+        let store = MetadataObjectStore::with_keys(&[]);
         let key = ObjectKey::parse("chunks/def").unwrap();
         let mut referenced = HashSet::new();
         let mut missing = HashSet::new();
@@ -822,6 +780,7 @@ mod tests {
             .await
             .unwrap();
         let record = FileRecord {
+            deduplication_domain: None,
             file_id: "retained-history".to_owned(),
             content_hash: member.clone(),
             total_bytes: 4,
@@ -856,78 +815,73 @@ mod tests {
         assert_eq!(reachability.scanned_records, 1);
     }
 
-    #[test]
-    fn collect_referenced_object_keys_with_empty_stores() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+    #[tokio::test]
+    async fn collect_referenced_object_keys_with_empty_stores() {
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            assert_eq!(reachability.scanned_records, 0);
-            assert!(reachability.referenced_object_keys.is_empty());
-        });
+        assert_eq!(reachability.scanned_records, 0);
+        assert!(reachability.referenced_object_keys.is_empty());
     }
 
-    #[test]
-    fn collect_referenced_object_keys_with_stored_chunk_record() {
+    #[tokio::test]
+    async fn collect_referenced_object_keys_with_stored_chunk_record() {
         use shardline_index::{FileChunkRecord, FileRecord, MemoryRecordStore, RecordMutation};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-            let record = FileRecord {
-                file_id: "test-file".to_owned(),
-                content_hash: hash.to_owned(),
-                total_bytes: 100,
-                chunk_size: 100,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash.to_owned(),
-                    offset: 0,
-                    length: 100,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_latest_record(&record).await.unwrap();
+        let hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let record = FileRecord {
+            deduplication_domain: None,
+            file_id: "test-file".to_owned(),
+            content_hash: hash.to_owned(),
+            total_bytes: 100,
+            chunk_size: 100,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: hash.to_owned(),
+                offset: 0,
+                length: 100,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_latest_record(&record).await.unwrap();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            assert_eq!(reachability.scanned_records, 1);
-            let chunk_key = format!("{prefix}/{hash}", prefix = &hash[..2]);
-            assert!(
-                reachability.referenced_object_keys.contains(&chunk_key),
-                "chunk key must be marked as referenced"
-            );
-        });
+        assert_eq!(reachability.scanned_records, 1);
+        let chunk_key = format!("{prefix}/{hash}", prefix = &hash[..2]);
+        assert!(
+            reachability.referenced_object_keys.contains(&chunk_key),
+            "chunk key must be marked as referenced"
+        );
     }
 
     // ── managed_object_hash tests ───────────────────────────────────────
@@ -963,342 +917,260 @@ mod tests {
 
     // ── collect_referenced_object_keys with version records ──────────────
 
-    #[test]
-    fn collect_referenced_object_keys_with_version_records() {
+    #[tokio::test]
+    async fn collect_referenced_object_keys_with_version_records() {
         use shardline_index::{FileChunkRecord, FileRecord, MemoryRecordStore, RecordMutation};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            let hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-            let record = FileRecord {
-                file_id: "version-file".to_owned(),
-                content_hash: hash.to_owned(),
-                total_bytes: 200,
-                chunk_size: 200,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash.to_owned(),
-                    offset: 0,
-                    length: 200,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_version_record(&record).await.unwrap();
+        let hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let record = FileRecord {
+            deduplication_domain: None,
+            file_id: "version-file".to_owned(),
+            content_hash: hash.to_owned(),
+            total_bytes: 200,
+            chunk_size: 200,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: hash.to_owned(),
+                offset: 0,
+                length: 200,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_version_record(&record).await.unwrap();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            assert_eq!(reachability.scanned_records, 1);
-            let chunk_key = format!("{prefix}/{hash}", prefix = &hash[..2]);
-            assert!(
-                reachability.referenced_object_keys.contains(&chunk_key),
-                "version record chunk should be referenced"
-            );
-        });
+        assert_eq!(reachability.scanned_records, 1);
+        let chunk_key = format!("{prefix}/{hash}", prefix = &hash[..2]);
+        assert!(
+            reachability.referenced_object_keys.contains(&chunk_key),
+            "version record chunk should be referenced"
+        );
     }
 
     // ── collect_referenced_object_keys with dedupe shard mapping ─────────
 
-    #[test]
-    fn collect_referenced_object_keys_with_dedupe_shard_mapping() {
+    #[tokio::test]
+    async fn collect_referenced_object_keys_with_dedupe_shard_mapping() {
         use shardline_index::{
             DedupeShardMapping, FileChunkRecord, FileRecord, MemoryRecordStore, RecordMutation,
         };
         use shardline_protocol::ShardlineHash;
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            // Create a record with a stored chunk so its hash goes into
-            // live_dedupe_chunk_hashes.
-            let chunk_hash_hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-            let record = FileRecord {
-                file_id: "dedupe-file".to_owned(),
-                content_hash: chunk_hash_hex.to_owned(),
-                total_bytes: 100,
-                chunk_size: 100,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: chunk_hash_hex.to_owned(),
-                    offset: 0,
-                    length: 100,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_latest_record(&record).await.unwrap();
+        // Create a record with a stored chunk so its hash goes into
+        // live_dedupe_chunk_hashes.
+        let chunk_hash_hex = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let record = FileRecord {
+            deduplication_domain: None,
+            file_id: "dedupe-file".to_owned(),
+            content_hash: chunk_hash_hex.to_owned(),
+            total_bytes: 100,
+            chunk_size: 100,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: chunk_hash_hex.to_owned(),
+                offset: 0,
+                length: 100,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_latest_record(&record).await.unwrap();
 
-            // Add a dedupe shard mapping that references the same chunk hash.
-            let chunk_hash = ShardlineHash::from_bytes([0xee; 32]);
-            let shard_key = ObjectKey::parse(
-                "shards/ee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.shard",
-            )
-            .unwrap();
-            let mapping = DedupeShardMapping::new(chunk_hash, shard_key.clone());
-            index_store.upsert_dedupe_shard_mapping(&mapping).unwrap();
+        // Add a dedupe shard mapping that references the same chunk hash.
+        let chunk_hash = ShardlineHash::from_bytes([0xee; 32]);
+        let shard_key = ObjectKey::parse(
+            "shards/ee/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.shard",
+        )
+        .unwrap();
+        let mapping = DedupeShardMapping::new(chunk_hash, shard_key.clone());
+        index_store.upsert_dedupe_shard_mapping(&mapping).unwrap();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            // The shard key should be referenced because the chunk hash
-            // is in live_dedupe_chunk_hashes.
-            assert!(
-                reachability
-                    .referenced_object_keys
-                    .contains(shard_key.as_str()),
-                "shard key from dedupe mapping should be referenced"
-            );
-            // The chunk key should also be referenced.
-            let chunk_key = format!("ee/{chunk_hash_hex}");
-            assert!(
-                reachability.referenced_object_keys.contains(&chunk_key),
-                "chunk key should be referenced"
-            );
-        });
+        // The shard key should be referenced because the chunk hash
+        // is in live_dedupe_chunk_hashes.
+        assert!(
+            reachability
+                .referenced_object_keys
+                .contains(shard_key.as_str()),
+            "shard key from dedupe mapping should be referenced"
+        );
+        // The chunk key should also be referenced.
+        let chunk_key = format!("ee/{chunk_hash_hex}");
+        assert!(
+            reachability.referenced_object_keys.contains(&chunk_key),
+            "chunk key should be referenced"
+        );
     }
 
     // ── collect_referenced_object_keys with referenced-object-terms layout ─
 
-    #[test]
-    fn collect_referenced_object_keys_with_referenced_object_terms() {
+    #[tokio::test]
+    async fn collect_referenced_object_keys_with_referenced_object_terms() {
         use shardline_index::{FileChunkRecord, FileRecord, MemoryRecordStore, RecordMutation};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            // chunk_size = 0 → ReferencedObjectTerms storage layout.
-            let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-            let record = FileRecord {
-                file_id: "terms-file".to_owned(),
-                content_hash: hash.to_owned(),
-                total_bytes: 100,
-                chunk_size: 0,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash.to_owned(),
-                    offset: 0,
-                    length: 100,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_latest_record(&record).await.unwrap();
+        // chunk_size = 0 → ReferencedObjectTerms storage layout.
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let record = FileRecord {
+            deduplication_domain: None,
+            file_id: "terms-file".to_owned(),
+            content_hash: hash.to_owned(),
+            total_bytes: 100,
+            chunk_size: 0,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: hash.to_owned(),
+                offset: 0,
+                length: 100,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_latest_record(&record).await.unwrap();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            assert_eq!(reachability.scanned_records, 1);
-            // With terms layout, the referenced key is a xorb key.
-            let xorb_key = format!("xorbs/default/aa/{hash}.xorb");
-            assert!(
-                reachability.referenced_object_keys.contains(&xorb_key),
-                "xorb term key must be referenced"
-            );
-        });
+        assert_eq!(reachability.scanned_records, 1);
+        // With terms layout, the referenced key is a xorb key.
+        let xorb_key = format!("xorbs/default/aa/{hash}.xorb");
+        assert!(
+            reachability.referenced_object_keys.contains(&xorb_key),
+            "xorb term key must be referenced"
+        );
     }
 
     // ── collect_referenced_object_keys with both latest and version records ─
 
-    #[test]
-    fn collect_referenced_object_keys_counts_both_record_types() {
+    #[tokio::test]
+    async fn collect_referenced_object_keys_counts_both_record_types() {
         use shardline_index::{FileChunkRecord, FileRecord, MemoryRecordStore, RecordMutation};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let record_store = MemoryRecordStore::new();
-            let index_store = MemoryIndexStore::new();
-            let object_store = ServerObjectStore::blackhole();
+        let record_store = MemoryRecordStore::new();
+        let index_store = MemoryIndexStore::new();
+        let object_store = ServerObjectStore::blackhole();
 
-            let hash1 = "1111111111111111111111111111111111111111111111111111111111111111";
-            let hash2 = "2222222222222222222222222222222222222222222222222222222222222222";
+        let hash1 = "1111111111111111111111111111111111111111111111111111111111111111";
+        let hash2 = "2222222222222222222222222222222222222222222222222222222222222222";
 
-            // Latest record with hash1
-            let latest = FileRecord {
-                file_id: "latest-file".to_owned(),
-                content_hash: hash1.to_owned(),
-                total_bytes: 50,
-                chunk_size: 50,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash1.to_owned(),
-                    offset: 0,
-                    length: 50,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_latest_record(&latest).await.unwrap();
+        // Latest record with hash1
+        let latest = FileRecord {
+            deduplication_domain: None,
+            file_id: "latest-file".to_owned(),
+            content_hash: hash1.to_owned(),
+            total_bytes: 50,
+            chunk_size: 50,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: hash1.to_owned(),
+                offset: 0,
+                length: 50,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_latest_record(&latest).await.unwrap();
 
-            // Version record with hash2
-            let version = FileRecord {
-                file_id: "version-file".to_owned(),
-                content_hash: hash2.to_owned(),
-                total_bytes: 75,
-                chunk_size: 75,
-                storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
-                repository_scope: None,
-                chunks: vec![FileChunkRecord {
-                    hash: hash2.to_owned(),
-                    offset: 0,
-                    length: 75,
-                    range_start: 0,
-                    range_end: 1,
-                    packed_start: 0,
-                    packed_end: 0,
-                }],
-            };
-            record_store.write_version_record(&version).await.unwrap();
+        // Version record with hash2
+        let version = FileRecord {
+            deduplication_domain: None,
+            file_id: "version-file".to_owned(),
+            content_hash: hash2.to_owned(),
+            total_bytes: 75,
+            chunk_size: 75,
+            storage_repr: shardline_index::StorageRepresentation::FixedChunkV1,
+            repository_scope: None,
+            chunks: vec![FileChunkRecord {
+                hash: hash2.to_owned(),
+                offset: 0,
+                length: 75,
+                range_start: 0,
+                range_end: 1,
+                packed_start: 0,
+                packed_end: 0,
+            }],
+        };
+        record_store.write_version_record(&version).await.unwrap();
 
-            let mut reachability = ReachabilityAccumulator::default();
-            collect_referenced_object_keys(
-                &record_store,
-                &index_store,
-                &object_store,
-                &[ServerFrontend::Xet],
-                &mut reachability,
-            )
-            .await
-            .unwrap();
+        let mut reachability = ReachabilityAccumulator::default();
+        collect_referenced_object_keys(
+            &record_store,
+            &index_store,
+            &object_store,
+            &[ServerFrontend::Xet],
+            &mut reachability,
+        )
+        .await
+        .unwrap();
 
-            assert_eq!(reachability.scanned_records, 2);
-            assert!(
-                reachability.referenced_object_keys.contains(
-                    "11/1111111111111111111111111111111111111111111111111111111111111111"
-                )
-            );
-            assert!(
-                reachability.referenced_object_keys.contains(
-                    "22/2222222222222222222222222222222222222222222222222222222222222222"
-                )
-            );
-        });
+        assert_eq!(reachability.scanned_records, 2);
+        assert!(
+            reachability
+                .referenced_object_keys
+                .contains("11/1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert!(
+            reachability
+                .referenced_object_keys
+                .contains("22/2222222222222222222222222222222222222222222222222222222222222222")
+        );
     }
 
     // ── scan_stale_temporary_artifacts tests ────────────────────────────
 
     const TEMP_TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    /// A mock object store exposing controllable metadata (including
-    /// backend-observed mtimes) for a fixed set of keys.
-    struct MockTempStore {
-        objects: Vec<(String, u64, Option<u64>)>,
-    }
-
-    impl MockTempStore {
-        fn new(objects: Vec<(&str, u64, Option<u64>)>) -> Self {
-            Self {
-                objects: objects
-                    .into_iter()
-                    .map(|(key, length, modified)| (key.to_owned(), length, modified))
-                    .collect(),
-            }
-        }
-    }
-
-    #[allow(clippy::unreachable)]
-    impl ObjectStore for MockTempStore {
-        type Error = std::io::Error;
-
-        fn put_if_absent(
-            &self,
-            _key: &ObjectKey,
-            _body: ObjectBody<'_>,
-            _integrity: &ObjectIntegrity,
-        ) -> Result<PutOutcome, Self::Error> {
-            unreachable!("not used in tests")
-        }
-
-        fn read_range(
-            &self,
-            _key: &ObjectKey,
-            _range: shardline_protocol::ByteRange,
-        ) -> Result<Vec<u8>, Self::Error> {
-            unreachable!("not used in tests")
-        }
-
-        fn contains(&self, key: &ObjectKey) -> Result<bool, Self::Error> {
-            Ok(self.objects.iter().any(|(k, _, _)| k == key.as_str()))
-        }
-
-        fn metadata(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>, Self::Error> {
-            Ok(self.objects.iter().find(|(k, _, _)| k == key.as_str()).map(
-                |(k, length, modified)| {
-                    let mut metadata =
-                        ObjectMetadata::new(ObjectKey::parse(k).unwrap(), *length, None);
-                    if let Some(modified) = modified {
-                        metadata = metadata.with_modified(*modified);
-                    }
-                    metadata
-                },
-            ))
-        }
-
-        fn list_prefix(&self, _prefix: &ObjectPrefix) -> Result<Vec<ObjectMetadata>, Self::Error> {
-            Ok(self
-                .objects
-                .iter()
-                .map(|(k, length, modified)| {
-                    let mut metadata =
-                        ObjectMetadata::new(ObjectKey::parse(k).unwrap(), *length, None);
-                    if let Some(modified) = modified {
-                        metadata = metadata.with_modified(*modified);
-                    }
-                    metadata
-                })
-                .collect())
-        }
-
-        fn delete_if_present(&self, _key: &ObjectKey) -> Result<DeleteOutcome, Self::Error> {
-            unreachable!("not used in tests")
-        }
-    }
 
     fn temp_key(nanos: u128, counter: u64) -> String {
         let prefix = &TEMP_TEST_HASH[..2];
@@ -1315,7 +1187,7 @@ mod tests {
         let old_embedded = u128::from(now_secs - 2 * 3600) * 1_000_000_000;
         let fresh_mtime = u64::try_from(u128::from(now_secs - 10) * 1_000_000_000).unwrap();
         let key = temp_key(old_embedded, 0);
-        let store = MockTempStore::new(vec![(key.as_str(), 42, Some(fresh_mtime))]);
+        let store = MetadataObjectStore::new(vec![(key.as_str(), 42, Some(fresh_mtime))]);
 
         let scan =
             scan_stale_temporary_artifacts(&store, &[ServerFrontend::Xet], now_secs).unwrap();
@@ -1335,7 +1207,7 @@ mod tests {
         let old_nanos = u128::from(now_secs - 2 * 3600) * 1_000_000_000;
         let old_mtime = u64::try_from(old_nanos).unwrap();
         let key = temp_key(old_nanos, 0);
-        let store = MockTempStore::new(vec![(key.as_str(), 42, Some(old_mtime))]);
+        let store = MetadataObjectStore::new(vec![(key.as_str(), 42, Some(old_mtime))]);
 
         let scan =
             scan_stale_temporary_artifacts(&store, &[ServerFrontend::Xet], now_secs).unwrap();
@@ -1355,7 +1227,7 @@ mod tests {
         let fresh_embedded = u128::from(now_secs) * 1_000_000_000;
         let stale_key = temp_key(old_embedded, 0);
         let fresh_key = temp_key(fresh_embedded, 1);
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (stale_key.as_str(), 42, None),
             (fresh_key.as_str(), 7, None),
         ]);
@@ -1398,7 +1270,7 @@ mod tests {
         let old_mtime = u64::try_from(old_nanos).unwrap();
         let xorb_key = xorb_temp_key(old_nanos, 0);
         let shard_key = shard_temp_key(old_nanos, 1);
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (xorb_key.as_str(), 512, Some(old_mtime)),
             (shard_key.as_str(), 64, Some(old_mtime)),
         ]);
@@ -1439,7 +1311,7 @@ mod tests {
             XORB_TEMP_TEST_HASH
         );
         let chunk_live = format!("{}/{}", &XORB_TEMP_TEST_HASH[..2], XORB_TEMP_TEST_HASH);
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (xorb_live.as_str(), 512, Some(old_mtime)),
             (shard_live.as_str(), 64, Some(old_mtime)),
             (chunk_live.as_str(), 32, Some(old_mtime)),
@@ -1475,7 +1347,7 @@ mod tests {
             "xorbs/default/aa/{}.xorb.tmp-{old_embedded}-3",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (user_key.as_str(), 10, Some(old_mtime)),
             (non_managed_key.as_str(), 11, Some(old_mtime)),
             (short_hash_xorb.as_str(), 12, Some(old_mtime)),
@@ -1558,7 +1430,7 @@ mod tests {
         let live_key = crate::quarantine::GC_CLOCK_BOOT_OBSERVATION_KEY;
         let temp_key = format!("{live_key}.tmp-{old_nanos}-0");
         let old_mtime = u64::try_from(old_nanos).unwrap();
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (live_key, 50, Some(old_mtime)),
             (temp_key.as_str(), 50, Some(old_mtime)),
         ]);
@@ -1585,7 +1457,7 @@ mod tests {
         let old_mtime = u64::try_from(old_nanos).unwrap();
         let sidecar_key = xorb_chunks_temp_key(old_nanos, 0);
         let anchor_key = anchor_temp_key(old_nanos, 1);
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (sidecar_key.as_str(), 42, Some(old_mtime)),
             (anchor_key.as_str(), 7, Some(old_mtime)),
         ]);
@@ -1630,7 +1502,7 @@ mod tests {
             &SIDECAR_TEMP_TEST_HASH[..2],
             SIDECAR_TEMP_TEST_HASH
         );
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (sidecar_live.as_str(), 512, Some(old_mtime)),
             (anchor_live, 19, Some(old_mtime)),
             (chunk_live.as_str(), 32, Some(old_mtime)),
@@ -1669,7 +1541,7 @@ mod tests {
         let prefix_mismatch_hash = format!("bb{}", "0".repeat(62));
         let prefix_mismatch_sidecar =
             format!("_xorb_chunks/aa/{prefix_mismatch_hash}.tmp-{old_embedded}-5");
-        let store = MockTempStore::new(vec![
+        let store = MetadataObjectStore::new(vec![
             (user_key.as_str(), 10, Some(old_mtime)),
             (other_gc_key.as_str(), 11, Some(old_mtime)),
             (anchor_like_key.as_str(), 12, Some(old_mtime)),

@@ -13,7 +13,7 @@ inputs:
   cargo-tools:
     description: Comma-separated cargo-installable tools for CI.
     required: false
-    default: cargo-make,cargo-nextest
+    default: cargo-make,cargo-nextest@0.9.123
 
 runs:
   using: composite
@@ -24,27 +24,7 @@ runs:
       run: |
         set -euo pipefail
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends clang llvm-dev libclang-dev jq ripgrep
-
-        llvm_config_bin="$(command -v llvm-config || true)"
-        if [[ -z "${llvm_config_bin}" ]]; then
-          llvm_config_bin="$(
-            compgen -c \
-              | grep -E '^llvm-config-[0-9]+$' \
-              | sort -V \
-              | tail -n 1 \
-              || true
-          )"
-        fi
-
-        if [[ -n "${llvm_config_bin}" ]]; then
-          llvm_config_path="$(command -v "${llvm_config_bin}")"
-          echo "LLVM_CONFIG_PATH=${llvm_config_path}" >> "${GITHUB_ENV}"
-          llvm_libdir="$("${llvm_config_path}" --libdir || true)"
-          if [[ -n "${llvm_libdir}" ]]; then
-            echo "LIBCLANG_PATH=${llvm_libdir}" >> "${GITHUB_ENV}"
-          fi
-        fi
+        sudo apt-get install -y --no-install-recommends clang jq ripgrep
 
     - name: Install Rust toolchain
       if: ${{ inputs.install-rust-toolchain == 'true' }}
@@ -58,6 +38,7 @@ runs:
         shared-key: "shardline-shared-cache"
 
     - name: Install cargo tools
+      if: ${{ inputs.cargo-tools != '' }}
       uses: taiki-e/install-action@v2
       with:
         tool: ${{ inputs.cargo-tools }}

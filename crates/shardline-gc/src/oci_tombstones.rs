@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 
 use shardline_index::{
-    FileRecord, LocalRecordStore, OciObjectKey, OciObjectKind, OciObjectStore, PostgresRecordStore,
-    RecordStore, RecordTraversal,
+    FileRecord, LocalRecordStore, OciObjectKey, OciObjectKind, OciObjectStore, OciObjectTombstone,
+    PostgresRecordStore, RecordStore, RecordTraversal,
 };
 use shardline_oci_adapter::{
     oci_blob_key_from_namespace, oci_manifest_key_from_namespace,
@@ -32,35 +31,44 @@ pub(crate) struct OciTombstoneGcReport {
 }
 
 #[doc(hidden)]
-#[async_trait]
 pub trait OciRecordReclaimer {
-    async fn delete_protocol_record(&self, record: &FileRecord) -> Result<(), GcError>;
+    fn delete_protocol_record(
+        &self,
+        record: &FileRecord,
+    ) -> impl std::future::Future<Output = Result<(), GcError>> + Send;
 }
 
-async fn latest_records_by_file_id<RecordAdapter>(
+async fn blob_records_for_tombstones<RecordAdapter>(
     record_store: &RecordAdapter,
-) -> Result<HashMap<String, FileRecord>, GcError>
+    tombstones: &[OciObjectTombstone],
+) -> Result<HashMap<String, Option<FileRecord>>, GcError>
 where
     RecordAdapter: RecordTraversal + Sync,
     RecordAdapter::Error: Into<GcError>,
 {
     let mut records = HashMap::new();
-    for locator in record_store
-        .list_latest_record_locators()
-        .await
-        .map_err(Into::into)?
+    for tombstone in tombstones
+        .iter()
+        .filter(|entry| entry.key.kind == OciObjectKind::Blob)
     {
-        let bytes = record_store
-            .read_record_bytes(&locator)
-            .await
-            .map_err(Into::into)?;
-        let record = parse_stored_file_record_bytes(&bytes)?;
-        records.insert(record.file_id.clone(), record);
+        let key = &tombstone.key;
+        let object_key =
+            oci_blob_key_from_namespace(&key.repository, &key.digest_hex, &key.scope_namespace)?;
+        records.insert(protocol_object_file_id(&object_key), None);
     }
+    record_store
+        .visit_latest_records(|entry| {
+            // Validate every record, but retain only metadata needed for reclamation.
+            let record = parse_stored_file_record_bytes(&entry.bytes)?;
+            if let Some(slot) = records.get_mut(&record.file_id) {
+                *slot = Some(record);
+            }
+            Ok::<(), GcError>(())
+        })
+        .await?;
     Ok(records)
 }
 
-#[async_trait]
 impl OciRecordReclaimer for LocalRecordStore {
     async fn delete_protocol_record(&self, record: &FileRecord) -> Result<(), GcError> {
         self.delete_file_version_metadata(record).await?;
@@ -68,7 +76,6 @@ impl OciRecordReclaimer for LocalRecordStore {
     }
 }
 
-#[async_trait]
 impl OciRecordReclaimer for PostgresRecordStore {
     async fn delete_protocol_record(&self, record: &FileRecord) -> Result<(), GcError> {
         self.delete_file_version_metadata(record).await?;
@@ -117,7 +124,7 @@ where
         scanned: u64::try_from(tombstones.len())?,
         ..OciTombstoneGcReport::default()
     };
-    if !options.sweep {
+    if !options.sweep || tombstones.is_empty() {
         return Ok(report);
     }
 
@@ -137,7 +144,7 @@ where
         return Ok(report);
     }
     let held_keys = read_active_retention_hold_object_keys(index_store, now, false).await?;
-    let mut latest_records = latest_records_by_file_id(record_store).await?;
+    let mut latest_records = blob_records_for_tombstones(record_store, &tombstones).await?;
 
     for tombstone in tombstones {
         let Some(delete_after) = tombstone
@@ -150,43 +157,22 @@ where
             continue;
         }
         let key = &tombstone.key;
+        let object_keys = tombstone_object_keys(key)?;
         // Tombstone reclamation precedes ordinary GC, so it must enforce holds
         // itself. Keep the whole manifest pair if either object is held and
         // retain the tombstone for reclamation after the hold is released.
-        if tombstone_has_active_hold(index_store, key, &held_keys, now).await? {
+        if tombstone_has_active_hold(index_store, &object_keys, &held_keys, now).await? {
             continue;
         }
         report.eligible = shardline_server_core::checked_increment(report.eligible)?;
 
-        match key.kind {
-            OciObjectKind::Blob => {
-                let object_key = oci_blob_key_from_namespace(
-                    &key.repository,
-                    &key.digest_hex,
-                    &key.scope_namespace,
-                )?;
-                crate::remote_delete::delete_gc_object(object_store, &object_key, remote_guard)
-                    .await?;
-                let file_id = protocol_object_file_id(&object_key);
-                if let Some(record) = latest_records.remove(&file_id) {
+        for object_key in &object_keys {
+            crate::remote_delete::delete_gc_object(object_store, object_key, remote_guard).await?;
+            if key.kind == OciObjectKind::Blob {
+                let file_id = protocol_object_file_id(object_key);
+                if let Some(record) = latest_records.remove(&file_id).flatten() {
                     record_store.delete_protocol_record(&record).await?;
                 }
-            }
-            OciObjectKind::Manifest => {
-                let manifest_key = oci_manifest_key_from_namespace(
-                    &key.repository,
-                    &key.digest_hex,
-                    &key.scope_namespace,
-                )?;
-                crate::remote_delete::delete_gc_object(object_store, &manifest_key, remote_guard)
-                    .await?;
-                let media_type_key = oci_manifest_media_type_key_from_namespace(
-                    &key.repository,
-                    &key.digest_hex,
-                    &key.scope_namespace,
-                )?;
-                crate::remote_delete::delete_gc_object(object_store, &media_type_key, remote_guard)
-                    .await?;
             }
         }
 
@@ -201,17 +187,8 @@ where
     Ok(report)
 }
 
-async fn tombstone_has_active_hold<IndexAdapter>(
-    index_store: &IndexAdapter,
-    key: &OciObjectKey,
-    held_keys: &HashSet<String>,
-    now: u64,
-) -> Result<bool, GcError>
-where
-    IndexAdapter: shardline_index::AsyncIndexStore + Sync,
-    IndexAdapter::Error: Into<GcError>,
-{
-    let keys = match key.kind {
+fn tombstone_object_keys(key: &OciObjectKey) -> Result<Vec<shardline_storage::ObjectKey>, GcError> {
+    Ok(match key.kind {
         OciObjectKind::Blob => vec![oci_blob_key_from_namespace(
             &key.repository,
             &key.digest_hex,
@@ -229,7 +206,19 @@ where
                 &key.scope_namespace,
             )?,
         ],
-    };
+    })
+}
+
+async fn tombstone_has_active_hold<IndexAdapter>(
+    index_store: &IndexAdapter,
+    keys: &[shardline_storage::ObjectKey],
+    held_keys: &HashSet<String>,
+    now: u64,
+) -> Result<bool, GcError>
+where
+    IndexAdapter: shardline_index::AsyncIndexStore + Sync,
+    IndexAdapter::Error: Into<GcError>,
+{
     for object_key in keys {
         // Recheck for callers that supplied equivalent writer exclusion around
         // the low-level GC entrypoint, including the manifest companion.
@@ -237,7 +226,7 @@ where
         // whole operation; this lookup alone cannot synchronize deletion.
         if held_keys.contains(object_key.as_str())
             || index_store
-                .retention_hold(&object_key)
+                .retention_hold(object_key)
                 .await
                 .map_err(Into::into)?
                 .is_some_and(|hold| hold.is_active_at(now))
@@ -322,6 +311,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn empty_tombstone_inventory_skips_records_but_pending_reclamation_validates_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let object_store = ServerObjectStore::local(root.join("chunks")).unwrap();
+        let index_store = LocalIndexStore::new(root.clone()).unwrap();
+        let blocked_root = root.join("unavailable-records");
+        std::fs::write(&blocked_root, b"not a directory").unwrap();
+        let record_store = LocalRecordStore::open(blocked_root);
+        assert!(
+            blob_records_for_tombstones(&record_store, &[])
+                .await
+                .is_err()
+        );
+
+        let report =
+            reclaim_oci_tombstones(&record_store, &index_store, &object_store, sweep_now())
+                .await
+                .unwrap();
+        assert_eq!(report, OciTombstoneGcReport::default());
+        // The shortcut skips only OCI's extra scan; ordinary GC still validates records.
+        assert!(
+            run_gc_with_oci_tombstones(
+                &record_store,
+                &index_store,
+                &object_store,
+                &[],
+                sweep_now()
+            )
+            .await
+            .is_err()
+        );
+
+        let digest = "a".repeat(64);
+        let key = oci_blob_key_from_namespace("team/assets", &digest, "global").unwrap();
+        put(&object_store, &key, b"retained blob");
+        let object = tombstone(OciObjectKind::Blob, &digest);
+        index_store.delete_oci_object(&object).await.unwrap();
+        assert!(
+            reclaim_oci_tombstones(&record_store, &index_store, &object_store, sweep_now())
+                .await
+                .is_err()
+        );
+        assert!(object_store.contains(&key).unwrap());
+        assert!(index_store.oci_object_is_deleted(&object).await.unwrap());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn manifest_reclamation_is_retained_then_idempotently_removes_both_objects() {
         let directory = tempfile::tempdir().unwrap();
@@ -394,8 +430,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(snapshot.is_empty());
+            let object_keys = tombstone_object_keys(&object).unwrap();
             assert!(
-                !tombstone_has_active_hold(&index_store, &object, &snapshot, now)
+                !tombstone_has_active_hold(&index_store, &object_keys, &snapshot, now)
                     .await
                     .unwrap()
             );
@@ -421,7 +458,7 @@ mod tests {
             // This is the exact predicate guarding physical deletion, supplied
             // with the stale run-start snapshot and the updated real index.
             assert!(
-                tombstone_has_active_hold(&index_store, &object, &snapshot, now)
+                tombstone_has_active_hold(&index_store, &object_keys, &snapshot, now)
                     .await
                     .unwrap()
             );
@@ -532,6 +569,7 @@ mod tests {
         put(&object_store, &chunk_key, chunk_bytes);
 
         let record = |file_id: String, content_hash: char| FileRecord {
+            deduplication_domain: None,
             file_id,
             content_hash: content_hash.to_string().repeat(64),
             total_bytes: u64::try_from(chunk_bytes.len()).unwrap(),
@@ -560,6 +598,20 @@ mod tests {
             .delete_oci_object(&tombstone(OciObjectKind::Blob, &digest_hex))
             .await
             .unwrap();
+
+        let pending = index_store.list_oci_object_tombstones().await.unwrap();
+        let retained = blob_records_for_tombstones(&record_store, &pending)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.len(),
+            1,
+            "unrelated records must not accumulate in GC memory"
+        );
+        assert_eq!(
+            retained[&deleted_file_id].as_ref().unwrap().file_id,
+            deleted_file_id
+        );
 
         let diagnostics = run_gc_with_oci_tombstones(
             &record_store,

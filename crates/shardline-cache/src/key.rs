@@ -32,7 +32,7 @@ impl RepositoryScopeCacheKey {
     #[must_use]
     pub fn from_scope(scope: &RepositoryScope) -> Self {
         Self {
-            provider: provider_token(scope.provider()),
+            provider: scope.provider().as_str(),
             owner: Arc::from(scope.owner()),
             repo: Arc::from(scope.name()),
             revision: scope.revision().map(Arc::from),
@@ -73,7 +73,7 @@ impl RepositoryScopeCacheKey {
             "gitlab" => RepositoryProvider::GitLab,
             "codeberg" => RepositoryProvider::Codeberg,
             // Unreachable by construction: `provider` is only ever populated
-            // from `RepositoryProvider::as_str()` via `provider_token`. Kept as
+            // from `RepositoryProvider::as_str()`. Kept as
             // a lint-safe fallback (no unwrap/panic) to keep the match exhaustive.
             _other => RepositoryProvider::Generic,
         }
@@ -99,10 +99,11 @@ impl RepositoryScopeCacheKey {
 }
 
 /// Stable cache key for one file reconstruction response.
+/// Clones share immutable identity strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReconstructionCacheKey {
-    file_id: String,
-    content_hash: Option<String>,
+    file_id: Arc<str>,
+    content_hash: Option<Arc<str>>,
     repository_scope: Option<RepositoryScopeCacheKey>,
 }
 
@@ -138,7 +139,7 @@ impl ReconstructionCacheKey {
     #[must_use]
     pub fn latest(file_id: &str, repository_scope: Option<&RepositoryScope>) -> Self {
         Self {
-            file_id: file_id.to_owned(),
+            file_id: Arc::from(file_id),
             content_hash: None,
             repository_scope: repository_scope.map(RepositoryScopeCacheKey::from_scope),
         }
@@ -170,8 +171,8 @@ impl ReconstructionCacheKey {
         repository_scope: Option<&RepositoryScope>,
     ) -> Self {
         Self {
-            file_id: file_id.to_owned(),
-            content_hash: Some(content_hash.to_owned()),
+            file_id: Arc::from(file_id),
+            content_hash: Some(Arc::from(content_hash)),
             repository_scope: repository_scope.map(RepositoryScopeCacheKey::from_scope),
         }
     }
@@ -195,307 +196,86 @@ impl ReconstructionCacheKey {
     }
 }
 
-const fn provider_token(provider: RepositoryProvider) -> &'static str {
-    match provider {
-        RepositoryProvider::GitHub => "github",
-        RepositoryProvider::Gitea => "gitea",
-        RepositoryProvider::GitLab => "gitlab",
-        RepositoryProvider::Codeberg => "codeberg",
-        RepositoryProvider::Generic => "generic",
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use shardline_protocol::{RepositoryProvider, RepositoryScope};
 
-    use super::{ReconstructionCacheKey, RepositoryScopeCacheKey, provider_token};
+    use super::{ReconstructionCacheKey, RepositoryScopeCacheKey};
+
+    const PROVIDERS: [(RepositoryProvider, &str); 5] = [
+        (RepositoryProvider::GitHub, "github"),
+        (RepositoryProvider::GitLab, "gitlab"),
+        (RepositoryProvider::Gitea, "gitea"),
+        (RepositoryProvider::Codeberg, "codeberg"),
+        (RepositoryProvider::Generic, "generic"),
+    ];
 
     #[test]
-    fn cache_key_keeps_version_and_scope_components() {
-        let scope =
-            RepositoryScope::new(RepositoryProvider::GitHub, "team", "assets", Some("main"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
+    fn cache_key_clones_share_immutable_identity_and_preserve_lookup() {
+        use std::{collections::HashMap, sync::Arc};
 
-        let latest = ReconstructionCacheKey::latest("asset.bin", Some(&scope));
-        let version = ReconstructionCacheKey::version("asset.bin", "deadbeef", Some(&scope));
-
-        assert_eq!(latest.file_id(), "asset.bin");
-        assert_eq!(latest.content_hash(), None);
-        assert_eq!(version.content_hash(), Some("deadbeef"));
-        let latest_scope = latest.repository_scope();
-        assert!(latest_scope.is_some());
-        let Some(latest_scope) = latest_scope else {
-            return;
-        };
-        assert_eq!(latest_scope.owner(), "team");
-        assert_eq!(latest_scope.repo(), "assets");
-        assert_eq!(latest_scope.provider(), "github");
-        assert_eq!(latest_scope.revision(), Some("main"));
-    }
-
-    // ── None scope ───────────────────────────────────────────────────────
-
-    #[test]
-    fn cache_key_without_scope() {
-        let latest = ReconstructionCacheKey::latest("file.bin", None);
-        assert_eq!(latest.file_id(), "file.bin");
-        assert_eq!(latest.content_hash(), None);
-        assert!(latest.repository_scope().is_none());
-    }
-
-    #[test]
-    fn cache_key_version_without_scope() {
-        let version = ReconstructionCacheKey::version("file.bin", "abc123", None);
-        assert_eq!(version.file_id(), "file.bin");
-        assert_eq!(version.content_hash(), Some("abc123"));
-        assert!(version.repository_scope().is_none());
-    }
-
-    // ── All provider tokens ──────────────────────────────────────────────
-
-    #[test]
-    fn provider_token_all_variants() {
-        assert_eq!(provider_token(RepositoryProvider::GitHub), "github");
-        assert_eq!(provider_token(RepositoryProvider::Gitea), "gitea");
-        assert_eq!(provider_token(RepositoryProvider::GitLab), "gitlab");
-        assert_eq!(provider_token(RepositoryProvider::Codeberg), "codeberg");
-        assert_eq!(provider_token(RepositoryProvider::Generic), "generic");
-    }
-
-    // ── Scope with no revision ───────────────────────────────────────────
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn cache_key_scope_without_revision() {
-        let scope = RepositoryScope::new(RepositoryProvider::GitLab, "group", "project", None);
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let latest = ReconstructionCacheKey::latest("doc.pdf", Some(&scope));
-        let scope_key = latest.repository_scope().unwrap();
-        assert_eq!(scope_key.provider(), "gitlab");
-        assert_eq!(scope_key.owner(), "group");
-        assert_eq!(scope_key.repo(), "project");
-        assert_eq!(scope_key.revision(), None);
-    }
-
-    // ── RepositoryScopeCacheKey from_scope ───────────────────────────────
-
-    #[test]
-    fn repository_scope_cache_key_from_scope() {
-        let scope = RepositoryScope::new(RepositoryProvider::Codeberg, "user", "repo", Some("v1"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let scope_key = RepositoryScopeCacheKey::from_scope(&scope);
-        assert_eq!(scope_key.provider(), "codeberg");
-        assert_eq!(scope_key.owner(), "user");
-        assert_eq!(scope_key.repo(), "repo");
-        assert_eq!(scope_key.revision(), Some("v1"));
-    }
-
-    // ── latest with all provider combinations ────────────────────────────
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn cache_key_latest_with_each_provider() {
-        let providers = [
-            (RepositoryProvider::GitHub, "github"),
-            (RepositoryProvider::GitLab, "gitlab"),
-            (RepositoryProvider::Gitea, "gitea"),
-            (RepositoryProvider::Codeberg, "codeberg"),
-            (RepositoryProvider::Generic, "generic"),
-        ];
-        for (provider, expected_token) in &providers {
-            let scope = RepositoryScope::new(*provider, "owner", "repo", Some("branch"));
-            assert!(scope.is_ok(), "scope creation failed for {expected_token}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let key = ReconstructionCacheKey::latest("file.bin", Some(&scope));
-            let scope_key = key.repository_scope().unwrap();
-            assert_eq!(scope_key.provider(), *expected_token);
-            assert_eq!(scope_key.owner(), "owner");
-            assert_eq!(scope_key.repo(), "repo");
-            assert_eq!(scope_key.revision(), Some("branch"));
-            assert_eq!(key.file_id(), "file.bin");
-            assert_eq!(key.content_hash(), None);
-        }
-    }
-
-    // ── version with all provider combinations ───────────────────────────
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn cache_key_version_with_each_provider() {
-        let providers = [
-            (RepositoryProvider::GitHub, "github"),
-            (RepositoryProvider::GitLab, "gitlab"),
-            (RepositoryProvider::Gitea, "gitea"),
-            (RepositoryProvider::Codeberg, "codeberg"),
-            (RepositoryProvider::Generic, "generic"),
-        ];
-        for (provider, expected_token) in &providers {
-            let scope = RepositoryScope::new(*provider, "org", "project", None);
-            assert!(scope.is_ok(), "scope creation failed for {expected_token}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let key = ReconstructionCacheKey::version("ver.bin", "hash123", Some(&scope));
-            let scope_key = key.repository_scope().unwrap();
-            assert_eq!(scope_key.provider(), *expected_token);
-            assert_eq!(scope_key.owner(), "org");
-            assert_eq!(scope_key.repo(), "project");
-            assert_eq!(scope_key.revision(), None);
-            assert_eq!(key.file_id(), "ver.bin");
-            assert_eq!(key.content_hash(), Some("hash123"));
-        }
-    }
-
-    // ── empty values in constructors ─────────────────────────────────────
-
-    #[test]
-    fn cache_key_latest_with_empty_file_id() {
-        let key = ReconstructionCacheKey::latest("", None);
-        assert_eq!(key.file_id(), "");
-        assert_eq!(key.content_hash(), None);
-        assert!(key.repository_scope().is_none());
-    }
-
-    #[test]
-    fn cache_key_version_with_empty_content_hash() {
-        let key = ReconstructionCacheKey::version("f", "", None);
-        assert_eq!(key.file_id(), "f");
-        assert_eq!(key.content_hash(), Some(""));
-        assert!(key.repository_scope().is_none());
-    }
-
-    #[allow(clippy::unwrap_used)]
-    #[test]
-    fn cache_key_version_with_each_provider_no_revision() {
-        let providers = [
-            RepositoryProvider::GitHub,
-            RepositoryProvider::GitLab,
-            RepositoryProvider::Gitea,
-            RepositoryProvider::Codeberg,
-            RepositoryProvider::Generic,
-        ];
-        for provider in &providers {
-            let scope = RepositoryScope::new(*provider, "ns", "name", None);
-            assert!(scope.is_ok(), "scope creation failed for {provider:?}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let key = ReconstructionCacheKey::version("v.bin", "abc", Some(&scope));
-            let scope_key = key.repository_scope().unwrap();
-            assert_eq!(
-                scope_key.revision(),
-                None,
-                "revision should be None for {provider:?}"
+        for content_hash in [None, Some("content-hash")] {
+            let key = content_hash.map_or_else(
+                || ReconstructionCacheKey::latest("file.bin", None),
+                |hash| ReconstructionCacheKey::version("file.bin", hash, None),
             );
+            let cloned = key.clone();
+            assert!(Arc::ptr_eq(&key.file_id, &cloned.file_id));
+            if let (Some(original), Some(copy)) = (&key.content_hash, &cloned.content_hash) {
+                assert!(Arc::ptr_eq(original, copy));
+            }
+            let mut entries = HashMap::new();
+            entries.insert(key, "payload");
+            assert_eq!(entries.get(&cloned), Some(&"payload"));
+            assert_eq!(cloned.content_hash(), content_hash);
         }
     }
 
     #[test]
-    fn repository_scope_cache_key_from_scope_with_all_providers() {
-        for provider in &[
-            RepositoryProvider::GitHub,
-            RepositoryProvider::GitLab,
-            RepositoryProvider::Gitea,
-            RepositoryProvider::Codeberg,
-            RepositoryProvider::Generic,
-        ] {
-            let scope = RepositoryScope::new(*provider, "owner", "repo", Some("main"));
-            assert!(scope.is_ok(), "scope creation failed for {provider:?}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let scope_key = RepositoryScopeCacheKey::from_scope(&scope);
-            assert_eq!(scope_key.owner(), "owner");
-            assert_eq!(scope_key.repo(), "repo");
-            assert_eq!(scope_key.revision(), Some("main"));
-        }
-    }
+    fn cache_key_constructors_preserve_distinct_file_version_and_scope_identity() {
+        use std::collections::HashSet;
 
-    #[test]
-    fn repository_scope_cache_key_from_scope_without_revision() {
-        for provider in &[
-            RepositoryProvider::GitHub,
-            RepositoryProvider::GitLab,
-            RepositoryProvider::Gitea,
-            RepositoryProvider::Codeberg,
-            RepositoryProvider::Generic,
-        ] {
-            let scope = RepositoryScope::new(*provider, "own", "proj", None);
-            assert!(scope.is_ok(), "scope creation failed for {provider:?}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let scope_key = RepositoryScopeCacheKey::from_scope(&scope);
-            assert_eq!(scope_key.owner(), "own");
-            assert_eq!(scope_key.repo(), "proj");
-            assert_eq!(scope_key.revision(), None);
-        }
-    }
-
-    #[test]
-    fn cache_key_latest_with_special_chars_in_file_id() {
-        let key = ReconstructionCacheKey::latest("file with spaces!@#.bin", None);
-        assert_eq!(key.file_id(), "file with spaces!@#.bin");
-        assert_eq!(key.content_hash(), None);
-    }
-
-    #[test]
-    fn cache_key_version_with_special_chars_in_hash() {
-        let key = ReconstructionCacheKey::version("f", "hash/with/slashes?", None);
-        assert_eq!(key.content_hash(), Some("hash/with/slashes?"));
-    }
-
-    #[test]
-    fn cache_key_latest_long_file_id() {
+        let repository =
+            RepositoryScope::new(RepositoryProvider::GitHub, "owner", "repo", Some("main"))
+                .unwrap();
         let long_id = "a".repeat(1000);
-        let key = ReconstructionCacheKey::latest(&long_id, None);
-        assert_eq!(key.file_id().len(), 1000);
-    }
-
-    #[test]
-    fn repository_scope_cache_key_provider_kind_roundtrip_all_variants() {
-        let providers = [
-            (RepositoryProvider::GitHub, "github"),
-            (RepositoryProvider::Gitea, "gitea"),
-            (RepositoryProvider::GitLab, "gitlab"),
-            (RepositoryProvider::Codeberg, "codeberg"),
-            (RepositoryProvider::Generic, "generic"),
-        ];
-        for (provider, token) in providers {
-            let scope = RepositoryScope::new(provider, "owner", "repo", None);
-            assert!(scope.is_ok(), "scope creation failed for {token}");
-            let Ok(scope) = scope else {
-                continue;
-            };
-            let scope_key = RepositoryScopeCacheKey::from_scope(&scope);
-            assert_eq!(scope_key.provider(), token);
-            assert_eq!(scope_key.provider_kind(), provider);
+        let mut keys = HashSet::new();
+        for scope in [None, Some(&repository)] {
+            let expected_scope = scope.map(RepositoryScopeCacheKey::from_scope);
+            for file_id in ["file.bin", "", "file with spaces!@#.bin", &long_id] {
+                for hash in [None, Some("hash123"), Some(""), Some("hash/with/slashes?")] {
+                    let key = hash.map_or_else(
+                        || ReconstructionCacheKey::latest(file_id, scope),
+                        |hash| ReconstructionCacheKey::version(file_id, hash, scope),
+                    );
+                    assert_eq!(key.file_id(), file_id);
+                    assert_eq!(key.content_hash(), hash);
+                    assert_eq!(key.repository_scope(), expected_scope.as_ref());
+                    assert!(keys.insert(key), "distinct identities must remain distinct");
+                }
+            }
         }
     }
 
     #[test]
-    fn cache_key_repository_scope_accessors() {
-        let scope = RepositoryScope::new(RepositoryProvider::GitHub, "org", "repo", Some("dev"));
-        assert!(scope.is_ok());
-        let Ok(scope) = scope else {
-            return;
-        };
-        let scope_key = RepositoryScopeCacheKey::from_scope(&scope);
-        assert_eq!(scope_key.provider(), "github");
-        assert_eq!(scope_key.owner(), "org");
-        assert_eq!(scope_key.repo(), "repo");
-        assert_eq!(scope_key.revision(), Some("dev"));
+    fn repository_scope_cache_keys_preserve_every_identity_component() {
+        use std::collections::HashSet;
+
+        let mut keys = HashSet::new();
+        for (provider, token) in PROVIDERS {
+            for revision in [None, Some("main")] {
+                for (owner, repo) in [("owner", "repo"), ("other", "repo"), ("owner", "other")] {
+                    let scope = RepositoryScope::new(provider, owner, repo, revision).unwrap();
+                    let key = RepositoryScopeCacheKey::from_scope(&scope);
+                    assert_eq!(key.provider(), token);
+                    assert_eq!(key.owner(), owner);
+                    assert_eq!(key.repo(), repo);
+                    assert_eq!(key.revision(), revision);
+                    assert_eq!(key.clone().provider_kind(), provider);
+                    assert!(keys.insert(key), "distinct scopes must remain distinct");
+                }
+            }
+        }
     }
 }

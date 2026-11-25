@@ -1,16 +1,18 @@
+mod inventory;
+
 use std::collections::HashMap;
 
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use shardline_protocol::{ChunkRange, RepositoryProvider, ShardlineHash};
 use shardline_reliability::{
-    EvidenceEventMetadata, LifecycleEvent, OperationKind, ProviderLifecycleEvent,
-    QuarantineEvidenceLog, QuarantineLifecycleState, QuarantineObjectIdentity, QuarantineSnapshot,
+    EvidenceEventMetadata, LifecycleEvent, OperationKind, QuarantineEvidenceLog,
+    QuarantineLifecycleState, QuarantineObjectIdentity, QuarantineSnapshot,
     ReliabilityMerkleCommit, RetentionEvidenceLog, RetentionHoldLifecycleState,
-    RetentionHoldSnapshot, RetentionObjectIdentity, SnapshotEvidence, WebhookDeliveryEvidenceLog,
-    WebhookDeliveryIdentity, WebhookDeliveryLifecycleState, WebhookDeliverySnapshot,
-    append_or_baseline_snapshot_evidence, baseline_upload_lifecycle_events,
-    persisted_event_identity, persisted_event_sequence,
+    RetentionHoldSnapshot, RetentionObjectIdentity, SnapshotEvidence, SnapshotEvidenceLog,
+    WebhookDeliveryEvidenceLog, WebhookDeliveryIdentity, WebhookDeliveryLifecycleState,
+    WebhookDeliverySnapshot, append_or_baseline_snapshot_evidence,
+    baseline_upload_lifecycle_events, persisted_event_identity, persisted_event_sequence,
     reliability_merkle_commit_json_with_previous, upload_lifecycle_event,
     upload_lifecycle_identity, verify_and_append_snapshot_transition,
     verify_and_reactivate_quarantine, verify_persisted_event_merkle_chain,
@@ -39,6 +41,97 @@ pub(crate) async fn load_postgres_latest_evidence_event(
     operation_kind: OperationKind,
     operation_id: &str,
 ) -> Result<Option<serde_json::Value>, PostgresMetadataStoreError> {
+    Ok(
+        load_postgres_latest_evidence_head(executor, operation_kind, operation_id)
+            .await?
+            .map(|head| head.event_json),
+    )
+}
+
+/// Loads one verified snapshot head, or an empty log when no boundary exists.
+pub(super) async fn load_postgres_snapshot_evidence<S>(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<SnapshotEvidenceLog<S>, PostgresMetadataStoreError>
+where
+    S: SnapshotEvidence + serde::de::DeserializeOwned,
+{
+    match load_postgres_latest_evidence_event(executor, operation_kind, operation_id).await? {
+        Some(event) => Ok(SnapshotEvidenceLog::from_head(serde_json::from_value(
+            event,
+        )?)?),
+        None => Ok(SnapshotEvidenceLog::default()),
+    }
+}
+
+pub(crate) async fn load_postgres_snapshot_evidence_for<S>(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    snapshot: &S,
+) -> Result<SnapshotEvidenceLog<S>, PostgresMetadataStoreError>
+where
+    S: SnapshotEvidence + serde::de::DeserializeOwned,
+{
+    let operation = snapshot.evidence_operation()?;
+    load_postgres_snapshot_evidence(executor, operation.kind, &operation.operation_id).await
+}
+
+pub(super) struct PostgresEvidenceHead {
+    pub(super) event_json: serde_json::Value,
+    pub(super) merkle_commit_json: Option<serde_json::Value>,
+}
+
+/// Checks the durable row identity and sequence before its event is used.
+fn verify_postgres_event_row(
+    row: &PgRow,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<(u64, serde_json::Value), PostgresMetadataStoreError> {
+    let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|error| {
+        PostgresMetadataStoreError::IntegerOutOfRange(format!("reliability sequence: {error}"))
+    })?;
+    let event_json: serde_json::Value = row.try_get("event_json")?;
+    if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
+        return Err(PostgresMetadataStoreError::Reliability(
+            shardline_reliability::ReliabilityError::Merkle(
+                "reliability row sequence does not match its event".into(),
+            ),
+        ));
+    }
+    let identity = persisted_event_identity(operation_kind, event_json.clone())?;
+    if identity.kind != operation_kind || identity.operation_id != operation_id {
+        return Err(PostgresMetadataStoreError::Reliability(
+            shardline_reliability::ReliabilityError::OperationMismatch,
+        ));
+    }
+    Ok((sequence, event_json))
+}
+
+fn verify_postgres_evidence_head(
+    row: &PgRow,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<PostgresEvidenceHead, PostgresMetadataStoreError> {
+    let (_, event_json) = verify_postgres_event_row(row, operation_kind, operation_id)?;
+    let merkle_commit_json: Option<serde_json::Value> = row.try_get("merkle_commit_json")?;
+    verify_persisted_merkle_commit_with_previous(
+        operation_kind,
+        event_json.clone(),
+        merkle_commit_json.clone(),
+        row.try_get("previous_merkle_commit_json")?,
+    )?;
+    Ok(PostgresEvidenceHead {
+        event_json,
+        merkle_commit_json,
+    })
+}
+
+/// Loads the verified event and its commitment from the same database snapshot.
+pub(super) async fn load_postgres_latest_evidence_head(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<Option<PostgresEvidenceHead>, PostgresMetadataStoreError> {
     let row = query(
         "SELECT latest.sequence, latest.event_json, latest.merkle_commit_json,
                 CASE WHEN EXISTS (
@@ -72,30 +165,7 @@ pub(crate) async fn load_postgres_latest_evidence_event(
     let Some(row) = row else {
         return Ok(None);
     };
-    let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|error| {
-        PostgresMetadataStoreError::IntegerOutOfRange(format!("reliability sequence: {error}"))
-    })?;
-    let event_json: serde_json::Value = row.try_get("event_json")?;
-    if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
-        return Err(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::Merkle(
-                "reliability row sequence does not match its event".into(),
-            ),
-        ));
-    }
-    let identity = persisted_event_identity(operation_kind, event_json.clone())?;
-    if identity.operation_id != operation_id {
-        return Err(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ));
-    }
-    verify_persisted_merkle_commit_with_previous(
-        operation_kind,
-        event_json.clone(),
-        row.try_get("merkle_commit_json")?,
-        row.try_get("previous_merkle_commit_json")?,
-    )?;
-    Ok(Some(event_json))
+    verify_postgres_evidence_head(&row, operation_kind, operation_id).map(Some)
 }
 
 /// Loads and verifies the current evidence boundary for many operations in a
@@ -152,36 +222,57 @@ pub(crate) async fn load_postgres_latest_evidence_heads(
     .await?;
     let mut heads = HashMap::with_capacity(operation_ids.len());
     for row in rows {
-        let Some(sequence) = row.try_get::<Option<i64>, _>("sequence")? else {
+        let Some(_) = row.try_get::<Option<i64>, _>("sequence")? else {
             continue;
         };
-        let sequence = u64::try_from(sequence).map_err(|error| {
-            PostgresMetadataStoreError::IntegerOutOfRange(format!("reliability sequence: {error}"))
-        })?;
         let operation_id: String = row.try_get("operation_id")?;
-        let event_json: serde_json::Value = row.try_get("event_json")?;
-        if persisted_event_sequence(operation_kind, event_json.clone())? != sequence {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::Merkle(
-                    "reliability row sequence does not match its event".into(),
-                ),
-            ));
-        }
-        let identity = persisted_event_identity(operation_kind, event_json.clone())?;
-        if identity.operation_id != operation_id {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ));
-        }
-        verify_persisted_merkle_commit_with_previous(
-            operation_kind,
-            event_json.clone(),
-            row.try_get("merkle_commit_json")?,
-            row.try_get("previous_merkle_commit_json")?,
-        )?;
-        heads.insert(operation_id, event_json);
+        let head = verify_postgres_evidence_head(&row, operation_kind, &operation_id)?;
+        heads.insert(operation_id, head.event_json);
     }
     Ok(heads)
+}
+
+/// Reads an ordered journal and verifies its row keys and complete Merkle chain
+/// before returning typed events. Callers retain their transaction and domain
+/// checks against the authoritative upload intent or resumable session.
+pub(super) async fn load_postgres_reliability_events<T: serde::de::DeserializeOwned>(
+    connection: &mut PgConnection,
+    operation_kind: OperationKind,
+    operation_id: &str,
+) -> Result<Vec<T>, PostgresMetadataStoreError> {
+    let rows = query(
+        "SELECT sequence, event_json, merkle_commit_json
+         FROM shardline_reliability_events
+         WHERE operation_kind = $1 AND operation_id = $2 ORDER BY sequence",
+    )
+    .bind(operation_kind.as_str())
+    .bind(operation_id)
+    .fetch_all(connection)
+    .await?;
+    let mut sequences = Vec::with_capacity(rows.len());
+    let mut events = Vec::with_capacity(rows.len());
+    let mut commitments = Vec::with_capacity(rows.len());
+    for row in rows {
+        sequences.push(
+            u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|error| {
+                PostgresMetadataStoreError::IntegerOutOfRange(format!(
+                    "reliability sequence: {error}"
+                ))
+            })?,
+        );
+        events.push(row.try_get("event_json")?);
+        commitments.push(row.try_get("merkle_commit_json")?);
+    }
+    verify_persisted_event_merkle_chain_with_sequences(
+        operation_kind,
+        &sequences,
+        &events,
+        &commitments,
+    )?;
+    events
+        .into_iter()
+        .map(|event| serde_json::from_value(event).map_err(Into::into))
+        .collect()
 }
 
 async fn verify_postgres_quarantine_evidence_batch(
@@ -291,6 +382,72 @@ async fn verify_postgres_webhook_evidence_batch(
     Ok(())
 }
 
+type UploadIntentRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+fn upload_intent_from_row(
+    (id, key, hash, length, state_str, created, updated): UploadIntentRow,
+) -> Result<UploadIntent, PostgresMetadataStoreError> {
+    let state = UploadIntentState::parse(&state_str).ok_or(
+        PostgresMetadataStoreError::InvalidUploadIntentState(state_str),
+    )?;
+    Ok(UploadIntent::from_parts(
+        id,
+        key,
+        hash,
+        i64_to_u64(length)?,
+        state,
+        std::time::Duration::from_secs(i64_to_u64(created.timestamp())?),
+        std::time::Duration::from_secs(i64_to_u64(updated.timestamp())?),
+    ))
+}
+
+/// Decode and verify a complete listing inside the caller's read snapshot.
+async fn verified_upload_intent_listing(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    rows: Vec<UploadIntentRow>,
+) -> Result<Vec<UploadIntent>, PostgresMetadataStoreError> {
+    let intents = rows
+        .into_iter()
+        .map(upload_intent_from_row)
+        .collect::<Result<Vec<_>, PostgresMetadataStoreError>>()?;
+    let operation_ids = intents
+        .iter()
+        .map(|intent| intent.intent_id().to_owned())
+        .collect::<Vec<_>>();
+    let heads = load_postgres_latest_evidence_heads(
+        &mut **transaction,
+        OperationKind::Upload,
+        &operation_ids,
+    )
+    .await?;
+    for intent in &intents {
+        let event_json = heads.get(intent.intent_id()).ok_or_else(|| {
+            PostgresMetadataStoreError::Reliability(
+                shardline_reliability::ReliabilityError::OperationMismatch,
+            )
+        })?;
+        let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
+        verify_upload_lifecycle_head(
+            &event,
+            event.operation.tenant.as_str(),
+            event.operation.repository.as_str(),
+            intent.intent_id(),
+            intent.object_key(),
+            intent.object_hash(),
+            intent.state(),
+        )?;
+    }
+    Ok(intents)
+}
+
 async fn verify_postgres_intent_evidence(
     store: &super::PostgresIndexStore,
     intent: &crate::UploadIntent,
@@ -361,20 +518,7 @@ async fn verify_postgres_provider_evidence(
     state: &ProviderRepositoryState,
 ) -> Result<(), PostgresMetadataStoreError> {
     let snapshot = crate::provider_evidence::snapshot_from_state(state)?;
-    let operation_id = snapshot.evidence_operation()?.operation_id;
-    let Some(event) = load_postgres_latest_evidence_event(
-        &store.pool,
-        OperationKind::ProviderEvent,
-        &operation_id,
-    )
-    .await?
-    else {
-        return Err(PostgresMetadataStoreError::Reliability(
-            shardline_reliability::ReliabilityError::OperationMismatch,
-        ));
-    };
-    let event = serde_json::from_value::<ProviderLifecycleEvent>(event)?;
-    let evidence = shardline_reliability::ProviderEvidenceLog::from_head(event)?;
+    let evidence = load_postgres_snapshot_evidence_for(&store.pool, &snapshot).await?;
     verify_snapshot_evidence(&evidence, &snapshot)?;
     Ok(())
 }
@@ -424,30 +568,14 @@ async fn load_postgres_quarantine_evidence(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     object_key: &str,
 ) -> Result<QuarantineEvidenceLog, PostgresMetadataStoreError> {
-    let event =
-        load_postgres_latest_evidence_event(executor, OperationKind::GarbageCollection, object_key)
-            .await?;
-    let Some(event) = event else {
-        return Ok(QuarantineEvidenceLog::default());
-    };
-    Ok(QuarantineEvidenceLog::from_head(serde_json::from_value(
-        event,
-    )?)?)
+    load_postgres_snapshot_evidence(executor, OperationKind::GarbageCollection, object_key).await
 }
 
 pub(super) async fn load_postgres_retention_evidence(
     executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
     object_key: &str,
 ) -> Result<RetentionEvidenceLog, PostgresMetadataStoreError> {
-    let event =
-        load_postgres_latest_evidence_event(executor, OperationKind::RetentionHold, object_key)
-            .await?;
-    let Some(event) = event else {
-        return Ok(RetentionEvidenceLog::default());
-    };
-    Ok(RetentionEvidenceLog::from_head(serde_json::from_value(
-        event,
-    )?)?)
+    load_postgres_snapshot_evidence(executor, OperationKind::RetentionHold, object_key).await
 }
 
 fn quarantine_snapshot(
@@ -876,84 +1004,14 @@ impl AsyncIndexStore for super::PostgresIndexStore {
 
     fn visit_quarantine_candidates<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> IndexStoreFuture<'operation, (), VisitorError>
     where
         Self::Error: Into<VisitorError> + 'operation,
         Visitor: FnMut(QuarantineCandidate) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *transaction)
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            // Validate all rows, snapshots, and heads before materialization checks
-            // and callbacks, using bounded pages from one coherent snapshot.
-            for phase in 0..5 {
-                let mut cursor: Option<String> = None;
-                loop {
-                    let mut request = if cursor.is_some() {
-                        query("SELECT object_key, observed_length, first_seen_unreachable_at_unix_seconds, delete_after_unix_seconds FROM shardline_quarantine_candidates
-                               WHERE object_key > $1 ORDER BY object_key LIMIT 256")
-                    } else {
-                        query(
-                            "SELECT object_key, observed_length, first_seen_unreachable_at_unix_seconds, delete_after_unix_seconds FROM shardline_quarantine_candidates ORDER BY object_key LIMIT 256",
-                        )
-                    };
-                    if let Some(key) = &cursor {
-                        request = request.bind(key);
-                    }
-                    let rows = request
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(Self::Error::from)
-                        .map_err(Into::into)?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut entries = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = quarantine_candidate_from_row(&row).map_err(Into::into)?;
-                        cursor = Some(entry.object_key().as_str().to_owned());
-                        entries.push(entry);
-                    }
-                    if phase == 1 {
-                        for entry in &entries {
-                            quarantine_snapshot(entry, QuarantineLifecycleState::Active)
-                                .and_then(|snapshot| {
-                                    snapshot.evidence_operation().map_err(Self::Error::from)
-                                })
-                                .map_err(Into::into)?;
-                        }
-                    } else if phase == 2 || phase == 3 {
-                        verify_postgres_quarantine_evidence_batch(
-                            &mut *transaction,
-                            &entries,
-                            phase == 3,
-                        )
-                        .await
-                        .map_err(Into::into)?;
-                    } else if phase == 4 {
-                        for entry in entries {
-                            visitor(entry)?;
-                        }
-                    }
-                }
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)
-        })
+        Box::pin(inventory::visit(&self.pool, visitor))
     }
 
     fn upsert_quarantine_candidate<'operation>(
@@ -1018,20 +1076,15 @@ impl AsyncIndexStore for super::PostgresIndexStore {
             } else {
                 verify_and_reactivate_quarantine(evidence, snapshot)?
             };
-            let event = evidence.events().last().ok_or_else(|| {
+            let _ = evidence.events().last().ok_or_else(|| {
                 PostgresMetadataStoreError::Reliability(
                     shardline_reliability::ReliabilityError::EmptyField(
                         "quarantine evidence event",
                     ),
                 )
             })?;
-            if evidence_was_empty {
-                for stored_event in evidence.events() {
-                    insert_reliability_event(&mut transaction, stored_event).await?;
-                }
-            } else {
-                insert_reliability_event(&mut transaction, event).await?;
-            }
+            persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                .await?;
             transaction.commit().await?;
             Ok(())
         })
@@ -1063,20 +1116,15 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                         .await?;
                 let (evidence, evidence_was_empty) =
                     verify_and_append_snapshot_transition(evidence, active, released)?;
-                let event = evidence.events().last().ok_or_else(|| {
+                let _ = evidence.events().last().ok_or_else(|| {
                     PostgresMetadataStoreError::Reliability(
                         shardline_reliability::ReliabilityError::EmptyField(
                             "quarantine evidence event",
                         ),
                     )
                 })?;
-                if evidence_was_empty {
-                    for stored_event in evidence.events() {
-                        insert_reliability_event(&mut transaction, stored_event).await?;
-                    }
-                } else {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
+                persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                    .await?;
             }
             transaction.commit().await?;
             Ok(deleted)
@@ -1132,20 +1180,15 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                 transaction.commit().await?;
                 return Ok(false);
             }
-            let event = evidence.events().last().ok_or_else(|| {
+            let _ = evidence.events().last().ok_or_else(|| {
                 PostgresMetadataStoreError::Reliability(
                     shardline_reliability::ReliabilityError::EmptyField(
                         "quarantine evidence event",
                     ),
                 )
             })?;
-            if evidence_was_empty {
-                for stored_event in evidence.events() {
-                    insert_reliability_event(&mut transaction, stored_event).await?;
-                }
-            } else {
-                insert_reliability_event(&mut transaction, event).await?;
-            }
+            persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                .await?;
             transaction.commit().await?;
             Ok(true)
         })
@@ -1214,84 +1257,14 @@ impl AsyncIndexStore for super::PostgresIndexStore {
 
     fn visit_retention_holds<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> IndexStoreFuture<'operation, (), VisitorError>
     where
         Self::Error: Into<VisitorError> + 'operation,
         Visitor: FnMut(RetentionHold) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *transaction)
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            // Validate all rows, snapshots, and heads before materialization checks
-            // and callbacks, using bounded pages from one coherent snapshot.
-            for phase in 0..5 {
-                let mut cursor: Option<String> = None;
-                loop {
-                    let mut request = if cursor.is_some() {
-                        query("SELECT object_key, reason, held_at_unix_seconds, release_after_unix_seconds FROM shardline_retention_holds
-                               WHERE object_key > $1 ORDER BY object_key LIMIT 256")
-                    } else {
-                        query(
-                            "SELECT object_key, reason, held_at_unix_seconds, release_after_unix_seconds FROM shardline_retention_holds ORDER BY object_key LIMIT 256",
-                        )
-                    };
-                    if let Some(key) = &cursor {
-                        request = request.bind(key);
-                    }
-                    let rows = request
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(Self::Error::from)
-                        .map_err(Into::into)?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut entries = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = retention_hold_from_row(&row).map_err(Into::into)?;
-                        cursor = Some(entry.object_key().as_str().to_owned());
-                        entries.push(entry);
-                    }
-                    if phase == 1 {
-                        for entry in &entries {
-                            retention_snapshot(entry, RetentionHoldLifecycleState::Active)
-                                .and_then(|snapshot| {
-                                    snapshot.evidence_operation().map_err(Self::Error::from)
-                                })
-                                .map_err(Into::into)?;
-                        }
-                    } else if phase == 2 || phase == 3 {
-                        verify_postgres_retention_evidence_batch(
-                            &mut *transaction,
-                            &entries,
-                            phase == 3,
-                        )
-                        .await
-                        .map_err(Into::into)?;
-                    } else if phase == 4 {
-                        for entry in entries {
-                            visitor(entry)?;
-                        }
-                    }
-                }
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)
-        })
+        Box::pin(inventory::visit(&self.pool, visitor))
     }
 
     fn upsert_retention_hold<'operation>(
@@ -1331,13 +1304,8 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                         .await?;
                 let (evidence, evidence_was_empty) =
                     verify_and_append_snapshot_transition(evidence, active, released)?;
-                if evidence_was_empty {
-                    for event in evidence.events() {
-                        insert_reliability_event(&mut transaction, event).await?;
-                    }
-                } else if let Some(event) = evidence.events().last() {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
+                persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                    .await?;
             }
             transaction.commit().await?;
             Ok(deleted)
@@ -1398,13 +1366,8 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                 transaction.commit().await?;
                 return Ok(false);
             }
-            if evidence_was_empty {
-                for event in evidence.events() {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
-            } else if let Some(event) = evidence.events().last() {
-                insert_reliability_event(&mut transaction, event).await?;
-            }
+            persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                .await?;
             transaction.commit().await?;
             Ok(true)
         })
@@ -1444,98 +1407,14 @@ impl AsyncIndexStore for super::PostgresIndexStore {
 
     fn visit_webhook_deliveries<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> IndexStoreFuture<'operation, (), VisitorError>
     where
         Self::Error: Into<VisitorError> + 'operation,
         Visitor: FnMut(WebhookDelivery) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *transaction)
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            // Preserve complete-row validation before evidence checks and any callbacks.
-            for phase in 0..5 {
-                let mut cursor: Option<[String; 4]> = None;
-                loop {
-                    let mut request = if cursor.is_some() {
-                        query("SELECT provider, owner, repo, delivery_id, processed_at_unix_seconds FROM shardline_webhook_deliveries
-                        WHERE (provider, owner, repo, delivery_id) > ($1, $2, $3, $4)
-                        ORDER BY provider, owner, repo, delivery_id LIMIT 256")
-                    } else {
-                        query("SELECT provider, owner, repo, delivery_id, processed_at_unix_seconds FROM shardline_webhook_deliveries
-                        ORDER BY provider, owner, repo, delivery_id LIMIT 256")
-                    };
-                    if let Some(key) = &cursor {
-                        for field in key {
-                            request = request.bind(field);
-                        }
-                    }
-                    let rows = request
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(Self::Error::from)
-                        .map_err(Into::into)?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut entries = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = webhook_delivery_from_row(&row).map_err(Into::into)?;
-                        cursor = Some([
-                            row.try_get::<String, _>("provider")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                            row.try_get::<String, _>("owner")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                            row.try_get::<String, _>("repo")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                            row.try_get::<String, _>("delivery_id")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                        ]);
-                        entries.push(entry);
-                    }
-                    if phase == 1 {
-                        for entry in &entries {
-                            webhook_snapshot(entry, WebhookDeliveryLifecycleState::Processed)
-                                .and_then(|snapshot| {
-                                    snapshot.evidence_operation().map_err(Self::Error::from)
-                                })
-                                .map_err(Into::into)?;
-                        }
-                    } else if phase == 2 || phase == 3 {
-                        verify_postgres_webhook_evidence_batch(
-                            &mut *transaction,
-                            &entries,
-                            phase == 3,
-                        )
-                        .await
-                        .map_err(Into::into)?;
-                    } else if phase == 4 {
-                        for entry in entries {
-                            visitor(entry)?;
-                        }
-                    }
-                }
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)
-        })
+        Box::pin(inventory::visit(&self.pool, visitor))
     }
     fn delete_webhook_delivery<'operation>(
         &'operation self,
@@ -1575,13 +1454,8 @@ impl AsyncIndexStore for super::PostgresIndexStore {
             .bind(existing.delivery_id())
             .execute(&mut *transaction)
             .await?;
-            if evidence_was_empty {
-                for event in evidence.events() {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
-            } else if let Some(event) = evidence.events().last() {
-                insert_reliability_event(&mut transaction, event).await?;
-            }
+            persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                .await?;
             transaction.commit().await?;
             Ok(result.rows_affected() > 0)
         })
@@ -1635,13 +1509,8 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                 transaction.commit().await?;
                 return Ok(false);
             }
-            if evidence_was_empty {
-                for event in evidence.events() {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
-            } else if let Some(event) = evidence.events().last() {
-                insert_reliability_event(&mut transaction, event).await?;
-            }
+            persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                .await?;
             transaction.commit().await?;
             Ok(true)
         })
@@ -1709,13 +1578,8 @@ impl AsyncIndexStore for super::PostgresIndexStore {
                 .bind(delivery.delivery_id())
                 .execute(&mut *transaction)
                 .await?;
-                if evidence_was_empty {
-                    for event in evidence.events() {
-                        insert_reliability_event(&mut transaction, event).await?;
-                    }
-                } else if let Some(event) = evidence.events().last() {
-                    insert_reliability_event(&mut transaction, event).await?;
-                }
+                persist_appended_events(&mut transaction, evidence.events(), evidence_was_empty)
+                    .await?;
             }
             transaction.commit().await?;
             Ok(u64::try_from(deliveries.len()).unwrap_or(u64::MAX))
@@ -1789,94 +1653,14 @@ impl AsyncIndexStore for super::PostgresIndexStore {
 
     fn visit_provider_repository_states<'operation, Visitor, VisitorError>(
         &'operation self,
-        mut visitor: Visitor,
+        visitor: Visitor,
     ) -> IndexStoreFuture<'operation, (), VisitorError>
     where
         Self::Error: Into<VisitorError> + 'operation,
         Visitor: FnMut(ProviderRepositoryState) -> Result<(), VisitorError> + Send + 'operation,
         VisitorError: Send + 'operation,
     {
-        Box::pin(async move {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                .execute(&mut *transaction)
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)?;
-            // Preserve complete-row validation before evidence checks and any callbacks.
-            for phase in 0..5 {
-                let mut cursor: Option<[String; 3]> = None;
-                loop {
-                    let mut request = if cursor.is_some() {
-                        query("SELECT provider, owner, repo, last_access_changed_at_unix_seconds, last_revision_pushed_at_unix_seconds, last_pushed_revision, last_cache_invalidated_at_unix_seconds, last_authorization_rechecked_at_unix_seconds, last_drift_checked_at_unix_seconds FROM shardline_provider_repository_states
-                        WHERE (provider, owner, repo) > ($1, $2, $3)
-                        ORDER BY provider, owner, repo LIMIT 256")
-                    } else {
-                        query("SELECT provider, owner, repo, last_access_changed_at_unix_seconds, last_revision_pushed_at_unix_seconds, last_pushed_revision, last_cache_invalidated_at_unix_seconds, last_authorization_rechecked_at_unix_seconds, last_drift_checked_at_unix_seconds FROM shardline_provider_repository_states
-                        ORDER BY provider, owner, repo LIMIT 256")
-                    };
-                    if let Some(key) = &cursor {
-                        for field in key {
-                            request = request.bind(field);
-                        }
-                    }
-                    let rows = request
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(Self::Error::from)
-                        .map_err(Into::into)?;
-                    if rows.is_empty() {
-                        break;
-                    }
-                    let mut entries = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let entry = provider_repository_state_from_row(&row).map_err(Into::into)?;
-                        cursor = Some([
-                            row.try_get::<String, _>("provider")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                            row.try_get::<String, _>("owner")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                            row.try_get::<String, _>("repo")
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?,
-                        ]);
-                        entries.push(entry);
-                    }
-                    if phase == 1 {
-                        for entry in &entries {
-                            crate::provider_evidence::snapshot_from_state(entry)
-                                .and_then(|snapshot| snapshot.evidence_operation())
-                                .map_err(Self::Error::from)
-                                .map_err(Into::into)?;
-                        }
-                    } else if phase == 2 || phase == 3 {
-                        verify_postgres_provider_evidence_batch(
-                            &mut *transaction,
-                            &entries,
-                            phase == 3,
-                        )
-                        .await
-                        .map_err(Into::into)?;
-                    } else if phase == 4 {
-                        for entry in entries {
-                            visitor(entry)?;
-                        }
-                    }
-                }
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(Self::Error::from)
-                .map_err(Into::into)
-        })
+        Box::pin(inventory::visit(&self.pool, visitor))
     }
     fn upsert_provider_repository_state<'operation>(
         &'operation self,
@@ -1899,60 +1683,15 @@ impl AsyncIndexStore for super::PostgresIndexStore {
     ) -> IndexStoreFuture<'operation, bool, Self::Error> {
         Box::pin(async move {
             let mut transaction = self.pool.begin().await?;
-            let operation_id = shardline_reliability::ProviderRepositoryOperationId::new(
-                provider.as_str(),
+            let deleted = super::provider_mutation::delete_provider_repository_state(
+                &mut transaction,
+                provider,
                 owner,
                 repo,
-            );
-            query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(operation_id.as_str())
-                .execute(&mut *transaction)
-                .await?;
-            let current = query(
-                "SELECT provider,
-                        owner,
-                        repo,
-                        last_access_changed_at_unix_seconds,
-                        last_revision_pushed_at_unix_seconds,
-                        last_pushed_revision,
-                        last_cache_invalidated_at_unix_seconds,
-                        last_authorization_rechecked_at_unix_seconds,
-                        last_drift_checked_at_unix_seconds
-                 FROM shardline_provider_repository_states
-                 WHERE provider = $1 AND owner = $2 AND repo = $3
-                 FOR UPDATE",
             )
-            .bind(provider.as_str())
-            .bind(owner)
-            .bind(repo)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            if let Some(row) = current {
-                let state = provider_repository_state_from_row(&row)?;
-                super::provider_mutation::verify_provider_repository_state_evidence(
-                    &mut transaction,
-                    &state,
-                )
-                .await?;
-            }
-            let result = query(
-                "DELETE FROM shardline_provider_repository_states
-                 WHERE provider = $1 AND owner = $2 AND repo = $3",
-            )
-            .bind(provider.as_str())
-            .bind(owner)
-            .bind(repo)
-            .execute(&mut *transaction)
-            .await?;
-            query(
-                "DELETE FROM shardline_reliability_events
-                 WHERE operation_kind = 'ProviderEvent' AND operation_id = $1",
-            )
-            .bind(operation_id.as_str())
-            .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
-            Ok(result.rows_affected() > 0)
+            Ok(deleted)
         })
     }
 
@@ -1961,16 +1700,11 @@ impl AsyncIndexStore for super::PostgresIndexStore {
         key: &'operation RepoKey,
         max_revisions: usize,
     ) -> IndexStoreFuture<'operation, u64, Self::Error> {
-        let store = self.clone();
-        let key = key.clone();
-        Box::pin(
-            async move { TreeStore::prune_revisions_over_cap(&store, &key, max_revisions).await },
-        )
+        TreeStore::prune_revisions_over_cap(self, key, max_revisions)
     }
 
     fn list_revision_repo_keys(&self) -> IndexStoreFuture<'_, Vec<RepoKey>, Self::Error> {
-        let store = self.clone();
-        Box::pin(async move { TreeStore::list_revision_repo_keys(&store).await })
+        TreeStore::list_revision_repo_keys(self)
     }
 }
 
@@ -1986,7 +1720,7 @@ pub(super) async fn create_upload_intent_in_transaction(
         .bind(intent.intent_id())
         .execute(&mut *transaction)
         .await?;
-    let existing = query(
+    let existing = sqlx::query_as::<_, UploadIntentRow>(
         "SELECT intent_id, object_key, object_hash, object_length, state,
                     created_at, updated_at
              FROM shardline_upload_intents WHERE intent_id = $1 FOR UPDATE",
@@ -2016,27 +1750,7 @@ pub(super) async fn create_upload_intent_in_transaction(
         return Err(crate::UploadIntentConflictError::new(intent.intent_id()).into());
     }
     if let Some(existing) = existing {
-        let state_text: String = existing.try_get("state")?;
-        let state = UploadIntentState::parse(&state_text).ok_or_else(|| {
-            PostgresMetadataStoreError::InvalidUploadIntentState(state_text.clone())
-        })?;
-        let durable_intent = UploadIntent::from_parts(
-            existing.try_get("intent_id")?,
-            existing.try_get("object_key")?,
-            existing.try_get("object_hash")?,
-            i64_to_u64(existing.try_get("object_length")?)?,
-            state,
-            std::time::Duration::from_secs(i64_to_u64(
-                existing
-                    .try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")?
-                    .timestamp(),
-            )?),
-            std::time::Duration::from_secs(i64_to_u64(
-                existing
-                    .try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")?
-                    .timestamp(),
-            )?),
-        );
+        let durable_intent = upload_intent_from_row(existing)?;
         let event_rows = query(
             "SELECT event_json, merkle_commit_json FROM shardline_reliability_events
                  WHERE operation_kind = 'Upload' AND operation_id = $1
@@ -2265,41 +1979,8 @@ impl UploadIntentStore for super::PostgresIndexStore {
         new_state: UploadIntentState,
         event: &LifecycleEvent,
     ) -> Result<bool, Self::Error> {
-        let current = self.intent_by_id(intent_id).await?;
-        let Some(current) = current else {
-            return Ok(false);
-        };
-        if current.state() == new_state {
-            return Ok(true);
-        }
-        if !current.state().can_transition_to(new_state) {
-            return Ok(false);
-        }
-        event.validate_for_transition(intent_id, current.state(), new_state)?;
-        let mut transaction = self.pool.begin().await?;
-        let previous = super::upload_recovery_guard::enter(
-            &mut transaction,
-            intent_id,
-            &event.operation.repository,
-        )
-        .await?;
-        let rows = sqlx::query(
-            "UPDATE shardline_upload_intents SET state = $1, updated_at = now()
-             WHERE intent_id = $2 AND state = $3",
-        )
-        .bind(new_state.as_str())
-        .bind(intent_id)
-        .bind(current.state().as_str())
-        .execute(&mut *transaction)
-        .await?;
-        if rows.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-        insert_reliability_event(transaction.as_mut(), event).await?;
-        super::upload_recovery_guard::leave(&mut transaction, previous.as_deref()).await?;
-        transaction.commit().await?;
-        Ok(true)
+        self.transition_intent_batch_with_events(intent_id, &[(new_state, event.clone())])
+            .await
     }
 
     async fn transition_intent_batch_with_events(
@@ -2311,33 +1992,30 @@ impl UploadIntentStore for super::PostgresIndexStore {
     }
 
     async fn intent_by_id(&self, intent_id: &str) -> Result<Option<UploadIntent>, Self::Error> {
-        let row = sqlx::query_as::<_, (String, String, String, i64, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+        let row = sqlx::query_as::<_, UploadIntentRow>(
             "SELECT intent_id, object_key, object_hash, object_length, state, created_at, updated_at FROM shardline_upload_intents WHERE intent_id = $1"
         )
         .bind(intent_id)
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some((id, key, hash, length, state_str, created, updated)) => {
-                let state = UploadIntentState::parse(&state_str).ok_or_else(|| {
-                    PostgresMetadataStoreError::InvalidUploadIntentState(state_str.clone())
-                })?;
-                let created_dur = std::time::Duration::from_secs(i64_to_u64(created.timestamp())?);
-                let updated_dur = std::time::Duration::from_secs(i64_to_u64(updated.timestamp())?);
-                let intent = UploadIntent::from_parts(
-                    id,
-                    key,
-                    hash,
-                    i64_to_u64(length)?,
-                    state,
-                    created_dur,
-                    updated_dur,
-                );
+            Some(row) => {
+                let intent = upload_intent_from_row(row)?;
                 verify_postgres_intent_evidence(self, &intent).await?;
                 Ok(Some(intent))
             }
             None => Ok(None),
         }
+    }
+
+    fn is_upload_intents_table_missing(error: &Self::Error) -> bool {
+        matches!(error,
+            PostgresMetadataStoreError::Sqlx(error)
+                if error.as_database_error().is_some_and(|error|
+                    error.code().as_deref() == Some("42P01")
+                        && error.message() == "relation \"shardline_upload_intents\" does not exist"
+                )
+        )
     }
 
     async fn intents_by_state(
@@ -2348,56 +2026,13 @@ impl UploadIntentStore for super::PostgresIndexStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *transaction)
             .await?;
-        let rows = sqlx::query_as::<_, (String, String, String, i64, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+        let rows = sqlx::query_as::<_, UploadIntentRow>(
             "SELECT intent_id, object_key, object_hash, object_length, state, created_at, updated_at FROM shardline_upload_intents WHERE state = $1 ORDER BY created_at"
         )
         .bind(state.as_str())
         .fetch_all(&mut *transaction)
         .await?;
-        let intents = rows
-            .into_iter()
-            .map(|(id, key, hash, length, state_str, created, updated)| {
-                let s = UploadIntentState::parse(&state_str).ok_or_else(|| {
-                    PostgresMetadataStoreError::InvalidUploadIntentState(state_str.clone())
-                })?;
-                Ok(UploadIntent::from_parts(
-                    id,
-                    key,
-                    hash,
-                    i64_to_u64(length)?,
-                    s,
-                    std::time::Duration::from_secs(i64_to_u64(created.timestamp())?),
-                    std::time::Duration::from_secs(i64_to_u64(updated.timestamp())?),
-                ))
-            })
-            .collect::<Result<Vec<_>, PostgresMetadataStoreError>>()?;
-        let operation_ids = intents
-            .iter()
-            .map(|intent| intent.intent_id().to_owned())
-            .collect::<Vec<_>>();
-        let heads = load_postgres_latest_evidence_heads(
-            &mut *transaction,
-            OperationKind::Upload,
-            &operation_ids,
-        )
-        .await?;
-        for intent in &intents {
-            let event_json = heads.get(intent.intent_id()).ok_or_else(|| {
-                PostgresMetadataStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                )
-            })?;
-            let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
-            verify_upload_lifecycle_head(
-                &event,
-                event.operation.tenant.as_str(),
-                event.operation.repository.as_str(),
-                intent.intent_id(),
-                intent.object_key(),
-                intent.object_hash(),
-                intent.state(),
-            )?;
-        }
+        let intents = verified_upload_intent_listing(&mut transaction, rows).await?;
         transaction.commit().await?;
         Ok(intents)
     }
@@ -2419,57 +2054,14 @@ impl UploadIntentStore for super::PostgresIndexStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *transaction)
             .await?;
-        let rows = sqlx::query_as::<_, (String, String, String, i64, String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+        let rows = sqlx::query_as::<_, UploadIntentRow>(
             "SELECT intent_id, object_key, object_hash, object_length, state, created_at, updated_at FROM shardline_upload_intents WHERE state = $1 AND created_at < $2 ORDER BY created_at"
         )
         .bind(state.as_str())
         .bind(cutoff)
         .fetch_all(&mut *transaction)
         .await?;
-        let intents = rows
-            .into_iter()
-            .map(|(id, key, hash, length, state_str, created, updated)| {
-                let s = UploadIntentState::parse(&state_str).ok_or_else(|| {
-                    PostgresMetadataStoreError::InvalidUploadIntentState(state_str.clone())
-                })?;
-                Ok(UploadIntent::from_parts(
-                    id,
-                    key,
-                    hash,
-                    i64_to_u64(length)?,
-                    s,
-                    std::time::Duration::from_secs(i64_to_u64(created.timestamp())?),
-                    std::time::Duration::from_secs(i64_to_u64(updated.timestamp())?),
-                ))
-            })
-            .collect::<Result<Vec<_>, PostgresMetadataStoreError>>()?;
-        let operation_ids = intents
-            .iter()
-            .map(|intent| intent.intent_id().to_owned())
-            .collect::<Vec<_>>();
-        let heads = load_postgres_latest_evidence_heads(
-            &mut *transaction,
-            OperationKind::Upload,
-            &operation_ids,
-        )
-        .await?;
-        for intent in &intents {
-            let event_json = heads.get(intent.intent_id()).ok_or_else(|| {
-                PostgresMetadataStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::OperationMismatch,
-                )
-            })?;
-            let event = serde_json::from_value::<LifecycleEvent>(event_json.clone())?;
-            verify_upload_lifecycle_head(
-                &event,
-                event.operation.tenant.as_str(),
-                event.operation.repository.as_str(),
-                intent.intent_id(),
-                intent.object_key(),
-                intent.object_hash(),
-                intent.state(),
-            )?;
-        }
+        let intents = verified_upload_intent_listing(&mut transaction, rows).await?;
         transaction.commit().await?;
         Ok(intents)
     }
@@ -2501,40 +2093,12 @@ impl UploadIntentStore for super::PostgresIndexStore {
                 shardline_reliability::ReliabilityError::EmptyField("unknown upload intent state"),
             )
         })?;
-        let rows = sqlx::query(
-            "SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id = $2
-             ORDER BY sequence",
-        )
-        .bind("Upload")
-        .bind(&event.operation.operation_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let mut sequences = Vec::with_capacity(rows.len());
-        let mut event_json = Vec::with_capacity(rows.len());
-        let mut merkle_commits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|error| {
-                PostgresMetadataStoreError::IntegerOutOfRange(format!(
-                    "reliability sequence: {error}"
-                ))
-            })?;
-            event_json.push(row.try_get("event_json")?);
-            merkle_commits.push(row.try_get("merkle_commit_json")?);
-            sequences.push(sequence);
-        }
-        verify_persisted_event_merkle_chain_with_sequences(
+        let mut events: Vec<LifecycleEvent> = load_postgres_reliability_events(
+            &mut transaction,
             OperationKind::Upload,
-            &sequences,
-            &event_json,
-            &merkle_commits,
-        )?;
-        let mut events = event_json
-            .iter()
-            .cloned()
-            .map(serde_json::from_value::<LifecycleEvent>)
-            .collect::<Result<Vec<LifecycleEvent>, _>>()?;
+            &event.operation.operation_id,
+        )
+        .await?;
         if let Some(existing) = events
             .iter()
             .find(|existing| existing.sequence == event.sequence)
@@ -2571,40 +2135,9 @@ impl UploadIntentStore for super::PostgresIndexStore {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(&mut *transaction)
             .await?;
-        let rows = sqlx::query(
-            "SELECT sequence, event_json, merkle_commit_json
-             FROM shardline_reliability_events
-             WHERE operation_kind = $1 AND operation_id = $2
-             ORDER BY sequence",
-        )
-        .bind("Upload")
-        .bind(operation_id)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        let mut event_json = Vec::with_capacity(rows.len());
-        let mut merkle_commits = Vec::with_capacity(rows.len());
-        for row in rows {
-            let sequence: i64 = row.try_get("sequence")?;
-            if sequence < 0 {
-                return Err(PostgresMetadataStoreError::IntegerOutOfRange(
-                    "reliability sequence".into(),
-                ));
-            }
-            let value: serde_json::Value = row.try_get("event_json")?;
-            let event = serde_json::from_value::<LifecycleEvent>(value.clone())?;
-            if u64_to_i64(event.sequence)? != sequence {
-                return Err(PostgresMetadataStoreError::Reliability(
-                    shardline_reliability::ReliabilityError::Merkle(
-                        "upload event sequence does not match its row".into(),
-                    ),
-                ));
-            }
-            events.push(event);
-            event_json.push(value);
-            merkle_commits.push(row.try_get("merkle_commit_json")?);
-        }
-        verify_persisted_event_merkle_chain(OperationKind::Upload, &event_json, &merkle_commits)?;
+        let events: Vec<LifecycleEvent> =
+            load_postgres_reliability_events(&mut transaction, OperationKind::Upload, operation_id)
+                .await?;
         let intent = sqlx::query(
             "SELECT object_key, object_hash, state
              FROM shardline_upload_intents
@@ -2642,6 +2175,24 @@ impl UploadIntentStore for super::PostgresIndexStore {
     }
 }
 
+// The caller owns the state mutation and transaction. New logs need their
+// baseline and transition; existing logs need only the newly appended head.
+pub(super) async fn persist_appended_events<T: EvidenceEventMetadata>(
+    connection: &mut PgConnection,
+    events: &[T],
+    was_empty: bool,
+) -> Result<(), PostgresMetadataStoreError> {
+    let pending = if was_empty {
+        events
+    } else {
+        events.last().map(std::slice::from_ref).unwrap_or_default()
+    };
+    for event in pending {
+        insert_reliability_event(connection, event).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn insert_reliability_event<T>(
     connection: &mut PgConnection,
     event: &T,
@@ -2659,25 +2210,8 @@ where
     let sequence = i64::try_from(event.sequence_number()).map_err(|_error| {
         PostgresMetadataStoreError::IntegerOutOfRange("reliability sequence".into())
     })?;
-    let previous_json: Option<serde_json::Value> = query_scalar(
-        "SELECT CASE WHEN EXISTS (
-             SELECT 1 FROM shardline_reliability_events AS missing
-             WHERE missing.operation_kind = $1 AND missing.operation_id = $2
-               AND missing.sequence < $3
-               AND missing.merkle_commit_json IS NULL
-         ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE merkle_commit_json END
-         FROM shardline_reliability_events
-         WHERE operation_kind = $1 AND operation_id = $2 AND sequence < $3
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(event.operation_identity().kind.as_str())
-    .bind(&event.operation_identity().operation_id)
-    .bind(sequence)
-    .fetch_optional(&mut *connection)
-    .await?;
-    let previous = previous_json
-        .map(serde_json::from_value::<ReliabilityMerkleCommit>)
-        .transpose()?;
+    let previous =
+        load_previous_reliability_commit(connection, event.operation_identity(), sequence).await?;
     let merkle_commit_json =
         reliability_merkle_commit_json_with_previous(event, previous.as_ref())?;
     insert_reliability_event_value(
@@ -2714,28 +2248,8 @@ async fn verify_existing_reliability_boundary(
     let Some(latest_row) = rows.next() else {
         return Ok(());
     };
-    let validate_row = |row: &sqlx::postgres::PgRow| {
-        let row_sequence = u64::try_from(row.try_get::<i64, _>("sequence")?).map_err(|error| {
-            PostgresMetadataStoreError::IntegerOutOfRange(format!("reliability sequence: {error}"))
-        })?;
-        let event_json: serde_json::Value = row.try_get("event_json")?;
-        if persisted_event_sequence(operation.kind, event_json.clone())? != row_sequence {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::Merkle(
-                    "reliability row sequence does not match its event".into(),
-                ),
-            ));
-        }
-        let identity = persisted_event_identity(operation.kind, event_json.clone())?;
-        if identity.kind != operation.kind || identity.operation_id != operation.operation_id {
-            return Err(PostgresMetadataStoreError::Reliability(
-                shardline_reliability::ReliabilityError::OperationMismatch,
-            ));
-        }
-        Ok::<_, PostgresMetadataStoreError>((row_sequence, event_json))
-    };
     let previous_commit = if let Some(previous_row) = rows.next() {
-        let (_previous_sequence, _previous_event_json) = validate_row(&previous_row)?;
+        verify_postgres_event_row(&previous_row, operation.kind, &operation.operation_id)?;
         let previous_commit: Option<serde_json::Value> =
             previous_row.try_get("merkle_commit_json")?;
         Some(previous_commit.ok_or_else(|| {
@@ -2748,7 +2262,8 @@ async fn verify_existing_reliability_boundary(
     } else {
         None
     };
-    let (latest_sequence, latest_event_json) = validate_row(&latest_row)?;
+    let (latest_sequence, latest_event_json) =
+        verify_postgres_event_row(&latest_row, operation.kind, &operation.operation_id)?;
     let latest_commit: Option<serde_json::Value> = latest_row.try_get("merkle_commit_json")?;
     verify_persisted_merkle_commit_with_previous(
         operation.kind,
@@ -2775,19 +2290,44 @@ async fn verify_existing_reliability_boundary(
     Ok(())
 }
 
-async fn insert_reliability_event_value(
+/// Loads the previous commitment, rejecting earlier rows without a commitment.
+pub(super) async fn load_previous_reliability_commit(
+    connection: &mut PgConnection,
+    operation: &shardline_reliability::OperationIdentity,
+    sequence: i64,
+) -> Result<Option<ReliabilityMerkleCommit>, PostgresMetadataStoreError> {
+    let previous_json: Option<serde_json::Value> = query_scalar(
+        "SELECT CASE WHEN EXISTS (
+             SELECT 1 FROM shardline_reliability_events AS missing
+             WHERE missing.operation_kind = $1 AND missing.operation_id = $2
+               AND missing.sequence < $3
+               AND missing.merkle_commit_json IS NULL
+         ) THEN '{\"missing_previous_merkle_commit\":true}'::jsonb ELSE merkle_commit_json END
+         FROM shardline_reliability_events
+         WHERE operation_kind = $1 AND operation_id = $2 AND sequence < $3
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(operation.kind.as_str())
+    .bind(&operation.operation_id)
+    .bind(sequence)
+    .fetch_optional(&mut *connection)
+    .await?;
+    Ok(previous_json
+        .map(serde_json::from_value::<ReliabilityMerkleCommit>)
+        .transpose()?)
+}
+
+pub(super) async fn insert_reliability_event_value(
     connection: &mut PgConnection,
     operation: &shardline_reliability::OperationIdentity,
     event_sequence: u64,
     event_json: serde_json::Value,
     merkle_commit_json: serde_json::Value,
-) -> Result<(), PostgresMetadataStoreError>
-where
-{
+) -> Result<(), PostgresMetadataStoreError> {
     let sequence = i64::try_from(event_sequence).map_err(|_error| {
         PostgresMetadataStoreError::IntegerOutOfRange("reliability sequence".into())
     })?;
-    let row = sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO shardline_reliability_events
             (operation_kind, operation_id, sequence, event_json, created_at_unix_seconds,
              merkle_commit_json)
@@ -2798,8 +2338,7 @@ where
                  shardline_reliability_events.merkle_commit_json,
                  EXCLUDED.merkle_commit_json
              )
-         WHERE shardline_reliability_events.event_json = EXCLUDED.event_json
-         RETURNING event_json",
+         WHERE shardline_reliability_events.event_json = EXCLUDED.event_json",
     )
     .bind(operation.kind.as_str())
     .bind(&operation.operation_id)
@@ -2807,9 +2346,9 @@ where
     .bind(event_json)
     .bind(shardline_protocol::unix_now_seconds_lossy() as i64)
     .bind(merkle_commit_json)
-    .fetch_optional(&mut *connection)
+    .execute(&mut *connection)
     .await?;
-    if row.is_none() {
+    if result.rows_affected() == 0 {
         return Err(PostgresMetadataStoreError::ReliabilityEventConflict(
             operation.operation_id.clone(),
         ));
@@ -3247,10 +2786,8 @@ mod tests {
 
     // ── Postgres UploadIntentStore integration tests ──────────────────────
 
+    use super::super::connect_isolated_postgres as connect_postgres;
     use crate::upload_intent::{UploadIntent, UploadIntentState, UploadIntentStore};
-    async fn connect_postgres() -> Option<sqlx::PgPool> {
-        super::super::connect_isolated_postgres().await
-    }
 
     fn postgres_upstream(database_url: &str) -> Option<String> {
         let parsed = url::Url::parse(database_url).ok()?;
@@ -3324,16 +2861,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        sqlx::query(
-            "DELETE FROM shardline_provider_repository_states
-             WHERE provider = $1 AND owner = $2 AND repo = $3",
-        )
-        .bind(RepositoryProvider::GitHub.as_str())
-        .bind("concurrent-team")
-        .bind("concurrent-state")
-        .execute(&pool)
-        .await
-        .expect("clean provider state fixture");
 
         let access_store = make_pg_store(pool.clone());
         let revision_store = make_pg_store(pool);
@@ -3407,25 +2934,6 @@ mod tests {
             Some(200),
             Some("refs/heads/main".into()),
         );
-        for repo in ["first", "second"] {
-            sqlx::query(
-                "DELETE FROM shardline_provider_repository_states
-                 WHERE provider = 'github' AND owner = $1 AND repo = $2",
-            )
-            .bind(owner)
-            .bind(repo)
-            .execute(&pool)
-            .await
-            .expect("clean provider state fixture");
-            sqlx::query(
-                "DELETE FROM shardline_reliability_events
-                 WHERE operation_kind = 'ProviderEvent' AND operation_id = $1",
-            )
-            .bind(format!("github:{owner}:{repo}"))
-            .execute(&pool)
-            .await
-            .expect("clean provider evidence fixture");
-        }
         store
             .upsert_provider_repository_state(&first)
             .await
@@ -3441,26 +2949,6 @@ mod tests {
             .expect("list provider states with batched evidence verification");
         assert!(states.iter().any(|state| state.repo() == "first"));
         assert!(states.iter().any(|state| state.repo() == "second"));
-
-        for repo in ["first", "second"] {
-            sqlx::query(
-                "DELETE FROM shardline_provider_repository_states
-                 WHERE provider = 'github' AND owner = $1 AND repo = $2",
-            )
-            .bind(owner)
-            .bind(repo)
-            .execute(&pool)
-            .await
-            .expect("clean provider state fixture");
-            sqlx::query(
-                "DELETE FROM shardline_reliability_events
-                 WHERE operation_kind = 'ProviderEvent' AND operation_id = $1",
-            )
-            .bind(format!("github:{owner}:{repo}"))
-            .execute(&pool)
-            .await
-            .expect("clean provider evidence fixture");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3470,21 +2958,6 @@ mod tests {
             return;
         };
         let store = make_pg_store(pool.clone());
-        sqlx::query(
-            "DELETE FROM shardline_provider_repository_states
-             WHERE provider = 'github' AND owner = 'evidence-team' AND repo = 'tampered'",
-        )
-        .execute(&pool)
-        .await
-        .expect("clean provider state fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'ProviderEvent'
-               AND operation_id = 'github:evidence-team:tampered'",
-        )
-        .execute(&pool)
-        .await
-        .expect("clean provider evidence fixture");
         let state = ProviderRepositoryState::new(
             RepositoryProvider::GitHub,
             "evidence-team".into(),
@@ -3526,21 +2999,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        sqlx::query(
-            "DELETE FROM shardline_provider_repository_states
-             WHERE provider = 'github' AND owner = 'evidence-team' AND repo = 'tampered'",
-        )
-        .execute(&pool)
-        .await
-        .expect("clean provider state fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'ProviderEvent'
-               AND operation_id = 'github:evidence-team:tampered'",
-        )
-        .execute(&pool)
-        .await
-        .expect("clean provider evidence fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3553,23 +3011,6 @@ mod tests {
         let owner = "evidence-repair-team";
         let repo = "missing-journal";
         let operation_id = format!("{}:{owner}:{repo}", RepositoryProvider::GitHub.as_str());
-        sqlx::query(
-            "DELETE FROM shardline_provider_repository_states
-             WHERE provider = 'github' AND owner = $1 AND repo = $2",
-        )
-        .bind(owner)
-        .bind(repo)
-        .execute(&pool)
-        .await
-        .expect("clean provider state fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'ProviderEvent' AND operation_id = $1",
-        )
-        .bind(&operation_id)
-        .execute(&pool)
-        .await
-        .expect("clean provider evidence fixture");
         sqlx::query(
             "INSERT INTO shardline_provider_repository_states
                 (provider, owner, repo, last_access_changed_at_unix_seconds)
@@ -3596,24 +3037,6 @@ mod tests {
         .await
         .expect("count evidence");
         assert_eq!(event_count, 0);
-
-        sqlx::query(
-            "DELETE FROM shardline_provider_repository_states
-             WHERE provider = 'github' AND owner = $1 AND repo = $2",
-        )
-        .bind(owner)
-        .bind(repo)
-        .execute(&pool)
-        .await
-        .expect("clean state fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'ProviderEvent' AND operation_id = $1",
-        )
-        .bind(&operation_id)
-        .execute(&pool)
-        .await
-        .expect("clean evidence fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3624,19 +3047,6 @@ mod tests {
         };
         let store = make_pg_store(pool.clone());
         let object_key = shardline_storage::ObjectKey::parse("gc/replayed-noop-cost").unwrap();
-        sqlx::query("DELETE FROM shardline_quarantine_candidates WHERE object_key = $1")
-            .bind(object_key.as_str())
-            .execute(&pool)
-            .await
-            .expect("clean quarantine fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean quarantine evidence fixture");
 
         let candidate = QuarantineCandidate::new(object_key.clone(), 4, 100, 200).unwrap();
         store
@@ -3681,20 +3091,6 @@ mod tests {
         .expect("count replay evidence");
         assert_eq!(xmin, original_xmin, "identical row should not be rewritten");
         assert_eq!(event_count, original_event_count + 1);
-
-        sqlx::query("DELETE FROM shardline_quarantine_candidates WHERE object_key = $1")
-            .bind(object_key.as_str())
-            .execute(&pool)
-            .await
-            .expect("clean quarantine fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean quarantine evidence fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3705,19 +3101,6 @@ mod tests {
         };
         let store = make_pg_store(pool.clone());
         let object_key = shardline_storage::ObjectKey::parse("gc/visitor-tampered").unwrap();
-        sqlx::query("DELETE FROM shardline_quarantine_candidates WHERE object_key = $1")
-            .bind(object_key.as_str())
-            .execute(&pool)
-            .await
-            .expect("clean quarantine fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean quarantine evidence fixture");
 
         let candidate = QuarantineCandidate::new(object_key.clone(), 4, 100, 200).unwrap();
         store
@@ -3743,20 +3126,6 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!visited, "tampered state must not reach GC visitors");
-
-        sqlx::query("DELETE FROM shardline_quarantine_candidates WHERE object_key = $1")
-            .bind(object_key.as_str())
-            .execute(&pool)
-            .await
-            .expect("clean quarantine fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean quarantine evidence fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3801,19 +3170,6 @@ mod tests {
         };
         let store = make_pg_store(pool.clone());
         let object_key = shardline_storage::ObjectKey::parse("gc/delete-repair").unwrap();
-        sqlx::query("DELETE FROM shardline_quarantine_candidates WHERE object_key = $1")
-            .bind(object_key.as_str())
-            .execute(&pool)
-            .await
-            .expect("clean quarantine fixture");
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean quarantine evidence fixture");
         let candidate = QuarantineCandidate::new(object_key.clone(), 4, 100, 200).unwrap();
         store
             .upsert_quarantine_candidate(&candidate)
@@ -3844,15 +3200,6 @@ mod tests {
         .await
         .expect("inspect repaired quarantine evidence");
         assert_eq!((count, minimum, maximum), (2, 0, 1));
-
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'GarbageCollection' AND operation_id = $1",
-        )
-        .bind(object_key.as_str())
-        .execute(&pool)
-        .await
-        .expect("clean repaired quarantine evidence");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3861,13 +3208,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        // A prior (possibly interrupted) run may have left this fixed id behind
-        // in another state; purge it so the assertions observe a fresh row.
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind("test-intent-1")
-            .execute(&pool)
-            .await
-            .expect("clean fixture");
         let store = make_pg_store(pool);
         let intent = UploadIntent::new(
             "test-intent-1".into(),
@@ -3898,19 +3238,6 @@ mod tests {
             "e".repeat(64),
             42,
         );
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent.intent_id())
-        .execute(&pool)
-        .await
-        .unwrap();
         let store = make_pg_store(pool.clone());
         store.create_intent(&intent).await.unwrap();
         assert!(
@@ -3935,20 +3262,19 @@ mod tests {
         .unwrap();
 
         assert!(store.intent_by_id(intent.intent_id()).await.is_err());
+        assert!(
+            store
+                .intents_by_state(UploadIntentState::Stored)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .stale_intents(UploadIntentState::Stored, Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert!(store.reliability_events(intent.intent_id()).await.is_err());
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent.intent_id())
-        .execute(&pool)
-        .await
-        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3963,19 +3289,6 @@ mod tests {
             "f".repeat(64),
             7,
         );
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent.intent_id())
-        .execute(&pool)
-        .await
-        .unwrap();
 
         let store = make_pg_store(pool.clone());
         store.create_intent(&intent).await.unwrap();
@@ -4004,6 +3317,7 @@ mod tests {
         )
         .unwrap();
         assert!(store.record_reliability_event(&event).await.is_err());
+        assert!(store.reliability_events(intent.intent_id()).await.is_err());
         let appended: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM shardline_reliability_events
              WHERE operation_kind = 'Upload' AND operation_id = $1 AND sequence = 2",
@@ -4013,20 +3327,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(appended, 0);
-
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent.intent_id())
-        .execute(&pool)
-        .await
-        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4302,11 +3602,6 @@ mod tests {
             "9a".repeat(32),
             4096,
         );
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&direct_pool)
-            .await
-            .expect("clean commit-response-loss fixture");
 
         let upstream = postgres_upstream(&database_url).expect("Postgres upstream address");
         let proxy = CommitResponseLossProxy::start(upstream).expect("start Postgres fault proxy");
@@ -4361,12 +3656,6 @@ mod tests {
         assert_eq!(loaded.object_hash(), intent.object_hash());
         assert_eq!(loaded.object_length(), intent.object_length());
         assert_eq!(loaded.state(), UploadIntentState::Created);
-
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent.intent_id())
-            .execute(&direct_pool)
-            .await
-            .expect("clean commit-response-loss fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4489,11 +3778,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind("test-intent-conflict")
-            .execute(&pool)
-            .await
-            .expect("clean leftover intent");
         let store = make_pg_store(pool);
         let original = UploadIntent::new(
             "test-intent-conflict".into(),
@@ -4521,15 +3805,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        // Robust against a persistent Postgres: a previous run may have left
-        // this fixed-id intent in a terminal state, which would make the forward
-        // transition chain below fail. Clean the row so the test starts fresh
-        // (CI's ephemeral database does not surface this).
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind("test-intent-transition")
-            .execute(&pool)
-            .await
-            .expect("clean leftover intent");
         let store = make_pg_store(pool);
         let intent = UploadIntent::new(
             "test-intent-transition".into(),
@@ -4565,11 +3840,6 @@ mod tests {
             return;
         };
         let intent_id = "pg-scoped-legacy-transition";
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent_id)
-            .execute(&pool)
-            .await
-            .expect("clean leftover intent");
         let store = make_pg_store(pool.clone());
         let intent = UploadIntent::new(
             intent_id.into(),
@@ -4657,19 +3927,6 @@ mod tests {
             return;
         };
         let intent_id = "pg-scoped-legacy-identity-migration";
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent_id)
-        .execute(&pool)
-        .await
-        .expect("clean legacy evidence fixture");
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent_id)
-            .execute(&pool)
-            .await
-            .expect("clean legacy intent fixture");
 
         let intent = UploadIntent::new(
             intent_id.into(),
@@ -4736,20 +3993,6 @@ mod tests {
         assert!(events.iter().all(|event| {
             event.operation.tenant == "tenant-pg" && event.operation.repository == "repo-pg"
         }));
-
-        sqlx::query(
-            "DELETE FROM shardline_reliability_events
-             WHERE operation_kind = 'Upload' AND operation_id = $1",
-        )
-        .bind(intent_id)
-        .execute(&pool)
-        .await
-        .expect("clean migrated evidence fixture");
-        sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-            .bind(intent_id)
-            .execute(&pool)
-            .await
-            .expect("clean migrated intent fixture");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4772,14 +4015,6 @@ mod tests {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
-        // Purge the fixed fixture ids so assertions observe only this run's rows.
-        for id in ["query-state-a", "query-state-b"] {
-            sqlx::query("DELETE FROM shardline_upload_intents WHERE intent_id = $1")
-                .bind(id)
-                .execute(&pool)
-                .await
-                .expect("clean fixture");
-        }
         let store = make_pg_store(pool);
         // Create two intents with different states
         let a = UploadIntent::new("query-state-a".into(), "test/a".into(), "01".repeat(32), 10);

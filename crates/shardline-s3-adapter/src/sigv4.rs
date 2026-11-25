@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::S3Error;
+use crate::{S3Error, auth::singleton_header};
 
 mod streaming;
 pub use streaming::SigV4ChunkVerifier;
@@ -208,9 +208,9 @@ impl VerifiedSigV4PostPolicy {
         if !bucket_constrained {
             return Err(denied());
         }
-        for name in values.keys() {
+        for (name, value) in &values {
             if name == "bucket" {
-                if values.get(name).copied() != Some(bucket) {
+                if *value != bucket {
                     return Err(denied());
                 }
                 continue;
@@ -282,7 +282,7 @@ pub fn verify_sigv4_post_policy(
     if STANDARD.encode(&policy_bytes) != policy {
         return Err(denied());
     }
-    let document: serde_json::Value =
+    let mut document: serde_json::Value =
         serde_json::from_slice(&policy_bytes).map_err(|_invalid_policy| denied())?;
     let expiration = document
         .get("expiration")
@@ -300,17 +300,18 @@ pub fn verify_sigv4_post_policy(
         return Err(denied());
     }
     let conditions = document
-        .get("conditions")
-        .and_then(serde_json::Value::as_array)
+        .get_mut("conditions")
+        .and_then(serde_json::Value::as_array_mut)
         .filter(|conditions| !conditions.is_empty())
-        .ok_or_else(denied)?
-        .clone();
+        .map(std::mem::take)
+        .ok_or_else(denied)?;
     let prefixed_secret = Zeroizing::new(format!("AWS4{}", credential.secret_key));
     let date_key = mac(prefixed_secret.as_bytes(), scope_date.as_bytes())?;
     let region_key = mac(&date_key, region.as_bytes())?;
     let service_key = mac(&region_key, b"s3")?;
     let signing_key = mac(&service_key, b"aws4_request")?;
-    let signature = hex::decode(auth.signature).map_err(|_invalid_signature| denied())?;
+    let mut signature = [0; 32];
+    hex::decode_to_slice(auth.signature, &mut signature).map_err(|_invalid_signature| denied())?;
     let mut verifier =
         Hmac::<Sha256>::new_from_slice(&signing_key).map_err(|_invalid_key| denied())?;
     verifier.update(policy.as_bytes());
@@ -371,20 +372,14 @@ pub fn verify_sigv4(
                 Ok((name, value))
             })
             .collect::<Result<Vec<_>, S3Error>>()?;
-        if fields.len() != 3
-            || ["Credential", "SignedHeaders", "Signature"]
-                .iter()
-                .any(|expected| fields.iter().filter(|(name, _)| name == expected).count() != 1)
-        {
+        if fields.len() != 3 {
             return Err(denied());
         }
         let field = |name| {
-            let mut values = fields.iter().filter(|(key, _)| *key == name);
-            let value = values.next().map(|(_, value)| *value).ok_or_else(denied)?;
-            if values.next().is_some() {
-                return Err(denied());
-            }
-            Ok(value)
+            fields
+                .iter()
+                .find_map(|(key, value)| (*key == name).then_some(*value))
+                .ok_or_else(denied)
         };
         (
             field("Credential")?,
@@ -479,31 +474,30 @@ pub fn verify_sigv4(
     let payload_sha256 = if payload == "UNSIGNED-PAYLOAD" || streaming {
         None
     } else {
-        Some(
-            hex::decode(payload)
-                .map_err(|_invalid_hash| denied())?
-                .try_into()
-                .map_err(|_invalid_length| denied())?,
-        )
+        let mut digest = [0; 32];
+        hex::decode_to_slice(payload, &mut digest).map_err(|_invalid_hash| denied())?;
+        Some(digest)
     };
     let mut canonical_headers = String::new();
     for name in names {
-        let values = headers
-            .get_all(name)
-            .iter()
-            .map(|value| {
-                value
-                    .to_str()
-                    .map(|value| value.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
-                    .map_err(|_invalid_header| denied())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if values.is_empty() || (name == "host" && values.len() != 1) {
+        let values = headers.get_all(name);
+        if values.iter().next().is_none() || (name == "host" && values.iter().nth(1).is_some()) {
             return Err(denied());
         }
         canonical_headers.push_str(name);
         canonical_headers.push(':');
-        canonical_headers.push_str(&values.join(","));
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                canonical_headers.push(',');
+            }
+            let value = value.to_str().map_err(|_invalid_header| denied())?;
+            for (word_index, word) in value.split_ascii_whitespace().enumerate() {
+                if word_index != 0 {
+                    canonical_headers.push(' ');
+                }
+                canonical_headers.push_str(word);
+            }
+        }
         canonical_headers.push('\n');
     }
     // S3 paths are not normalized: repeated slashes and dot segments identify
@@ -519,11 +513,15 @@ pub fn verify_sigv4(
         .map(|(name, value)| (encode(name), encode(value)))
         .collect::<Vec<_>>();
     pairs.sort();
-    let canonical_query = pairs
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join("&");
+    let mut canonical_query = String::new();
+    for (index, (name, value)) in pairs.into_iter().enumerate() {
+        if index != 0 {
+            canonical_query.push('&');
+        }
+        canonical_query.push_str(&name);
+        canonical_query.push('=');
+        canonical_query.push_str(&value);
+    }
     let canonical =
         format!("{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed}\n{payload}");
     let scope_suffix = scope
@@ -539,12 +537,13 @@ pub fn verify_sigv4(
     let region_key = mac(&date_key, region.as_bytes())?;
     let service_key = mac(&region_key, b"s3")?;
     let signing_key = mac(&service_key, b"aws4_request")?;
-    let signature = hex::decode(signature).map_err(|_invalid_signature| denied())?;
+    let mut signature_bytes = [0; 32];
+    hex::decode_to_slice(signature, &mut signature_bytes).map_err(|_invalid_signature| denied())?;
     let mut verifier =
         Hmac::<Sha256>::new_from_slice(&signing_key).map_err(|_invalid_key| denied())?;
     verifier.update(to_sign.as_bytes());
     verifier
-        .verify_slice(&signature)
+        .verify_slice(&signature_bytes)
         .map_err(|_mismatch| denied())?;
     let streaming = if streaming {
         let encoding = singleton_header(headers, "content-encoding")?.ok_or_else(denied)?;
@@ -574,9 +573,7 @@ pub fn verify_sigv4(
             key: shardline_protocol::SecretBytes::new(signing_key.to_vec()),
             timestamp: timestamp.to_owned(),
             scope: scope_suffix.to_owned(),
-            previous: signature
-                .try_into()
-                .map_err(|_invalid_signature| denied())?,
+            previous: signature_bytes,
             length: length.parse().map_err(|_invalid_length| denied())?,
         })
     } else {
@@ -615,21 +612,6 @@ fn mac(key: &[u8], value: &[u8]) -> Result<Zeroizing<Vec<u8>>, S3Error> {
     Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
 
-fn singleton_header<'headers>(
-    headers: &'headers HeaderMap,
-    name: &str,
-) -> Result<Option<&'headers str>, S3Error> {
-    let mut values = headers.get_all(name).iter();
-    let value = values
-        .next()
-        .map(|value| value.to_str().map_err(|_invalid_header| denied()))
-        .transpose()?;
-    if values.next().is_some() {
-        return Err(denied());
-    }
-    Ok(value)
-}
-
 fn unique<'pairs>(pairs: &'pairs [(String, String)], name: &str) -> Result<&'pairs str, S3Error> {
     optional_unique(pairs, name)?.ok_or_else(denied)
 }
@@ -648,7 +630,6 @@ fn optional_unique<'pairs>(
 
 fn query_pairs(uri: &Uri) -> Result<Vec<(String, String)>, S3Error> {
     uri.query()
-        .filter(|query| !query.is_empty())
         .unwrap_or("")
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -665,17 +646,13 @@ fn query_pairs(uri: &Uri) -> Result<Vec<(String, String)>, S3Error> {
         .collect()
 }
 
-fn encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-                char::from(byte).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
+pub(crate) fn encode(value: &str) -> String {
+    const ESCAPED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, ESCAPED).to_string()
 }
 
 #[cfg(test)]

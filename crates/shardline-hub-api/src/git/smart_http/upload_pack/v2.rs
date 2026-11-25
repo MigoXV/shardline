@@ -35,10 +35,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Option<Request>, HubApiError> {
         return Ok(None);
     }
     let packets = decode(bytes)?;
-    let Some(Some(command_line)) = packets.first() else {
-        return Err(invalid());
-    };
-    let command = std::str::from_utf8(command_line)
+    let command = std::str::from_utf8(first)
         .map_err(|_error| invalid())?
         .strip_prefix("command=")
         .ok_or_else(invalid)?;
@@ -62,10 +59,9 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Option<Request>, HubApiError> {
         .collect::<Result<Vec<_>, HubApiError>>()?;
     validate_capabilities(&capabilities)?;
     let args = packets
-        .get(delimiter.saturating_add(1)..)
-        .ok_or_else(invalid)?
-        .iter()
-        .map(|packet| packet.as_ref().ok_or_else(invalid).cloned())
+        .into_iter()
+        .skip(delimiter.saturating_add(1))
+        .map(|packet| packet.ok_or_else(invalid))
         .collect::<Result<Vec<_>, _>>()?;
     match command {
         "ls-refs" => parse_ls_refs(&args).map(Request::LsRefs).map(Some),
@@ -180,14 +176,11 @@ pub(super) fn fetch_response(
             if !updates.is_empty() {
                 body.extend_from_slice(pktline::encode_line("shallow-info\n")?.as_bytes());
                 body.extend_from_slice(updates);
-            }
-            if !updates.is_empty() {
                 body.extend_from_slice(pktline::DELIMITER.as_bytes());
             }
         }
         body.extend_from_slice(pktline::encode_line("packfile\n")?.as_bytes());
-        body.extend_from_slice(&pktline::sideband_data(pack));
-        body.extend_from_slice(pktline::FLUSH.as_bytes());
+        pktline::append_sideband_data(&mut body, pack);
     } else {
         body.extend_from_slice(pktline::encode_line("acknowledgments\n")?.as_bytes());
         if acknowledgments.is_empty() {
@@ -199,8 +192,8 @@ pub(super) fn fetch_response(
                 body.extend_from_slice(pktline::encode_line(&format!("ACK {oid}\n"))?.as_bytes());
             }
         }
-        body.extend_from_slice(pktline::FLUSH.as_bytes());
     }
+    body.extend_from_slice(pktline::FLUSH.as_bytes());
     Ok(body)
 }
 
@@ -228,16 +221,15 @@ fn parse_ls_refs(args: &[Vec<u8>]) -> Result<LsRefs, HubApiError> {
 }
 
 fn parse_fetch(args: Vec<Vec<u8>>) -> Result<Fetch, HubApiError> {
-    let mut wants = 0usize;
+    let mut has_wants = false;
     let mut done = false;
     let mut wait_for_done = false;
-    let mut lines = Vec::with_capacity(args.len());
-    for argument in args {
-        let line = std::str::from_utf8(&argument).map_err(|_error| invalid())?;
+    for argument in &args {
+        let line = std::str::from_utf8(argument).map_err(|_error| invalid())?;
         let line = line.strip_suffix('\n').unwrap_or(line);
         let fields = line.split_whitespace().collect::<Vec<_>>();
         match fields.as_slice() {
-            ["want", oid] if valid_oid(oid) => wants = wants.saturating_add(1),
+            ["want", oid] if valid_oid(oid) => has_wants = true,
             ["have", oid] if valid_oid(oid) => {}
             ["done"] if !done => done = true,
             ["wait-for-done"] if !wait_for_done => wait_for_done = true,
@@ -252,12 +244,11 @@ fn parse_fetch(args: Vec<Vec<u8>>) -> Result<Fetch, HubApiError> {
             ["filter", filter] if !filter.is_empty() && filter.len() <= 128 => {}
             _ => return Err(invalid()),
         }
-        lines.push(argument);
     }
-    if wants == 0 {
+    if !has_wants {
         return Err(invalid());
     }
-    Ok(Fetch { lines, done })
+    Ok(Fetch { lines: args, done })
 }
 
 fn validate_capabilities(capabilities: &[&str]) -> Result<(), HubApiError> {
@@ -307,44 +298,34 @@ fn first_packet(bytes: &[u8]) -> Result<(&[u8], usize), HubApiError> {
     Ok((bytes.get(4..end).ok_or_else(invalid)?, end))
 }
 
-fn decode(bytes: &[u8]) -> Result<Vec<Option<Vec<u8>>>, HubApiError> {
+fn decode(mut bytes: &[u8]) -> Result<Vec<Option<Vec<u8>>>, HubApiError> {
     let mut packets = Vec::new();
-    let mut offset = 0usize;
-    let mut flushed = false;
-    while offset < bytes.len() {
-        let end_header = offset.checked_add(4).ok_or_else(invalid)?;
-        let header = bytes.get(offset..end_header).ok_or_else(invalid)?;
+    while !bytes.is_empty() {
+        let (header, body) = bytes.split_at_checked(4).ok_or_else(invalid)?;
         let length =
             usize::from_str_radix(std::str::from_utf8(header).map_err(|_error| invalid())?, 16)
                 .map_err(|_error| invalid())?;
-        if length > 65_520 {
-            return Err(invalid());
-        }
-        offset = end_header;
+        bytes = body;
         match length {
             0 => {
-                if flushed || offset != bytes.len() {
-                    return Err(invalid());
-                }
-                flushed = true;
+                return if bytes.is_empty() {
+                    Ok(packets)
+                } else {
+                    Err(invalid())
+                };
             }
             1 => packets.push(None),
-            2 | 3 => return Err(invalid()),
-            _ => {
-                let payload_length = length.checked_sub(4).ok_or_else(invalid)?;
-                let end = offset.checked_add(payload_length).ok_or_else(invalid)?;
-                packets.push(Some(bytes.get(offset..end).ok_or_else(invalid)?.to_vec()));
-                offset = end;
+            4..=65_520 => {
+                let (payload, remaining) = bytes
+                    .split_at_checked(length.saturating_sub(4))
+                    .ok_or_else(invalid)?;
+                packets.push(Some(payload.to_vec()));
+                bytes = remaining;
             }
-        }
-        if flushed {
-            break;
+            _ => return Err(invalid()),
         }
     }
-    if !flushed {
-        return Err(invalid());
-    }
-    Ok(packets)
+    Err(invalid())
 }
 
 fn invalid() -> HubApiError {
@@ -374,6 +355,32 @@ mod tests {
         }
         body.extend_from_slice(pktline::FLUSH.as_bytes());
         body
+    }
+
+    #[test]
+    fn framing_requires_complete_packets_and_one_final_flush() {
+        assert_eq!(
+            decode(b"0005x000100040000").unwrap(),
+            vec![Some(b"x".to_vec()), None, Some(Vec::new())]
+        );
+        for wire in [
+            &b""[..],
+            b"00",
+            b"0005x",
+            b"0000trailing",
+            b"00000000",
+            b"0002",
+            b"0003",
+            b"zzzz",
+            b"\xff000",
+            b"000aabc0000",
+            b"fff1",
+        ] {
+            assert!(
+                decode(wire).is_err(),
+                "accepted malformed framing: {wire:?}"
+            );
+        }
     }
 
     #[test]

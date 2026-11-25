@@ -47,8 +47,7 @@ async fn create_ref(
     crate::revision_access::authorize_write(repo_id, name, auth)?;
     state
         .store
-        .get_repo(repo_id)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(repo_id)?
         .ok_or(HubApiError::RepoNotFound)?;
     let sha = crate::git::smart_http::resolve_commit_id(state, repo_id, target, auth)?
         .ok_or(HubApiError::RevisionNotFound)?;
@@ -57,8 +56,7 @@ async fn create_ref(
     // replace an existing ref after a read-before-write race.
     match state
         .store
-        .create_revision_if_absent(repo_id, Some(&sha), &sha, name, message)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .create_revision_if_absent(repo_id, Some(&sha), &sha, name, message)?
     {
         HubRefCreateOutcome::Created(_) => Ok(StatusCode::CREATED),
         HubRefCreateOutcome::AlreadyExists => {
@@ -70,29 +68,28 @@ async fn create_ref(
     }
 }
 
-fn remove_ref(state: &HubState, repo_id: &str, name: &str) -> Result<StatusCode, HubApiError> {
+fn remove_ref(
+    state: &HubState,
+    auth: &shardline_server_core::AuthorizedRepository,
+    repo_id: &str,
+    name: &str,
+) -> Result<StatusCode, HubApiError> {
+    crate::revision_access::authorize_write(repo_id, name, auth)?;
     state
         .store
-        .get_repo(repo_id)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(repo_id)?
         .ok_or(HubApiError::RepoNotFound)?;
     if name == "main" || name == "HEAD" {
         return Err(HubApiError::Forbidden);
     }
     // Resolving a revision can also resolve an immutable commit ID. Deletion
     // must match a live ref, then use the store's compare-and-delete operation.
-    let refs = state
-        .store
-        .list_refs_bounded(repo_id, 10_000)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let refs = state.store.list_refs_bounded(repo_id, 10_000)?;
     let current = refs
         .iter()
         .find(|reference| reference.ref_name == name)
         .ok_or(HubApiError::RevisionNotFound)?;
-    state
-        .store
-        .delete_ref(repo_id, name, &current.sha)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    state.store.delete_ref(repo_id, name, &current.sha)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -120,8 +117,7 @@ pub(crate) async fn branch_delete(
     Path((_kind, ns, repo, name)): Path<(String, String, String, String)>,
 ) -> Result<StatusCode, HubApiError> {
     let name = checked_ref(&name, false)?;
-    crate::revision_access::authorize_write(&format!("{ns}/{repo}"), &name, _repo.capability())?;
-    remove_ref(&state, &format!("{ns}/{repo}"), &name)
+    remove_ref(&state, _repo.capability(), &format!("{ns}/{repo}"), &name)
 }
 
 pub(crate) async fn tag_create(
@@ -148,6 +144,5 @@ pub(crate) async fn tag_delete(
     Path((_kind, ns, repo, name)): Path<(String, String, String, String)>,
 ) -> Result<StatusCode, HubApiError> {
     let name = checked_ref(&name, true)?;
-    crate::revision_access::authorize_write(&format!("{ns}/{repo}"), &name, _repo.capability())?;
-    remove_ref(&state, &format!("{ns}/{repo}"), &name)
+    remove_ref(&state, _repo.capability(), &format!("{ns}/{repo}"), &name)
 }

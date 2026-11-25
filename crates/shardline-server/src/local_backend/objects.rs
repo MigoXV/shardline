@@ -1,12 +1,7 @@
-use shardline_protocol::ByteRange;
-use shardline_storage::{DeleteOutcome, ObjectKey, ObjectMetadata, ObjectPrefix, ObjectStore};
+use shardline_storage::{DeleteOutcome, ObjectKey, ObjectStore};
 
 use super::LocalBackend;
-use crate::{
-    ServerError,
-    download_stream::{ServerByteStream, object_byte_range_stream, object_byte_stream},
-    object_store::{read_small_object, visit_object_prefix},
-};
+use crate::ServerError;
 
 impl LocalBackend {
     pub(crate) async fn object_length(&self, object_key: &ObjectKey) -> Result<u64, ServerError> {
@@ -21,49 +16,6 @@ impl LocalBackend {
         })
         .await
         .map_err(ServerError::BlockingTask)?
-    }
-
-    pub(crate) async fn read_object(&self, object_key: &ObjectKey) -> Result<Vec<u8>, ServerError> {
-        read_small_object(self.object_store(), object_key.clone()).await
-    }
-
-    pub(crate) async fn read_object_stream(
-        &self,
-        object_key: &ObjectKey,
-        total_length: u64,
-        range: Option<ByteRange>,
-    ) -> Result<ServerByteStream, ServerError> {
-        let object_store = self.object_store();
-        if let Some(range) = range {
-            return object_byte_range_stream(object_store, object_key.clone(), total_length, range)
-                .await;
-        }
-
-        object_byte_stream(object_store, object_key.clone(), total_length).await
-    }
-
-    pub(crate) fn visit_object_prefix<Visitor>(
-        &self,
-        prefix: &ObjectPrefix,
-        visitor: Visitor,
-    ) -> Result<(), ServerError>
-    where
-        Visitor: FnMut(ObjectMetadata) -> Result<(), ServerError>,
-    {
-        tokio::task::block_in_place(|| visit_object_prefix(&self.object_store(), prefix, visitor))
-    }
-
-    pub(crate) fn list_object_flat_namespace_page(
-        &self,
-        prefix: &ObjectPrefix,
-        start_after: Option<&ObjectKey>,
-        limit: usize,
-    ) -> Result<Vec<ObjectMetadata>, ServerError> {
-        tokio::task::block_in_place(|| {
-            Ok(self
-                .object_store()
-                .list_flat_namespace_page(prefix, start_after, limit)?)
-        })
     }
 
     pub(crate) async fn delete_object_if_present(
@@ -194,7 +146,7 @@ mod tests {
         let (backend, _tmp) = make_backend().await;
         let prefix = ObjectPrefix::parse("nonexistent-prefix").unwrap();
         let mut visited = Vec::new();
-        let result = backend.visit_object_prefix(&prefix, |meta| {
+        let result = crate::ServerBackend::Local(backend).visit_object_prefix(&prefix, |meta| {
             visited.push(meta.key().as_str().to_owned());
             Ok(())
         });
@@ -212,7 +164,7 @@ mod tests {
 
         let prefix = ObjectPrefix::parse("prefix1").unwrap();
         let mut keys = Vec::new();
-        backend
+        crate::ServerBackend::Local(backend)
             .visit_object_prefix(&prefix, |meta| {
                 keys.push(meta.key().as_str().to_owned());
                 Ok(())
@@ -277,7 +229,9 @@ mod tests {
         let key = ObjectKey::parse("read-test-key").unwrap();
         let data = b"readable-content";
         backend.put_fixture(&key, data.to_vec()).unwrap();
-        let result = backend.read_object(&key).await.unwrap();
+        let result = crate::object_store::read_small_object(backend.object_store(), key)
+            .await
+            .unwrap();
         assert_eq!(result.as_slice(), data);
     }
 
@@ -285,7 +239,7 @@ mod tests {
     async fn read_object_returns_not_found_for_missing() {
         let (backend, _tmp) = make_backend().await;
         let key = ObjectKey::parse("missing-read-key").unwrap();
-        let result = backend.read_object(&key).await;
+        let result = crate::object_store::read_small_object(backend.object_store(), key).await;
         assert!(matches!(result, Err(crate::ServerError::NotFound)));
     }
 
@@ -295,8 +249,8 @@ mod tests {
         let key = ObjectKey::parse("stream-test-key").unwrap();
         let data = b"stream-content";
         backend.put_fixture(&key, data.to_vec()).unwrap();
-        let result = backend
-            .read_object_stream(&key, data.len() as u64, None)
+        let result = crate::ServerBackend::Local(backend)
+            .direct_object_stream(&key, data.len() as u64, None)
             .await;
         assert!(result.is_ok());
     }
@@ -309,7 +263,7 @@ mod tests {
             let key = ObjectKey::parse(&format!("list-prefix/obj{i}")).unwrap();
             backend.put_fixture(&key, b"data".to_vec()).unwrap();
         }
-        let page = backend
+        let page = crate::ServerBackend::Local(backend)
             .list_object_flat_namespace_page(&prefix, None, 10)
             .unwrap();
         assert_eq!(page.len(), 3);
@@ -323,8 +277,8 @@ mod tests {
         backend.put_fixture(&key, data.to_vec()).unwrap();
         use shardline_protocol::ByteRange;
         let range = ByteRange::new(0, 4).unwrap();
-        let result = backend
-            .read_object_stream(&key, data.len() as u64, Some(range))
+        let result = crate::ServerBackend::Local(backend)
+            .direct_object_stream(&key, data.len() as u64, Some(range))
             .await;
         assert!(result.is_ok());
     }
@@ -346,10 +300,7 @@ mod tests {
         drop(tmpfile);
 
         let bytes = std::fs::read(&tmp_path);
-        assert!(bytes.is_ok());
-        let Ok(bytes) = bytes else {
-            return;
-        };
+        let bytes = bytes.expect("expected valid bytes");
         let result = backend.put_fixture(&canonical_key, bytes);
         assert!(
             result.is_ok(),

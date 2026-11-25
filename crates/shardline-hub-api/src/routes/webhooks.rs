@@ -9,8 +9,6 @@ use axum::{
 };
 
 use crate::{error::HubApiError, models::*, types::WebhookScheme};
-// HubRepoType used in the webhook_create handler for repo lookup
-// (used implicitly via state.store methods)
 use shardline_index::hub::HubWebhook;
 use shardline_protocol::SecretString;
 
@@ -57,7 +55,7 @@ pub(crate) async fn deliver_webhook_events(
     static WEBHOOK_DELIVERY_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(16));
 
     let client = match &state.http_client {
-        Some(client) => client.clone(),
+        Some(client) => client,
         None => return,
     };
     let webhooks = match state.store.webhooks_for_event(repo_id, event) {
@@ -81,20 +79,17 @@ pub(crate) async fn deliver_webhook_events(
         data: serde_json::json!({}),
     };
     let body = match serde_json::to_vec(&payload) {
-        Ok(b) => b,
+        Ok(b) => bytes::Bytes::from(b),
         Err(e) => {
             tracing::warn!("failed to serialize webhook payload: {e}");
             return;
         }
     };
-    for webhook in &webhooks {
-        let url = webhook.url.clone();
-        let body = body.clone();
-        let client = client.clone();
-        let url_for_log = sanitize_log_url(&url);
+    for webhook in webhooks {
+        let url_for_log = sanitize_log_url(&webhook.url);
         // Resolve the plaintext signing secret, decrypting at-rest ciphertext
         // and lazily upgrading legacy plaintext rows when a key is configured.
-        let secret = match resolve_webhook_secret(state, webhook) {
+        let secret = match resolve_webhook_secret(state, &webhook) {
             Ok(secret) => secret,
             Err(e) => {
                 tracing::warn!("failed to resolve secret for webhook {url_for_log}: {e}");
@@ -105,6 +100,9 @@ pub(crate) async fn deliver_webhook_events(
             tracing::warn!("webhook delivery semaphore closed");
             return;
         };
+        let url = webhook.url;
+        let body = body.clone();
+        let client = client.clone();
         // Spawn a delivery task and a separate monitoring task that holds the
         // semaphore permit and logs panics. If the delivery task panics, tokio
         // catches it and the JoinHandle returns Err, which we log here.
@@ -112,7 +110,7 @@ pub(crate) async fn deliver_webhook_events(
             deliver_one_webhook(
                 &client,
                 &url,
-                &body,
+                body,
                 secret.as_ref().map(SecretString::expose_secret),
             )
             .await
@@ -210,7 +208,7 @@ pub(crate) fn sanitize_log_url(url: &str) -> String {
 async fn deliver_one_webhook(
     client: &reqwest::Client,
     url: &str,
-    body: &[u8],
+    body: bytes::Bytes,
     secret: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     validate_webhook_url(url)?;
@@ -242,7 +240,7 @@ async fn deliver_one_webhook(
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes())?;
-        mac.update(body);
+        mac.update(&body);
         let signature = hex::encode(mac.finalize().into_bytes());
         request = request.header("X-Hub-Signature-256", format!("sha256={signature}"));
     }
@@ -262,7 +260,7 @@ async fn deliver_one_webhook(
         }
     }
     let response = request
-        .body(body.to_vec())
+        .body(body)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -380,12 +378,12 @@ pub(crate) const fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
 }
 
 pub(crate) fn webhook_response_from_hub(
-    webhook: &shardline_index::hub::HubWebhook,
+    webhook: shardline_index::hub::HubWebhook,
 ) -> WebhookResponse {
     WebhookResponse {
-        id: webhook.id.clone(),
-        url: webhook.url.clone(),
-        events: webhook.events.clone(),
+        id: webhook.id,
+        url: webhook.url,
+        events: webhook.events,
         active: webhook.active,
         created_at: webhook.created_at_unix_seconds,
     }
@@ -411,8 +409,7 @@ pub(crate) async fn webhook_create(
     validate_webhook_url(&request.url)?;
     let _ = state
         .store
-        .get_repo(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?
+        .get_repo(&name)?
         .ok_or(HubApiError::RepoNotFound)?;
     // Encrypt the signing secret at rest when a cipher is configured.
     let secret_to_store: Option<String> =
@@ -424,18 +421,15 @@ pub(crate) async fn webhook_create(
             ),
             _ => None,
         };
-    let webhook = state
-        .store
-        .create_webhook_bounded(
-            &name,
-            &request.url,
-            &request.events,
-            secret_to_store
-                .as_deref()
-                .or_else(|| request.secret.as_ref().map(SecretString::expose_secret)),
-            MAX_WEBHOOKS_PER_REPO,
-        )
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let webhook = state.store.create_webhook_bounded(
+        &name,
+        &request.url,
+        &request.events,
+        secret_to_store
+            .as_deref()
+            .or_else(|| request.secret.as_ref().map(SecretString::expose_secret)),
+        MAX_WEBHOOKS_PER_REPO,
+    )?;
     let webhook = match webhook {
         shardline_index::hub::HubWebhookCreateOutcome::Created(webhook) => webhook,
         shardline_index::hub::HubWebhookCreateOutcome::Duplicate => {
@@ -457,7 +451,7 @@ pub(crate) async fn webhook_create(
     };
     Ok((
         StatusCode::CREATED,
-        Json(webhook_response_from_hub(&webhook)),
+        Json(webhook_response_from_hub(webhook)),
     ))
 }
 
@@ -470,12 +464,12 @@ pub(crate) async fn webhook_list(
     shardline_metrics::record_hub_api_request("webhook_list", "GET", 200);
     let name = format!("{ns}/{repo}");
     crate::revision_access::authorize_repository_wide(&name, _repo.capability())?;
-    let webhooks = state
-        .store
-        .list_webhooks(&name)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    let webhooks = state.store.list_webhooks(&name)?;
     let response = WebhookListResponse {
-        webhooks: webhooks.iter().map(webhook_response_from_hub).collect(),
+        webhooks: webhooks
+            .into_iter()
+            .map(webhook_response_from_hub)
+            .collect(),
     };
     Ok(Json(response))
 }
@@ -489,10 +483,7 @@ pub(crate) async fn webhook_delete(
     shardline_metrics::record_hub_api_request("webhook_delete", "DELETE", 204);
     let name = format!("{ns}/{repo}");
     crate::revision_access::authorize_repository_wide(&name, _repo.capability())?;
-    state
-        .store
-        .delete_webhook(&name, &webhook_id)
-        .map_err(|e| HubApiError::CasError(e.to_string()))?;
+    state.store.delete_webhook(&name, &webhook_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -504,6 +495,37 @@ mod tests {
     use super::*;
     use crate::routes::test_repo;
     use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn webhook_delivery_rejects_unsafe_urls_before_transport() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/hook",
+            "http://localhost/hook",
+            "http://127.0.0.1/hook",
+            "http://169.254.169.254/hook",
+            "http://10.0.0.1/hook",
+            "http://[::1]/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+        ] {
+            let error = deliver_one_webhook(
+                &client,
+                url,
+                bytes::Bytes::from_static(b"private payload"),
+                None,
+            )
+            .await
+            .expect_err("unsafe destination must fail before sending the payload");
+            assert!(
+                matches!(
+                    error.downcast_ref::<HubApiError>(),
+                    Some(HubApiError::PathValidation(_))
+                ),
+                "{url}: expected URL validation failure, got {error}"
+            );
+        }
+    }
 
     #[test]
     fn webhook_dns_rejects_the_entire_mixed_or_empty_answer() {
@@ -531,127 +553,46 @@ mod tests {
     }
 
     #[test]
-    fn validate_webhook_url_accepts_valid_http() {
+    fn webhook_url_validation_accepts_public_http_and_rejects_unsafe_inputs() {
         assert!(validate_webhook_url("http://example.com/hook").is_ok());
+        let oversized = format!("http://example.com/{}", "a".repeat(3000));
+        for url in [
+            "ftp://example.com/hook",
+            "javascript:alert(1)",
+            "http://localhost/hook",
+            "http://10.0.0.1/hook",
+            "http://192.168.1.1/hook",
+            "http://127.0.0.1/hook",
+            "http://[::1]/hook",
+            oversized.as_str(),
+        ] {
+            assert!(validate_webhook_url(url).is_err(), "{url}");
+        }
     }
 
     #[test]
-    fn validate_webhook_url_rejects_ftp_scheme() {
-        assert!(validate_webhook_url("ftp://example.com/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_javascript_scheme() {
-        assert!(validate_webhook_url("javascript:alert(1)").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_localhost() {
-        assert!(validate_webhook_url("http://localhost/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_private_ip_10() {
-        assert!(validate_webhook_url("http://10.0.0.1/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_private_ip_192_168() {
-        assert!(validate_webhook_url("http://192.168.1.1/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_loopback() {
-        assert!(validate_webhook_url("http://127.0.0.1/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_ipv6_loopback() {
-        assert!(validate_webhook_url("http://[::1]/hook").is_err());
-    }
-
-    #[test]
-    fn validate_webhook_url_rejects_long_url() {
-        let long = format!("http://example.com/{}", "a".repeat(3000));
-        assert!(validate_webhook_url(&long).is_err());
-    }
-
-    #[test]
-    fn is_private_ip_true_for_loopback() {
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_private_10() {
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_private_172() {
-        let ip: IpAddr = "172.16.0.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_private_192_168() {
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_link_local() {
-        let ip: IpAddr = "169.254.1.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_cgnat() {
-        let ip: IpAddr = "100.64.0.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_unspecified() {
-        let ip: IpAddr = "0.0.0.0".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_ipv6_loopback() {
-        let ip: IpAddr = "::1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_ipv6_link_local() {
-        let ip: IpAddr = "fe80::1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_false_for_public() {
-        let ip: IpAddr = "8.8.8.8".parse().unwrap();
-        assert!(!is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_false_for_ipv6_public() {
-        let ip: IpAddr = "2001:4860:4860::8888".parse().unwrap();
-        assert!(!is_private_ip(&ip));
-    }
-
-    #[test]
-    fn sanitize_log_url_normal() {
-        let url = "https://example.com/webhook";
-        assert_eq!(sanitize_log_url(url), "https://example.com");
-    }
-
-    #[test]
-    fn sanitize_log_url_replaces_control_chars() {
-        let url = "https://example.com/new\nline";
-        assert_eq!(sanitize_log_url(url), "https://example.com");
+    fn webhook_address_classification_preserves_blocked_and_public_ranges() {
+        for (address, blocked) in [
+            ("127.0.0.1", true),
+            ("10.0.0.1", true),
+            ("172.16.0.1", true),
+            ("192.168.1.1", true),
+            ("169.254.1.1", true),
+            ("100.64.0.1", true),
+            ("0.0.0.0", true),
+            ("::1", true),
+            ("fe80::1", true),
+            ("8.8.8.8", false),
+            ("2001:4860:4860::8888", false),
+            ("::ffff:8.8.8.8", false),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:192.168.1.1", true),
+            ("fc00::1", true),
+            ("2600::1", false),
+        ] {
+            let ip: IpAddr = address.parse().unwrap();
+            assert_eq!(is_private_ip(&ip), blocked, "{address}");
+        }
     }
 
     #[test]
@@ -664,30 +605,23 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_log_url_replaces_tab() {
-        let url = "https://example.com/\tpath";
-        assert_eq!(sanitize_log_url(url), "https://example.com");
-    }
-
-    #[test]
-    fn sanitize_log_url_short_no_truncation() {
-        let url = "http://a.b";
-        assert_eq!(sanitize_log_url(url), url);
-        assert!(!url.ends_with("..."));
-    }
-
-    #[test]
-    fn webhook_logs_redact_credentials_and_path_tokens() {
-        let url = "https://user:password@example.com:8443/services/private-token?key=query-secret#fragment-secret";
-        assert_eq!(sanitize_log_url(url), "https://example.com:8443");
-        assert_eq!(
-            sanitize_log_url("invalid private-token"),
-            "<invalid webhook URL>"
-        );
-        assert_eq!(
-            sanitize_log_url("data:text/plain,private-token"),
-            "<invalid webhook URL>"
-        );
+    fn webhook_logs_redact_credentials_paths_and_invalid_urls() {
+        let long_path = format!("https://example.com/{}", "a".repeat(300));
+        for (input, expected) in [
+            ("https://example.com/webhook", "https://example.com"),
+            ("https://example.com/new\nline", "https://example.com"),
+            ("https://example.com/\tpath", "https://example.com"),
+            ("http://a.b", "http://a.b"),
+            (long_path.as_str(), "https://example.com"),
+            (
+                "https://user:password@example.com:8443/services/private-token?key=query-secret#fragment-secret",
+                "https://example.com:8443",
+            ),
+            ("invalid private-token", "<invalid webhook URL>"),
+            ("data:text/plain,private-token", "<invalid webhook URL>"),
+        ] {
+            assert_eq!(sanitize_log_url(input), expected, "{input:?}");
+        }
     }
 
     #[test]
@@ -739,26 +673,13 @@ mod tests {
         assert!(validate_webhook_url("http://255.255.255.255/hook").is_err());
     }
 
-    #[test]
-    fn is_private_ip_false_for_ipv4_mapped_public_v6() {
-        let ip: IpAddr = "::ffff:8.8.8.8".parse().unwrap();
-        assert!(!is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_ipv4_mapped_loopback_v6() {
-        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
     // ── At-rest webhook secret encryption ─────────────────────────────────
 
     use axum::Json;
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
-    use shardline_index::hub::{BoxedHubStore, HubRepoType};
+    use shardline_index::hub::HubRepoType;
     use shardline_protocol::SecretBytes;
-    use shardline_server_core::ServerObjectStore;
 
     use crate::models::WebhookCreateRequest;
     use crate::secrets::{WebhookSecretCipher, WebhookSecretCipherError};
@@ -766,44 +687,23 @@ mod tests {
     const ENC_KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdef";
 
     fn make_encrypted_state(key: &[u8; 32]) -> (tempfile::TempDir, HubState) {
-        let ts = tempfile::tempdir().unwrap();
-        shardline_index::hub::ensure_hub_tables(ts.path()).unwrap();
-        let store = shardline_index::LocalIndexStore::open(ts.path().to_path_buf());
-        let boxed = BoxedHubStore::from_store(store);
-        boxed
+        let (ts, mut state) = crate::routes::tests::make_test_state();
+        state
+            .store
             .create_repo(HubRepoType::Model, "org/enc", false)
             .unwrap();
-        let cipher = WebhookSecretCipher::new(SecretBytes::new(key.to_vec())).unwrap();
-        let object_store = ServerObjectStore::local(ts.path().join("lfs")).unwrap();
-        let state = HubState {
-            store: boxed,
-            object_store,
-            auth: None,
-            http_client: None,
-            webhook_secret_cipher: Some(cipher),
-            public_base_url: "http://127.0.0.1:8080".to_owned(),
-        };
+        state.webhook_secret_cipher =
+            Some(WebhookSecretCipher::new(SecretBytes::new(key.to_vec())).unwrap());
         (ts, state)
     }
 
     #[tokio::test]
     async fn webhook_create_rejects_beyond_per_repo_cap() {
-        let ts = tempfile::tempdir().unwrap();
-        shardline_index::hub::ensure_hub_tables(ts.path()).unwrap();
-        let store = shardline_index::LocalIndexStore::open(ts.path().to_path_buf());
-        let boxed = BoxedHubStore::from_store(store);
-        boxed
+        let (_ts, state) = crate::routes::tests::make_test_state();
+        state
+            .store
             .create_repo(HubRepoType::Model, "org/cap", false)
             .unwrap();
-        let object_store = ServerObjectStore::local(ts.path().join("lfs")).unwrap();
-        let state = HubState {
-            store: boxed,
-            object_store,
-            auth: None,
-            http_client: None,
-            webhook_secret_cipher: None,
-            public_base_url: "http://127.0.0.1:8080".to_owned(),
-        };
         let headers = axum::http::HeaderMap::new();
 
         // Registering up to the cap succeeds.
@@ -995,22 +895,11 @@ mod tests {
 
     #[test]
     fn without_key_secret_stored_and_read_as_plaintext() {
-        let ts = tempfile::tempdir().unwrap();
-        shardline_index::hub::ensure_hub_tables(ts.path()).unwrap();
-        let store = shardline_index::LocalIndexStore::open(ts.path().to_path_buf());
-        let boxed = BoxedHubStore::from_store(store);
-        boxed
+        let (_ts, state) = crate::routes::tests::make_test_state();
+        state
+            .store
             .create_repo(HubRepoType::Model, "org/plain", false)
             .unwrap();
-        let object_store = ServerObjectStore::local(ts.path().join("lfs")).unwrap();
-        let state = HubState {
-            store: boxed,
-            object_store,
-            auth: None,
-            http_client: None,
-            webhook_secret_cipher: None,
-            public_base_url: "http://127.0.0.1:8080".to_owned(),
-        };
         state
             .store
             .create_webhook(
@@ -1076,24 +965,6 @@ mod tests {
         let wrong = WebhookSecretCipher::new(SecretBytes::new(WRONG_KEY.to_vec())).unwrap();
         let result = wrong.decrypt(repo, wh.secret.as_ref().unwrap().expose_secret());
         assert!(matches!(result, Err(WebhookSecretCipherError::Decrypt(_))));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_ipv4_mapped_private_v6() {
-        let ip: IpAddr = "::ffff:192.168.1.1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_true_for_ipv6_unique_local() {
-        let ip: IpAddr = "fc00::1".parse().unwrap();
-        assert!(is_private_ip(&ip));
-    }
-
-    #[test]
-    fn is_private_ip_false_for_ipv6_public_unicast() {
-        let ip: IpAddr = "2600::1".parse().unwrap();
-        assert!(!is_private_ip(&ip));
     }
 
     #[test]

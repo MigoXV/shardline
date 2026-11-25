@@ -7,7 +7,7 @@ use axum::{
         HeaderMap, StatusCode, Uri,
         header::{CONTENT_RANGE, LOCATION, RANGE},
     },
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use sha2::{Digest as _, Sha256};
 use shardline_index::{
@@ -80,6 +80,19 @@ async fn stage_oci_ranged_body(
     Ok(Some(staged))
 }
 
+fn upload_session_response(
+    status: StatusCode,
+    repository: &str,
+    session_id: &str,
+    length: u64,
+) -> Result<Response, axum::http::Error> {
+    Response::builder()
+        .status(status)
+        .header(LOCATION, upload_session_location(repository, session_id))
+        .header(RANGE, format!("0-{}", length.saturating_sub(1)))
+        .body(Body::empty())
+}
+
 #[tracing::instrument(skip(state, _headers, uri, body, repo), fields(repository = %repo.repository()))]
 pub(crate) async fn oci_post_blob_upload(
     state: &Arc<AppState>,
@@ -132,7 +145,12 @@ pub(crate) async fn oci_post_blob_upload(
         let object_key = oci_blob_key(repository, &digest_hex, auth)?;
         let _stored = state
             .backend
-            .put_sha256_addressed_object_stream_if_absent(&object_key, &digest_hex, body)
+            .put_sha256_addressed_object_stream_if_absent(
+                &object_key,
+                &digest_hex,
+                body,
+                auth.namespace(),
+            )
             .await?;
         publish_oci_blob(state, repository, auth, &digest_hex).await?;
         metrics().protocol.record_oci_upload();
@@ -173,11 +191,7 @@ pub(crate) async fn oci_post_blob_upload(
                 return Err(ServerError::TooManyUploadSessions);
             }
         }
-        return Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .header(LOCATION, upload_session_location(repository, &session_id))
-            .header(RANGE, "0-0")
-            .body(Body::empty())
+        return upload_session_response(StatusCode::ACCEPTED, repository, &session_id, 0)
             .map_err(|_error| ServerError::Overflow);
     }
     let session_id = create_upload_session(
@@ -190,15 +204,10 @@ pub(crate) async fn oci_post_blob_upload(
         state.backend.uses_s3_object_store(),
     )
     .await?;
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(LOCATION, upload_session_location(repository, &session_id))
-        .header(RANGE, "0-0")
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build post blob upload response");
-            ServerError::Overflow
-        })
+    upload_session_response(StatusCode::ACCEPTED, repository, &session_id, 0).map_err(|e| {
+        tracing::warn!(error = %e, "failed to build post blob upload response");
+        ServerError::Overflow
+    })
 }
 
 #[tracing::instrument(skip(state, headers, body, repo), fields(repository = %repo.repository(), session_id))]
@@ -291,16 +300,10 @@ pub(crate) async fn oci_patch_blob_upload(
     if !session.use_s3_multipart {
         touch_upload_session(state.config.root_dir(), session_id, session).await?;
     }
-    let last = new_length.saturating_sub(1);
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(LOCATION, upload_session_location(repository, session_id))
-        .header(RANGE, format!("0-{last}"))
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build patch blob upload response");
-            ServerError::Overflow
-        })
+    upload_session_response(StatusCode::ACCEPTED, repository, session_id, new_length).map_err(|e| {
+        tracing::warn!(error = %e, "failed to build patch blob upload response");
+        ServerError::Overflow
+    })
 }
 
 async fn durable_oci_patch_blob_upload(
@@ -390,11 +393,7 @@ async fn durable_oci_patch_blob_upload(
             .checked_add(1)
             .ok_or(ServerError::Overflow)?;
     }
-    Response::builder()
-        .status(StatusCode::ACCEPTED)
-        .header(LOCATION, upload_session_location(repository, session_id))
-        .header(RANGE, format!("0-{}", new_length.saturating_sub(1)))
-        .body(Body::empty())
+    upload_session_response(StatusCode::ACCEPTED, repository, session_id, new_length)
         .map_err(|_error| ServerError::Overflow)
 }
 
@@ -551,7 +550,13 @@ pub(crate) async fn oci_put_blob_upload(
     let upload_path = upload_body_path_for_session(state.config.root_dir(), session_id)?;
     let _stored = state
         .backend
-        .put_sha256_addressed_object_file(&object_key, &digest_hex, &upload_path, &integrity)
+        .put_sha256_addressed_object_file(
+            &object_key,
+            &digest_hex,
+            &upload_path,
+            &integrity,
+            auth.namespace(),
+        )
         .await?;
     publish_oci_blob(state, repository, auth, &digest_hex).await?;
     delete_upload_session(state.config.root_dir(), session_id).await?;
@@ -654,7 +659,12 @@ async fn durable_oci_put_blob_upload(
     {
         state
             .backend
-            .put_sha256_addressed_object_stream_if_absent(&object_key, digest_hex, reader)
+            .put_sha256_addressed_object_stream_if_absent(
+                &object_key,
+                digest_hex,
+                reader,
+                auth.namespace(),
+            )
             .await?
     } else {
         let temporary = tempfile::tempdir()?;
@@ -705,7 +715,13 @@ async fn durable_oci_put_blob_upload(
         );
         state
             .backend
-            .put_sha256_addressed_object_file(&object_key, digest_hex, &assembled_path, &integrity)
+            .put_sha256_addressed_object_file(
+                &object_key,
+                digest_hex,
+                &assembled_path,
+                &integrity,
+                auth.namespace(),
+            )
             .await?
     };
 
@@ -783,11 +799,7 @@ pub(crate) async fn oci_get_blob_upload(
                 .checked_add(part.size_bytes())
                 .ok_or(ServerError::Overflow)
         })?;
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .header(LOCATION, upload_session_location(repository, session_id))
-            .header(RANGE, format!("0-{}", length.saturating_sub(1)))
-            .body(Body::empty())
+        return upload_session_response(StatusCode::NO_CONTENT, repository, session_id, length)
             .map_err(|_error| ServerError::Overflow);
     }
     let _lock = lock_upload_sessions(state.config.root_dir()).await?;
@@ -808,16 +820,10 @@ pub(crate) async fn oci_get_blob_upload(
         upload_length(state.config.root_dir(), session_id).await?
     };
     touch_upload_session(state.config.root_dir(), session_id, session).await?;
-    let last = length.saturating_sub(1);
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .header(LOCATION, upload_session_location(repository, session_id))
-        .header(RANGE, format!("0-{last}"))
-        .body(Body::empty())
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build get blob upload response");
-            ServerError::Overflow
-        })
+    upload_session_response(StatusCode::NO_CONTENT, repository, session_id, length).map_err(|e| {
+        tracing::warn!(error = %e, "failed to build get blob upload response");
+        ServerError::Overflow
+    })
 }
 
 #[tracing::instrument(skip(state, _headers, repo), fields(repository = %repo.repository(), session_id))]
@@ -858,10 +864,7 @@ pub(crate) async fn oci_delete_blob_upload(
         {
             return Err(ServerError::NotFound);
         }
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .map_err(|_error| ServerError::Overflow);
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let _lock = lock_upload_sessions(state.config.root_dir()).await?;
     let session = read_upload_session(
@@ -879,10 +882,7 @@ pub(crate) async fn oci_delete_blob_upload(
         abort_s3_multipart_upload_session(&state.backend, &session).await?;
     }
     delete_upload_session(state.config.root_dir(), session_id).await?;
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .map_err(|_error| ServerError::Overflow)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[cfg(test)]
@@ -893,33 +893,13 @@ mod tests {
         body::Body,
         http::{Method, StatusCode, header},
     };
-    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
     use super::super::test_helpers::{
-        build_oci_postgres_test_cluster, build_oci_test_state, oci_test_router,
+        build_oci_postgres_test_cluster, build_oci_test_state, oci_test_router, send, sha256_hex,
     };
 
     const REPO: &str = "team/assets";
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        hex::encode(Sha256::digest(bytes))
-    }
-
-    async fn send(
-        app: &axum::Router,
-        method: Method,
-        uri: &str,
-        body: Body,
-    ) -> axum::http::Response<Body> {
-        let request = axum::http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .body(body)
-            .unwrap();
-        app.clone().oneshot(request).await.unwrap()
-    }
 
     async fn upload_blob_direct(
         app: &axum::Router,

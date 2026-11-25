@@ -5,7 +5,7 @@ use crate::{
     OperationKind, ProviderLifecycleEvent, QuarantineLifecycleEvent, ReliabilityError,
     ReliabilityMerkleCommit, RepairEvidenceEvent, RetentionHoldLifecycleEvent,
     S3ObjectLifecycleEvent, StateTransitionEvent, WebhookDeliveryLifecycleEvent,
-    reliability_merkle_commit_json_with_previous,
+    build_reliability_merkle_commit_with_previous,
 };
 
 /// Verifies one persisted reliability event using the canonical domain decoder.
@@ -127,6 +127,18 @@ pub fn build_persisted_merkle_commit_with_previous(
     event_json: Value,
     previous_json: Option<Value>,
 ) -> Result<Value, ReliabilityError> {
+    Ok(serde_json::to_value(build_persisted_commit(
+        operation_kind,
+        event_json,
+        previous_json,
+    )?)?)
+}
+
+fn build_persisted_commit(
+    operation_kind: OperationKind,
+    event_json: Value,
+    previous_json: Option<Value>,
+) -> Result<ReliabilityMerkleCommit, ReliabilityError> {
     let previous = previous_json
         .map(serde_json::from_value::<ReliabilityMerkleCommit>)
         .transpose()?;
@@ -203,14 +215,9 @@ pub fn verify_persisted_merkle_commit_with_previous(
             operation_kind.as_str()
         ))
     })?;
-    let expected =
-        build_persisted_merkle_commit_with_previous(operation_kind, event_json, previous_json)?;
+    let expected_commit = build_persisted_commit(operation_kind, event_json, previous_json)?;
     let observed_commit = serde_json::from_value::<ReliabilityMerkleCommit>(observed)?;
-    let expected_commit = serde_json::from_value::<ReliabilityMerkleCommit>(expected)?;
-    if observed_commit.schema_version > crate::RELIABILITY_MERKLE_SCHEMA_VERSION
-        || observed_commit.body != expected_commit.body
-        || observed_commit.event != expected_commit.event
-    {
+    if !observed_commit.matches_expected(&expected_commit) {
         return Err(ReliabilityError::Merkle(format!(
             "persisted Merkle commitment mismatch for {}",
             operation_kind.as_str()
@@ -300,7 +307,7 @@ fn verify_persisted_event_merkle_chain_inner(
             operation_kind,
             event,
             commit.clone(),
-            previous.clone(),
+            previous,
         )?;
         previous = commit;
     }
@@ -342,7 +349,7 @@ fn build<E>(
     operation_kind: OperationKind,
     event_json: Value,
     previous: Option<&ReliabilityMerkleCommit>,
-) -> Result<Value, ReliabilityError>
+) -> Result<ReliabilityMerkleCommit, ReliabilityError>
 where
     E: serde::de::DeserializeOwned + crate::event_metadata::EvidenceEventMetadata,
 {
@@ -350,7 +357,7 @@ where
     if event.operation_identity().kind != operation_kind {
         return Err(ReliabilityError::OperationMismatch);
     }
-    reliability_merkle_commit_json_with_previous(&event, previous)
+    build_reliability_merkle_commit_with_previous(&event, previous)
 }
 
 #[cfg(test)]
@@ -458,11 +465,10 @@ mod tests {
         )
         .unwrap();
 
-        let chained_commit = second_commit.clone();
         verify_persisted_merkle_commit_with_previous(
             OperationKind::Upload,
             second_json.clone(),
-            Some(chained_commit.clone()),
+            Some(second_commit.clone()),
             Some(first_commit.clone()),
         )
         .unwrap();
@@ -470,23 +476,25 @@ mod tests {
             verify_persisted_merkle_commit(
                 OperationKind::Upload,
                 second_json,
-                Some(chained_commit)
+                Some(second_commit.clone())
             )
             .is_err()
         );
 
-        let mut legacy_commit = build_persisted_merkle_commit_with_previous(
-            OperationKind::Upload,
-            serde_json::to_value(&second).unwrap(),
-            Some(
-                build_persisted_merkle_commit(
-                    OperationKind::Upload,
-                    serde_json::to_value(&first).unwrap(),
-                )
-                .unwrap(),
-            ),
-        )
-        .unwrap();
+        let mut future_commit = second_commit.clone();
+        future_commit["schema_version"] =
+            serde_json::json!(crate::RELIABILITY_MERKLE_SCHEMA_VERSION + 1);
+        assert!(
+            verify_persisted_merkle_commit_with_previous(
+                OperationKind::Upload,
+                serde_json::to_value(&second).unwrap(),
+                Some(future_commit),
+                Some(first_commit.clone()),
+            )
+            .is_err()
+        );
+
+        let mut legacy_commit = second_commit;
         legacy_commit
             .as_object_mut()
             .unwrap()

@@ -20,101 +20,73 @@ use crate::{
 };
 
 #[tokio::test]
-async fn memory_cache_roundtrips_one_payload() {
-    let cache = MemoryReconstructionCache::new(NonZeroU64::MIN, NonZeroUsize::MIN);
-    let key = ReconstructionCacheKey::latest("asset.bin", None);
-    let put = cache.put(&key, b"payload").await;
-    assert!(put.is_ok());
-
-    let value = cache.get(&key).await;
-
-    assert!(value.is_ok());
-    assert_eq!(value.ok(), Some(Some(b"payload".to_vec())));
-}
-
-#[tokio::test]
-async fn memory_cache_evicts_oldest_entry_when_capacity_is_full() {
-    let max_entries = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
-    let ttl_seconds = NonZeroU64::new(60).unwrap_or(NonZeroU64::MIN);
-    let cache = MemoryReconstructionCache::new(ttl_seconds, max_entries);
-    let first = ReconstructionCacheKey::latest("asset-1.bin", None);
-    let second = ReconstructionCacheKey::latest("asset-2.bin", None);
-    let third = ReconstructionCacheKey::latest("asset-3.bin", None);
-
-    assert!(cache.put(&first, b"first").await.is_ok());
-    assert!(cache.put(&second, b"second").await.is_ok());
-    assert!(cache.put(&third, b"third").await.is_ok());
-
-    let first_value = cache.get(&first).await;
-    let second_value = cache.get(&second).await;
-    let third_value = cache.get(&third).await;
-
-    assert!(first_value.is_ok());
-    assert!(second_value.is_ok());
-    assert!(third_value.is_ok());
-    assert_eq!(first_value.ok(), Some(None));
-    assert_eq!(second_value.ok(), Some(Some(b"second".to_vec())));
-    assert_eq!(third_value.ok(), Some(Some(b"third".to_vec())));
+async fn memory_cache_basic_lifecycle_preserves_payload_and_delete_results() {
+    for (ttl, capacity, name, payload) in [
+        (1, 1, "asset.bin", b"payload".as_slice()),
+        (3600, 100, "del-test", b"data".as_slice()),
+    ] {
+        let cache = MemoryReconstructionCache::new(
+            NonZeroU64::new(ttl).unwrap(),
+            NonZeroUsize::new(capacity).unwrap(),
+        );
+        cache.ready().await.unwrap();
+        let absent = ReconstructionCacheKey::latest("nonexistent", None);
+        assert_eq!(cache.get(&absent).await.unwrap(), None);
+        assert!(!cache.delete(&absent).await.unwrap());
+        assert!(
+            !cache
+                .delete(&ReconstructionCacheKey::latest("missing", None))
+                .await
+                .unwrap()
+        );
+        let key = ReconstructionCacheKey::latest(name, None);
+        cache.put(&key, payload).await.unwrap();
+        assert_eq!(cache.get(&key).await.unwrap(), Some(payload.to_vec()));
+        assert!(cache.delete(&key).await.unwrap());
+        assert_eq!(cache.get(&key).await.unwrap(), None);
+        assert!(!cache.delete(&key).await.unwrap());
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn memory_cache_expires_entries_after_ttl() {
-    let ttl_seconds = NonZeroU64::new(1).unwrap_or(NonZeroU64::MIN);
-    let cache = MemoryReconstructionCache::new(ttl_seconds, NonZeroUsize::MIN);
+async fn memory_cache_fifo_eviction_handles_equal_timestamps_and_each_capacity() {
+    let keys = ["first", "second", "third", "fourth"]
+        .map(|name| ReconstructionCacheKey::latest(name, None));
+    for capacity in 1..=3 {
+        let cache = MemoryReconstructionCache::new(
+            NonZeroU64::new(60).unwrap(),
+            NonZeroUsize::new(capacity).unwrap(),
+        );
+        let inserted_at = tokio::time::Instant::now();
+        for key in &keys[..capacity] {
+            cache.put(key, b"data").await.unwrap();
+            assert_eq!(cache.get(key).await.unwrap(), Some(b"data".to_vec()));
+        }
+        cache.put(&keys[capacity], b"replacement").await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), inserted_at);
+        for (index, key) in keys[..capacity].iter().enumerate() {
+            assert_eq!(
+                cache.get(key).await.unwrap(),
+                (index != 0).then(|| b"data".to_vec()),
+                "capacity {capacity}, entry {index}"
+            );
+        }
+        assert_eq!(
+            cache.get(&keys[capacity]).await.unwrap(),
+            Some(b"replacement".to_vec())
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_cache_expires_at_the_ttl_boundary() {
+    let cache = MemoryReconstructionCache::new(NonZeroU64::MIN, NonZeroUsize::MIN);
     let key = ReconstructionCacheKey::latest("asset.bin", None);
-    assert!(cache.put(&key, b"payload").await.is_ok());
-
-    tokio::time::advance(Duration::from_secs(1)).await;
-    let value = cache.get(&key).await;
-
-    assert!(value.is_ok());
-    assert_eq!(value.ok(), Some(None));
-}
-
-// ── TTL expiry (wall-clock) ───────────────────────────────────────────
-
-#[allow(clippy::shadow_unrelated)]
-#[tokio::test]
-async fn memory_cache_expires_entries_after_ttl_wall_clock() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(1).unwrap(),
-        NonZeroUsize::new(100).unwrap(),
-    );
-    let key = ReconstructionCacheKey::latest("test-file", None);
-    cache.put(&key, b"hello").await.unwrap();
-
-    // Immediately readable
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(b"hello".to_vec()));
-
-    // After expiry
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, None, "expired entry should return None");
-}
-
-// ── Eviction with max_entries = 1 ─────────────────────────────────────
-
-#[allow(clippy::shadow_unrelated)]
-#[tokio::test]
-async fn memory_cache_evicts_oldest_when_at_capacity_one() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap(),
-        NonZeroUsize::new(1).unwrap(), // only 1 entry
-    );
-    let key_a = ReconstructionCacheKey::latest("file-a", None);
-    let key_b = ReconstructionCacheKey::latest("file-b", None);
-
-    cache.put(&key_a, b"aaa").await.unwrap();
-    cache.put(&key_b, b"bbb").await.unwrap();
-
-    // key_a should be evicted (oldest)
-    let result = cache.get(&key_a).await.unwrap();
-    assert_eq!(result, None, "oldest entry should be evicted");
-
-    // key_b should still be present
-    let result = cache.get(&key_b).await.unwrap();
-    assert_eq!(result, Some(b"bbb".to_vec()));
+    cache.put(&key, b"payload").await.unwrap();
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_eq!(cache.get(&key).await.unwrap(), Some(b"payload".to_vec()));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(cache.get(&key).await.unwrap(), None);
 }
 
 // ── Concurrent get_or_load deduplication ──────────────────────────────
@@ -182,35 +154,6 @@ async fn memory_cache_loader_failure_cleans_up_pending() {
     assert_eq!(result.unwrap(), Some(b"success".to_vec()));
 }
 
-// ── Delete ────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn memory_cache_delete_removes_entry() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap(),
-        NonZeroUsize::new(100).unwrap(),
-    );
-    let key = ReconstructionCacheKey::latest("del-test", None);
-
-    cache.put(&key, b"data").await.unwrap();
-    assert!(cache.get(&key).await.unwrap().is_some());
-
-    let deleted = cache.delete(&key).await.unwrap();
-    assert!(deleted);
-    assert!(cache.get(&key).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn memory_cache_delete_missing_returns_false() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap(),
-        NonZeroUsize::new(100).unwrap(),
-    );
-    let key = ReconstructionCacheKey::latest("missing", None);
-    let deleted = cache.delete(&key).await.unwrap();
-    assert!(!deleted);
-}
-
 // ── delete() releases an orphaned loading latch ────────────────────────
 //
 // When a loader fails in a path that does not notify (e.g. the caller uses
@@ -274,32 +217,6 @@ async fn delete_clears_orphaned_loading_latch_and_wakes_waiter() {
         Ok(result) => assert_eq!(result.unwrap(), Some(b"ok".to_vec())),
         Err(_) => panic!("get_or_load stalled after latch cleanup"),
     }
-}
-
-// ── ready() test ─────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn memory_cache_ready_returns_ok() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
-    );
-    let result = cache.ready().await;
-    assert!(result.is_ok());
-}
-
-// ── get returns None for missing key ──────────────────────────────────
-
-#[tokio::test]
-async fn memory_cache_get_returns_none_for_missing_key() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
-    );
-    let key = ReconstructionCacheKey::latest("nonexistent", None);
-    let result = cache.get(&key).await;
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), None);
 }
 
 // ── get returns None for expired entry (not in loading state) ─────────
@@ -1083,18 +1000,27 @@ async fn put_update_existing_no_eviction() {
     assert_eq!(result, Some(b"second".to_vec()));
 }
 
-// ── PartialOrd implementation for EvictionKey ────────────────────────
-
 #[test]
-fn eviction_key_partial_cmp() {
+fn eviction_key_orders_by_age_then_sequence() {
     use super::inner::EvictionKey;
     use tokio::time::Instant;
 
-    let a = EvictionKey(Instant::now(), 1);
-    let b = EvictionKey(Instant::now(), 2);
-    // partial_cmp delegates to cmp
-    let ordering = a.partial_cmp(&b);
-    assert!(ordering.is_some());
+    let now = Instant::now();
+    let later = now + Duration::from_millis(1);
+    let mut keys = [
+        EvictionKey(later, 0),
+        EvictionKey(now, 2),
+        EvictionKey(now, 1),
+    ];
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            EvictionKey(now, 1),
+            EvictionKey(now, 2),
+            EvictionKey(later, 0)
+        ]
+    );
 }
 
 // ── get: race to hit no-loading / re-check paths ─────────────────────
@@ -1103,73 +1029,7 @@ fn eviction_key_partial_cmp() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn get_race_with_write_lock_contention() {
-    // Use a longer TTL so pre-seeded entries don't expire before we race.
-    // The goal is to have get()'s read-lock see loading=true on an expired
-    // entry, then lose the write-lock race to a concurrent operation,
-    // landing on lines 260-270.
-    let cache = std::sync::Arc::new(MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(10_000).unwrap_or(NonZeroUsize::MIN),
-    ));
-
-    let mut handles = Vec::new();
-    for i in 0..500 {
-        let key = ReconstructionCacheKey::latest(&format!("contention-{i}"), None);
-
-        // Write-lock contender (put)
-        let c1 = std::sync::Arc::clone(&cache);
-        let k1 = key.clone();
-        let h1 = tokio::spawn(async move {
-            let _ = c1.put(&k1, b"preloaded").await;
-        });
-
-        // Write-lock contender (delete)
-        let c2 = std::sync::Arc::clone(&cache);
-        let k2 = key.clone();
-        let h2 = tokio::spawn(async move {
-            let _ = c2.delete(&k2).await;
-        });
-
-        // Failing loader (get_or_load)
-        let c3 = std::sync::Arc::clone(&cache);
-        let k3 = key.clone();
-        let h3 = tokio::spawn(async move {
-            let _ = c3
-                .get_or_load(&k3, || {
-                    Box::pin(async {
-                        tokio::time::sleep(Duration::from_micros(100)).await;
-                        Err::<Vec<u8>, ReconstructionCacheError>(
-                            ReconstructionCacheError::Operation,
-                        )
-                    })
-                })
-                .await;
-        });
-
-        // Getter
-        let c4 = std::sync::Arc::clone(&cache);
-        let k4 = key.clone();
-        let h4 = tokio::spawn(async move {
-            let _ = c4.get(&k4).await;
-        });
-
-        // Extra write-lock contender
-        let c5 = std::sync::Arc::clone(&cache);
-        let k5 = key.clone();
-        let h5 = tokio::spawn(async move {
-            let _ = c5.put(&k5, b"extra").await;
-        });
-
-        handles.push(h1);
-        handles.push(h2);
-        handles.push(h3);
-        handles.push(h4);
-        handles.push(h5);
-    }
-
-    for h in handles {
-        let _ = h.await;
-    }
+    exercise_get_contention(GetContention::PreloadedMutations).await;
 }
 
 // ── Concurrency stress tests ──────────────────────────────────────────
@@ -1353,53 +1213,100 @@ async fn get_write_lock_recheck_finds_valid_entry() {
     }
 }
 
-// ── get(): creates a new loading entry after a previous one vanished ──
-//
-// This covers lines ~267-277 where get() finds NO loading entry in the
-// write lock (it was removed by a concurrent failing loader between
-// the read and write lock), so it creates a fresh loading entry.
+enum GetContention {
+    DisappearingLoader,
+    ConcurrentMutations,
+    ShortLivedSeed,
+    PreloadedMutations,
+}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn get_creates_loading_entry_when_loader_disappears() {
-    let cache = std::sync::Arc::new(MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
+async fn exercise_get_contention(scenario: GetContention) {
+    use std::sync::Arc;
+
+    let (rounds, capacity, readers_per_key, ttl, delay, seed, mutate) = match scenario {
+        GetContention::PreloadedMutations => (500, 10_000, 1, 3600, 100, true, true),
+        GetContention::DisappearingLoader => (1000, 100, 1, 3600, 10, false, false),
+        GetContention::ConcurrentMutations => (3000, 10_000, 3, 3600, 1, false, true),
+        GetContention::ShortLivedSeed => (2000, 10_000, 3, 1, 1, true, true),
+    };
+    let cache = Arc::new(MemoryReconstructionCache::new(
+        NonZeroU64::new(ttl).unwrap(),
+        NonZeroUsize::new(capacity).unwrap(),
     ));
-    // Use a unique key per round so stale loading entries from one
-    // round never cascade into another round's 30-second timeout.
-    let mut handles = Vec::new();
-    for i in 0..1000 {
-        let key = ReconstructionCacheKey::latest(&format!("disappearing-loader-{i}"), None);
-
-        // Failing get_or_load — fast 10 µs sleep
-        let c1 = std::sync::Arc::clone(&cache);
-        let k1 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c1
-                .get_or_load(&k1, || {
-                    Box::pin(async {
-                        tokio::time::sleep(Duration::from_micros(10)).await;
-                        Err::<Vec<u8>, ReconstructionCacheError>(
-                            ReconstructionCacheError::Operation,
-                        )
+    let mut writers = Vec::new();
+    let mut readers = Vec::new();
+    for number in 0..rounds {
+        let key = ReconstructionCacheKey::latest(&format!("contention-{number}"), None);
+        if seed {
+            let seed_cache = Arc::clone(&cache);
+            let seed_key = key.clone();
+            writers.push(tokio::spawn(async move {
+                seed_cache.put(&seed_key, b"seed").await.unwrap();
+            }));
+        }
+        let loader_cache = Arc::clone(&cache);
+        let loader_key = key.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        writers.push(tokio::spawn(async move {
+            let mut started = Some(started);
+            let result = loader_cache
+                .get_or_load(&loader_key, || {
+                    started.take().unwrap().send(()).unwrap();
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_micros(delay)).await;
+                        Err::<Vec<u8>, _>(ReconstructionCacheError::Operation)
                     })
                 })
                 .await;
+            // A seeded cache hit does not invoke the loader callback.
+            if let Some(started) = started {
+                started.send(()).unwrap();
+            }
+            assert!(matches!(
+                result,
+                Ok(_) | Err(ReconstructionCacheError::Operation)
+            ));
         }));
-
-        // get() — may race to see loading entry in read lock but not
-        // in write lock, exercising lines 261-271.
-        let c2 = std::sync::Arc::clone(&cache);
-        let k2 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let result = c2.get(&k2).await;
-            assert!(result.is_ok(), "get() should not error");
-        }));
+        ready.await.unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..readers_per_key {
+            let reader_cache = Arc::clone(&cache);
+            let reader_key = key.clone();
+            waiters.push(tokio::spawn(async move {
+                reader_cache.get(&reader_key).await.unwrap();
+            }));
+        }
+        if mutate {
+            let put_cache = Arc::clone(&cache);
+            let put_key = key.clone();
+            writers.push(tokio::spawn(async move {
+                put_cache.put(&put_key, b"noise").await.unwrap();
+            }));
+            let delete_cache = Arc::clone(&cache);
+            let delete_key = key.clone();
+            writers.push(tokio::spawn(async move {
+                delete_cache.delete(&delete_key).await.unwrap();
+            }));
+        }
+        readers.push((key, waiters));
     }
-
-    for h in handles {
-        let _ = h.await;
+    for writer in writers {
+        writer.await.unwrap();
     }
+    for (key, waiters) in readers {
+        // No mutators remain. Fulfill any cold get() reservation left by the
+        // race, then drain that key before capacity eviction can remove it.
+        cache.put(&key, b"settled").await.unwrap();
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert_eq!(cache.get(&key).await.unwrap(), Some(b"settled".to_vec()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn get_creates_loading_entry_when_loader_disappears() {
+    exercise_get_contention(GetContention::DisappearingLoader).await;
 }
 
 // ── put() notifies waiters when a loading entry exists ─────────────────
@@ -1455,92 +1362,6 @@ async fn put_notifies_waiting_loading_entry() {
         final_val.is_some(),
         "cache should have some value after put notify"
     );
-}
-
-// ── CacheInner seq ordering ───────────────────────────────────────────
-//
-// Verifies that entries are evicted in FIFO order (oldest first) by
-// using monotonic Insertion-time progression (wall-clock with small
-// sleeps between inserts).
-
-#[tokio::test]
-async fn cache_inner_fifo_eviction_order() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(3).unwrap_or(NonZeroUsize::MIN), // capacity = 3
-    );
-    let keys = [
-        ReconstructionCacheKey::latest("first", None),
-        ReconstructionCacheKey::latest("second", None),
-        ReconstructionCacheKey::latest("third", None),
-        ReconstructionCacheKey::latest("fourth", None),
-    ];
-
-    // Insert 3 entries with distinct insertion times
-    for k in &keys[..3] {
-        cache.put(k, b"data").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-
-    // Fourth insert triggers eviction of the oldest (first)
-    cache.put(&keys[3], b"fourth").await.unwrap();
-
-    // First should be evicted (oldest)
-    assert_eq!(
-        cache.get(&keys[0]).await.unwrap(),
-        None,
-        "first (oldest) should be evicted"
-    );
-    // Second and third should still be present
-    assert_eq!(
-        cache.get(&keys[1]).await.unwrap(),
-        Some(b"data".to_vec()),
-        "second should survive"
-    );
-    assert_eq!(
-        cache.get(&keys[2]).await.unwrap(),
-        Some(b"data".to_vec()),
-        "third should survive"
-    );
-    assert_eq!(
-        cache.get(&keys[3]).await.unwrap(),
-        Some(b"fourth".to_vec()),
-        "fourth should be present"
-    );
-}
-
-// ── CacheInner evict_oldest skips stale eviction entries ──────────────
-//
-// If eviction_order has a stale key (entry was already removed from
-// `entries` without cleaning up eviction_order), evict_oldest should
-// skip it and pop the next one.
-
-#[tokio::test]
-async fn cache_inner_evict_oldest_skips_stale_entries() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN), // capacity = 2
-    );
-    let keys = [
-        ReconstructionCacheKey::latest("stale-a", None),
-        ReconstructionCacheKey::latest("stale-b", None),
-        ReconstructionCacheKey::latest("stale-c", None),
-    ];
-
-    // Fill cache to capacity
-    cache.put(&keys[0], b"a").await.unwrap();
-    cache.put(&keys[1], b"b").await.unwrap();
-
-    // Delete keys[0] normally (cleans up eviction_order)
-    cache.delete(&keys[0]).await.unwrap();
-
-    // Now cache has capacity for 1 more, insert keys[2] (no eviction needed)
-    cache.put(&keys[2], b"c").await.unwrap();
-
-    // keys[0] is gone, keys[1] and keys[2] are present
-    assert_eq!(cache.get(&keys[0]).await.unwrap(), None);
-    assert_eq!(cache.get(&keys[1]).await.unwrap(), Some(b"b".to_vec()));
-    assert_eq!(cache.get(&keys[2]).await.unwrap(), Some(b"c".to_vec()));
 }
 
 // ── get_or_load write-lock re-check hit ───────────────────────────────
@@ -1898,233 +1719,99 @@ async fn concurrent_put_and_get_loading_entry_stress() {
             let c_put = std::sync::Arc::clone(&cache);
             let k_put = key.clone();
             handles.push(tokio::spawn(async move {
-                let _ = c_put.put(&k_put, b"data").await;
+                c_put.put(&k_put, b"data").await.unwrap();
             }));
 
             let c_get = std::sync::Arc::clone(&cache);
             let k_get = key.clone();
             handles.push(tokio::spawn(async move {
-                let result = c_get.get(&k_get).await;
-                assert!(result.is_ok(), "get should not error under stress");
+                if c_get.get(&k_get).await.unwrap().is_none() {
+                    // This task has no loader to fulfill its cold reservation.
+                    c_get.release_loading(&k_get);
+                }
             }));
 
             let c_del = std::sync::Arc::clone(&cache);
             let k_del = key.clone();
             handles.push(tokio::spawn(async move {
-                let _ = c_del.delete(&k_del).await;
+                c_del.delete(&k_del).await.unwrap();
             }));
         }
     }
 
     for h in handles {
-        let _ = h.await;
+        h.await.unwrap();
     }
 }
-
-// ── get: phantom loading entry + write-lock re-check with contention ─
-//
-// Spawns many concurrent operations (get_or_load, get, put, delete)
-// on the same cache to create write-lock contention.  This improves
-// the chance that get()'s write-lock acquisition yields, allowing:
-//
-//   a) A loading entry to disappear between read lock and write lock,
-//      triggering the phantom loading entry path (lines 261-271).
-//
-//   b) A put() to store an entry between read lock and write lock,
-//      triggering the write-lock re-check path (lines 230-233).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn get_phantom_loading_recheck_with_contention() {
-    let cache = std::sync::Arc::new(MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(10_000).unwrap_or(NonZeroUsize::MIN),
-    ));
-
-    let mut handles = Vec::new();
-
-    for i in 0..3000 {
-        let key = ReconstructionCacheKey::latest(&format!("contention-{i}"), None);
-
-        // Fast-failing get_or_load — creates a loading entry that
-        // vanishes quickly.
-        let c1 = std::sync::Arc::clone(&cache);
-        let k1 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c1
-                .get_or_load(&k1, || {
-                    Box::pin(async {
-                        tokio::time::sleep(Duration::from_micros(1)).await;
-                        Err::<Vec<u8>, ReconstructionCacheError>(
-                            ReconstructionCacheError::Operation,
-                        )
-                    })
-                })
-                .await;
-        }));
-
-        // get() calls that race against the loader.
-        for _ in 0..3 {
-            let c = std::sync::Arc::clone(&cache);
-            let k = key.clone();
-            handles.push(tokio::spawn(async move {
-                let result = c.get(&k).await;
-                assert!(result.is_ok(), "get() should not error");
-            }));
-        }
-
-        // put() calls to create write-lock contention
-        let c_put2 = std::sync::Arc::clone(&cache);
-        let k_put2 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c_put2.put(&k_put2, b"data").await;
-        }));
-
-        // delete() calls for more write-lock contention
-        let c_del2 = std::sync::Arc::clone(&cache);
-        let k_del2 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c_del2.delete(&k_del2).await;
-        }));
-    }
-
-    for h in handles {
-        let _ = h.await;
-    }
+    exercise_get_contention(GetContention::ConcurrentMutations).await;
 }
-
-// ── get: phantom loading with expired entry removal ──────────────────
-//
-// When the phantom loading path is hit AND an expired entry exists,
-// the `should_remove` check (line 267) is true and the expired entry
-// is cleaned up (lines 268-269).  Uses high contention to hit the
-// race.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn get_phantom_loading_removes_expired_entry() {
-    let cache = std::sync::Arc::new(MemoryReconstructionCache::new(
-        NonZeroU64::new(1).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(10_000).unwrap_or(NonZeroUsize::MIN),
-    ));
+    exercise_get_contention(GetContention::ShortLivedSeed).await;
+}
 
-    let mut handles = Vec::new();
+#[test]
+fn cache_inner_eviction_handles_empty_and_stale_state_without_losing_live_entries() {
+    use super::inner::{CacheInner, EvictionKey};
 
-    for i in 0..2000 {
-        // Each key gets a short-TTL entry via the main cache (1s TTL).
-        // By the time operations race, the entry may be expired,
-        // exercising the should_remove check in the phantom path.
-        let key = ReconstructionCacheKey::latest(&format!("phantom-exp-{i}"), None);
-
-        // Seed: put with 1s TTL
-        let c_seed = std::sync::Arc::clone(&cache);
-        let k_seed = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c_seed.put(&k_seed, b"seed").await;
-        }));
-
-        // Fast-failing loader
-        let c1 = std::sync::Arc::clone(&cache);
-        let k1 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c1
-                .get_or_load(&k1, || {
-                    Box::pin(async {
-                        tokio::time::sleep(Duration::from_micros(1)).await;
-                        Err::<Vec<u8>, ReconstructionCacheError>(
-                            ReconstructionCacheError::Operation,
-                        )
-                    })
-                })
-                .await;
-        }));
-
-        // get() calls
-        for _ in 0..3 {
-            let c_get2 = std::sync::Arc::clone(&cache);
-            let k_get2 = key.clone();
-            handles.push(tokio::spawn(async move {
-                let result = c_get2.get(&k_get2).await;
-                assert!(result.is_ok(), "get() should not error");
-            }));
+    let now = tokio::time::Instant::now();
+    let first = ReconstructionCacheKey::latest("first", None);
+    let second = ReconstructionCacheKey::latest("second", None);
+    let stale = ReconstructionCacheKey::latest("stale", None);
+    for stale_count in [0, 2] {
+        for live in [false, true] {
+            let mut inner = CacheInner::default();
+            for seq in 0..stale_count {
+                inner
+                    .eviction_order
+                    .insert(EvictionKey(now, seq), stale.clone());
+            }
+            if live {
+                let inserted_at = now + Duration::from_secs(1);
+                inner.store(&first, b"a", inserted_at, 2, 16);
+                inner.store(&second, b"bb", inserted_at, 2, 16);
+            }
+            inner.evict_oldest();
+            assert!(!inner.entries.contains_key(&first));
+            assert_eq!(inner.total_bytes, if live { 2 } else { 0 });
+            assert_eq!(inner.eviction_order.len(), usize::from(live));
+            if live {
+                assert_eq!(inner.entries[&second].payload.as_slice(), b"bb");
+                inner.evict_oldest();
+            }
+            assert!(inner.entries.is_empty());
+            assert!(inner.eviction_order.is_empty());
+            assert_eq!(inner.total_bytes, 0);
         }
-
-        // Additional write-lock contention via put/delete
-        let c_put3 = std::sync::Arc::clone(&cache);
-        let k_put3 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c_put3.put(&k_put3, b"noise").await;
-        }));
-        let c_del3 = std::sync::Arc::clone(&cache);
-        let k_del3 = key.clone();
-        handles.push(tokio::spawn(async move {
-            let _ = c_del3.delete(&k_del3).await;
-        }));
-    }
-
-    for h in handles {
-        let _ = h.await;
     }
 }
 
-// ── CacheInner evict_oldest on empty cache ────────────────────────────
-
-#[tokio::test]
-async fn cache_inner_evict_oldest_empty_cache_is_noop() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(5).unwrap_or(NonZeroUsize::MIN),
-    );
-    let key = ReconstructionCacheKey::latest("new-key", None);
-
-    // Eviction should not prevent insertion
-    cache.put(&key, b"data").await.unwrap();
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(b"data".to_vec()));
-}
-
-// ── CacheInner evict_oldest stale eviction entries only ────────────────
-
-#[tokio::test]
-async fn cache_inner_evict_oldest_all_stale_clears_eviction_order() {
-    // Create a cache with capacity 2 and insert 2 entries, then
-    // delete both via remove() which cleans eviction_order.
-    // Then insert a third key — evict_oldest must handle finding
-    // nothing to evict gracefully.
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
-    );
-    let k1 = ReconstructionCacheKey::latest("k1", None);
-    let k2 = ReconstructionCacheKey::latest("k2", None);
-    let k3 = ReconstructionCacheKey::latest("k3", None);
-
-    cache.put(&k1, b"one").await.unwrap();
-    cache.put(&k2, b"two").await.unwrap();
-
-    // Delete both to clean up entries but keep eviction_order entries
-    cache.delete(&k1).await.unwrap();
-    cache.delete(&k2).await.unwrap();
-
-    // k3 should be insertable without panic
-    cache.put(&k3, b"three").await.unwrap();
-    assert_eq!(cache.get(&k3).await.unwrap(), Some(b"three".to_vec()));
-}
-
-// ── CacheInner insert overwrites existing key correctly ────────────────
-
-#[tokio::test]
-async fn cache_inner_insert_overwrites_existing_key() {
-    let cache = MemoryReconstructionCache::new(
-        NonZeroU64::new(3600).unwrap_or(NonZeroU64::MIN),
-        NonZeroUsize::new(100).unwrap_or(NonZeroUsize::MIN),
-    );
+#[test]
+fn cache_inner_replacement_and_removal_preserve_accounting() {
+    let mut inner = super::inner::CacheInner::default();
     let key = ReconstructionCacheKey::latest("overwrite", None);
-
-    // Insert twice — the first entry is replaced in insert()
-    cache.put(&key, b"first").await.unwrap();
-    cache.put(&key, b"second").await.unwrap();
-
-    let result = cache.get(&key).await.unwrap();
-    assert_eq!(result, Some(b"second".to_vec()));
+    let now = tokio::time::Instant::now();
+    for (seq, payload) in [(0, b"first".as_slice()), (1, b"second".as_slice())] {
+        inner.store(&key, payload, now, 2, 16);
+        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.total_bytes, payload.len());
+        assert_eq!(inner.eviction_order.len(), 1);
+        assert!(
+            inner
+                .eviction_order
+                .contains_key(&super::inner::EvictionKey(now, seq))
+        );
+    }
+    assert_eq!(inner.remove(&key).unwrap().payload.as_slice(), b"second");
+    assert!(inner.entries.is_empty());
+    assert!(inner.eviction_order.is_empty());
+    assert_eq!(inner.total_bytes, 0);
+    assert!(inner.remove(&key).is_none());
+    assert_eq!(inner.total_bytes, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -2188,7 +1875,7 @@ async fn memory_cache_huge_ttl_waiter_receives_loaded_value() {
 fn memory_entry_age_expiration_preserves_zero_and_exact_boundary() {
     let inserted_at = tokio::time::Instant::now();
     let entry = super::inner::MemoryEntry {
-        payload: std::sync::Arc::new(b"payload".to_vec()),
+        payload: b"payload".to_vec(),
         inserted_at,
         seq: 0,
     };
@@ -2213,7 +1900,7 @@ fn memory_replacement_admission_counts_net_bytes_and_refreshes_fifo() {
     let third = ReconstructionCacheKey::latest("third", None);
     for replacement in [b"a".as_slice(), b"bbbb".as_slice()] {
         for replace_first in [false, true] {
-            let mut inner = super::inner::CacheInner::new();
+            let mut inner = super::inner::CacheInner::default();
             inner.store(&first, b"1111", now, 2, 8);
             inner.store(&second, b"2222", now, 2, 8);
             let target = if replace_first { &first } else { &second };
@@ -2242,7 +1929,7 @@ fn memory_replacement_growing_payload_evicts_only_under_real_byte_pressure() {
     let now = tokio::time::Instant::now();
     let first = ReconstructionCacheKey::latest("first", None);
     let second = ReconstructionCacheKey::latest("second", None);
-    let mut inner = super::inner::CacheInner::new();
+    let mut inner = super::inner::CacheInner::default();
     inner.store(&first, b"1111", now, 2, 8);
     inner.store(&second, b"22", now, 2, 8);
     inner.store(&second, b"4444", now, 2, 8);
@@ -2260,7 +1947,7 @@ fn memory_oversized_replacement_invalidates_old_value_without_other_eviction() {
     let now = tokio::time::Instant::now();
     let first = ReconstructionCacheKey::latest("first", None);
     let second = ReconstructionCacheKey::latest("second", None);
-    let mut inner = super::inner::CacheInner::new();
+    let mut inner = super::inner::CacheInner::default();
     inner.store(&first, b"1111", now, 2, 8);
     inner.store(&second, b"2222", now, 2, 8);
     inner.store(&second, b"oversized", now, 2, 8);

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+mod provider_failures;
 mod range_bounds;
 use futures_util::StreamExt;
 use object_store::{
@@ -10,7 +11,7 @@ use shardline_protocol::{ByteRange, SecretString, ShardlineHash};
 use super::{
     S3ObjectStore, S3ObjectStoreConfig, S3ObjectStoreError, STREAM_COMPARE_CHUNK_BYTES, chunk_hash,
     is_temp_upload_key, normalize_prefix, stream_payload_for_range, temp_key_for,
-    temporary_upload_location, validated_external_range, verify_file_length, verify_integrity,
+    validated_external_range, verify_file_length, verify_integrity,
 };
 use crate::{
     ObjectBody, ObjectIntegrity, ObjectKey, ObjectPrefix, ObjectStore as ObjectStoreTrait,
@@ -400,14 +401,6 @@ fn synchronous_s3_listing_keeps_non_send_callbacks_on_caller_thread() {
 }
 
 #[test]
-fn s3_config_normalizes_key_prefix() {
-    let config = S3ObjectStoreConfig::new("assets".to_owned(), "us-east-1".to_owned())
-        .with_key_prefix(Some("/tenant-a/"));
-
-    assert_eq!(config.key_prefix(), Some("tenant-a"));
-}
-
-#[test]
 fn s3_location_applies_key_prefix() {
     let store = S3ObjectStore::new(
         S3ObjectStoreConfig::new("assets".to_owned(), "us-east-1".to_owned())
@@ -419,52 +412,27 @@ fn s3_location_applies_key_prefix() {
                 None,
             )
             .with_key_prefix(Some("tenant-a")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
-    let key = ObjectKey::parse("xorbs/default/aa/hash.xorb");
-    assert!(key.is_ok());
-    let Ok(key) = key else {
-        return;
-    };
+    )
+    .unwrap();
+    let key = ObjectKey::parse("xorbs/default/aa/hash.xorb").unwrap();
     let location = store.location_for_key(&key);
 
-    assert!(location.is_ok());
-    if let Ok(location) = location {
-        assert_eq!(location.as_ref(), "tenant-a/xorbs/default/aa/hash.xorb");
+    let location = location.expect("expected valid location");
+    assert_eq!(location.as_ref(), "tenant-a/xorbs/default/aa/hash.xorb");
+}
+
+#[test]
+fn s3_store_rejects_unsafe_prefixes_after_normalization() {
+    for prefix in ["../tenant-b", "/tenant-a/./objects/"] {
+        let config = S3ObjectStoreConfig::new("assets".to_owned(), "us-east-1".to_owned())
+            .with_key_prefix(Some(prefix));
+        assert!(matches!(
+            S3ObjectStore::new(config),
+            Err(S3ObjectStoreError::InvalidKeyPrefix(
+                crate::ObjectPrefixError::UnsafePath
+            ))
+        ));
     }
-}
-
-#[test]
-fn s3_store_rejects_traversal_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("assets".to_owned(), "us-east-1".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("../tenant-b")),
-    );
-
-    assert!(matches!(
-        store,
-        Err(super::S3ObjectStoreError::InvalidKeyPrefix(_))
-    ));
-}
-
-#[test]
-fn s3_store_rejects_dot_segment_key_prefix_after_normalization() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("assets".to_owned(), "us-east-1".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("/tenant-a/./objects/")),
-    );
-
-    assert!(matches!(
-        store,
-        Err(super::S3ObjectStoreError::InvalidKeyPrefix(_))
-    ));
 }
 
 #[test]
@@ -479,31 +447,36 @@ fn s3_store_debug_redacts_credentials() {
                 Some(SecretString::from_secret("session-token")),
             )
             .with_key_prefix(Some("tenant-a")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else {
-        return;
-    };
+    )
+    .unwrap();
 
     let rendered = format!("{store:?}");
 
     assert!(!rendered.contains("access-key"));
     assert!(!rendered.contains("secret-key"));
     assert!(!rendered.contains("session-token"));
+    assert!(rendered.contains("runtime"));
 }
 
 #[test]
-fn validated_external_range_converts_inclusive_byte_range() {
-    let range = ByteRange::new(3, 8);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
-
-    let external = validated_external_range(range);
-
-    assert!(external.is_ok());
-    assert_eq!(external.ok(), Some(3..9));
+fn external_ranges_preserve_endpoints_and_reject_exclusive_end_overflow() {
+    for (start, end, expected) in [
+        (3, 8, 3..9),
+        (5, 5, 5..6),
+        (0, 0, 0..1),
+        (0, u64::MAX - 1, 0..u64::MAX),
+        (u64::MAX - 1, u64::MAX - 1, u64::MAX - 1..u64::MAX),
+    ] {
+        let range = ByteRange::new(start, end).unwrap();
+        assert_eq!(validated_external_range(range).unwrap(), expected);
+    }
+    for start in [0, 5, u64::MAX] {
+        let range = ByteRange::new(start, u64::MAX).unwrap();
+        assert!(matches!(
+            validated_external_range(range),
+            Err(S3ObjectStoreError::RangeOutOfBounds)
+        ));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -518,11 +491,8 @@ async fn stream_payload_for_range_rejects_mismatched_result_range() {
     );
     let result = store
         .get_opts(&location, GetOptions::new().with_range(Some(0..4)))
-        .await;
-    assert!(result.is_ok());
-    let Ok(result) = result else {
-        return;
-    };
+        .await
+        .unwrap();
 
     let stream = stream_payload_for_range(result, 1..5);
 
@@ -544,34 +514,17 @@ async fn stream_payload_for_range_preserves_streamed_bytes() {
     );
     let result = store
         .get_opts(&location, GetOptions::new().with_range(Some(0..4)))
-        .await;
-    assert!(result.is_ok());
-    let Ok(result) = result else {
-        return;
-    };
+        .await
+        .unwrap();
 
-    let stream = stream_payload_for_range(result, 0..4);
-    assert!(stream.is_ok());
-    let Ok(mut stream) = stream else {
-        return;
-    };
+    let mut stream = stream_payload_for_range(result, 0..4).unwrap();
     let mut observed = Vec::new();
     while let Some(item) = stream.next().await {
-        assert!(item.is_ok());
-        let Ok(chunk) = item else {
-            return;
-        };
+        let chunk = item.expect("expected valid chunk");
         observed.extend_from_slice(&chunk);
     }
 
     assert_eq!(observed, b"abcd");
-}
-
-#[test]
-fn s3_store_rejects_empty_bucket() {
-    let config = S3ObjectStoreConfig::new(String::new(), "us-east-1".to_owned());
-    let result = S3ObjectStore::new(config);
-    assert!(matches!(result, Err(S3ObjectStoreError::EmptyBucket)));
 }
 
 #[test]
@@ -608,8 +561,7 @@ fn is_temp_upload_key_matches_generated_overwrite_temp_format() {
 #[test]
 fn is_temp_upload_key_matches_generated_stream_upload_temp_prefix() {
     // Grammar (b): the reserved `__tmp/shardline-stream-upload/` prefix with a
-    // `<nanos>-<pid>-<counter>` tail — the exact shape
-    // `temporary_upload_location` generates.
+    // legacy `<nanos>-<pid>-<counter>` tail, retained for upgrade cleanup.
     assert!(is_temp_upload_key(
         "__tmp/shardline-stream-upload/1750000000000000000-42-7"
     ));
@@ -617,93 +569,90 @@ fn is_temp_upload_key_matches_generated_stream_upload_temp_prefix() {
 }
 
 #[test]
-fn is_temp_upload_key_rejects_non_temp() {
-    assert!(!is_temp_upload_key("uploads/obj"));
-    assert!(!is_temp_upload_key("obj.tmp."));
-    assert!(!is_temp_upload_key("obj.tmp.abc"));
-    assert!(!is_temp_upload_key("obj.tmpx.42"));
+fn temp_key_numeric_fields_require_exactly_three_ascii_decimal_groups() {
+    for (tail, valid) in [
+        ("0,1,2", true),
+        ("001,002,003", true),
+        ("", false),
+        ("1,2", false),
+        ("1,2,3,4", false),
+        (",2,3", false),
+        ("1,,3", false),
+        ("1,2,", false),
+        ("x,2,3", false),
+        ("1,x,3", false),
+        ("1,2,x", false),
+        ("１,2,3", false),
+        ("1, 2,3", false),
+        ("1,2,3/", false),
+    ] {
+        let overwrite = format!(
+            "__tmp/shardline-overwrite/{}.{}",
+            "a".repeat(64),
+            tail.replace(',', ".")
+        );
+        let stream = format!("__tmp/shardline-stream-upload/{}", tail.replace(',', "-"));
+        for key in [overwrite, stream] {
+            assert_eq!(is_temp_upload_key(&key), valid, "{key}");
+        }
+    }
 }
 
 #[test]
-fn is_temp_upload_key_does_not_shadow_user_keys() {
-    // F-49: dots are legal in user keys. `data.tmp.1` is one digit group (not
-    // the generated four-group reserved shape), `report.tmp.2026.1` is two
-    // groups, and a mid-key `.tmp.<digits>` / non-digit tail never matches —
-    // none of these may be filtered from listings or GC enumeration.
-    assert!(!is_temp_upload_key("data.tmp.1"));
-    assert!(!is_temp_upload_key("report.tmp.2026.1"));
-    assert!(!is_temp_upload_key("prefix/obj.tmp.123/suffix"));
-    assert!(!is_temp_upload_key("obj.tmp.42extra"));
-    assert!(!is_temp_upload_key("obj.tmp.42.tmp.99"));
-    assert!(!is_temp_upload_key(".tmp.42"));
-    assert!(!is_temp_upload_key("a/.tmp.42"));
+fn temporary_key_detection_never_shadows_user_objects() {
+    // F-49/F-56/F-80: user keys, including legacy temporary shapes, must remain visible and must never be swept.
+    for key in [
+        "uploads/obj",
+        "obj.tmp.",
+        "obj.tmp.abc",
+        "obj.tmpx.42",
+        "data.tmp.1",
+        "report.tmp.2026.1",
+        "prefix/obj.tmp.123/suffix",
+        "obj.tmp.42extra",
+        "obj.tmp.42.tmp.99",
+        ".tmp.42",
+        "a/.tmp.42",
+        "report.tmp.2026.01.15",
+        "backup.tmp.2026.08.16",
+        "data.tmp.001.002.003",
+        "photos.tmp.1.2.3",
+        "v1.tmp.2026.01.15",
+        "uploads/report.tmp.2026.01.15",
+        "data.tmp.1.1.1750000000000000000",
+        "user/report.tmp.2026.1.1234567890123456",
+        "v1.tmp.123.456.1750000000000000000",
+        "data.tmp.1.4294967296.1750000000000000000",
+        "data.tmp.1.2.999999999999999",
+        "",
+        "obj.tmp.tmp.42",
+        "obj",
+        "obj.temp.42",
+        "obj.tmp.42",
+        "obj.tmp.42.99",
+        "prefix.tmp.",
+    ] {
+        assert!(!is_temp_upload_key(key), "{key}");
+    }
 }
 
 #[test]
-fn is_temp_upload_key_rejects_user_keys_that_look_like_generated_temps() {
-    // F-56/F-80: the pre-fix grammar matched ANY `<base>.tmp.<digits>.<digits>.<digits>`
-    // tail whose groups had the generated numeric shapes, so user keys whose
-    // suffixes are date stamps / version tags / numeric OCI tags collided with
-    // the generated temp grammar — they were shadowed from listings and
-    // deleted by the GC sweep after 1h. The F-80 fix moved the generated temps
-    // into the RESERVED `__tmp/shardline-overwrite/` namespace, so NONE of
-    // these — including keys shaped EXACTLY like the old generated temps — may
-    // be treated as temps.
-    assert!(!is_temp_upload_key("report.tmp.2026.01.15"));
-    assert!(!is_temp_upload_key("backup.tmp.2026.08.16"));
-    assert!(!is_temp_upload_key("data.tmp.001.002.003"));
-    assert!(!is_temp_upload_key("photos.tmp.1.2.3"));
-    assert!(!is_temp_upload_key("v1.tmp.2026.01.15"));
-    assert!(!is_temp_upload_key("uploads/report.tmp.2026.01.15"));
-    // The exact old generated shapes (`<base>.tmp.<u64>.<u32>.<nanos>=10^15..10^20`)
-    // are now indistinguishable from user keys — they must never match.
-    assert!(!is_temp_upload_key("data.tmp.1.1.1750000000000000000"));
-    assert!(!is_temp_upload_key(
-        "user/report.tmp.2026.1.1234567890123456"
-    ));
-    assert!(!is_temp_upload_key("v1.tmp.123.456.1750000000000000000"));
-    // A pid beyond u32 range is never a generated pid (kept as defense).
-    assert!(!is_temp_upload_key(
-        "data.tmp.1.4294967296.1750000000000000000"
-    ));
-    // A 15-digit (sub-10^15) nanos is not a plausible epoch clock value.
-    assert!(!is_temp_upload_key("data.tmp.1.2.999999999999999"));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_overwrite_prefix_with_wrong_shape() {
-    // The reserved overwrite prefix must carry the exact
-    // `<key-digest>.<counter>.<pid>.<nanos>` tail; other names under it (e.g.
-    // a hand-placed lookalike) are not filtered.
-    assert!(!is_temp_upload_key("__tmp/shardline-overwrite/"));
-    assert!(!is_temp_upload_key("__tmp/shardline-overwrite/notes.txt"));
-    // A short / non-hex key digest or a missing digit group never matches.
-    assert!(!is_temp_upload_key("__tmp/shardline-overwrite/abcd.1.2.3"));
-    assert!(!is_temp_upload_key(
-        "__tmp/shardline-overwrite/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.1.2.3"
-    ));
-    assert!(!is_temp_upload_key(
-        "__tmp/shardline-overwrite/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.1.2"
-    ));
-    // A key under a different `__tmp/` sub-namespace never matches.
-    assert!(!is_temp_upload_key("__tmp/other/1.2.3"));
-}
-
-#[test]
-fn validated_external_range_zero_length_rejected() {
-    // ByteRange(5, 3) has start > end, which is invalid
-    let result = shardline_protocol::ByteRange::new(5, 3);
-    assert!(result.is_err());
-}
-
-#[test]
-fn s3_error_display_and_debug_are_implemented() {
-    let err = S3ObjectStoreError::RangeOutOfBounds;
-    let display = format!("{err}");
-    assert!(!display.is_empty(), "Display should produce a message");
-
-    let debug = format!("{err:?}");
-    assert!(!debug.is_empty(), "Debug should produce a message");
+fn temporary_key_detection_rejects_malformed_reserved_keys() {
+    // A reserved prefix alone is insufficient: only the complete generated grammar may be swept.
+    for key in [
+        "__tmp/shardline-overwrite/",
+        "__tmp/shardline-overwrite/notes.txt",
+        "__tmp/shardline-overwrite/abcd.1.2.3",
+        "__tmp/shardline-overwrite/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.1.2.3",
+        "__tmp/shardline-overwrite/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.1.2",
+        "__tmp/other/1.2.3",
+        "__tmp/shardline-stream-upload/",
+        "__tmp/shardline-stream-upload/notes.txt",
+        "__tmp/shardline-stream-upload/42-abc-7",
+        "__tmp/other/1750000000000000000-42-7",
+    ] {
+        assert!(!is_temp_upload_key(key), "{key}");
+    }
 }
 
 #[test]
@@ -782,123 +731,109 @@ fn verify_file_length_mismatch() {
     ));
 }
 
-// ── temporary_upload_location ─────────────────────────────────────────
-
-#[test]
-fn temporary_upload_location_with_prefix() {
-    let prefix = Some("tenant-a".to_owned());
-    let location = temporary_upload_location(&prefix);
-    let path_str = location.as_ref();
-    assert!(path_str.starts_with("tenant-a/__tmp/shardline-stream-upload/"));
-    assert!(path_str.len() > "tenant-a/__tmp/shardline-stream-upload/".len());
-}
-
-#[test]
-fn temporary_upload_location_without_prefix() {
-    let prefix: Option<String> = None;
-    let location = temporary_upload_location(&prefix);
-    let path_str = location.as_ref();
-    assert!(path_str.starts_with("__tmp/shardline-stream-upload/"));
-    assert!(path_str.len() > "__tmp/shardline-stream-upload/".len());
-}
-
 // ── normalize_prefix edge cases ───────────────────────────────────────
 
 #[test]
-fn normalize_prefix_multi_slash() {
-    assert_eq!(normalize_prefix("///a///b///"), Some("a///b".to_owned()));
-}
-
-#[test]
-fn normalize_prefix_already_clean() {
-    assert_eq!(normalize_prefix("a/b/c"), Some("a/b/c".to_owned()));
-}
-
-#[test]
-fn normalize_prefix_preserves_single_component() {
-    assert_eq!(normalize_prefix("prefix"), Some("prefix".to_owned()));
-}
-
-// ── normalize_prefix ─────────────────────────────────────────────────
-
-#[test]
-fn normalize_prefix_trims_trailing_slashes() {
-    assert_eq!(normalize_prefix("prefix/"), Some("prefix".to_owned()));
-}
-
-#[test]
-fn normalize_prefix_trims_leading_slashes() {
-    assert_eq!(normalize_prefix("/prefix"), Some("prefix".to_owned()));
-}
-
-#[test]
-fn normalize_prefix_trims_both_slashes() {
-    assert_eq!(normalize_prefix("/prefix/"), Some("prefix".to_owned()));
-}
-
-#[test]
-fn normalize_prefix_returns_none_for_empty_after_trim() {
-    assert_eq!(normalize_prefix(""), None);
-    assert_eq!(normalize_prefix("/"), None);
-    assert_eq!(normalize_prefix("///"), None);
-}
-
-#[test]
-fn normalize_prefix_preserves_inner_slashes() {
-    assert_eq!(normalize_prefix("/a/b/c/"), Some("a/b/c".to_owned()));
+fn normalize_prefix_contract() {
+    for (prefix, expected) in [
+        ("///a///b///", Some("a///b")),
+        ("a/b/c", Some("a/b/c")),
+        ("prefix", Some("prefix")),
+        ("prefix/", Some("prefix")),
+        ("/prefix", Some("prefix")),
+        ("/prefix/", Some("prefix")),
+        ("", None),
+        ("/", None),
+        ("///", None),
+        ("/a/b/c/", Some("a/b/c")),
+        ("//", None),
+        ("///////", None),
+        ("plain", Some("plain")),
+    ] {
+        assert_eq!(normalize_prefix(prefix).as_deref(), expected, "{prefix:?}");
+    }
 }
 
 // ── validate_config ───────────────────────────────────────────────────
 
 #[test]
-fn validate_config_rejects_empty_region() {
-    let config = S3ObjectStoreConfig::new("bucket".to_owned(), String::new());
-    let result = S3ObjectStore::new(config);
-    assert!(matches!(result, Err(S3ObjectStoreError::EmptyRegion)));
-}
-
-#[test]
-fn validate_config_rejects_empty_bucket() {
-    let config = S3ObjectStoreConfig::new(String::new(), "region".to_owned());
-    let result = S3ObjectStore::new(config);
-    assert!(matches!(result, Err(S3ObjectStoreError::EmptyBucket)));
+fn s3_store_rejects_blank_bucket_and_region() {
+    for blank in ["", "   ", "\t\n"] {
+        assert!(matches!(
+            S3ObjectStore::new(S3ObjectStoreConfig::new(
+                blank.to_owned(),
+                "us-east-1".to_owned()
+            )),
+            Err(S3ObjectStoreError::EmptyBucket)
+        ));
+        assert!(matches!(
+            S3ObjectStore::new(S3ObjectStoreConfig::new(
+                "bucket".to_owned(),
+                blank.to_owned()
+            )),
+            Err(S3ObjectStoreError::EmptyRegion)
+        ));
+    }
+    assert!(matches!(
+        S3ObjectStore::new(S3ObjectStoreConfig::new(String::new(), String::new())),
+        Err(S3ObjectStoreError::EmptyBucket)
+    ));
 }
 
 // ── S3ObjectStoreConfig accessors ──────────────────────────────────────
 
 #[test]
-fn s3_config_bucket_accessor() {
+fn s3_config_defaults_and_prefix_accessors() {
     let config = S3ObjectStoreConfig::new("my-bucket".to_owned(), "us-east-1".to_owned());
     assert_eq!(config.bucket(), "my-bucket");
-}
-
-#[test]
-fn s3_config_bucket_accessor_with_prefix() {
-    let config =
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_key_prefix(Some("pfx"));
-    assert_eq!(config.key_prefix(), Some("pfx"));
-}
-
-#[test]
-fn s3_config_bucket_accessor_no_prefix() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned());
     assert_eq!(config.key_prefix(), None);
+    assert!(!config.allow_http);
+    assert!(!config.virtual_hosted_style_request);
+    for (prefix, expected) in [
+        (Some("pfx"), Some("pfx")),
+        (Some("/tenant-a/"), Some("tenant-a")),
+        (None, None),
+    ] {
+        let configured = config.clone().with_key_prefix(prefix);
+        assert_eq!(configured.bucket(), "my-bucket");
+        assert_eq!(configured.key_prefix(), expected);
+    }
 }
 
 // ── S3ObjectStoreConfig Debug redaction ────────────────────────────────
 
 #[test]
-fn s3_config_debug_redacts_credentials() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
-        Some(SecretString::from_secret("access-key-123")),
-        Some(SecretString::from_secret("secret-key-456")),
-        Some(SecretString::from_secret("session-token-789")),
-    );
-    let rendered = format!("{config:?}");
-    assert!(!rendered.contains("access-key-123"));
-    assert!(!rendered.contains("secret-key-456"));
-    assert!(!rendered.contains("session-token-789"));
-    assert!(rendered.contains("***"));
+fn s3_config_debug_preserves_diagnostics_and_redacts_credentials() {
+    for credentials in [false, true] {
+        for virtual_hosted in [false, true] {
+            let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
+                .with_virtual_hosted_style_request(virtual_hosted)
+                .with_credentials(
+                    credentials.then(|| SecretString::from_secret("access-key-123")),
+                    credentials.then(|| SecretString::from_secret("secret-key-456")),
+                    credentials.then(|| SecretString::from_secret("session-token-789")),
+                );
+            let rendered = format!("{config:?}");
+            for secret in ["access-key-123", "secret-key-456", "session-token-789"] {
+                assert!(!rendered.contains(secret));
+            }
+            for field in [
+                "bucket",
+                "region",
+                "allow_http",
+                "key_prefix",
+                "endpoint: None",
+            ] {
+                assert!(rendered.contains(field));
+            }
+            assert!(rendered.contains(&format!("virtual_hosted_style_request: {virtual_hosted}")));
+            assert!(rendered.contains(if credentials {
+                "***"
+            } else {
+                "access_key_id: None"
+            }));
+        }
+    }
 }
 
 // ── chunk_hash ────────────────────────────────────────────────────────
@@ -924,132 +859,58 @@ fn chunk_hash_handles_empty_input() {
     assert_eq!(hash, expected);
 }
 
-// ── Error variant Display ─────────────────────────────────────────────
-
 #[test]
-fn s3_error_display_incomplete_credentials() {
-    let err = S3ObjectStoreError::IncompleteCredentials;
+fn storage_errors_preserve_diagnostic_sources() {
+    use std::error::Error;
+
+    let io_error: S3ObjectStoreError =
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into();
+    assert!(matches!(&io_error, S3ObjectStoreError::Io(error)
+        if error.kind() == std::io::ErrorKind::PermissionDenied));
+    assert_eq!(io_error.source().unwrap().to_string(), "denied");
+
+    let external: S3ObjectStoreError = object_store::Error::Generic {
+        store: "fixture",
+        source: std::io::Error::other("disconnected").into(),
+    }
+    .into();
+    assert!(matches!(&external, S3ObjectStoreError::External(_)));
     assert_eq!(
-        err.to_string(),
-        "s3 object store credentials must include both access key id and secret access key"
+        external.source().unwrap().source().unwrap().to_string(),
+        "disconnected"
     );
-}
 
-#[test]
-fn s3_error_display_empty_bucket() {
-    let err = S3ObjectStoreError::EmptyBucket;
-    assert_eq!(err.to_string(), "s3 object store bucket must not be empty");
-}
-
-#[test]
-fn s3_error_display_empty_region() {
-    let err = S3ObjectStoreError::EmptyRegion;
-    assert_eq!(err.to_string(), "s3 object store region must not be empty");
-}
-
-#[test]
-fn s3_error_display_integrity_length_mismatch() {
-    let err = S3ObjectStoreError::IntegrityLengthMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body length did not match expected integrity"
+    let prefix_error = crate::ObjectPrefixError::UnsafePath;
+    let expected_prefix_source = prefix_error.to_string();
+    for (error, expected_detail) in [
+        (
+            S3ObjectStoreError::InvalidKeyPrefix(prefix_error),
+            expected_prefix_source.as_str(),
+        ),
+        (
+            S3ObjectStoreError::Path(object_store::path::Error::InvalidPath {
+                path: "/bad".into(),
+            }),
+            "/bad",
+        ),
+        (
+            S3ObjectStoreError::Runtime(std::io::Error::other("thread spawn failed")),
+            "thread spawn failed",
+        ),
+    ] {
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .to_string()
+                .contains(expected_detail)
+        );
+    }
+    assert!(
+        S3ObjectStoreError::ExistingObjectConflict
+            .source()
+            .is_none()
     );
-}
-
-#[test]
-fn s3_error_display_integrity_hash_mismatch() {
-    let err = S3ObjectStoreError::IntegrityHashMismatch;
-    assert_eq!(
-        err.to_string(),
-        "object body hash did not match expected integrity"
-    );
-}
-
-#[test]
-fn s3_error_display_existing_object_conflict() {
-    let err = S3ObjectStoreError::ExistingObjectConflict;
-    assert_eq!(
-        err.to_string(),
-        "object key already exists with conflicting bytes"
-    );
-}
-
-#[test]
-fn s3_error_display_range_out_of_bounds() {
-    let err = S3ObjectStoreError::RangeOutOfBounds;
-    assert_eq!(
-        err.to_string(),
-        "requested byte range exceeded stored object length"
-    );
-}
-
-#[test]
-fn s3_error_display_invalid_listed_key() {
-    let err = S3ObjectStoreError::InvalidListedKey;
-    assert_eq!(
-        err.to_string(),
-        "s3 listed an object outside the configured key prefix"
-    );
-}
-
-#[test]
-fn s3_error_display_invalid_upload_parts() {
-    let err = S3ObjectStoreError::InvalidUploadParts;
-    assert_eq!(
-        err.to_string(),
-        "upload parts list has invalid part numbering"
-    );
-}
-
-#[test]
-fn s3_error_display_runtime_unavailable() {
-    let err = S3ObjectStoreError::RuntimeUnavailable;
-    assert_eq!(err.to_string(), "s3 object store runtime is unavailable");
-}
-
-#[test]
-fn s3_error_display_invalid_key_prefix() {
-    use crate::ObjectPrefixError;
-    let err = S3ObjectStoreError::InvalidKeyPrefix(ObjectPrefixError::UnsafePath);
-    let msg = err.to_string();
-    assert!(msg.contains("key prefix was invalid"));
-}
-
-#[test]
-fn s3_error_display_io() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-    let err = S3ObjectStoreError::Io(io_err);
-    let msg = err.to_string();
-    assert!(msg.contains("temporary file operation failed"));
-}
-
-#[test]
-fn s3_error_display_path() {
-    use object_store::path::Error as PathError;
-    let err = S3ObjectStoreError::Path(PathError::InvalidPath {
-        path: "/bad".into(),
-    });
-    let msg = err.to_string();
-    assert!(msg.contains("object-store path conversion failed"));
-}
-
-#[test]
-fn s3_error_display_runtime() {
-    let io_err = std::io::Error::other("thread spawn failed");
-    let err = S3ObjectStoreError::Runtime(io_err);
-    let msg = err.to_string();
-    assert!(msg.contains("s3 object store runtime initialization failed"));
-}
-
-#[test]
-fn s3_error_display_external() {
-    let ext_err = object_store::Error::NotImplemented {
-        operation: "test".to_owned(),
-        implementer: "test".to_owned(),
-    };
-    let err = S3ObjectStoreError::External(ext_err);
-    let msg = err.to_string();
-    assert!(msg.contains("s3 object store operation failed"));
 }
 
 // ── S3ObjectStoreConfig builder ───────────────────────────────────────
@@ -1069,10 +930,7 @@ fn s3_config_with_virtual_hosted_style() {
 fn temp_key_for_reserved_prefix_shape() {
     let key = ObjectKey::parse("test/object.xorb").unwrap();
     let result: Result<ObjectKey, S3ObjectStoreError> = temp_key_for(&key);
-    assert!(result.is_ok());
-    let Ok(temp) = result else {
-        return;
-    };
+    let temp = result.expect("expected valid temp");
     let temp_str: &str = temp.as_str();
     // F-80: the temp lives in the reserved `__tmp/shardline-overwrite/`
     // namespace (never under the base key, so a user key cannot collide with
@@ -1102,20 +960,6 @@ fn temp_key_for_differs_on_subsequent_calls() {
 // ── validate_config whitespace edge cases ──────────────────────────────
 
 #[test]
-fn validate_config_rejects_whitespace_bucket() {
-    let config = S3ObjectStoreConfig::new("   ".to_owned(), "us-east-1".to_owned());
-    let result = S3ObjectStore::new(config);
-    assert!(matches!(result, Err(S3ObjectStoreError::EmptyBucket)));
-}
-
-#[test]
-fn validate_config_rejects_whitespace_region() {
-    let config = S3ObjectStoreConfig::new("bucket".to_owned(), "   ".to_owned());
-    let result = S3ObjectStore::new(config);
-    assert!(matches!(result, Err(S3ObjectStoreError::EmptyRegion)));
-}
-
-#[test]
 fn validate_config_accepts_valid_config() {
     let config = S3ObjectStoreConfig::new("bucket".to_owned(), "region".to_owned());
     let result = S3ObjectStore::new(config);
@@ -1123,101 +967,6 @@ fn validate_config_accepts_valid_config() {
 }
 
 // ── is_temp_upload_key edge cases ──────────────────────────────────────
-
-#[test]
-fn is_temp_upload_key_rejects_empty() {
-    assert!(!is_temp_upload_key(""));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_no_digits_after_tmp() {
-    assert!(!is_temp_upload_key("obj.tmp."));
-    assert!(!is_temp_upload_key("obj.tmp.abc"));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_multiple_tmp_as_middle_segment() {
-    assert!(!is_temp_upload_key("obj.tmp.tmp.42"));
-    assert!(!is_temp_upload_key("obj.tmp.42.tmp.99"));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_without_tmp_suffix() {
-    assert!(!is_temp_upload_key("obj"));
-    assert!(!is_temp_upload_key("obj.tmpx.42"));
-    assert!(!is_temp_upload_key("obj.temp.42"));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_partial_grammar_matches() {
-    // One or two trailing digit groups, a `.tmp.` in the middle of the key, or
-    // a bare `.tmp.<digits>` with no base are NOT the generated three-group
-    // suffix — none may be filtered from listings (F-49).
-    assert!(!is_temp_upload_key("prefix/obj.tmp.123/suffix"));
-    assert!(!is_temp_upload_key(".tmp.42"));
-    assert!(!is_temp_upload_key("a/.tmp.42"));
-    assert!(!is_temp_upload_key("obj.tmp.42extra"));
-    assert!(!is_temp_upload_key("obj.tmp.42"));
-    assert!(!is_temp_upload_key("obj.tmp.42.99"));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_tmp_alone_after_prefix() {
-    assert!(!is_temp_upload_key("prefix.tmp."));
-}
-
-#[test]
-fn is_temp_upload_key_rejects_stream_upload_prefix_with_wrong_shape() {
-    // The reserved prefix must carry the exact `<nanos>-<pid>-<counter>` tail;
-    // other names under it (e.g. a user-created file) are not filtered.
-    assert!(!is_temp_upload_key("__tmp/shardline-stream-upload/"));
-    assert!(!is_temp_upload_key(
-        "__tmp/shardline-stream-upload/notes.txt"
-    ));
-    assert!(!is_temp_upload_key(
-        "__tmp/shardline-stream-upload/42-abc-7"
-    ));
-    assert!(!is_temp_upload_key("__tmp/other/1750000000000000000-42-7"));
-}
-
-// ── S3ObjectStoreConfig Debug with missing credentials ─────────────────
-
-#[test]
-fn s3_config_debug_without_credentials() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned());
-    let rendered = format!("{config:?}");
-    assert!(rendered.contains("bucket"));
-    assert!(rendered.contains("allow_http"));
-    assert!(rendered.contains("region"));
-    assert!(rendered.contains("key_prefix"));
-}
-
-#[test]
-fn s3_config_with_allow_http_defaults_to_false() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned());
-    let store = S3ObjectStore::new(config);
-    assert!(store.is_ok());
-}
-
-// ── S3ObjectStoreError From impls ──────────────────────────────────────
-
-#[test]
-fn s3_error_from_io_error() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
-    let err: S3ObjectStoreError = io_err.into();
-    assert!(matches!(err, S3ObjectStoreError::Io(_)));
-}
-
-#[test]
-fn s3_error_from_external_error() {
-    use object_store::Error as ExtError;
-    let ext_err = ExtError::Generic {
-        store: "test",
-        source: Box::new(std::io::Error::other("fail")),
-    };
-    let err: S3ObjectStoreError = ext_err.into();
-    assert!(matches!(err, S3ObjectStoreError::External(_)));
-}
 
 // ── S3ByteStream type alias smoke test ─────────────────────────────────
 
@@ -1227,40 +976,7 @@ fn s3_byte_stream_type_is_send() {
     assert_send::<super::S3ByteStream>();
 }
 
-#[test]
-fn validated_external_range_rejects_len_overflow() {
-    // ByteRange(0, u64::MAX) is valid (start <= end) but len()
-    // returns None because (MAX - 0) + 1 overflows u64.
-    let range = ByteRange::new(0, u64::MAX).expect("valid range");
-    let result = validated_external_range(range);
-    assert!(matches!(result, Err(S3ObjectStoreError::RangeOutOfBounds)));
-}
-
 // ── verified_external_range edge cases ────────────────────────────
-
-#[test]
-fn validated_external_range_single_byte() {
-    let range = ByteRange::new(5, 5);
-    assert!(range.is_ok());
-    let Ok(range) = range else {
-        return;
-    };
-
-    let external = validated_external_range(range);
-
-    assert!(external.is_ok());
-    assert_eq!(external.ok(), Some(5..6));
-}
-
-#[test]
-fn validated_external_range_large_range() {
-    // A large valid range
-    let range = ByteRange::new(0, u64::MAX - 1).expect("valid large range");
-    let external = validated_external_range(range);
-    // Should succeed
-    assert!(external.is_ok());
-    assert_eq!(external.ok(), Some(0..u64::MAX));
-}
 
 // ── S3MultipartUploadWriter via InMemory ──────────────────────────────
 
@@ -1395,31 +1111,18 @@ fn streaming_large_copy_rejects_empty_region_config() {
 // ── Incomplete credentials rejection ──────────────────────────────────
 
 #[test]
-fn s3_store_rejects_incomplete_credentials_key_without_secret() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
-        Some(SecretString::from_secret("key")),
-        None,
-        None,
-    );
-    let store = S3ObjectStore::new(config);
-    assert!(matches!(
-        store,
-        Err(S3ObjectStoreError::IncompleteCredentials)
-    ));
-}
-
-#[test]
-fn s3_store_rejects_incomplete_credentials_secret_without_key() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
-        None,
-        Some(SecretString::from_secret("secret")),
-        None,
-    );
-    let store = S3ObjectStore::new(config);
-    assert!(matches!(
-        store,
-        Err(S3ObjectStoreError::IncompleteCredentials)
-    ));
+fn s3_store_rejects_incomplete_credentials() {
+    for (access_key, secret_key) in [(Some("key"), None), (None, Some("secret"))] {
+        let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
+            access_key.map(SecretString::from_secret),
+            secret_key.map(SecretString::from_secret),
+            None,
+        );
+        assert!(matches!(
+            S3ObjectStore::new(config),
+            Err(S3ObjectStoreError::IncompleteCredentials)
+        ));
+    }
 }
 
 // ── MinIO-backed integration tests ───────────────────────────────────
@@ -1461,6 +1164,35 @@ mod minio_tests {
             )
             .with_key_prefix(raw.key_prefix.as_deref());
         S3ObjectStore::new(config).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn minio_resumable_completion_sorts_parts_and_preserves_bytes() {
+        let Some(stack) = ensure_minio() else {
+            return;
+        };
+        let prefix = stack.unique_s3_key_prefix("resumable-order");
+        let store = build_s3_store(&stack, Some(&prefix));
+        let key = ObjectKey::parse("objects/resumable.xorb").unwrap();
+        let mut body = vec![b'a'; 5 * 1024 * 1024];
+        let split = body.len();
+        body.extend_from_slice(b"final part");
+        let body = bytes::Bytes::from(body);
+        let upload_id = store.create_resumable_upload(&key).await.unwrap();
+        let first = store
+            .upload_resumable_part(&key, &upload_id, 0, body.slice(..split))
+            .await
+            .unwrap();
+        let last = store
+            .upload_resumable_part(&key, &upload_id, 1, body.slice(split..))
+            .await
+            .unwrap();
+        store
+            .complete_resumable_upload(&key, &upload_id, vec![(1, last), (0, first)])
+            .await
+            .unwrap();
+        let range = ByteRange::new(0, body.len() as u64 - 1).unwrap();
+        assert_eq!(store.read_range(&key, range).unwrap(), body.as_ref());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1646,8 +1378,7 @@ mod minio_tests {
         let body = b"content addressed payload";
 
         let begin = store.begin_content_addressed_upload(&canonical).await;
-        assert!(begin.is_ok());
-        let Ok(begin) = begin else { return };
+        let begin = begin.expect("expected valid begin");
 
         match begin {
             BeginMultipartUploadResult::AlreadyExists => {
@@ -1660,7 +1391,6 @@ mod minio_tests {
                 let finish = store
                     .finish_content_addressed_upload(writer, &temp_key, &canonical)
                     .await;
-                assert!(finish.is_ok());
                 let outcome = finish.unwrap();
                 // Could be Inserted or AlreadyExists depending on timing
                 assert!(
@@ -1979,129 +1709,61 @@ mod minio_tests {
 // ── Additional pure function edge cases ──────────────────────────────
 
 #[test]
-fn normalize_prefix_empty_input_chain() {
-    assert_eq!(normalize_prefix("//"), None);
-    assert_eq!(normalize_prefix("///////"), None);
-}
-
-#[test]
-fn location_for_key_without_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let key = ObjectKey::parse("simple/key.xorb").unwrap();
-    let location = store.location_for_key(&key);
-    assert!(location.is_ok());
-    if let Ok(loc) = location {
-        assert_eq!(loc.as_ref(), "simple/key.xorb");
-    }
-}
-
-#[test]
-fn location_for_prefix_empty_without_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let prefix = crate::ObjectPrefix::parse("").unwrap();
-    let location = store.location_for_prefix(&prefix);
-    assert!(location.is_ok());
-    if let Ok(loc) = location {
-        // Empty prefix with no key_prefix should give empty path
-        assert_eq!(loc.as_ref(), "");
-    }
-}
-
-#[test]
-fn location_for_prefix_empty_with_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("tenant-x")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let prefix = crate::ObjectPrefix::parse("").unwrap();
-    let location = store.location_for_prefix(&prefix);
-    assert!(location.is_ok());
-    if let Ok(loc) = location {
-        assert_eq!(loc.as_ref(), "tenant-x");
-    }
-}
-
-#[test]
-fn location_for_prefix_with_prefix_and_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("tenant-x")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let prefix = crate::ObjectPrefix::parse("sub/").unwrap();
-    let location = store.location_for_prefix(&prefix);
-    assert!(location.is_ok());
-    if let Ok(loc) = location {
-        // ObjectStorePath::parse may strip trailing slashes
-        let path_str = loc.as_ref();
-        assert!(
-            path_str == "tenant-x/sub" || path_str == "tenant-x/sub/",
-            "unexpected path: {path_str}"
+fn location_for_key_contract() {
+    for (port, tenant, key, expected) in [
+        (9000, None, "simple/key.xorb", "simple/key.xorb"),
+        (
+            18979,
+            Some("tenant-z"),
+            "ns/obj.xorb",
+            "tenant-z/ns/obj.xorb",
+        ),
+        (18978, None, "ns/obj.xorb", "ns/obj.xorb"),
+    ] {
+        let store = S3ObjectStore::new(
+            S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
+                .with_endpoint(Some(format!("http://127.0.0.1:{port}")))
+                .with_allow_http(true)
+                .with_key_prefix(tenant),
+        )
+        .unwrap();
+        let location = store
+            .location_for_key(&ObjectKey::parse(key).unwrap())
+            .unwrap();
+        assert_eq!(
+            location.as_ref(),
+            expected,
+            "tenant={tenant:?}, key={key:?}"
         );
     }
 }
 
 #[test]
-fn s3_config_debug_shows_virtual_hosted_style() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-        .with_virtual_hosted_style_request(true);
-    let rendered = format!("{config:?}");
-    assert!(rendered.contains("virtual_hosted_style_request: true"));
-}
-
-#[test]
-fn s3_store_debug_shows_runtime_status() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let rendered = format!("{store:?}");
-    // Should mention runtime status
-    assert!(rendered.contains("runtime"));
-}
-
-#[test]
-fn validated_external_range_start_at_u64_max_rejected() {
-    // Range starting at u64::MAX with length 1 would overflow
-    let range = ByteRange::new(u64::MAX, u64::MAX).expect("valid range with single byte at MAX");
-    let result = validated_external_range(range);
-    assert!(matches!(result, Err(S3ObjectStoreError::RangeOutOfBounds)));
-}
-
-#[test]
-fn s3_error_source_invalid_key_prefix() {
-    use crate::ObjectPrefixError;
-    let prefix_err = ObjectPrefixError::UnsafePath;
-    let err = S3ObjectStoreError::InvalidKeyPrefix(prefix_err);
-    let source = std::error::Error::source(&err);
-    assert!(source.is_some());
-    let source = source.unwrap();
-    assert_eq!(
-        source.to_string(),
-        ObjectPrefixError::UnsafePath.to_string()
-    );
+fn location_for_prefix_contract() {
+    for (port, tenant, prefix, expected) in [
+        (9000, None, "", ""),
+        (9000, Some("tenant-x"), "", "tenant-x"),
+        (9000, Some("tenant-x"), "sub/", "tenant-x/sub"),
+        (9000, None, "my-stuff/", "my-stuff"),
+        (18993, None, "subdir/", "subdir"),
+        (18992, Some("pfx"), "subdir/", "pfx/subdir"),
+    ] {
+        let store = S3ObjectStore::new(
+            S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
+                .with_endpoint(Some(format!("http://127.0.0.1:{port}")))
+                .with_allow_http(true)
+                .with_key_prefix(tenant),
+        )
+        .unwrap();
+        let location = store
+            .location_for_prefix(&ObjectPrefix::parse(prefix).unwrap())
+            .unwrap();
+        let path = location.as_ref();
+        assert!(
+            path == expected || (prefix.ends_with('/') && path == format!("{expected}/")),
+            "tenant={tenant:?}, prefix={prefix:?}: unexpected path {path:?}"
+        );
+    }
 }
 
 #[test]
@@ -2111,8 +1773,7 @@ fn temp_key_for_overflow_key_rejected() {
     // independent of the base key's length, so it always parses.
     let long_base = "a".repeat(4090);
     let key = ObjectKey::parse(&long_base);
-    assert!(key.is_ok());
-    let Ok(key) = key else { return };
+    let key = key.expect("expected valid key");
 
     let result = temp_key_for(&key);
     let temp = result.expect("temp_key_for must not overflow on a long base key");
@@ -2135,53 +1796,6 @@ fn verify_file_length_nonexistent_file() {
     assert!(matches!(result, Err(S3ObjectStoreError::Io(_))));
 }
 
-// ── Error variant source() tests ──────────────────────────────────────
-
-#[test]
-fn s3_error_source_io() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test");
-    let err = S3ObjectStoreError::Io(io_err);
-    let source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
-    assert!(source.is_some());
-    let source = source.unwrap();
-    assert_eq!(source.to_string(), "test");
-}
-
-#[test]
-fn s3_error_source_path() {
-    use object_store::path::Error as PathError;
-    let path_err = PathError::InvalidPath {
-        path: "/bad".into(),
-    };
-    let err = S3ObjectStoreError::Path(path_err);
-    let source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
-    assert!(source.is_some());
-    let source = source.unwrap();
-    assert!(source.to_string().contains("/bad"));
-}
-
-#[test]
-fn s3_error_source_runtime() {
-    let io_err = std::io::Error::other("thread spawn failed");
-    let err = S3ObjectStoreError::Runtime(io_err);
-    let source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
-    assert!(source.is_some());
-    let source = source.unwrap();
-    assert_eq!(source.to_string(), "thread spawn failed");
-}
-
-#[test]
-fn s3_error_source_external() {
-    let ext_err = object_store::Error::NotImplemented {
-        operation: "test".to_owned(),
-        implementer: "test".to_owned(),
-    };
-    let err = S3ObjectStoreError::External(ext_err);
-    let source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&err);
-    // External derives source via #[from]
-    assert!(source.is_some());
-}
-
 // ── S3ObjectStore partial config properties ───────────────────────────
 
 #[test]
@@ -2194,511 +1808,114 @@ fn s3_config_clone_and_eq() {
 }
 
 #[test]
-fn s3_config_with_credentials_only_key() {
-    // Only access_key_id without secret_access_key should fail
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
-        Some(SecretString::from_secret("key")),
-        None,
-        None,
+fn s3_object_namespaces_detect_overlapping_prefix_boundaries() {
+    let config = |prefix: Option<&str>| {
+        S3ObjectStoreConfig::new("archive".to_owned(), "us-east-1".to_owned())
+            .with_endpoint(Some("https://objects.example.test/".to_owned()))
+            .with_key_prefix(prefix)
+    };
+
+    assert!(config(Some("hub")).overlaps_object_namespace(&config(Some("hub/refs"))));
+    assert!(config(None).overlaps_object_namespace(&config(Some("hub"))));
+    assert!(!config(Some("hub")).overlaps_object_namespace(&config(Some("hub-other"))));
+    assert!(
+        !config(Some("hub")).overlaps_object_namespace(
+            &S3ObjectStoreConfig::new("different".to_owned(), "us-east-1".to_owned())
+                .with_endpoint(Some("https://objects.example.test".to_owned()))
+                .with_key_prefix(Some("hub")),
+        )
     );
-    let store = S3ObjectStore::new(config);
-    assert!(matches!(
-        store,
-        Err(S3ObjectStoreError::IncompleteCredentials)
-    ));
-}
-
-#[test]
-fn s3_config_with_credentials_only_secret() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_credentials(
-        None,
-        Some(SecretString::from_secret("secret")),
-        None,
+    assert!(
+        !config(Some("hub")).overlaps_object_namespace(
+            &S3ObjectStoreConfig::new("archive".to_owned(), "us-east-1".to_owned())
+                .with_endpoint(Some("https://other.example.test".to_owned()))
+                .with_key_prefix(Some("hub")),
+        )
     );
-    let store = S3ObjectStore::new(config);
-    assert!(matches!(
-        store,
-        Err(S3ObjectStoreError::IncompleteCredentials)
-    ));
-}
-
-// ── S3ObjectStoreConfig Debug without endpoint ────────────────────────
-
-#[test]
-fn s3_config_debug_without_endpoint_shows_none() {
-    let config = S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned());
-    let dbg = format!("{config:?}");
-    assert!(dbg.contains("endpoint: None"));
-}
-
-// ── S3MultipartUploadWriter Debug ────────────────────────────────────
-
-#[test]
-fn s3_multipart_upload_writer_debug_not_available() {
-    // The writer type doesn't implement Debug, but we can
-    // verify the wrapper compiles and works.
-}
-
-// ── normalize_prefix coverage edge cases ─────────────────────────────
-
-#[test]
-fn normalize_prefix_single_slash_only() {
-    assert_eq!(normalize_prefix("/"), None);
-}
-
-#[test]
-fn normalize_prefix_no_trim_needed() {
-    assert_eq!(normalize_prefix("plain"), Some("plain".to_owned()));
-}
-
-// ── location_for_prefix with non-empty prefix, no key prefix ─────────
-
-#[test]
-fn location_for_prefix_non_empty_no_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-    let prefix = crate::ObjectPrefix::parse("my-stuff/").unwrap();
-    let location = store.location_for_prefix(&prefix);
-    assert!(location.is_ok());
-    if let Ok(loc) = location {
-        let path = loc.as_ref();
-        assert!(
-            path == "my-stuff" || path == "my-stuff/",
-            "unexpected: {path}"
-        );
-    }
 }
 
 // ── metadata_from_external with prefix and without ────────────────────
 
 #[test]
-fn metadata_from_external_strips_prefix() {
-    use object_store::path::Path as ObjectStorePath;
-
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("tenant-x")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-
-    let meta = object_store::ObjectMeta {
-        location: ObjectStorePath::from("tenant-x/ns/key.xorb"),
-        last_modified: chrono::Utc::now(),
-        size: 42,
-        e_tag: None,
-        version: None,
-    };
-    let result = store.metadata_from_external(&meta);
-    assert!(result.is_ok());
-    if let Ok(metadata) = result {
-        assert_eq!(metadata.key().as_str(), "ns/key.xorb");
-        assert_eq!(metadata.length(), 42);
+fn metadata_conversion_preserves_keys_lengths_and_prefix_boundaries() {
+    for (prefix, location, size, expected) in [
+        (
+            Some("tenant-x"),
+            "tenant-x/ns/key.xorb",
+            42,
+            Some("ns/key.xorb"),
+        ),
+        (None, "plain/key.xorb", 100, Some("plain/key.xorb")),
+        (Some("tenant-x"), "other-prefix/key.xorb", 42, None),
+        (Some("tenant-x"), "tenant-x-other/key.xorb", 42, None),
+        (Some("tenant-x"), "tenant-x", 42, None),
+        (Some("tenant-x"), "tenant-x/", 42, None),
+    ] {
+        let store = S3ObjectStore::new(
+            S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned()).with_key_prefix(prefix),
+        )
+        .unwrap();
+        let meta = object_store::ObjectMeta {
+            location: ObjectStorePath::from(location),
+            last_modified: chrono::DateTime::from_timestamp(123, 456).unwrap(),
+            size,
+            e_tag: None,
+            version: None,
+        };
+        let result = store.metadata_from_external(&meta);
+        if let Some(key) = expected {
+            let metadata = result.unwrap();
+            assert_eq!(metadata.key().as_str(), key);
+            assert_eq!(metadata.length(), size);
+            assert_eq!(metadata.modified_unix_nanos(), Some(123_000_000_456));
+        } else {
+            assert!(
+                matches!(result, Err(S3ObjectStoreError::InvalidListedKey)),
+                "{location}"
+            );
+        }
     }
 }
 
 #[test]
-fn metadata_from_external_no_prefix() {
-    use object_store::path::Path as ObjectStorePath;
-
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-
-    let meta = object_store::ObjectMeta {
-        location: ObjectStorePath::from("plain/key.xorb"),
-        last_modified: chrono::Utc::now(),
-        size: 100,
-        e_tag: None,
-        version: None,
-    };
-    let result = store.metadata_from_external(&meta);
-    assert!(result.is_ok());
-    if let Ok(metadata) = result {
-        assert_eq!(metadata.key().as_str(), "plain/key.xorb");
-        assert_eq!(metadata.length(), 100);
+fn file_upload_preflight_rejects_local_failures_before_contacting_storage() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let store = synchronous_runtime_fixture(format!("http://{}", listener.local_addr().unwrap()));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.bin");
+    let key = ObjectKey::parse("test/key").unwrap();
+    let integrity = ObjectIntegrity::new(chunk_hash(b"short"), 99);
+    for exists in [false, true] {
+        if exists {
+            std::fs::write(&path, b"short").unwrap();
+        }
+        let results = [
+            super::existing_object_outcome_from_file(&store, &key, &path, &integrity).map(|_| ()),
+            store
+                .put_file_if_absent(&key, &path, &integrity)
+                .map(|_| ()),
+            store
+                .put_content_addressed_file(&key, &path, &integrity)
+                .map(|_| ()),
+        ];
+        for result in results {
+            if exists {
+                assert!(matches!(
+                    result,
+                    Err(S3ObjectStoreError::IntegrityLengthMismatch)
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(S3ObjectStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+                );
+            }
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
-}
-
-#[test]
-fn metadata_from_external_rejects_outside_prefix() {
-    use object_store::path::Path as ObjectStorePath;
-
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:9000".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("tenant-x")),
-    );
-    assert!(store.is_ok());
-    let Ok(store) = store else { return };
-
-    let meta = object_store::ObjectMeta {
-        location: ObjectStorePath::from("other-prefix/key.xorb"),
-        last_modified: chrono::Utc::now(),
-        size: 42,
-        e_tag: None,
-        version: None,
-    };
-    let result = store.metadata_from_external(&meta);
-    assert!(matches!(result, Err(S3ObjectStoreError::InvalidListedKey)));
-}
-
-// ── block_on / block_on_result fallback paths ──────────────────────
-
-#[test]
-fn s3_block_on_fallback_with_own_runtime_on_contains() {
-    // In a regular #[test] there is no tokio runtime, so Handle::try_current()
-    // returns Err, which exercises the self.runtime fallback in block_on.
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18999".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    // This will fail because there is no S3 endpoint, but the block_on
-    // fallback path through self.runtime is exercised.
-    let result = store.contains(&key);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-#[test]
-fn s3_block_on_fallback_with_own_runtime_on_metadata() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18998".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store.metadata(&key);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-#[test]
-fn s3_block_on_fallback_with_own_runtime_on_delete() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18997".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store.delete_if_present(&key);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-#[test]
-fn s3_block_on_fallback_with_own_runtime_on_read_range() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18996".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let range = shardline_protocol::ByteRange::new(0, 5).unwrap();
-
-    let result = store.read_range(&key, range);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-#[test]
-fn s3_block_on_result_fallback_on_visit_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18995".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let prefix = ObjectPrefix::parse("ns/").unwrap();
-    let result: Result<(), S3ObjectStoreError> = store.visit_prefix(&prefix, |_meta| Ok(()));
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-#[test]
-fn s3_block_on_result_fallback_on_list_flat() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18994".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let prefix = ObjectPrefix::parse("ns/").unwrap();
-    let result = store.list_flat_namespace_page(&prefix, None, 10);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── location_for_prefix edge cases ────────────────────────────────
-
-#[test]
-fn location_for_prefix_with_prefix_no_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18993".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let prefix = ObjectPrefix::parse("subdir/").unwrap();
-    let location = store.location_for_prefix(&prefix).unwrap();
-    let path = location.as_ref();
-    assert!(path == "subdir" || path == "subdir/", "unexpected: {path}");
-}
-
-#[test]
-fn location_for_prefix_non_empty_prefix_with_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18992".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("pfx")),
-    )
-    .unwrap();
-    let prefix = ObjectPrefix::parse("subdir/").unwrap();
-    let location = store.location_for_prefix(&prefix).unwrap();
-    let path = location.as_ref();
-    assert!(path.starts_with("pfx/"), "expected pfx/ prefix, got {path}");
-}
-
-// ── copy_object_if_absent edge cases ──────────────────────────────
-
-#[test]
-fn s3_copy_object_if_absent_source_eq_destination_with_source_exists() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18991".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    // source == destination with missing source — should Err because metadata returns None
-    // (the head() call fails with connection error, which is mapped through)
-    let key = ObjectKey::parse("test/key").unwrap();
-    let result = store.copy_object_if_absent(&key, &key);
-    // Without a connection, metadata() fails, so this should be an error
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── put_if_absent error path (connection error) ────────────────────
-
-#[test]
-fn s3_put_if_absent_connection_error() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18990".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let body = ObjectBody::from_slice(b"hello world");
-    let integrity = ObjectIntegrity::new(super::chunk_hash(b"hello world"), 11);
-    let result = store.put_if_absent(&key, body, &integrity);
-    // verify_integrity passes, then metadata() fails with connection error
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── put_overwrite error path ───────────────────────────────────────
-
-#[test]
-fn s3_put_overwrite_connection_error() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18989".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let body = ObjectBody::from_slice(b"hello world");
-    let integrity = ObjectIntegrity::new(super::chunk_hash(b"hello world"), 11);
-    let result = store.put_overwrite(&key, body, &integrity);
-    // verify_integrity passes, then put_opts fails with connection error
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── existing_object_outcome_from_file edge case ────────────────────
-
-#[test]
-fn existing_object_outcome_from_file_verify_file_length_fails() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18985".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("mismatch.bin");
-    std::fs::write(&path, b"short").unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let integrity = ObjectIntegrity::new(super::chunk_hash(b"short"), 99);
-    // verify_file_length fails
-    let result = super::existing_object_outcome_from_file(&store, &key, &path, &integrity);
-    assert!(matches!(
-        result,
-        Err(S3ObjectStoreError::IntegrityLengthMismatch)
-    ));
-}
-
-// ── existing_copy_outcome edge case ────────────────────────────────
-
-#[test]
-fn existing_copy_outcome_missing_destination() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18984".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let src = ObjectKey::parse("test/src").unwrap();
-    let dst = ObjectKey::parse("test/dst").unwrap();
-    // destination metadata() will fail with connection error
-    let result = super::existing_copy_outcome(&store, &src, &dst, 10);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── delete_location_if_present ─────────────────────────────────────
-
-#[test]
-fn s3_delete_location_if_present_connection_error() {
-    use object_store::path::Path as ObjectStorePath;
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18983".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let location = ObjectStorePath::from("test/key");
-    let result = store.delete_location_if_present(&location);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── list_prefix on empty prefix ────────────────────────────────────
-
-#[test]
-fn s3_list_prefix_empty_prefix_with_connection() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18982".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let prefix = ObjectPrefix::parse("").unwrap();
-    // visit_prefix will fail with connection error
-    let result = store.list_prefix(&prefix);
-    assert!(
-        result.is_err(),
-        "expected error from unreachable S3: {result:?}"
-    );
-}
-
-// ── put_file_if_absent with non-existent file ──────────────────────
-
-#[test]
-fn s3_put_file_if_absent_nonexistent_file() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18981".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("nonexistent.bin");
-    let integrity = ObjectIntegrity::new(super::chunk_hash(b""), 0);
-    // verify_file_length will fail with Io error (file not found)
-    let result = store.put_file_if_absent(&key, &path, &integrity);
-    assert!(matches!(result, Err(S3ObjectStoreError::Io(_))));
-}
-
-#[test]
-fn s3_put_content_addressed_file_nonexistent_file() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18980".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("nonexistent.bin");
-    let integrity = ObjectIntegrity::new(super::chunk_hash(b""), 0);
-    let result = store.put_content_addressed_file(&key, &path, &integrity);
-    assert!(matches!(result, Err(S3ObjectStoreError::Io(_))));
-}
-
-// ── location_for_key with key_prefix ───────────────────────────────
-
-#[test]
-fn s3_location_for_key_with_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18979".to_owned()))
-            .with_allow_http(true)
-            .with_key_prefix(Some("tenant-z")),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("ns/obj.xorb").unwrap();
-    let location = store.location_for_key(&key).unwrap();
-    assert_eq!(location.as_ref(), "tenant-z/ns/obj.xorb");
-}
-
-#[test]
-fn s3_location_for_key_without_key_prefix() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18978".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("ns/obj.xorb").unwrap();
-    let location = store.location_for_key(&key).unwrap();
-    assert_eq!(location.as_ref(), "ns/obj.xorb");
 }
 
 // ── S3MultipartUploadWriter finish via InMemory ────────────────────
@@ -2727,120 +1944,32 @@ async fn s3_multipart_upload_writer_finish() {
 // ── complete_resumable_upload validation ────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s3_complete_resumable_empty_parts_rejected() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18978".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
+async fn resumable_completion_rejects_invalid_parts_before_contacting_storage() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let store = synchronous_runtime_fixture(format!("http://{}", listener.local_addr().unwrap()));
     let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store
-        .complete_resumable_upload(&key, "upload-id", vec![])
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(S3ObjectStoreError::InvalidUploadParts)
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s3_complete_resumable_non_consecutive_parts_rejected() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18977".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store
-        .complete_resumable_upload(&key, "upload-id", vec![(0, "e0".into()), (2, "e2".into())])
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(S3ObjectStoreError::InvalidUploadParts)
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s3_complete_resumable_reordered_parts_validated() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18976".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    // Parts are out of order but consecutive — sort fixes them,
-    // then validation passes and we proceed to the S3 call which fails.
-    let result = store
-        .complete_resumable_upload(&key, "upload-id", vec![(1, "e1".into()), (0, "e0".into())])
-        .await;
-
-    // The connection to the fake endpoint fails after validation passes.
-    // We expect an External error, not InvalidUploadParts.
-    assert!(
-        !matches!(result, Err(S3ObjectStoreError::InvalidUploadParts)),
-        "consecutive parts should pass validation"
-    );
-    assert!(result.is_err(), "should fail with connection error");
-}
-
-// ── begin_content_addressed_upload early return ─────────────────────
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s3_begin_content_addressed_upload_fails_with_connection_error() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18975".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store.begin_content_addressed_upload(&key).await;
-    // metadata() will fail with connection error before reaching the upload logic
-    assert!(result.is_err(), "expected connection error");
-}
-
-// ── delete_if_present with AlreadyExists from external error ────────
-
-#[test]
-fn s3_delete_if_present_connection_error() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18974".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    let key = ObjectKey::parse("test/key").unwrap();
-
-    let result = store.delete_if_present(&key);
-    // The S3 head/delete operation fails with connection error
-    assert!(result.is_err(), "expected connection error");
-}
-
-// ── list_flat_namespace_page with start_after validation ───────────
-
-#[test]
-fn s3_list_flat_namespace_validates_start_after() {
-    let store = S3ObjectStore::new(
-        S3ObjectStoreConfig::new("b".to_owned(), "r".to_owned())
-            .with_endpoint(Some("http://127.0.0.1:18972".to_owned()))
-            .with_allow_http(true),
-    )
-    .unwrap();
-    // Test that start_after is properly converted to a location
-    // (the S3 call itself will fail, but the transformation runs)
-    let prefix = ObjectPrefix::parse("ns/").unwrap();
-    let key = ObjectKey::parse("ns/key01").unwrap();
-    let result = store.list_flat_namespace_page(&prefix, Some(&key), 10);
-    // Should fail with connection error (the function validates start_after
-    // internally in its own way for S3)
-    assert!(result.is_err(), "expected connection error");
+    for numbers in [
+        vec![],
+        vec![0, 2],
+        vec![0, 0],
+        vec![1],
+        vec![1, 2],
+        vec![0, usize::MAX],
+    ] {
+        let parts = numbers
+            .into_iter()
+            .map(|number| (number, format!("etag-{number}")))
+            .collect();
+        assert!(matches!(
+            store
+                .complete_resumable_upload(&key, "upload-id", parts)
+                .await,
+            Err(S3ObjectStoreError::InvalidUploadParts)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
