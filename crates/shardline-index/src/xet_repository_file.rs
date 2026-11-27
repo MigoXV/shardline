@@ -106,3 +106,65 @@ impl PostgresRecordStore {
         .await
     }
 }
+
+impl LocalRecordStore {
+    /// Removes all revision-less native references owned by a reserved copy scope.
+    ///
+    /// # Errors
+    /// Returns an error if the metadata transaction fails.
+    pub async fn drop_hub_xet_scope(
+        &self,
+        scope: &RepositoryScope,
+    ) -> Result<(), LocalIndexStoreError> {
+        let scope_key = XetFileIdentity::repository_key_for_scope(scope);
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = store.open_connection()?;
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM shardline_file_records WHERE scope_key=?1",
+                [&scope_key],
+            )?;
+            transaction.execute(
+                "DELETE FROM shardline_xet_file_identities WHERE scope_key=?1",
+                [&scope_key],
+            )?;
+            transaction.execute(
+                "DELETE FROM shardline_xet_file_aliases WHERE scope_key=?1",
+                [&scope_key],
+            )?;
+            transaction.commit()?;
+            Ok::<_, LocalIndexStoreError>(())
+        })
+        .await
+        .map_err(|error| LocalIndexStoreError::BlockingTask(error.to_string()))?
+    }
+}
+
+impl PostgresRecordStore {
+    /// Removes all revision-less native references owned by a reserved copy scope.
+    ///
+    /// # Errors
+    /// Returns an error if the metadata transaction fails.
+    pub async fn drop_hub_xet_scope(
+        &self,
+        scope: &RepositoryScope,
+    ) -> Result<(), PostgresMetadataStoreError> {
+        let scope_key = XetFileIdentity::repository_key_for_scope(scope);
+        let mut transaction = self.pool().begin().await?;
+        sqlx::query("DELETE FROM shardline_file_records WHERE scope_key=$1")
+            .bind(&scope_key)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM shardline_xet_file_identities WHERE scope_key=$1")
+            .bind(&scope_key)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM shardline_xet_file_aliases WHERE scope_key=$1")
+            .bind(&scope_key)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
