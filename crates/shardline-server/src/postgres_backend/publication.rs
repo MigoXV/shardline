@@ -22,7 +22,7 @@ impl super::PostgresBackend {
             .await
     }
 
-    pub(super) async fn commit_validated_native_shard_with_descriptors(
+    pub(crate) async fn commit_validated_native_shard_with_descriptors(
         &self,
         records: &[FileRecord],
         mappings: &[shardline_index::DedupeShardMapping],

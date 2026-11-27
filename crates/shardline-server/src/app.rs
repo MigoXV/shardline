@@ -4,6 +4,7 @@ mod admin_api;
 mod background_tasks;
 mod delta;
 mod hub_recovery_worker;
+pub(crate) mod hub_xet_copy;
 mod hub_xet_download;
 pub use background_tasks::RouterBackgroundTasks;
 mod metadata_routes;
@@ -863,6 +864,12 @@ fn register_xet_routes(
             .route(
                 "/v2/file-chunk-hashes/{file_id}",
                 get(delta::file_chunk_hashes),
+            )
+            .route(
+                "/v1/hub/xet-copy-references",
+                post(hub_xet_copy::copy_references)
+                    .delete(hub_xet_copy::drop_references)
+                    .layer(DefaultBodyLimit::max(32 * 1024)),
             )
             .route("/v1/hub/xet-files/{sha256}", get(download_hub_xet_file))
             .route(

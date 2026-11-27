@@ -152,6 +152,14 @@ pub(crate) fn register_route_policies(registry: &mut RoutePolicyRegistry) {
         RouteAuthPolicy::Authenticated,
     );
 
+    for method in ["POST", "DELETE"] {
+        registry.register(
+            method,
+            "/v1/hub/xet-copy-references",
+            RouteAuthPolicy::AuthenticatedWrite,
+        );
+    }
+
     // Shard upload — write
     registry.register("POST", "/v1/shards", RouteAuthPolicy::AuthenticatedWrite);
     registry.register("POST", "/v2/shards", RouteAuthPolicy::AuthenticatedWrite);
